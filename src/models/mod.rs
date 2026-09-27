@@ -4,6 +4,10 @@
 
 pub mod f5;
 
+// Dense Qwen3.5 checkpoint structure. Backend-free config/layout only for now;
+// the resident hybrid text/vision runtime is a separate implementation step.
+pub mod qwen3_5;
+
 // Qwen2.5-VL text backbone (BiQwen2_5 / nomic-embed-multimodal-7b). Reuses
 // gemma's RoPE table, so it rides the `gemma` feature.
 #[cfg(feature = "gemma")]
