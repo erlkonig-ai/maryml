@@ -76,6 +76,20 @@
 # only machines that are, are the measurement machines. Building elsewhere is not
 # an available answer, which is why reserving is.
 #
+# BUILD SLOTS: AN OPT-IN, MEMORY-GATED SECOND HOLDER FOR CPU BUILDS.
+# By default this is one lock per box and nothing below changes that. A box's
+# owner may write `$HOME/gb10/build-slots` on the box, one line `N MIN_GB`
+# (N in 1..4): then up to N tags hold the box at once, in box.lock.d,
+# box.lock.d.2 and so on, and slot 2 or higher is granted only while the box's
+# MemAvailable is at least MIN_GB. It exists for nights when several CPU-only
+# builds, each capped at 4 jobs and run through rustc-expendable, queue behind
+# one another. It was allowed on 2026-09-28 with the explicit warning that an OOM locks the
+# box up. This script cannot tell a build from a GPU run, so the file must only
+# exist while no GPU work is scheduled on the box: pause GPU timers first, and
+# delete the file afterwards. refresh and release find a holder by its tag in
+# any slot, so removing the file never strands a holder; it only stops new
+# slots from being granted. GB10_LOCK_ROOT overrides $HOME/gb10, for tests.
+#
 # IF YOU CAN SEE THE BOX, LOOK BEFORE YOU BREAK A STALE LOCK. This script reads
 # silence as death because it cannot see the holder -- that is the right rule for
 # the mechanism, and the wrong rule for a caller with ssh. A holder doing one long
@@ -214,7 +228,7 @@ case "$ACTION" in take|release) [ -z "$TAG" ] && usage ;; esac
 # answer that reads as "free" is the most dangerous possible failure for a
 # lock, so it is called out rather than just avoided.
 timeout 60 ssh -o BatchMode=yes -o ConnectTimeout=10 "$HOST" \
-  "bash -s -- '$ACTION' '$TAG' '$GB10_LOCK_TIMEOUT_S' '$HOST'" <<'REMOTE'
+  "bash -s -- '$ACTION' '$TAG' '$GB10_LOCK_TIMEOUT_S' '$HOST' '${GB10_LOCK_ROOT:-}'" <<'REMOTE'
 set -uo pipefail
 # HOSTALIAS is the ssh alias the CALLER used. It is passed in purely so the
 # take message can print a command that actually runs: `refresh` takes
@@ -223,71 +237,96 @@ set -uo pipefail
 # and then the lock goes stale mid-measurement while another agent takes the
 # box. Cost one round trip on 2026-08-30; the silent-stale outcome is worse.
 ACTION=$1; TAG=$2; TIMEOUT=$3; HOSTALIAS=${4:-<host>}
-LOCKD="$HOME/gb10/box.lock.d"
-INFO="$LOCKD/info"
+LOCKROOT=${5:-}; [ -n "$LOCKROOT" ] || LOCKROOT="$HOME/gb10"
+LOCKD="$LOCKROOT/box.lock.d"
 ME=$(hostname)
 NOW=$(date -u +%s)
 
+# Build slots (see the header): absent file means exactly one slot.
+SLOTS=1; MINGB=0
+if [ -f "$LOCKROOT/build-slots" ]; then
+  read -r n g _ < "$LOCKROOT/build-slots"
+  case "$n" in [1-4]) SLOTS=$n ;; esac
+  case "$g" in ''|*[!0-9]*) MINGB=1000000 ;; *) MINGB=$g ;; esac
+fi
+slotdir() { if [ "$1" = 1 ]; then echo "$LOCKD"; else echo "$LOCKD.$1"; fi; }
+# Every slot directory that exists, whatever the current file allows, so a
+# holder is always found by its tag after the file shrinks or disappears.
+held_dirs() { for d in "$LOCKD" "$LOCKD".[0-9]*; do [ -d "$d" ] && echo "$d"; done; }
+tag_of() { sed -n 's/^tag=//p' "$1/info" 2>/dev/null; }
+find_tag_dir() { for d in $(held_dirs); do [ "$(tag_of "$d")" = "$TAG" ] && { echo "$d"; return 0; }; done; return 1; }
+avail_gb() { awk '/^MemAvailable:/{print int($2/1048576)}' /proc/meminfo; }
+holders() { for d in $(held_dirs); do tr '\n' ' ' < "$d/info" 2>/dev/null; echo; done; }
+
 write_info() {
-  printf 'host=%s\ntag=%s\nstart=%s\nbeat=%s\n' "$ME" "$TAG" "$NOW" "$NOW" > "$INFO"
+  printf 'host=%s\ntag=%s\nstart=%s\nbeat=%s\n' "$ME" "$TAG" "$NOW" "$NOW" > "$1/info"
 }
 
 case "$ACTION" in
   take)
-    mkdir -p "$HOME/gb10"
-    if mkdir "$LOCKD" 2>/dev/null; then write_info
-      echo "TAKEN $TAG -- you MUST call 'refresh $HOSTALIAS $TAG' at least every ${TIMEOUT}s"
-      echo "  or this lock goes stale and another agent may take the box while you run."
-      exit 0; fi
-    [ -f "$INFO" ] || { echo "HELD by an unidentified holder"; exit 3; }
-    hhost=$(sed -n 's/^host=//p' "$INFO")
-    htag=$(sed -n 's/^tag=//p' "$INFO");  hst=$(sed -n 's/^beat=//p' "$INFO")
-    age=$(( NOW - ${hst:-0} ))
-    # TAKING A LOCK YOU ALREADY HOLD SUCCEEDS. `mkdir` fails when the directory
-    # exists, so without this a caller is refused BY ITSELF -- which breaks the
-    # two cases that matter most for unattended work: a crashed run relaunched
-    # with the same tag (exactly what a restartable job does), and a third party
-    # taking it on your behalf. It is safe because it succeeds only when the
-    # holder IS you, so it can never put two tags on one box. Beat while we are
-    # here, since a re-take is proof of life.
-    if [ "$htag" = "$TAG" ]; then
-      sed -i "s/^beat=.*/beat=$NOW/" "$INFO" 2>/dev/null
+    mkdir -p "$LOCKROOT"
+    # TAKING A LOCK YOU ALREADY HOLD SUCCEEDS, in whichever slot you hold it.
+    # Without this a caller is refused BY ITSELF, which breaks the two cases
+    # that matter most for unattended work: a crashed run relaunched with the
+    # same tag, and a third party taking it on your behalf. It can never put
+    # two tags on one slot. Beat while we are here: a re-take is proof of life.
+    if d=$(find_tag_dir); then
+      sed -i "s/^beat=.*/beat=$NOW/" "$d/info" 2>/dev/null
       echo "TAKEN $TAG (already held by you; beat refreshed)"; exit 0
     fi
-    # THERE IS DELIBERATELY NO PID-LIVENESS TEST, and the reason is worth keeping.
-    # The first version had one: "a dead pid on this box is a dead lock, no
-    # timeout needed", which reads as the more exact answer. It is the more exact
-    # answer to the WRONG QUESTION. The pid it recorded was the transient ssh
-    # shell that took the lock, which exits the instant the take returns -- so
-    # every lock was born dead and the very next caller broke it. Caught by this
-    # script's own self-test, where `take b` cheerfully broke `take a` one second
-    # later and reported it as a repair. Liveness here is a HEARTBEAT, not a pid:
-    # a holder doing long work calls `refresh` to prove it is still there.
-    if [ "$age" -gt "$TIMEOUT" ]; then
-      rm -rf "$LOCKD"
-      if mkdir "$LOCKD" 2>/dev/null; then write_info
-        echo "TAKEN $TAG (broke a stale lock: $htag silent ${age}s > ${TIMEOUT}s)"; exit 0; fi
+    notes=""
+    for i in $(seq 1 "$SLOTS"); do
+      d=$(slotdir "$i")
+      if [ "$i" -gt 1 ]; then
+        av=$(avail_gb)
+        if [ "${av:-0}" -lt "$MINGB" ]; then
+          notes="$notes slot $i needs ${MINGB} GB available, box has ${av:-?} GB;"; continue
+        fi
+      fi
+      if mkdir "$d" 2>/dev/null; then write_info "$d"
+        [ "$i" -gt 1 ] && slot=" (build slot $i of $SLOTS)" || slot=""
+        echo "TAKEN $TAG$slot -- you MUST call 'refresh $HOSTALIAS $TAG' at least every ${TIMEOUT}s"
+        echo "  or this lock goes stale and another agent may take the box while you run."
+        exit 0; fi
+      # An unidentified holder is held, never broken.
+      [ -f "$d/info" ] || { notes="$notes slot $i held by an unidentified holder;"; continue; }
+      hst=$(sed -n 's/^beat=//p' "$d/info"); age=$(( NOW - ${hst:-0} ))
+      # THERE IS DELIBERATELY NO PID-LIVENESS TEST: the pid a take could record
+      # is the transient ssh shell, dead the moment the take returns, so every
+      # lock would be born dead. Liveness is a HEARTBEAT: `refresh`.
+      if [ "$age" -gt "$TIMEOUT" ]; then
+        htag=$(tag_of "$d"); rm -rf "$d"
+        if mkdir "$d" 2>/dev/null; then write_info "$d"
+          echo "TAKEN $TAG (broke a stale lock in slot $i: $htag silent ${age}s > ${TIMEOUT}s)"; exit 0; fi
+      fi
+      notes="$notes slot $i held by tag=$(tag_of "$d") on $(sed -n 's/^host=//p' "$d/info"), last beat ${age}s ago;"
+    done
+    if [ "$SLOTS" = 1 ]; then
+      d=$(slotdir 1)
+      if [ -f "$d/info" ]; then
+        hst=$(sed -n 's/^beat=//p' "$d/info")
+        echo "HELD by tag=$(tag_of "$d") on $(sed -n 's/^host=//p' "$d/info"), last beat $(( NOW - ${hst:-0} ))s ago -- WAIT or exit, do not kill"
+      else echo "HELD by an unidentified holder"; fi
+    else
+      echo "HELD:$notes -- WAIT or exit, do not kill"
     fi
-    echo "HELD by tag=$htag on $hhost, last beat ${age}s ago -- WAIT or exit, do not kill"
     exit 3
     ;;
   refresh)
     # A long run proves it is alive. Cheap, and it lets the timeout be short
     # enough that a crash costs one slot instead of the night.
-    [ -d "$LOCKD" ] || { echo "NOT HELD"; exit 3; }
-    htag=$(sed -n 's/^tag=//p' "$INFO" 2>/dev/null)
-    [ "$htag" = "$TAG" ] || { echo "REFUSING: held by $htag, not $TAG"; exit 3; }
-    sed -i "s/^beat=.*/beat=$NOW/" "$INFO" && echo "BEAT $TAG"; exit 0
+    [ -n "$(held_dirs)" ] || { echo "NOT HELD"; exit 3; }
+    d=$(find_tag_dir) || { echo "REFUSING: held by $(for x in $(held_dirs); do tag_of "$x"; done | paste -sd' '), not $TAG"; exit 3; }
+    sed -i "s/^beat=.*/beat=$NOW/" "$d/info" && echo "BEAT $TAG"; exit 0
     ;;
   release)
-    [ -d "$LOCKD" ] || { echo "NOT HELD"; exit 0; }
-    htag=$(sed -n 's/^tag=//p' "$INFO" 2>/dev/null)
-    if [ "$htag" = "$TAG" ]; then rm -rf "$LOCKD"; echo "RELEASED $TAG"; exit 0; fi
-    echo "REFUSING: held by $htag, not $TAG"; exit 3
+    [ -n "$(held_dirs)" ] || { echo "NOT HELD"; exit 0; }
+    if d=$(find_tag_dir); then rm -rf "$d"; echo "RELEASED $TAG"; exit 0; fi
+    echo "REFUSING: held by $(for x in $(held_dirs); do tag_of "$x"; done | paste -sd' '), not $TAG"; exit 3
     ;;
   check)
-    [ -d "$LOCKD" ] || { echo "FREE"; exit 0; }
-    tr '\n' ' ' < "$INFO" 2>/dev/null; echo
+    [ -n "$(held_dirs)" ] || { echo "FREE"; exit 0; }
+    holders
     exit 3
     ;;
   *) echo "usage: gb10-lock.sh take|refresh|release|check <host> [tag]"; exit 2 ;;
