@@ -39,7 +39,7 @@
 
 use anyhow::{Context, Result};
 use triblespace::core::attribute::Attribute;
-use triblespace::core::blob::encodings::tensor::elements::{F16, F32, NVFP4};
+use triblespace::core::blob::encodings::tensor::elements::{BF16, F16, F32, NVFP4};
 use triblespace::core::blob::encodings::tensor::{Tensor, TensorElement, TensorView, tensor_blob};
 use triblespace::core::blob::{Blob, TryFromBlob};
 use triblespace::core::id_hex;
@@ -70,6 +70,8 @@ pub fn leaf<T: TensorElement, const RANK: usize>() -> Attribute<Handle<Tensor<T,
 pub enum Elem {
     F32,
     F16,
+    /// Native bfloat16, distinct from IEEE f16 despite sharing its width.
+    Bf16,
     /// Packed NVFP4: E2M1 codes with E4M3 block scales and one global scale in
     /// the payload (`crate::nvfp4`). Reading it as f32 decodes on the host.
     Nvfp4,
@@ -81,6 +83,7 @@ impl Elem {
         match self {
             Elem::F32 => <F32 as TensorElement>::payload_len(elems),
             Elem::F16 => <F16 as TensorElement>::payload_len(elems),
+            Elem::Bf16 => <BF16 as TensorElement>::payload_len(elems),
             Elem::Nvfp4 => <NVFP4 as TensorElement>::payload_len(elems),
         }
     }
@@ -130,7 +133,7 @@ impl Leaf {
     pub fn view_f32(&self) -> Option<anybytes::View<[f32]>> {
         match self.elem {
             Elem::F32 => self.payload.clone().view::<[f32]>().ok(),
-            Elem::F16 | Elem::Nvfp4 => None,
+            Elem::F16 | Elem::Bf16 | Elem::Nvfp4 => None,
         }
     }
 
@@ -139,7 +142,16 @@ impl Leaf {
     pub fn view_f16(&self) -> Option<anybytes::View<[half::f16]>> {
         match self.elem {
             Elem::F16 => self.payload.clone().view::<[half::f16]>().ok(),
-            Elem::F32 | Elem::Nvfp4 => None,
+            Elem::F32 | Elem::Bf16 | Elem::Nvfp4 => None,
+        }
+    }
+
+    /// Borrow the native BF16 payload without conversion or allocation.
+    /// Returns `None` for every other element format, including IEEE f16.
+    pub fn view_bf16(&self) -> Option<anybytes::View<[half::bf16]>> {
+        match self.elem {
+            Elem::Bf16 => self.payload.clone().view::<[half::bf16]>().ok(),
+            Elem::F32 | Elem::F16 | Elem::Nvfp4 => None,
         }
     }
 
@@ -158,6 +170,12 @@ impl Leaf {
                 .clone()
                 .view::<[half::f16]>()
                 .expect("f16 payload view")
+                .iter()
+                .map(|h| h.to_f32())
+                .collect(),
+            Elem::Bf16 => self
+                .view_bf16()
+                .expect("bf16 payload view")
                 .iter()
                 .map(|h| h.to_f32())
                 .collect(),
@@ -291,6 +309,13 @@ macro_rules! leaf_by_rank {
             (Elem::F16, 4) => leaf_entity!($blobs, $head, F16, 4, dims, $payload, $what),
             (Elem::F16, 5) => leaf_entity!($blobs, $head, F16, 5, dims, $payload, $what),
             (Elem::F16, 6) => leaf_entity!($blobs, $head, F16, 6, dims, $payload, $what),
+            (Elem::Bf16, 0) => leaf_entity!($blobs, $head, BF16, 0, dims, $payload, $what),
+            (Elem::Bf16, 1) => leaf_entity!($blobs, $head, BF16, 1, dims, $payload, $what),
+            (Elem::Bf16, 2) => leaf_entity!($blobs, $head, BF16, 2, dims, $payload, $what),
+            (Elem::Bf16, 3) => leaf_entity!($blobs, $head, BF16, 3, dims, $payload, $what),
+            (Elem::Bf16, 4) => leaf_entity!($blobs, $head, BF16, 4, dims, $payload, $what),
+            (Elem::Bf16, 5) => leaf_entity!($blobs, $head, BF16, 5, dims, $payload, $what),
+            (Elem::Bf16, 6) => leaf_entity!($blobs, $head, BF16, 6, dims, $payload, $what),
             (Elem::Nvfp4, 1) => leaf_entity!($blobs, $head, NVFP4, 1, dims, $payload, $what),
             (Elem::Nvfp4, 2) => leaf_entity!($blobs, $head, NVFP4, 2, dims, $payload, $what),
             (Elem::Nvfp4, 3) => leaf_entity!($blobs, $head, NVFP4, 3, dims, $payload, $what),
@@ -378,6 +403,13 @@ pub fn resolve(tribles: &TribleSet, blobs: &impl BlobStoreGet, weight: Id) -> Re
     typed!(F16, 4, Elem::F16);
     typed!(F16, 5, Elem::F16);
     typed!(F16, 6, Elem::F16);
+    typed!(BF16, 0, Elem::Bf16);
+    typed!(BF16, 1, Elem::Bf16);
+    typed!(BF16, 2, Elem::Bf16);
+    typed!(BF16, 3, Elem::Bf16);
+    typed!(BF16, 4, Elem::Bf16);
+    typed!(BF16, 5, Elem::Bf16);
+    typed!(BF16, 6, Elem::Bf16);
     typed!(NVFP4, 1, Elem::Nvfp4);
     typed!(NVFP4, 2, Elem::Nvfp4);
     typed!(NVFP4, 3, Elem::Nvfp4);
@@ -548,6 +580,13 @@ pub fn index_typed_all(
     sweep_all!(F16, 4, Elem::F16);
     sweep_all!(F16, 5, Elem::F16);
     sweep_all!(F16, 6, Elem::F16);
+    sweep_all!(BF16, 0, Elem::Bf16);
+    sweep_all!(BF16, 1, Elem::Bf16);
+    sweep_all!(BF16, 2, Elem::Bf16);
+    sweep_all!(BF16, 3, Elem::Bf16);
+    sweep_all!(BF16, 4, Elem::Bf16);
+    sweep_all!(BF16, 5, Elem::Bf16);
+    sweep_all!(BF16, 6, Elem::Bf16);
     sweep_all!(NVFP4, 1, Elem::Nvfp4);
     sweep_all!(NVFP4, 2, Elem::Nvfp4);
     sweep_all!(NVFP4, 3, Elem::Nvfp4);
@@ -587,6 +626,13 @@ pub fn typed_leaf_attrs() -> Vec<(String, Id)> {
     name_all!(F16, 4, "f16");
     name_all!(F16, 5, "f16");
     name_all!(F16, 6, "f16");
+    name_all!(BF16, 0, "bf16");
+    name_all!(BF16, 1, "bf16");
+    name_all!(BF16, 2, "bf16");
+    name_all!(BF16, 3, "bf16");
+    name_all!(BF16, 4, "bf16");
+    name_all!(BF16, 5, "bf16");
+    name_all!(BF16, 6, "bf16");
 
     out
 }
@@ -646,6 +692,12 @@ pub(crate) fn fixture_leaf(
                     .map(|&v| half::f16::from_f32(v))
                     .collect::<Vec<half::f16>>(),
             ),
+            Elem::Bf16 => anybytes::Bytes::from_source(
+                values
+                    .iter()
+                    .map(|&v| half::bf16::from_f32(v))
+                    .collect::<Vec<half::bf16>>(),
+            ),
             Elem::Nvfp4 => panic!("fixture leaves are dense"),
         }
     };
@@ -673,6 +725,10 @@ pub(crate) fn fixture_leaf(
             (Elem::F16, 1) => typed!(F16, 1),
             (Elem::F16, 2) => typed!(F16, 2),
             (Elem::F16, 3) => typed!(F16, 3),
+            (Elem::Bf16, 0) => typed!(BF16, 0),
+            (Elem::Bf16, 1) => typed!(BF16, 1),
+            (Elem::Bf16, 2) => typed!(BF16, 2),
+            (Elem::Bf16, 3) => typed!(BF16, 3),
             (_, r) => panic!("fixture leaf rank {r} has no arm; add one"),
         },
         Form::TwoBlob => {
@@ -691,7 +747,7 @@ pub(crate) fn fixture_leaf(
                     );
                     triblespace::macros::entity! { _ @ attrs::data_f16: data, attrs::shape: shape }
                 }
-                Elem::Nvfp4 => panic!("the two-blob form has no packed leaves"),
+                Elem::Bf16 | Elem::Nvfp4 => panic!("the two-blob form has no bf16 or packed leaves"),
             }
         }
     };
