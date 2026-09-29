@@ -140,6 +140,10 @@ cpal = { version = "0.17", optional = true }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 
 [features]
+# Resident Qwen3.5 Gated DeltaNet primitives. Raw CubeTensor throughout; these
+# features do not select a Fusion backend or enable timing-based autotuning.
+qwen3_5-gpu = ["dep:cubecl", "dep:burn-cubecl"]
+qwen3_5-cuda = ["qwen3_5-gpu", "cubecl?/cuda", "burn/cuda"]
 # THE RESIDENT MIND, whole: `models::inkling::engine` (a Session, the
 # checkpoint's tokenizer, the incremental detokenizer and the host-side rank
 # link) plus `models::inkling::resident` (the turn vocabulary and the
@@ -388,6 +392,10 @@ dev-tools = ["import"]
 [[bin]]
 name = "mary"
 required-features = ["import", "hub"]
+
+[[bin]]
+name = "qwen3_5_deltanet_gate"
+required-features = ["qwen3_5-cuda"]
 
 # Totality gate for the K3 checkpoint layout: walks the real safetensors headers
 # and asserts the tensor-name/module-slot mapping is a bijection. Header-only -
