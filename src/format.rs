@@ -202,6 +202,26 @@ pub fn put_raw_f16(
     )?)
 }
 
+/// Store native BF16 bytes without a floating-point conversion.
+///
+/// `payload` can borrow an input mapping. Only the tensor encoding allocates
+/// the stored header plus payload; no f32 or f16 staging buffer is created.
+/// The bytes must be little-endian BF16, as in safetensors and the tensor
+/// encoding. Shape and payload length are checked by that encoding.
+pub fn put_raw_bf16(
+    blobs: &mut impl BlobStorePut,
+    payload: anybytes::Bytes,
+    shape: &[u64],
+) -> Result<Fragment, BlobErr> {
+    Ok(crate::leaf::put_leaf(
+        blobs,
+        crate::leaf::Elem::Bf16,
+        shape,
+        payload,
+        "bf16 leaf",
+    )?)
+}
+
 /// Store a PACKED-Q4 weight (`nn::q4::quantize_q4` output: nibble words +
 /// f16 group scales) as a quantized leaf (`{data_q4, q_scales, shape}`).
 /// `shape` is the logical row-major `[out, in]`. The packed words are the
