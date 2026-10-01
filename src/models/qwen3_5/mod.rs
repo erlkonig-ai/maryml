@@ -9,11 +9,16 @@
 //! The CUDA prepared-token path now assembles all 32 shared decoder blocks
 //! and the output boundary. The single-image prepared composition connects
 //! the vision tower through GPU scatter and explicit MRoPE positions. Raw
-//! image processing, video, batching and numerical admission remain open.
+//! image processing is available through the separately gated, bounded
+//! `wemm-input` codec/CUDA preparation API; video and batching remain open.
 
 pub mod config;
 pub mod layout;
 pub mod multimodal_layout;
+#[cfg(feature = "wemm-input")]
+pub mod input_codec;
+#[cfg(feature = "wemm-input")]
+pub mod image_prepare;
 #[cfg(feature = "qwen3_5-cuda")]
 pub mod position_table;
 #[cfg(feature = "qwen3_5-cuda")]
