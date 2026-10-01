@@ -10,10 +10,7 @@ use burn::tensor::DType;
 use burn_cubecl::tensor::CubeTensor;
 use cubecl::{cuda::CudaRuntime, prelude::*};
 use half::bf16;
-use triblespace::core::{
-    blob::{Blob, encodings::tensor::{Tensor as NativeTensor, elements::BF16}},
-    repo::pile::PileSnapshot,
-};
+use triblespace::core::blob::{Blob, encodings::tensor::{Tensor as NativeTensor, elements::BF16}};
 use triblespace::prelude::{BlobStoreGet, Id, TribleSet};
 use crate::nn::cuda_bf16_alias::CudaBf16Aliases;
 use super::{
@@ -43,12 +40,13 @@ impl PreparedDecoder {
     /// binder. Required path/blob faults remain errors; unrelated facts do not.
     ///
     /// # Safety
-    /// `snapshot` must be a genuine validated pile prefix. Payloads AND their
+    /// `snapshot` may acquire exact bytes but must preserve the selected facts
+    /// and return leaves from genuine validated pile prefixes. Payloads AND their
     /// preceding partial pages stay immutable and untruncated until the CUDA
     /// runtime releases its registrations. Dropping this object is insufficient.
     /// A failure can retain registrations in the supplied binder/runtime.
-    pub unsafe fn from_pile(
-        facts: &TribleSet, snapshot: &PileSnapshot, root: Id,
+    pub unsafe fn from_pile<R: BlobStoreGet>(
+        facts: &TribleSet, snapshot: &R, root: Id,
         aliases: &mut CudaBf16Aliases,
         mut selected: impl FnMut(&str, [u8; 32], &[u64], &[u8]) -> Result<(), String>,
     ) -> Result<Self, String> {
@@ -152,8 +150,8 @@ fn gather(table: &Array<bf16>, ids: &Array<u32>, out: &mut Array<bf16>, count: u
     }
 }
 
-fn gdn_slots(
-    facts: &TribleSet, snapshot: &PileSnapshot, root: Id, layer: usize,
+fn gdn_slots<R: BlobStoreGet>(
+    facts: &TribleSet, snapshot: &R, root: Id, layer: usize,
     selected: &mut impl FnMut(&str, [u8; 32], &[u64], &[u8]) -> Result<(), String>,
 ) -> Result<gdn_decoder::Slots, String> {
     let prefix = format!("model.language_model.layers.{layer}.");
@@ -180,8 +178,8 @@ fn gdn_slots(
     })
 }
 
-fn attention_slots(
-    facts: &TribleSet, snapshot: &PileSnapshot, root: Id, layer: usize,
+fn attention_slots<R: BlobStoreGet>(
+    facts: &TribleSet, snapshot: &R, root: Id, layer: usize,
     selected: &mut impl FnMut(&str, [u8; 32], &[u64], &[u8]) -> Result<(), String>,
 ) -> Result<full_attention::Slots, String> {
     let prefix = format!("model.language_model.layers.{layer}.");

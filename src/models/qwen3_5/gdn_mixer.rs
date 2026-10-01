@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use triblespace::core::{
     blob::{Blob, encodings::tensor::{Tensor as NativeTensor, elements::BF16}},
     inline::{Inline, encodings::hash::Handle},
-    repo::{BlobStoreGet, pile::PileSnapshot},
+    repo::BlobStoreGet,
 };
 use super::{deltanet::{self, DeltaNetInputs}, gdn_ops};
 use crate::nn::cuda_bf16_alias::CudaBf16Aliases;
@@ -113,18 +113,20 @@ pub struct GdnOutput {
 }
 
 impl GdnMixer {
-    /// Bind typed slots from one actual, validated native pile snapshot.
+    /// Bind fixed typed slots through a local or exact-acquiring reader.
     ///
     /// # Safety
-    /// The snapshot's backing file must remain an immutable append-only prefix
+    /// Every returned leaf must originate in a genuine validated native pile.
+    /// Its backing file must remain an immutable append-only prefix
     /// through CUDA runtime teardown, including the partial page preceding each
     /// payload. No rewrite, truncation, in-place mutation, or external writer
     /// violating that premise is permitted. This obligation is passed directly
     /// to the reviewed unsafe binder; a MmapRaw owner alone is NOT provenance.
-    /// No generic BlobStore/heap/MmapRaw constructor can enter this boundary.
+    /// A generic reader is not provenance: heap blobs remain refused and merely
+    /// wrapping an arbitrary MmapRaw does not satisfy this unsafe obligation.
     /// A late shape/budget error can leave earlier registrations runtime-owned.
-    pub unsafe fn from_pile(
-        snapshot: &PileSnapshot,
+    pub unsafe fn from_pile<R: BlobStoreGet>(
+        snapshot: &R,
         slots: GdnSlots,
         config: GdnConfig,
         aliases: &mut CudaBf16Aliases,

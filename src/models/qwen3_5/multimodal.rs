@@ -13,7 +13,7 @@ use burn_cubecl::tensor::CubeTensor;
 use cubecl::{cuda::CudaRuntime, prelude::*};
 use half::bf16;
 use triblespace::{
-    core::repo::pile::PileSnapshot,
+    core::repo::BlobStoreGet,
     prelude::{Id, TribleSet},
 };
 
@@ -55,13 +55,16 @@ impl PreparedMultimodal {
     /// `selected` is immediate provenance exhaust, not a retained catalogue.
     ///
     /// # Safety
+    /// The reader must preserve the selected facts/roles while exact gets may
+    /// acquire their bytes. A fetching reader must return genuine pile-backed
+    /// leaves; implementing BlobStoreGet alone does not establish provenance.
     /// Forward the binder's genuine append-only pile-prefix obligation for
     /// every parameter and its preceding partial page, until CUDA runtime
     /// teardown. Caller owns source/session and reuses one bounded binder.
     /// A late error can retain earlier registrations; drop is not unregister.
-    pub unsafe fn from_pile(
+    pub unsafe fn from_pile<R: BlobStoreGet>(
         facts: &TribleSet,
-        snapshot: &PileSnapshot,
+        snapshot: &R,
         root: Id,
         config: &Qwen3_5Config,
         aliases: &mut CudaBf16Aliases,

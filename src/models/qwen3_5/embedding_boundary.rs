@@ -13,7 +13,7 @@ use half::bf16;
 use triblespace::core::{
     blob::{Blob, encodings::tensor::{Tensor as NativeTensor, elements::BF16}},
     inline::{Inline, encodings::hash::Handle},
-    repo::{BlobStoreGet, pile::PileSnapshot},
+    repo::BlobStoreGet,
 };
 use crate::nn::cuda_bf16_alias::CudaBf16Aliases;
 use super::decoder_ops;
@@ -38,12 +38,13 @@ pub struct Output {
 
 impl Boundary {
     /// # Safety
-    /// The selected leaf must belong to a genuine validated append-only pile
+    /// An exact-acquiring reader is permitted; its returned selected leaf must
+    /// belong to a genuine validated append-only pile
     /// prefix. Its payload AND preceding partial page must remain immutable
     /// and untruncated through CUDA runtime teardown. A late descriptor error
     /// may retain the registration. Forwarded to the existing native binder.
-    pub unsafe fn from_pile(
-        snapshot: &PileSnapshot, slot: FinalNormSlot, aliases: &mut CudaBf16Aliases,
+    pub unsafe fn from_pile<R: BlobStoreGet>(
+        snapshot: &R, slot: FinalNormSlot, aliases: &mut CudaBf16Aliases,
     ) -> Result<Self, String> {
         let blob: Blob<NativeTensor<BF16, 1>> = snapshot.get(slot).map_err(|e| e.to_string())?;
         // SAFETY: the caller establishes the genuine immutable-prefix premise.
@@ -52,6 +53,9 @@ impl Boundary {
         if final_norm.handle.can_mut() { return Err("immutable final-norm weight required".into()); }
         Ok(Self { final_norm })
     }
+
+    /// Share the already-validated immutable alias without another store get.
+    pub(crate) fn weight_anchor(&self) -> &CudaTensor { &self.final_norm }
 
     /// No padding/mask API: exactly one unpadded sequence, pooled at T-1.
     /// The producer must follow CubeCL's valid-handle and stream-ordering
@@ -127,5 +131,136 @@ fn finish_kernel(x: &Array<bf16>, selected: &mut Array<bf16>, out: &mut Array<bf
         for j in 0..4096usize {
             out[j] = bf16::cast_from(f32::cast_from(x[offset + j]) / denominator);
         }
+    }
+}
+
+#[cfg(test)]
+mod reader_tests {
+    use super::*;
+    use std::{cell::Cell, error::Error, path::PathBuf};
+    use triblespace::core::{
+        blob::{BlobEncoding, TryFromBlob},
+        inline::InlineEncoding,
+        repo::{BlobStorePut, SnapshotSource, StorageClose, pile::{Pile, PileSnapshot}},
+    };
+    use triblespace::prelude::{Id, TribleSet, fucid};
+    use crate::models::qwen3_5::{
+        config::Qwen3_5Config, decoder_stack, full_attention, gdn_decoder,
+        gdn_mixer, multimodal::PreparedMultimodal, prepared::PreparedDecoder,
+    };
+
+    // Deliberately no Deref/AsRef<PileSnapshot>, Clone, StoreRead or catalogue:
+    // constructors must need only the caller's exact typed gets.
+    struct Reader<R> { source: R, gets: Cell<usize> }
+
+    impl<R: BlobStoreGet> BlobStoreGet for Reader<R> {
+        type GetError<E: Error + Send + Sync + 'static> = R::GetError<E>;
+
+        fn get<T, S>(&self, handle: Inline<Handle<S>>) -> Result<T, Self::GetError<T::Error>>
+        where
+            S: BlobEncoding + 'static,
+            T: TryFromBlob<S>,
+            Handle<S>: InlineEncoding,
+        {
+            self.gets.set(self.gets.get() + 1);
+            self.source.get(handle)
+        }
+    }
+
+    // Assigning each constructor proves its generic boundary without creating
+    // a CUDA client, fake aliases, uninitialized resources or model weights.
+    fn constructors_accept<R: BlobStoreGet>() {
+        type Observer = fn(&str, [u8; 32], &[u64], &[u8]) -> Result<(), String>;
+        let _: unsafe fn(&TribleSet, &R, Id, &Qwen3_5Config, &mut CudaBf16Aliases, Observer)
+            -> Result<PreparedMultimodal, String> = PreparedMultimodal::from_pile::<R>;
+        let _: unsafe fn(&TribleSet, &R, Id, &mut CudaBf16Aliases, Observer)
+            -> Result<PreparedDecoder, String> = PreparedDecoder::from_pile::<R>;
+        let _: unsafe fn(&R, decoder_stack::Slots, &mut CudaBf16Aliases)
+            -> Result<decoder_stack::Stack, String> = decoder_stack::Stack::from_pile::<R>;
+        let _: unsafe fn(&R, gdn_decoder::Slots, gdn_decoder::Config, &mut CudaBf16Aliases)
+            -> Result<gdn_decoder::Block, String> = gdn_decoder::Block::from_pile::<R>;
+        let _: unsafe fn(&R, gdn_mixer::GdnSlots, gdn_mixer::GdnConfig, &mut CudaBf16Aliases)
+            -> Result<gdn_mixer::GdnMixer, String> = gdn_mixer::GdnMixer::from_pile::<R>;
+        let _: unsafe fn(&R, full_attention::Slots, full_attention::Config, &mut CudaBf16Aliases)
+            -> Result<full_attention::Block, String> = full_attention::Block::from_pile::<R>;
+        let _: unsafe fn(&R, FinalNormSlot, &mut CudaBf16Aliases)
+            -> Result<Boundary, String> = Boundary::from_pile::<R>;
+    }
+
+    #[test]
+    fn native_constructors_accept_exact_reader_without_snapshot_downcast() {
+        constructors_accept::<Reader<PileSnapshot>>();
+        use triblespace::core::repo::async_store::{AcquiringReader, SyncAsAsync};
+        constructors_accept::<AcquiringReader<SyncAsAsync<PileSnapshot>>>();
+    }
+
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("mary-fetching-leaf-{}", fucid().id));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn pile(&self) -> Pile {
+            let path = self.0.join("weights.pile");
+            std::fs::File::create_new(&path).unwrap();
+            Pile::open(&path).unwrap()
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
+
+    fn norm_blob() -> Blob<NativeTensor<BF16, 1>> {
+        // Native fixture bytes, not a host model computation or conversion.
+        let bits: Vec<u8> = (0..HIDDEN).flat_map(|i| (i as u16).to_le_bytes()).collect();
+        crate::leaf::leaf_blob::<BF16, 1>([HIDDEN as u64], bits.into()).unwrap()
+    }
+
+    #[test]
+    fn forwarded_native_leaf_keeps_its_owner_after_reader_and_store_close() {
+        let fixture = Fixture::new();
+        let mut pile = fixture.pile();
+        let slot = pile.put::<NativeTensor<BF16, 1>, _>(norm_blob()).unwrap();
+        let reader = Reader { source: pile.snapshot().unwrap(), gets: Cell::new(0) };
+        let blob: Blob<NativeTensor<BF16, 1>> = reader.get(slot).unwrap();
+        assert_eq!(reader.gets.get(), 1);
+        let leaf = crate::leaf::read_leaf(blob).unwrap();
+        let address = leaf.payload().as_ptr();
+        let owner = leaf.payload().clone().downcast_to_owner::<memmap2::MmapRaw>().unwrap();
+        let weak = std::sync::Arc::downgrade(&owner);
+        drop(owner);
+        drop(reader);
+        pile.close().unwrap();
+        assert!(weak.upgrade().is_some());
+        assert_eq!(leaf.payload().as_ptr(), address);
+        assert_eq!(&leaf.payload()[..4], &[0, 0, 1, 0]);
+        assert_eq!(leaf.payload().len(), HIDDEN * 2);
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly reserved CUDA host-page-table device"]
+    fn generic_boundary_alias_survives_reader_store_and_binder_drop() {
+        let fixture = Fixture::new();
+        let mut pile = fixture.pile();
+        let slot = pile.put::<NativeTensor<BF16, 1>, _>(norm_blob()).unwrap();
+        let reader = Reader { source: pile.snapshot().unwrap(), gets: Cell::new(0) };
+        let mut aliases = CudaBf16Aliases::new(cubecl::cuda::CudaDevice { index: 0 }, 1).unwrap();
+        // SAFETY: this private pile and all preceding pages remain unchanged;
+        // closing its handle does not truncate/rewrite its retained mmap.
+        let boundary = unsafe { Boundary::from_pile(&reader, slot, &mut aliases) }.unwrap();
+        assert_eq!(reader.gets.get(), 1);
+        let anchor = boundary.weight_anchor().clone();
+        assert_eq!(reader.gets.get(), 1, "sharing the anchor must not read again");
+        assert_eq!(aliases.stats().registrations, 1);
+        assert!(!anchor.handle.can_mut());
+        drop(reader);
+        pile.close().unwrap();
+        drop(aliases);
+        drop(boundary);
+        let raw = anchor.client.read_one(anchor.handle.clone()).unwrap().to_vec();
+        let expected = crate::leaf::read_leaf(norm_blob()).unwrap();
+        assert_eq!(raw.as_slice(), expected.payload().as_ref());
     }
 }

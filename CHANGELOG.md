@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Native BF16 WeMM constructors accept caller-owned exact-get readers while
+  preserving selected model facts/slots and genuine immutable pile backing.
+  Decoder client validation shares its already-bound final norm instead of
+  reading/registering it twice. No numerical kernel, dtype, model selection,
+  preparation or Files indexing behavior changes. Generic-reader and owner
+  lifetime witnesses are added; execution is separate from this source slice.
+
 - Add an unexecuted prepared-image CUDA oracle/native gate over the existing
   imported model pile. The pinned actual HF wrapper owns vision/scatter/MRoPE;
   both runtimes generate identical prepared BF16 patch inputs on GPU. Reports

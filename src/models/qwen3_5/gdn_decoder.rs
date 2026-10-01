@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use triblespace::core::{
     blob::{Blob, encodings::tensor::{Tensor as NativeTensor, elements::BF16}},
     inline::{Inline, encodings::hash::Handle},
-    repo::{BlobStoreGet, pile::PileSnapshot},
+    repo::BlobStoreGet,
 };
 use crate::nn::cuda_bf16_alias::CudaBf16Aliases;
 use super::{decoder_ops::{norm, elementwise},
@@ -50,12 +50,13 @@ pub struct Output { pub hidden: CudaTensor, pub state: GdnState }
 
 impl Block {
     /// # Safety
-    /// Snapshot leaves must originate in a genuine validated immutable
+    /// Exact gets may acquire the fixed slots' bytes. Returned leaves must
+    /// originate in a genuine validated immutable
     /// append-only pile prefix, including the preceding partial page. No
     /// truncation/rewrite through CUDA runtime teardown; forwarded unchanged
     /// to the native binder and GdnMixer. Late errors may retain registrations.
-    pub unsafe fn from_pile(
-        snapshot: &PileSnapshot, slots: Slots, config: Config, aliases: &mut CudaBf16Aliases,
+    pub unsafe fn from_pile<R: BlobStoreGet>(
+        snapshot: &R, slots: Slots, config: Config, aliases: &mut CudaBf16Aliases,
     ) -> Result<Self, String> {
         config.validate()?;
         macro_rules! bind { ($slot:expr, $rank:literal) => {{

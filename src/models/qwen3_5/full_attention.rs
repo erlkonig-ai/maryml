@@ -13,7 +13,7 @@ use cubecl::{cuda::CudaRuntime, prelude::*};
 use half::bf16;
 use serde::{Deserialize, Serialize};
 use triblespace::core::{blob::{Blob, encodings::tensor::{Tensor as NativeTensor, elements::BF16}},
-    inline::{Inline, encodings::hash::Handle}, repo::{BlobStoreGet, pile::PileSnapshot}};
+    inline::{Inline, encodings::hash::Handle}, repo::BlobStoreGet};
 use crate::nn::cuda_bf16_alias::CudaBf16Aliases;
 use super::gdn_mixer::project;
 use super::decoder_ops::{norm, elementwise};
@@ -84,11 +84,12 @@ pub struct Output { pub hidden: CudaTensor, pub state: State }
 
 impl Block {
     /// # Safety
-    /// Genuine validated pile backing, INCLUDING each preceding partial page,
+    /// Exact gets may acquire fixed slot bytes. Genuine validated pile backing
+    /// of each returned leaf, INCLUDING its preceding partial page,
     /// must remain immutable/append-only and untruncated through CUDA runtime
     /// teardown. Same obligation as bind_pile_leaf. Late failure can retain
     /// earlier registrations; no transactional/last-handle reclamation claim.
-    pub unsafe fn from_pile(snapshot: &PileSnapshot, s: Slots, config: Config, aliases: &mut CudaBf16Aliases) -> Result<Self, String> {
+    pub unsafe fn from_pile<R: BlobStoreGet>(snapshot: &R, s: Slots, config: Config, aliases: &mut CudaBf16Aliases) -> Result<Self, String> {
         config.validate()?;
         macro_rules! bind { ($slot:expr, $rank:literal) => {{
             let blob: Blob<NativeTensor<BF16, $rank>> = snapshot.get($slot).map_err(|e| e.to_string())?;

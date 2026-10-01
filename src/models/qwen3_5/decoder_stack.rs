@@ -13,10 +13,7 @@
 //! All arithmetic is delegated to the unchanged resident GPU implementations.
 
 use burn::tensor::DType;
-use triblespace::core::{
-    blob::{Blob, encodings::tensor::{Tensor as NativeTensor, elements::BF16}},
-    repo::{BlobStoreGet, pile::PileSnapshot},
-};
+use triblespace::core::repo::BlobStoreGet;
 use crate::nn::cuda_bf16_alias::CudaBf16Aliases;
 use super::{
     embedding_boundary::{self, Boundary, CudaTensor, FinalNormSlot},
@@ -72,33 +69,30 @@ impl Stack {
     /// Bind exactly the explicit 425 typed roles through ONE supplied binder.
     ///
     /// # Safety
-    /// The snapshot must be a genuine validated native pile observation. Every
+    /// The reader may acquire exact bytes for these fixed slots; every returned
+    /// leaf must come from a genuine validated native pile observation. Every
     /// selected payload AND its preceding partial page must remain immutable
     /// and untruncated through CUDA runtime teardown. No mutable-file, generic
     /// heap blob, dtype conversion or legacy alias path is provided.
     ///
     /// This forwards the existing blocks'/endpoint's unsafe binding contract.
     /// A late error can retain earlier registrations; this is not transactional.
-    /// The final norm is bound twice through the SAME binder, from the same
-    /// snapshot owner/offset, so its registration is reused: 426 successful
-    /// binding calls for 425 roles, at most 425 distinct weight registrations.
-    pub unsafe fn from_pile(
-        snapshot: &PileSnapshot, slots: Slots, aliases: &mut CudaBf16Aliases,
+    /// The client-validation anchor clones the already-bound final norm. No
+    /// second get can fetch/remap that content under another mmap owner:
+    /// 425 binding calls for 425 roles, at most 425 weight registrations.
+    pub unsafe fn from_pile<R: BlobStoreGet>(
+        snapshot: &R, slots: Slots, aliases: &mut CudaBf16Aliases,
     ) -> Result<Self, String> {
         let Slots { groups, final_norm } = slots;
-        // Retain an actual binder-created client/device anchor. Never trust a
-        // caller-supplied advertised device as proof of client identity.
-        let blob: Blob<NativeTensor<BF16, 1>> =
-            snapshot.get(final_norm).map_err(|e| format!("final norm: {e}"))?;
-        // SAFETY: genuine immutable-prefix lifetime is required of the caller.
-        let input_anchor = unsafe { aliases.bind_pile_leaf(blob)? };
+        // SAFETY: same reader, same supplied binder, same immutable prefixes.
+        let endpoint = unsafe { Boundary::from_pile(snapshot, final_norm, aliases)? };
+        // Retain the actual bound client/device anchor without reading or
+        // registering its source again through a possibly acquiring reader.
+        let input_anchor = endpoint.weight_anchor().clone();
         check_tensor(&input_anchor, &input_anchor, &[HIDDEN])?;
         if input_anchor.handle.can_mut() {
             return Err("immutable final-norm alias required".into());
         }
-        // SAFETY: same snapshot, same supplied binder, same immutable prefix.
-        let endpoint = unsafe { Boundary::from_pile(snapshot, final_norm, aliases)? };
-
         // Ephemeral construction scratch only. Retained structure has exactly
         // eight groups, not a configurable graph or a weight catalogue.
         let mut bound = Vec::with_capacity(GROUPS);
@@ -203,8 +197,8 @@ fn attention_config() -> full_attention::Config {
     }
 }
 
-unsafe fn bind_group(
-    snapshot: &PileSnapshot, slots: GroupSlots, first_layer: usize,
+unsafe fn bind_group<R: BlobStoreGet>(
+    snapshot: &R, slots: GroupSlots, first_layer: usize,
     aliases: &mut CudaBf16Aliases,
 ) -> Result<Group, String> {
     let [s0, s1, s2] = slots.gdn;
