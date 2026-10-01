@@ -12,6 +12,7 @@ use mary::{
     },
     nn::cuda_bf16_alias::CudaBf16Aliases,
 };
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -20,7 +21,7 @@ use std::{
     fs::{self, OpenOptions},
     io::Write,
     path::Path,
-    time::Instant,
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 use triblespace::{
     core::{
@@ -178,6 +179,16 @@ fn run(args: &[std::ffi::OsString]) -> Result<()> {
         args.len() == 7,
         "run MODEL ROOT CONFIG FIXTURE INPUTS HF NEW_REPORT"
     );
+    let started_unix_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_nanos()
+        .to_string();
+    let mut nonce = [0u8; 32];
+    rand::rngs::OsRng
+        .try_fill_bytes(&mut nonce)
+        .map_err(|e| anyhow::anyhow!("run nonce: {e}"))?;
+    let process = json!({"pid":std::process::id(),"started_unix_ns":started_unix_ns,
+        "run_nonce":nonce.iter().map(|b|format!("{b:02x}")).collect::<String>()});
     let root = Id::from_hex(args[1].to_str().context("root UTF8")?).context("opaque root")?;
     let config_bytes = fs::read(&args[2])?;
     ensure!(hash(&config_bytes) == CONFIG, "checkpoint config identity");
@@ -186,6 +197,10 @@ fn run(args: &[std::ffi::OsString]) -> Result<()> {
     let (fixture_bytes, fixture) = read_json(Path::new(&args[3]))?;
     let inputs = items(&fixture)?;
     let (hf_bytes, hf) = read_json(Path::new(&args[5]))?;
+    ensure!(
+        hf["engine"] == "HF-CUDA-BF16",
+        "expected actual HF reference report"
+    );
     let source = serde_json::to_value(source_identity())?;
     ensure!(
         fixture["native_sources"] == source && hf["native_sources"] == source,
@@ -347,7 +362,7 @@ fn run(args: &[std::ffi::OsString]) -> Result<()> {
         &json!({"schema":"wemm-behavior-embeddings-v1","engine":"native-CUDA-BF16","checkpoint_sha256":CHECKPOINT,
         "fixture_sha256":hash(&fixture_bytes),"hf_report_sha256":hash(&hf_bytes),"native_sources":source,"selected_roles":selected,
         "model_root":format!("{root:?}"),"alias_registrations":aliases.stats().registrations,"bind_ms":bind_ms,"embeddings":vectors,
-        "reverse_order_byte_exact":reproducible,
+        "reverse_order_byte_exact":reproducible,"process":process,
         "timing":"bind_ms includes selection, payload hashing and input aliasing; elapsed_ms is each forward plus readback wait; forward_dispatch_ms is host call duration, not GPU-only kernel time",
         "scope":"B1 serial calls, fresh state; no vectorized-batch or cross-host claim; coordinate parity diagnostic only"}),
     )?;

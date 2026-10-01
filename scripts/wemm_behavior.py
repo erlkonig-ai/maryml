@@ -12,6 +12,7 @@ No model math or image-preprocessing fallback on CPU; no truncation/threshold fi
 import hashlib
 import json
 from pathlib import Path
+import re
 import sys
 import time
 import types
@@ -273,10 +274,35 @@ def retrieval_tasks(fixture):
     return tasks
 
 
+def validate_report_provenance(reports, paths, digests):
+    expected = {"hf":"HF-CUDA-BF16", "native":"native-CUDA-BF16", "native_new_process":"native-CUDA-BF16"}
+    for name, engine in expected.items():
+        assert reports[name]["engine"] == engine, f"{name}: wrong engine"
+        assert reports[name]["schema"] == "wemm-behavior-embeddings-v1", f"{name}: wrong schema"
+        assert re.fullmatch("[0-9a-f]{64}", digests[name]), f"{name}: invalid report digest"
+    assert paths["native"].resolve() != paths["native_new_process"].resolve(), "same native report path is not another process"
+    assert digests["native"] != digests["native_new_process"], "same native report bytes are not another process"
+    for name in ["native", "native_new_process"]:
+        assert reports[name]["hf_report_sha256"] == digests["hf"], f"{name}: different HF report binding"
+        process = reports[name].get("process")
+        assert isinstance(process, dict), f"{name}: missing process evidence"
+        assert type(process.get("pid")) is int and process["pid"] > 0, f"{name}: invalid PID"
+        assert isinstance(process.get("run_nonce"), str) and re.fullmatch("[0-9a-f]{64}", process["run_nonce"]), f"{name}: invalid nonce"
+        stamp = process.get("started_unix_ns")
+        assert isinstance(stamp, str) and stamp.isascii() and stamp.isdigit() and int(stamp) > 0, f"{name}: invalid start time"
+    first, second = reports["native"]["process"], reports["native_new_process"]["process"]
+    for key in ["pid", "run_nonce", "started_unix_ns"]:
+        assert first[key] != second[key], f"distinct native process evidence required: {key}"
+
+
 def score(fixture_path, hf_path, native_path, second_path, output):
     setup()
     fixture, fixture_sha = read(fixture_path)
-    reports = {name: read(path)[0] for name, path in [("hf", hf_path), ("native", native_path), ("native_new_process", second_path)]}
+    paths = {"hf":hf_path, "native":native_path, "native_new_process":second_path}
+    loaded = {name:read(path) for name,path in paths.items()}
+    reports = {name:value for name,(value,_) in loaded.items()}
+    digests = {name:digest for name,(_,digest) in loaded.items()}
+    validate_report_provenance(reports, paths, digests)
     ids = [i["id"] for i in fixture["items"]]
     assert len(ids) == len(set(ids)) == 11
     rows = {i["id"]: i for i in fixture["items"]}
@@ -326,7 +352,9 @@ def score(fixture_path, hf_path, native_path, second_path, output):
         no_coordinate_admission_gate=True, threshold_fitted=False,
         native_hf_top3_overlap={n["query"]+":"+n["mode"]:len(set(n["ranked"][:3]) & set(h["ranked"][:3]))/min(3,len(n["ranked"]))
             for n,h in zip(metrics["native"],metrics["hf"])},
-        report_sha256={name:read(path)[1] for name,path in [("hf",hf_path),("native",native_path),("native_new_process",second_path)]},
+        report_sha256=digests,
+        native_process_evidence={name:reports[name]["process"] for name in ["native","native_new_process"]},
+        process_evidence_caveat="report metadata plus separately retained launcher exits; not authenticated attestation, vectorized-batch or cross-host evidence",
         performance={name:{"one_time_load_or_bind_ms":r.get("load_ms",r.get("bind_ms")),
             "items":[{k:e[k] for k in ("id","pass","elapsed_ms","prepare_ms","forward_ms","readback_ms","forward_dispatch_ms","readback_wait_ms") if k in e}
                      for e in r["embeddings"]]} for name,r in reports.items()},
@@ -345,7 +373,36 @@ def self_test():
     assert specific["attention-page", "image-to-text"]["relevant"] == ["attention-extract"]
     assert specific["ferris-image", "image-to-text"]["relevant"] == ["ferris-short"]
     assert specific["bloom-query", "text-to-image"]["relevant"] == []
-    print("BEHAVIOR METADATA: 7 checks pass; no GPU execution")
+    schema = "wemm-behavior-embeddings-v1"
+    good = {"hf":dict(schema=schema,engine="HF-CUDA-BF16"),
+            "native":dict(schema=schema,engine="native-CUDA-BF16",hf_report_sha256="a"*64,
+                          process=dict(pid=11,run_nonce="1"*64,started_unix_ns="100")),
+            "native_new_process":dict(schema=schema,engine="native-CUDA-BF16",hf_report_sha256="a"*64,
+                          process=dict(pid=12,run_nonce="2"*64,started_unix_ns="200"))}
+    paths = {name:Path("/fixture") / name for name in good}
+    digests = dict(hf="a"*64,native="b"*64,native_new_process="c"*64)
+    validate_report_provenance(good, paths, digests)
+    cases = ["both_native_are_hf", "second_native_is_hf", "same_path", "same_digest",
+             "same_pid", "same_nonce", "same_start", "missing_process", "wrong_hf_binding"]
+    for case in cases:
+        report = json.loads(json.dumps(good))
+        p, d = dict(paths), dict(digests)
+        if case == "both_native_are_hf":
+            report["native"]["engine"] = report["native_new_process"]["engine"] = "HF-CUDA-BF16"
+        elif case == "second_native_is_hf": report["native_new_process"]["engine"] = "HF-CUDA-BF16"
+        elif case == "same_path": p["native_new_process"] = p["native"]
+        elif case == "same_digest": d["native_new_process"] = d["native"]
+        elif case == "same_pid": report["native_new_process"]["process"]["pid"] = 11
+        elif case == "same_nonce": report["native_new_process"]["process"]["run_nonce"] = "1"*64
+        elif case == "same_start": report["native_new_process"]["process"]["started_unix_ns"] = "100"
+        elif case == "missing_process": del report["native_new_process"]["process"]
+        elif case == "wrong_hf_binding": report["native"]["hf_report_sha256"] = "d"*64
+        try:
+            validate_report_provenance(report, p, d)
+        except AssertionError:
+            continue
+        raise AssertionError(f"provenance negative control passed: {case}")
+    print("BEHAVIOR METADATA: 17 checks pass; no GPU execution")
 
 
 if __name__ == "__main__":
