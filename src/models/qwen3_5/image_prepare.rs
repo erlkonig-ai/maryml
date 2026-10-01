@@ -467,6 +467,12 @@ pub(crate) mod tests {
     fn pixels_match_the_retained_torch_cuda_fixture() {
         let f = fixture();
         let p = GpuPreparer::new(CudaDevice { index: 0 }).unwrap();
+        let output = std::path::PathBuf::from(
+            std::env::var("WEMM_INPUT_DIAGNOSTICS_DIR").expect("fresh diagnostic output directory"),
+        );
+        // Refuse to overwrite evidence from any earlier numerical attempt.
+        std::fs::create_dir(&output).unwrap();
+        let mut reports = Vec::new();
         for item in f["items"]
             .as_array()
             .unwrap()
@@ -489,19 +495,85 @@ pub(crate) mod tests {
                 .unwrap();
             let blob = prepared.to_leaf().unwrap();
             let view = crate::leaf::read_leaf(blob).unwrap();
+            let repeat = p
+                .prepare(&DecodedRgba::decode(&bytes).unwrap(), crop)
+                .unwrap()
+                .to_leaf()
+                .unwrap();
+            let repeat = crate::leaf::read_leaf(repeat).unwrap();
             let expected = std::fs::read(item["pixels_path"].as_str().unwrap()).unwrap();
             assert_eq!(
                 format!("{:x}", Sha256::digest(&expected)),
                 item["pixels_sha256"].as_str().unwrap()
             );
             assert_eq!(view.payload().len(), expected.len());
-            let differing = view
-                .payload()
-                .chunks_exact(2)
-                .zip(expected.chunks_exact(2))
-                .filter(|(a, b)| a != b)
-                .count();
-            assert_eq!(differing, 0, "{} BF16 pixel words differ", item["id"]);
+            assert_eq!(expected.len(), 256 * 1536 * 2);
+            let raw = &view.payload()[..];
+            let repeat_raw = &repeat.payload()[..];
+            // CPU diagnostics only: inputs and all preparation arithmetic stay
+            // on CUDA. These numbers do not replace the exact-equality check.
+            let mut differing = 0usize;
+            let mut max_abs = 0.0f32;
+            let mut max_bf16_steps = 0u16;
+            let mut nonfinite_pairs = 0usize;
+            let ordered = |bits: u16| {
+                if bits & 0x8000 != 0 {
+                    !bits
+                } else {
+                    bits | 0x8000
+                }
+            };
+            for (a, b) in raw.chunks_exact(2).zip(expected.chunks_exact(2)) {
+                let a = u16::from_le_bytes([a[0], a[1]]);
+                let b = u16::from_le_bytes([b[0], b[1]]);
+                differing += usize::from(a != b);
+                max_bf16_steps = max_bf16_steps.max(ordered(a).abs_diff(ordered(b)));
+                let af = bf16::from_bits(a).to_f32();
+                let bf = bf16::from_bits(b).to_f32();
+                if af.is_finite() && bf.is_finite() {
+                    max_abs = max_abs.max((af - bf).abs());
+                } else {
+                    nonfinite_pairs += 1;
+                }
+            }
+            let index = reports.len();
+            let native_name = format!("{index}.native.bf16");
+            let repeat_name = format!("{index}.repeat.bf16");
+            std::fs::write(output.join(&native_name), raw).unwrap();
+            std::fs::write(output.join(&repeat_name), repeat_raw).unwrap();
+            let report = serde_json::json!({
+                "id": item["id"], "source_sha256": item["sha256"],
+                "expected_sha256": item["pixels_sha256"],
+                "native_file": native_name, "repeat_file": repeat_name,
+                "native_sha256": format!("{:x}", Sha256::digest(raw)),
+                "repeat_sha256": format!("{:x}", Sha256::digest(repeat_raw)),
+                "words": raw.len() / 2, "differing_words": differing,
+                "max_abs": max_abs, "max_bf16_steps": max_bf16_steps,
+                "nonfinite_pairs": nonfinite_pairs,
+                "repeat_identical": raw == repeat_raw,
+            });
+            println!("{report}");
+            reports.push(report);
         }
+        let all_exact = reports.len() == 3
+            && reports.iter().all(|r| {
+                r["differing_words"] == 0
+                    && r["nonfinite_pairs"] == 0
+                    && r["repeat_identical"] == true
+            });
+        let report = serde_json::json!({
+            "scope": "B1 still-image preparation; same-process fresh preparation repeats; not batch or cross-host",
+            "prepared_fixture_sha256": std::env::var("WEMM_PREPARED_FIXTURE_SHA256").unwrap(),
+            "images": reports, "exact_pixels_pass": all_exact,
+        });
+        std::fs::write(
+            output.join("report.json"),
+            serde_json::to_vec_pretty(&report).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            all_exact,
+            "exact pixel fixture/repeat mismatch; complete diagnostic evidence retained"
+        );
     }
 }
