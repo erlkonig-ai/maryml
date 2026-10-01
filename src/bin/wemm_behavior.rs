@@ -146,7 +146,7 @@ fn pack(prepared: &Path, pile_path: &Path, output: &Path) -> Result<()> {
     let mut pile = Pile::open(pile_path)?;
     for (id, raw) in payloads {
         let blob = mary::leaf::leaf_blob::<BF16, 2>([256, 1536], raw.into())?;
-        let handle = pile.put(blob)?;
+        let handle = pile.put::<Tensor<BF16, 2>, _>(blob)?;
         let row = manifest["items"]
             .as_array_mut()
             .unwrap()
