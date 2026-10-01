@@ -191,7 +191,7 @@ impl Qwen3TtsWeights {
             source: &str,
             quantization: &str,
         ) -> anyhow::Result<HashMap<String, Leaf>> {
-            let root = crate::selection::select_model_root(
+            let root = crate::selection::select_model_root_acquiring(
                 facts,
                 reader,
                 ModelSelector::Source {

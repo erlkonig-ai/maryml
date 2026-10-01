@@ -250,6 +250,93 @@ pub fn select_model_roots(
     Ok(roots.into_iter().collect())
 }
 
+/// Operational selection over one fixed graph. An empty result means that
+/// every queried label was readable and no root matched; an unavailable label
+/// is an error, never a reason to select a different model. Undecodable label
+/// bytes still supply no typed row, as in the passive selectors above.
+pub fn matching_model_roots_acquiring(
+    tribles: &TribleSet,
+    blobs: &impl BlobStoreGet,
+    selector: ModelSelector<'_>,
+) -> anyhow::Result<Vec<Id>> {
+    let mut roots = BTreeSet::new();
+    match selector {
+        ModelSelector::Only => roots = model_roots(tribles),
+        ModelSelector::Root(root) => {
+            if exists!(pattern!(tribles, [{ root @ attrs::member: _?member }])) {
+                roots.insert(root);
+            }
+        }
+        ModelSelector::Name(wanted) => {
+            for (model, name) in find!(
+                (model: Id, name: Inline<inlineencodings::Handle<blobencodings::UTF8String>>),
+                pattern!(tribles, [{ ?model @ attrs::model_name: ?name, attrs::member: _?member }])
+            ) {
+                if acquiring_label(blobs, name, "model_name")?.as_deref() == Some(wanted) {
+                    roots.insert(model);
+                }
+            }
+        }
+        ModelSelector::Source { source: wanted, quantization } => {
+            for (model, source) in find!(
+                (model: Id, source: Inline<inlineencodings::Handle<blobencodings::UTF8String>>),
+                pattern!(tribles, [{ ?model @
+                    attrs::source: ?source,
+                    attrs::quantization: quantization,
+                    attrs::member: _?member,
+                }])
+            ) {
+                if acquiring_label(blobs, source, "source")?.as_deref() == Some(wanted) {
+                    roots.insert(model);
+                }
+            }
+        }
+    }
+    Ok(roots.into_iter().collect())
+}
+
+fn acquiring_label(
+    blobs: &impl BlobStoreGet,
+    handle: Inline<inlineencodings::Handle<blobencodings::UTF8String>>,
+    field: &str,
+) -> anyhow::Result<Option<anybytes::View<str>>> {
+    use triblespace::core::blob::{Blob, TryFromBlob};
+    let bytes: Blob<blobencodings::UTF8String> = blobs
+        .get(handle)
+        .with_context(|| format!("read {field} label {handle:?}"))?;
+    Ok(anybytes::View::<str>::try_from_blob(bytes).ok())
+}
+
+/// Exactly one operational model root; unlike passive discovery, a failed
+/// label read cannot erase an otherwise ambiguous candidate.
+pub fn select_model_root_acquiring(
+    tribles: &TribleSet,
+    blobs: &impl BlobStoreGet,
+    selector: ModelSelector<'_>,
+) -> anyhow::Result<Id> {
+    exactly_one(
+        matching_model_roots_acquiring(tribles, blobs, selector)?,
+        format_args!("model root matching {selector:?}"),
+    )
+}
+
+/// Operational component selection with the same shard/single-root contract
+/// as [`select_model_roots`]. All label failures propagate before selection.
+pub fn select_model_roots_acquiring(
+    tribles: &TribleSet,
+    blobs: &impl BlobStoreGet,
+    selector: ModelSelector<'_>,
+) -> anyhow::Result<Vec<Id>> {
+    if !matches!(selector, ModelSelector::Source { .. }) {
+        return Ok(vec![select_model_root_acquiring(tribles, blobs, selector)?]);
+    }
+    let roots = matching_model_roots_acquiring(tribles, blobs, selector)?;
+    if roots.is_empty() {
+        bail!("no model root matches {selector:?}");
+    }
+    Ok(roots)
+}
+
 /// Index a component named by `selector`, however many roots carry it.
 ///
 /// The pair of [`select_model_roots`] and [`index_keymap_for_roots`], which is
@@ -446,8 +533,18 @@ pub fn load_keymap_from_graph(
     blobs: &impl BlobStoreGet,
     selector: ModelSelector<'_>,
 ) -> anyhow::Result<HashMap<String, (Vec<f32>, Vec<usize>)>> {
+    let roots = select_model_roots(tribles, blobs, selector)?;
+    load_keymap_for_roots(tribles, blobs, &roots)
+}
+
+/// Load already-selected roots without repeating label discovery after I/O.
+pub fn load_keymap_for_roots(
+    tribles: &TribleSet,
+    blobs: &impl BlobStoreGet,
+    roots: &[Id],
+) -> anyhow::Result<HashMap<String, (Vec<f32>, Vec<usize>)>> {
     let mut keymap: HashMap<String, (Vec<f32>, Vec<usize>)> =
-        index_keymap_for_selector(tribles, blobs, selector)?
+        index_keymap_for_roots(tribles, blobs, roots)?
             .into_iter()
             .map(|(name, leaf)| (name, leaf.to_f32_shape()))
             .collect();
@@ -530,6 +627,28 @@ pub fn select_tokenizer_root(
             exactly_one(matches, format_args!("tokenizer root named {wanted:?}"))
         }
     }
+}
+
+/// Operational tokenizer selection; missing labels are not absent candidates.
+pub fn select_tokenizer_root_acquiring(
+    tribles: &TribleSet,
+    blobs: &impl BlobStoreGet,
+    selector: TokenizerSelector<'_>,
+) -> anyhow::Result<Id> {
+    let TokenizerSelector::Name(wanted) = selector else {
+        return select_tokenizer_root(tribles, blobs, selector);
+    };
+    let roots = tokenizer_roots(tribles);
+    let mut matches = BTreeSet::new();
+    for (tokenizer, name) in find!(
+        (tokenizer: Id, name: Inline<inlineencodings::Handle<blobencodings::UTF8String>>),
+        pattern!(tribles, [{ ?tokenizer @ crate::tokenizer::attrs::model_name: ?name }])
+    ).filter(|(tokenizer, _)| roots.contains(tokenizer)) {
+        if acquiring_label(blobs, name, "tokenizer model_name")?.as_deref() == Some(wanted) {
+            matches.insert(tokenizer);
+        }
+    }
+    exactly_one(matches, format_args!("tokenizer root named {wanted:?}"))
 }
 
 /// Select and construct one HuggingFace tokenizer from an already-open graph.
@@ -643,6 +762,60 @@ mod tests {
         let root = model.root().unwrap();
         *facts += model.into_facts();
         ModelFixture { root, members }
+    }
+
+    #[test]
+    fn acquiring_selection_does_not_erase_an_unread_label() {
+        use triblespace::core::blob::IntoBlob;
+        let mut facts = TribleSet::new();
+        let mut blobs = MemoryBlobStore::new();
+        let alpha = add_model(
+            &mut facts, &mut blobs, "alpha", "org/alpha", "native",
+            &[("alpha.weight", 1.0)],
+        );
+        let late: triblespace::core::blob::Blob<blobencodings::UTF8String> =
+            "org/other".to_owned().to_blob();
+        let missing = late.get_handle();
+        facts += entity! {
+            attrs::source: missing,
+            attrs::quantization: "native",
+            attrs::member: fucid(),
+        }.into_facts();
+        let selector = ModelSelector::Source { source: "org/alpha", quantization: "native" };
+        let before = blobs.snapshot().unwrap();
+        assert_eq!(select_model_roots(&facts, &before, selector).unwrap(), vec![alpha.root]);
+        let error = matching_model_roots_acquiring(&facts, &before, selector).unwrap_err();
+        assert!(error.to_string().contains("read source label"));
+        // Making bytes available changes what can be answered, not the facts
+        // or the roots named by the already-selected graph.
+        blobs.put::<blobencodings::UTF8String, _>(late).unwrap();
+        let after = blobs.snapshot().unwrap();
+        assert_eq!(matching_model_roots_acquiring(&facts, &after, selector).unwrap(), vec![alpha.root]);
+        assert!(matching_model_roots_acquiring(&facts, &before, selector).is_err());
+        assert!(matching_model_roots_acquiring(&facts, &after, ModelSelector::Source {
+            source: "org/absent", quantization: "native",
+        }).unwrap().is_empty());
+    }
+
+    #[test]
+    fn acquiring_selection_keeps_undecodable_labels_out_of_the_typed_query() {
+        let mut facts = TribleSet::new();
+        let mut blobs = MemoryBlobStore::new();
+        let alpha = add_model(
+            &mut facts, &mut blobs, "alpha", "org/alpha", "native",
+            &[("alpha.weight", 1.0)],
+        );
+        let invalid = blobs.put::<blobencodings::RawBytes, _>(vec![0xff_u8]).unwrap();
+        let invalid: Inline<inlineencodings::Handle<blobencodings::UTF8String>> = invalid.transmute();
+        facts += entity! {
+            attrs::source: invalid,
+            attrs::quantization: "native",
+            attrs::member: fucid(),
+        }.into_facts();
+        let reader = blobs.snapshot().unwrap();
+        assert_eq!(select_model_root_acquiring(&facts, &reader, ModelSelector::Source {
+            source: "org/alpha", quantization: "native",
+        }).unwrap(), alpha.root);
     }
 
     #[test]

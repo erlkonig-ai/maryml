@@ -262,6 +262,13 @@ write_info() {
   printf 'host=%s\ntag=%s\nstart=%s\nbeat=%s\n' "$ME" "$TAG" "$NOW" "$NOW" > "$1/info"
 }
 
+# A suffix makes in-place sed portable to both GNU and macOS sed. Never
+# announce a refreshed reservation if its heartbeat could not be written.
+refresh_info() {
+  sed -i.bak "s/^beat=.*/beat=$NOW/" "$1/info" || return 1
+  rm -f "$1/info.bak"
+}
+
 case "$ACTION" in
   take)
     mkdir -p "$LOCKROOT"
@@ -271,7 +278,7 @@ case "$ACTION" in
     # same tag, and a third party taking it on your behalf. It can never put
     # two tags on one slot. Beat while we are here: a re-take is proof of life.
     if d=$(find_tag_dir); then
-      sed -i "s/^beat=.*/beat=$NOW/" "$d/info" 2>/dev/null
+      refresh_info "$d" || exit 4
       echo "TAKEN $TAG (already held by you; beat refreshed)"; exit 0
     fi
     notes=""
@@ -317,7 +324,8 @@ case "$ACTION" in
     # enough that a crash costs one slot instead of the night.
     [ -n "$(held_dirs)" ] || { echo "NOT HELD"; exit 3; }
     d=$(find_tag_dir) || { echo "REFUSING: held by $(for x in $(held_dirs); do tag_of "$x"; done | paste -sd' '), not $TAG"; exit 3; }
-    sed -i "s/^beat=.*/beat=$NOW/" "$d/info" && echo "BEAT $TAG"; exit 0
+    refresh_info "$d" || exit 4
+    echo "BEAT $TAG"; exit 0
     ;;
   release)
     [ -n "$(held_dirs)" ] || { echo "NOT HELD"; exit 0; }

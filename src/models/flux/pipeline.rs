@@ -95,14 +95,15 @@ impl FluxWeights {
             component: &str,
         ) -> anyhow::Result<HashMap<String, Leaf>> {
             let source = variant.component_source(component);
-            crate::selection::index_keymap_for_selector(
+            let roots = crate::selection::select_model_roots_acquiring(
                 facts,
                 reader,
                 ModelSelector::Source {
                     source: &source,
                     quantization: crate::persist::QUANTIZATION_NATIVE,
                 },
-            )
+            )?;
+            crate::selection::index_keymap_for_roots(facts, reader, &roots)
         }
 
         let text_encoder =

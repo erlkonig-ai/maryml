@@ -114,8 +114,8 @@ pub fn prepare_model_fragment(fragment: Fragment) -> PreparedCollectionCommit {
     PreparedCollectionCommit::from_fragment(fragment)
 }
 
-fn named_collections_from_handles(
-    store: &PileSnapshot,
+fn named_collections_from_handles<R: StoreRead>(
+    store: &R,
     wanted: &str,
     handles: impl IntoIterator<Item = CollectionHandle>,
 ) -> (Vec<ModelCollection>, Vec<CollectionHandle>) {
@@ -162,8 +162,8 @@ fn named_collections_from_handles(
     (collections, retired)
 }
 
-fn named_collections_in(
-    store: &PileSnapshot,
+fn named_collections_in<R: StoreRead>(
+    store: &R,
     wanted: &str,
 ) -> anyhow::Result<Vec<ModelCollection>> {
     let mut handles = BTreeSet::new();
@@ -185,8 +185,8 @@ fn named_collections_in(
     Ok(collections)
 }
 
-fn sole_named_collection_in(
-    store: &PileSnapshot,
+fn sole_named_collection_in<R: StoreRead>(
+    store: &R,
     wanted: &'static str,
 ) -> anyhow::Result<ModelCollection> {
     let collections = named_collections_in(store, wanted)?;
@@ -201,11 +201,83 @@ fn sole_named_collection_in(
     }
 }
 
-pub fn model_graph_collections_in(store: &PileSnapshot) -> anyhow::Result<Vec<ModelCollection>> {
+/// Operational discovery over the same record inventory as passive discovery.
+/// A failed exact read is not evidence that a candidate is unrelated or
+/// retired. Decode failures remain open-world non-matches.
+fn sole_named_collection_acquiring_in<R: StoreRead>(
+    store: &R,
+    wanted: &'static str,
+) -> anyhow::Result<ModelCollection> {
+    use triblespace::core::collection::{CollectionDescriptorError, CollectionOpenError};
+    use triblespace::core::capability::capability_action;
+    let mut handles = BTreeSet::new();
+    for record in store.records().context("read model collection records")? {
+        if let CollectionRecord::Commit(commit) = record.context("decode model collection record")? {
+            handles.insert(commit.collection());
+        }
+    }
+    let mut collections = Vec::new();
+    let mut retired = Vec::new();
+    for handle in handles {
+        let blob: Blob<SimpleArchive> = store.get(handle.transmute())
+            .with_context(|| format!("read model candidate descriptor {handle:?}"))?;
+        let Ok(facts) = TribleSet::try_from_blob(blob) else { continue };
+        let Ok(Some(name_handle)) = descriptor::name(&facts) else { continue };
+        let name_blob: Blob<blobencodings::UTF8String> = store.get(name_handle)
+            .with_context(|| format!("read model candidate name {name_handle:?}"))?;
+        let Ok(name) = anybytes::View::<str>::try_from_blob(name_blob) else { continue };
+        if &*name != wanted {
+            continue;
+        }
+        let collection = match ModelCollection::open(store, handle) {
+            Ok(collection) => collection,
+            Err(error @ CollectionOpenError::Descriptor(CollectionDescriptorError::Get { .. })) => {
+                return Err(error).context("open selected model descriptor");
+            }
+            Err(_) => {
+                retired.push(handle);
+                continue;
+            }
+        };
+        let mut has_read = false;
+        let mut has_write = false;
+        // Same supported bindings as admission_policies, but keep transport
+        // errors distinct from a definition with no recognized action row.
+        for (definition, _) in descriptor::capability_policies(&facts, Some(SimpleArchive::id())) {
+            let blob: Blob<SimpleArchive> = store.get(definition)
+                .with_context(|| format!("read model policy definition {definition:?}"))?;
+            let Ok(definition) = TribleSet::try_from_blob(blob) else { continue };
+            has_read |= exists!(pattern!(&definition, [{
+                _?definition @ capability_action: ACTION_READ
+            }]));
+            has_write |= exists!(pattern!(&definition, [{
+                _?definition @ capability_action: ACTION_WRITE
+            }]));
+        }
+        if has_read && has_write {
+            collections.push(collection);
+        } else {
+            retired.push(handle);
+        }
+    }
+    match collections.as_slice() {
+        [collection] => Ok(*collection),
+        [] if !retired.is_empty() => bail!(
+            "found only retired descriptors named '{wanted}' ({retired:?}); run the additive model collection migration"
+        ),
+        [] => bail!("no collection named '{wanted}' in this pile"),
+        _ => bail!(
+            "{} policy collections are named '{wanted}'; select one explicitly: {:?}",
+            collections.len(), collections,
+        ),
+    }
+}
+
+pub fn model_graph_collections_in<R: StoreRead>(store: &R) -> anyhow::Result<Vec<ModelCollection>> {
     named_collections_in(store, mary_model_graph_name())
 }
 
-pub fn model_bundle_collections_in(store: &PileSnapshot) -> anyhow::Result<Vec<ModelCollection>> {
+pub fn model_bundle_collections_in<R: StoreRead>(store: &R) -> anyhow::Result<Vec<ModelCollection>> {
     named_collections_in(store, mary_model_bundle_name())
 }
 
@@ -397,8 +469,27 @@ pub fn snapshot_model_collection_local_latest(
     snapshot_model_collection_in(&store)
 }
 
-pub fn snapshot_model_collection_in(store: &PileSnapshot) -> anyhow::Result<ModelPileSnapshot> {
+/// Discover and read from the caller's fixed observation. An acquiring reader
+/// resolves the descriptor, names, policy definitions and selected model bytes
+/// through its exact-read contract; a local reader retains local-only behavior.
+pub fn snapshot_model_collection_in<R: StoreRead>(store: &R) -> anyhow::Result<ModelSnapshot<R>> {
     snapshot_model_collection_named_in(store, mary_model_graph_name())
+}
+
+/// Operational model read: choose the cover once from this observation,
+/// including known foundations not represented by resident cover members.
+/// Exact gets may fetch their bytes; no later record or proof joins the read.
+/// The ordinary resident-only helpers remain suitable for bounded mappings.
+pub fn snapshot_model_collection_acquiring_in<R: StoreRead>(
+    store: &R,
+) -> anyhow::Result<ModelSnapshot<R>> {
+    let collection = sole_named_collection_acquiring_in(store, mary_model_graph_name())?;
+    let observed = store
+        .collection_acquiring(collection)
+        .context("select model collection for acquisition")?;
+    let facts = observed.view::<TribleSet>().context("read selected model collection")?;
+    let (store, support, _) = observed.into_parts().context("resolve selected model support")?;
+    Ok(ModelSnapshot::new(facts, support, store))
 }
 
 /// The sole model collection of this name, frozen from the local observation.
@@ -413,10 +504,10 @@ pub fn snapshot_model_collection_named_local_latest(
     snapshot_model_collection_named_in(&store, name)
 }
 
-pub fn snapshot_model_collection_named_in(
-    store: &PileSnapshot,
+pub fn snapshot_model_collection_named_in<R: StoreRead>(
+    store: &R,
     name: &'static str,
-) -> anyhow::Result<ModelPileSnapshot> {
+) -> anyhow::Result<ModelSnapshot<R>> {
     let collection = sole_named_collection_in(store, name)?;
     snapshot_model_collection_for(store, collection)
 }
@@ -450,9 +541,9 @@ pub fn snapshot_model_bundle_collection_local_latest(
     snapshot_model_bundle_collection_in(&store)
 }
 
-pub fn snapshot_model_bundle_collection_in(
-    store: &PileSnapshot,
-) -> anyhow::Result<ModelPileSnapshot> {
+pub fn snapshot_model_bundle_collection_in<R: StoreRead>(
+    store: &R,
+) -> anyhow::Result<ModelSnapshot<R>> {
     let collection = sole_named_collection_in(store, mary_model_bundle_name())?;
     snapshot_model_collection_for(store, collection)
 }
@@ -1057,6 +1148,96 @@ mod tests {
         drop(materialized);
         drop(snapshot);
         pile.close().unwrap();
+    }
+
+    #[test]
+    fn acquiring_discovery_never_drops_an_unread_candidate_descriptor() {
+        use triblespace::core::collection::CollectionStore;
+        use triblespace::core::repo::memoryrepo::MemoryRepo;
+        let mut repo = MemoryRepo::default();
+        let key = SigningKey::from_bytes(&[0x76; 32]);
+        let collection = repo.collection(
+            mary_model_graph_name(), direct_model_policy(key.verifying_key()),
+        ).unwrap();
+        repo.commit(collection, &key, entity! { metadata::name: "known model" }).unwrap();
+        let absent: Blob<SimpleArchive> = entity! {
+            metadata::name: "a descriptor not yet received"
+        }.into_facts().to_blob();
+        let data = repo.put::<SimpleArchive, _>(TribleSet::new()).unwrap();
+        repo.insert(CollectionRecord::Commit(CollectionCommit::sign(
+            &key, absent.get_handle().transmute(), data, data,
+        ))).unwrap();
+        let before = repo.snapshot().unwrap();
+        assert_eq!(model_graph_collections_in(&before).unwrap(), vec![collection]);
+        let error = sole_named_collection_acquiring_in(&before, mary_model_graph_name()).unwrap_err();
+        assert!(error.to_string().contains("read model candidate descriptor"));
+        // An available but unrecognized descriptor is still an open-world
+        // non-match. It does not poison another correctly named collection.
+        repo.put::<SimpleArchive, _>(absent).unwrap();
+        let after = repo.snapshot().unwrap();
+        assert_eq!(sole_named_collection_acquiring_in(&after, mary_model_graph_name()).unwrap(), collection);
+        assert!(sole_named_collection_acquiring_in(&before, mary_model_graph_name()).is_err());
+    }
+
+    #[test]
+    fn acquiring_discovery_does_not_retire_an_unread_policy_definition() {
+        use triblespace::core::repo::memoryrepo::MemoryRepo;
+        let mut repo = MemoryRepo::default();
+        let key = SigningKey::from_bytes(&[0x77; 32]);
+        let definition: Blob<SimpleArchive> = entity! {
+            capability_action: ACTION_READ,
+            metadata::name: "a definition whose bytes arrive later",
+        }.into_facts().to_blob();
+        let descriptor = entity! {
+            metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+            collection_name: mary_model_graph_name().to_owned(),
+            collection_representation: SimpleArchive::id(),
+            resource_policy*: AdmissionPolicy::direct(key.verifying_key()).binding(definition.get_handle())
+                + AdmissionPolicy::direct(key.verifying_key()).binding(write_capability()),
+        };
+        let write = entity! { capability_action: ACTION_WRITE };
+        repo.put::<SimpleArchive, _>(write.into_facts()).unwrap();
+        let collection = repo.register_collection::<SimpleArchive>(descriptor).unwrap();
+        repo.commit(collection, &key, entity! { metadata::name: "model member" }).unwrap();
+        let before = repo.snapshot().unwrap();
+        let error = sole_named_collection_acquiring_in(&before, mary_model_graph_name()).unwrap_err();
+        assert!(error.to_string().contains("read model policy definition"));
+        repo.put::<SimpleArchive, _>(definition).unwrap();
+        let after = repo.snapshot().unwrap();
+        assert_eq!(sole_named_collection_acquiring_in(&after, mary_model_graph_name()).unwrap(), collection);
+    }
+
+    #[test]
+    fn acquiring_model_snapshot_does_not_hide_a_known_missing_foundation() {
+        use triblespace::core::collection::CollectionStore;
+        use triblespace::core::repo::memoryrepo::MemoryRepo;
+
+        let mut repo = MemoryRepo::default();
+        let key = SigningKey::from_bytes(&[0x75; 32]);
+        let collection = repo.collection(
+            mary_model_graph_name(), direct_model_policy(key.verifying_key()),
+        ).unwrap();
+        let first = entity! { metadata::name: "resident model annotation" };
+        let mut expected = first.facts().clone();
+        repo.commit(collection, &key, first).unwrap();
+        let late = entity! { metadata::name: "known model member arriving later" };
+        expected += late.facts().clone();
+        let late_blob: Blob<SimpleArchive> = late.into_facts().to_blob();
+        let metadata = repo.put::<SimpleArchive, _>(TribleSet::new()).unwrap();
+        repo.insert(CollectionRecord::Commit(CollectionCommit::sign(
+            &key, collection.handle(), late_blob.get_handle().transmute(), metadata,
+        ))).unwrap();
+
+        let before = repo.snapshot().unwrap();
+        assert_eq!(snapshot_model_collection_in(&before).unwrap().support().len(), 1);
+        assert!(snapshot_model_collection_acquiring_in(&before).is_err());
+        repo.put::<SimpleArchive, _>(late_blob).unwrap();
+        let after = repo.snapshot().unwrap();
+        let model = snapshot_model_collection_acquiring_in(&after).unwrap();
+        assert_eq!(model.facts(), &expected);
+        assert_eq!(model.support().len(), 2);
+        // Acquisition never silently substitutes the later store observation.
+        assert!(snapshot_model_collection_acquiring_in(&before).is_err());
     }
 
     #[test]

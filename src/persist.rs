@@ -2854,7 +2854,7 @@ pub fn select_nomic_mm7b_index_from_snapshot<R: BlobStoreGet>(
     snapshot: crate::model_collection::ModelSnapshot<R>,
 ) -> anyhow::Result<crate::selection::SelectedModelIndex<R>> {
     let (facts, _, reader) = snapshot.into_parts();
-    let mut roots = crate::selection::select_model_roots(
+    let mut roots = crate::selection::select_model_roots_acquiring(
         &facts,
         &reader,
         crate::selection::ModelSelector::Source {
@@ -2862,7 +2862,7 @@ pub fn select_nomic_mm7b_index_from_snapshot<R: BlobStoreGet>(
             quantization: QUANTIZATION_NATIVE,
         },
     )?;
-    roots.extend(crate::selection::select_model_roots(
+    roots.extend(crate::selection::select_model_roots_acquiring(
         &facts,
         &reader,
         crate::selection::ModelSelector::Source {
@@ -2902,8 +2902,8 @@ pub fn load_nomic_mm7b_keymap_from_snapshot<R: BlobStoreGet>(
 /// This constructor neither opens storage nor falls back to a Repository
 /// branch, and ambiguous or incompatible model selections fail closed.
 #[cfg(all(feature = "gemma", target_os = "macos"))]
-pub fn load_nomic_mm7b_aliased_from_snapshot(
-    snapshot: crate::model_collection::ModelPileSnapshot,
+pub fn load_nomic_mm7b_aliased_from_snapshot<R: BlobStoreGet>(
+    snapshot: crate::model_collection::ModelSnapshot<R>,
     tokenizer_path: &Path,
     device: burn::backend::wgpu::WgpuDevice,
 ) -> anyhow::Result<
