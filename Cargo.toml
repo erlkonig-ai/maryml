@@ -1258,3 +1258,7 @@ debug = 0
 [[bin]]
 name = "wemm_prepared_gate"
 required-features = ["wemm-prepared-gate"]
+
+[[bin]]
+name = "wemm_image_gate"
+required-features = ["wemm-prepared-gate"]

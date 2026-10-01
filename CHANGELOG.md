@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Add an unexecuted prepared-image CUDA oracle/native gate over the existing
+  imported model pile. The pinned actual HF wrapper owns vision/scatter/MRoPE;
+  both runtimes generate identical prepared BF16 patch inputs on GPU. Reports
+  retain input bits, merged vision/scatter/decoder/final outputs, rotary-buffer
+  dtypes and unchanged coordinate budgets. Existing text-gate code is unchanged;
+  this one synthetic still-image case is not raw-image or model admission.
+
 - Add a source-only prepared single-image/text WeMM composition over one
   frozen model root and caller-owned BF16 alias binder: checked integer layout,
   GPU placeholder scatter, explicit three-axis GPU positions, and fresh shared
