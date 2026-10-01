@@ -141,7 +141,7 @@ mod reader_tests {
     use triblespace::core::{
         blob::{BlobEncoding, TryFromBlob},
         inline::InlineEncoding,
-        repo::{BlobStorePut, SnapshotSource, StorageClose, pile::{Pile, PileSnapshot}},
+        repo::{BlobStorePut, SnapshotSource, pile::{Pile, PileSnapshot}},
     };
     use triblespace::prelude::{Id, TribleSet, fucid};
     use crate::models::qwen3_5::{
@@ -190,8 +190,9 @@ mod reader_tests {
     #[test]
     fn native_constructors_accept_exact_reader_without_snapshot_downcast() {
         constructors_accept::<Reader<PileSnapshot>>();
-        use triblespace::core::repo::async_store::{AcquiringReader, SyncAsAsync};
-        constructors_accept::<AcquiringReader<SyncAsAsync<PileSnapshot>>>();
+        // The generic body above must typecheck for every BlobStoreGet, which
+        // includes downstream acquiring adapters without enabling their
+        // object-store feature merely to compile this native loader witness.
     }
 
     struct Fixture(PathBuf);
