@@ -595,7 +595,7 @@ fn main() -> anyhow::Result<()> {
         "prepared_pixel_bits":pixel_bits,"prepared_pixel_sha256":hash(&pixel_bytes),
         "vision_merged":merged,"scattered":scattered,"layers":layers,"final_hidden":final_hidden,
         "hf_vision_rotary_dtype":f.vision_rotary_dtype,"hf_text_rotary_dtype":f.text_rotary_dtype,
-        "native_vision_rotary_recipe":"BF16 inv_freq and angle boundaries inherited; mismatch remains gate evidence",
+        "native_vision_rotary_recipe":"actual HF constructor: F32 inv_freq/angles/cos/sin and rotation, final Q/K BF16",
         "checks":checks,"repeat_byte_exact":repeat_exact,"scatter_copy_byte_exact":scatter_copy_exact,
         "vision_output_scope":"merged features after all27blocks; no individual vision-layer witness",
         "embedding_diagnostic_not_admission":diagnostic,"embedding_byte_order":"little-endian BF16",

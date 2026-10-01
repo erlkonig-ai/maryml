@@ -1,7 +1,7 @@
 //! Native BF16 vision block; composed by `vision_tower`.
 //! Fixed-order GPU arithmetic, 12 typed immutable pile roles, no upload fallback.
-//! Rotary recipe: actual HF VisionModel converted wholesale to BF16, including
-//! inv_freq. This is explicit synthetic-oracle scope, NOT all checkpoint loaders.
+//! Rotary follows the pinned actual HF constructor: F32 inverse frequencies,
+//! angles and trigonometric tables; F32 rotation with only its Q/K result BF16.
 //! Biased linear uses F32 dot+bias then BF16; parity is deliberately unproven.
 pub use super::vision_frontend::Grid;
 use crate::nn::cuda_bf16_alias::CudaBf16Aliases;
@@ -79,6 +79,7 @@ pub struct Output {
     pub q: CudaTensor,
     pub k: CudaTensor,
     pub v: CudaTensor,
+    /// F32 rotary intermediates, unlike the BF16 activation stages.
     pub angles: CudaTensor,
     pub cos: CudaTensor,
     pub sin: CudaTensor,
@@ -94,6 +95,8 @@ pub struct Output {
     pub hidden: CudaTensor,
 }
 impl Output {
+    /// Mixed dtype diagnostic views: angles/cos/sin are F32; all others BF16.
+    /// Consumers must dispatch by each tensor's dtype, never reinterpret bytes.
     pub fn stages(&self) -> [(&'static str, &CudaTensor); 18] {
         [
             ("norm1", &self.norm1),
@@ -207,9 +210,9 @@ impl Block {
         let q = channel(&qkv, 0, h);
         let k = channel(&qkv, h, h);
         let v = channel(&qkv, 2 * h, h);
-        let angles = empty(x, &[n, d]);
-        let cos = empty(x, &[n, d]);
-        let sin = empty(x, &[n, d]);
+        let angles = empty_f32(x, &[n, d]);
+        let cos = empty_f32(x, &[n, d]);
+        let sin = empty_f32(x, &[n, d]);
         let q_rot = if no_rotary {
             q.clone()
         } else {
@@ -326,6 +329,15 @@ fn empty(x: &CudaTensor, s: &[usize]) -> CudaTensor {
         s.into(),
         x.client.empty(s.iter().product::<usize>() * 2),
         DType::BF16,
+    )
+}
+fn empty_f32(x: &CudaTensor, s: &[usize]) -> CudaTensor {
+    CubeTensor::new_contiguous(
+        x.client.clone(),
+        x.device.clone(),
+        s.into(),
+        x.client.empty(s.iter().product::<usize>() * 4),
+        DType::F32,
     )
 }
 fn grid(x: &CudaTensor, n: usize) -> CubeCount {
@@ -505,9 +517,9 @@ fn channel(x: &CudaTensor, start: usize, ow: usize) -> CudaTensor {
 }
 #[cube(launch_unchecked)]
 fn rotary_table(
-    angle: &mut Array<bf16>,
-    cos: &mut Array<bf16>,
-    sin: &mut Array<bf16>,
+    angle: &mut Array<f32>,
+    cos: &mut Array<f32>,
+    sin: &mut Array<f32>,
     n: usize,
     offset: usize,
     d: usize,
@@ -527,23 +539,20 @@ fn rotary_table(
             coordinate = col;
         }
         let theta = f32::cast_from(10000.0f32);
-        let inv = f32::cast_from(bf16::cast_from(
-            1.0f32 / theta.powf(f32::cast_from(2 * (f % (d / 4))) / f32::cast_from(d / 2)),
-        ));
-        let pos = f32::cast_from(bf16::cast_from(f32::cast_from(coordinate)));
-        let a = bf16::cast_from(pos * inv);
+        let inv = 1.0f32 / theta.powf(f32::cast_from(2 * (f % (d / 4))) / f32::cast_from(d / 2));
+        let a = f32::cast_from(coordinate) * inv;
         let at = offset * d + i;
         angle[at] = a;
-        cos[at] = bf16::cast_from(f32::cast_from(a).cos());
-        sin[at] = bf16::cast_from(f32::cast_from(a).sin());
+        cos[at] = a.cos();
+        sin[at] = a.sin();
     }
 }
 #[cube(launch_unchecked)]
 fn rotate(
     q: &Array<bf16>,
     k: &Array<bf16>,
-    cos: &Array<bf16>,
-    sin: &Array<bf16>,
+    cos: &Array<f32>,
+    sin: &Array<f32>,
     qr: &mut Array<bf16>,
     kr: &mut Array<bf16>,
     n: usize,
@@ -738,6 +747,71 @@ mod tests {
             .read_one(t.handle.clone())
             .expect("GPU output read")
             .to_vec()
+    }
+
+    #[test]
+    #[ignore = "requires reserved CUDA; actual-constructor F32 rotary boundaries, not model parity"]
+    fn rotary_tables_remain_f32_until_final_qk_cast() {
+        let (n, h, d) = (256, 1152, 72);
+        let q = fixture(n, h, 3);
+        let angles = empty_f32(&q, &[n, d]);
+        let cos = empty_f32(&q, &[n, d]);
+        let sin = empty_f32(&q, &[n, d]);
+        let qr = empty(&q, &[n, h]);
+        let kr = empty(&q, &[n, h]);
+        unsafe {
+            rotary_table::launch_unchecked::<CudaRuntime>(
+                &q.client,
+                grid(&q, n * d),
+                CubeDim::new_1d(64),
+                arg(&angles),
+                arg(&cos),
+                arg(&sin),
+                n * d,
+                0,
+                d,
+                16,
+                16,
+            );
+            rotate::launch_unchecked::<CudaRuntime>(
+                &q.client,
+                grid(&q, n * h),
+                CubeDim::new_1d(64),
+                arg(&q),
+                arg(&q),
+                arg(&cos),
+                arg(&sin),
+                arg(&qr),
+                arg(&kr),
+                n * h,
+                0,
+                h,
+                d,
+            );
+        }
+        // Only byte/metadata assertions on host; all reference arithmetic is
+        // GPU. Position zero is exactly (angle0, cos1, sin0), and nonzero
+        // tables must retain bits below the BF16 mantissa boundary.
+        for (table, zero_bits) in [(&angles, 0u32), (&cos, 0x3f800000), (&sin, 0)] {
+            assert_eq!(table.dtype, DType::F32);
+            let raw = bytes(table);
+            assert_eq!(raw.len(), n * d * 4);
+            assert!(
+                raw[..d * 4]
+                    .chunks_exact(4)
+                    .all(|b| u32::from_le_bytes(b.try_into().unwrap()) == zero_bits)
+            );
+            assert!(
+                raw[d * 4..]
+                    .chunks_exact(4)
+                    .any(|b| u32::from_le_bytes(b.try_into().unwrap()) & 0xffff != 0)
+            );
+        }
+        assert_eq!(qr.dtype, DType::BF16);
+        let rotated = bytes(&qr);
+        assert_eq!(rotated, bytes(&kr));
+        assert_eq!(&rotated[..h * 2], &bytes(&q)[..h * 2]);
+        assert_ne!(&rotated[h * 2..], &bytes(&q)[h * 2..]);
     }
 
     #[test]
