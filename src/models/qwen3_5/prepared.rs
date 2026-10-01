@@ -120,6 +120,13 @@ impl PreparedDecoder {
     }
 }
 
+// Same bound model, not independently selected text weights for another
+// embedder. The original affine gather and its public execution stay intact.
+impl PreparedDecoder {
+    pub(crate) fn embedding_table(&self) -> &CudaTensor { &self.token_embedding }
+    pub(crate) fn decoder_stack(&self) -> &Stack { &self.stack }
+}
+
 pub fn validate_ids(ids: &[u32]) -> Result<(), String> {
     if !(1..=decoder_stack::MAX_TOKENS).contains(&ids.len()) {
         return Err("prepared WeMM input requires 1..=256 unpadded integer IDs".into());

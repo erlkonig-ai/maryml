@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Add a source-only prepared single-image/text WeMM composition over one
+  frozen model root and caller-owned BF16 alias binder: checked integer layout,
+  GPU placeholder scatter, explicit three-axis GPU positions, and fresh shared
+  decoder prefill. The existing affine text/decode execution is unchanged.
+  This is B1/unpadded, with the processor's all-ones mask policy; no raw image
+  processor, video, continuation, executed gate or numerical admission claim.
+
 - Add the native BF16 WeMM prepared-token decoder leg: typed opaque-root role
   queries, zero-copy pile aliases, GPU embedding gather, all 32 Qwen3.5 layers,
   and the shared embedding boundary. A separate prepared-patch vision tower

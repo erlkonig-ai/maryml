@@ -300,3 +300,143 @@ fn attention(q:&CudaTensor,k:&CudaTensor,v:&CudaTensor,past:usize,c:Config)->Cud
     }
     tensor(q,s,out)
 }
+
+// Separate fresh-prefill entry: the existing affine/decode path above is
+// byte-unchanged. A position table does not fabricate an affine cache state.
+impl Block {
+    /// Fresh B1, no padding. The caller's all-ones mask policy means ordinary
+    /// causal token order, independent of repeated image temporal positions.
+    /// No continuation state is returned or retained by this entry point.
+    pub fn prefill_positioned(
+        &self, x: &CudaTensor, positions: &super::position_table::PositionTable,
+    ) -> Result<CudaTensor, String> {
+        let shape = x.meta.shape().as_slice();
+        let c = self.config;
+        if shape.len() != 3 || shape[0] != 1 || shape[1] == 0 || shape[1] > c.capacity {
+            return Err("position-table prefill requires B1, nonempty bounded unpadded tokens".into());
+        }
+        let tokens = shape[1];
+        check(x, &self.q, &[1,tokens,c.hidden])?;
+        if !std::ptr::eq(x.client.properties(), self.q.client.properties()) {
+            return Err("position-table input and weights require the same CUDA client".into());
+        }
+        positions.validate(x, tokens)?;
+        for shape in [vec![1,tokens,2*c.heads*c.head_dim], vec![1,tokens,c.kv_heads,c.head_dim],
+            vec![1,tokens,c.intermediate], vec![1,tokens,c.heads,tokens]] { count(&shape)?; }
+        let normalized = norm(x, &self.input_norm, c.hidden, c.epsilon);
+        let packed = project(&normalized, &self.q)?;
+        let (q, gate) = split(&packed, 1, tokens, c.heads, c.head_dim);
+        let q = norm(&q, &self.q_norm, c.head_dim, c.epsilon);
+        let k = reshape(project(&normalized, &self.k)?, &[1,tokens,c.kv_heads,c.head_dim]);
+        let k = norm(&k, &self.k_norm, c.head_dim, c.epsilon);
+        let v = reshape(project(&normalized, &self.v)?, &[1,tokens,c.kv_heads,c.head_dim]);
+        let q = positioned_rope(&q, c, positions);
+        let k = positioned_rope(&k, c, positions);
+        let attended = attention(&q, &k, &v, 0, c);
+        let gated = elementwise(&attended, &gate, 2);
+        let output = project(&reshape(gated, &[1,tokens,c.heads*c.head_dim]), &self.o)?;
+        let residual = elementwise(x, &output, 0);
+        let post = norm(&residual, &self.post_norm, c.hidden, c.epsilon);
+        let gate = project(&post, &self.gate)?;
+        let up = project(&post, &self.up)?;
+        let mlp = elementwise(&gate, &up, 1);
+        let down = project(&mlp, &self.down)?;
+        Ok(elementwise(&residual, &down, 0))
+    }
+}
+
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn positioned_rope_kernel(
+    x: &Array<bf16>, positions: &Array<u32>, y: &mut Array<bf16>,
+    n: usize, tokens: usize, heads: usize, d: usize, r: usize,
+    sh: usize, sw: usize, theta: f32,
+) {
+    let i = ABSOLUTE_POS as usize;
+    if i < n {
+        let j = i % d;
+        if j >= r { y[i] = x[i]; } else {
+            let half = r / 2;
+            let f = j % half;
+            let row = i / d;
+            let token = row / heads % tokens;
+            let mut axis = 0usize;
+            if f % 3 == 1 && f < sh * 3 { axis = 1; }
+            if f % 3 == 2 && f < sw * 3 { axis = 2; }
+            let position = positions[axis * tokens + token];
+            let inv = 1.0f32 / theta.powf(f32::cast_from(2 * f) / f32::cast_from(r));
+            let angle = inv * f32::cast_from(position);
+            let cos = f32::cast_from(bf16::cast_from(angle.cos()));
+            let sin = f32::cast_from(bf16::cast_from(angle.sin()));
+            let low = f32::cast_from(x[row * d + f]);
+            let high = f32::cast_from(x[row * d + half + f]);
+            if j < half {
+                y[i] = bf16::cast_from(f32::cast_from(bf16::cast_from(low * cos)) - f32::cast_from(bf16::cast_from(high * sin)));
+            } else {
+                y[i] = bf16::cast_from(f32::cast_from(bf16::cast_from(high * cos)) + f32::cast_from(bf16::cast_from(low * sin)));
+            }
+        }
+    }
+}
+
+fn positioned_rope(x: &CudaTensor, c: Config, positions: &super::position_table::PositionTable) -> CudaTensor {
+    let shape = x.meta.shape().as_slice();
+    let n = len(x);
+    let out = x.client.empty(n * 2);
+    unsafe {
+        positioned_rope_kernel::launch_unchecked::<CudaRuntime>(
+            &x.client, grid(x,n), CubeDim::new_1d(64),
+            ArrayArg::from_raw_parts(x.handle.clone(),n),
+            ArrayArg::from_raw_parts(positions.tensor().handle.clone(),3*shape[1]),
+            ArrayArg::from_raw_parts(out.clone(),n),
+            n,shape[1],shape[2],c.head_dim,c.rotary_dim,c.sections[1],c.sections[2],c.theta,
+        );
+    }
+    tensor(x,shape,out)
+}
+
+#[cfg(test)]
+mod positioned_tests {
+    use super::*;
+    use cubecl::cuda::CudaDevice;
+    use super::super::position_table::PositionTable;
+
+    #[cube(launch_unchecked)]
+    fn fill_position_fixture(out: &mut Array<bf16>, n: usize, offset: usize) {
+        let i=ABSOLUTE_POS as usize;
+        if i<n { out[i]=bf16::cast_from((f32::cast_from(((i+offset)*17)%251)-125.0f32)/128.0f32); }
+    }
+
+    fn fixture(tokens: usize, offset: usize) -> CudaTensor {
+        let device=CudaDevice{index:0};
+        let client=CudaRuntime::client(&device);
+        let n=tokens*16*256;
+        let out=CubeTensor::new_contiguous(client.clone(),device,[1,tokens,16,256].into(),client.empty(n*2),DType::BF16);
+        unsafe { fill_position_fixture::launch_unchecked::<CudaRuntime>(&client,grid(&out,n),CubeDim::new_1d(64),
+            ArrayArg::from_raw_parts(out.handle.clone(),n),n,offset); }
+        out
+    }
+
+    #[test]
+    #[ignore="requires reserved CUDA; table indexing/unchanged arithmetic, not HF admission"]
+    fn explicit_positions_match_affine_and_per_token_three_axis_control() {
+        let c=Config{hidden:4096,intermediate:12288,heads:16,kv_heads:4,head_dim:256,
+            rotary_dim:64,sections:[11,11,10],theta:10_000_000.0,epsilon:1e-6,capacity:256,attention_bias:false};
+        let x=fixture(4,0);
+        let sequential=PositionTable::from_positions(&x,&[[0;3],[1;3],[2;3],[3;3]]).unwrap();
+        let expected=rope(&x,c,Positions{start:0,batch_stride:0,axis_base:[0;3],axis_step:[1;3]},0);
+        let actual=positioned_rope(&x,c,&sequential);
+        assert_eq!(actual.client.read_one(actual.handle.clone()).unwrap().to_vec(),expected.client.read_one(expected.handle.clone()).unwrap().to_vec());
+        let axes=[[2,2,2],[2,2,3],[2,3,2],[4,4,4]];
+        let table=PositionTable::from_positions(&x,&axes).unwrap();
+        assert!(table.validate(&x,3).is_err());
+        let actual=positioned_rope(&x,c,&table);
+        let actual=actual.client.read_one(actual.handle.clone()).unwrap().to_vec();
+        for (token,&axis_base) in axes.iter().enumerate() {
+            let one=fixture(1,token*16*256);
+            let expected=rope(&one,c,Positions{start:0,batch_stride:0,axis_base,axis_step:[0;3]},0);
+            let expected=expected.client.read_one(expected.handle.clone()).unwrap().to_vec();
+            assert_eq!(&actual[token*8192..(token+1)*8192],expected.as_slice());
+        }
+    }
+}

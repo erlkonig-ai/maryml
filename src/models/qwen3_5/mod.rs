@@ -7,11 +7,17 @@
 //! The opt-in `deltanet` module implements the resident post-convolution scan;
 //! `gdn_ops` supplies the causal convolution and ordinary gated output norm.
 //! The CUDA prepared-token path now assembles all 32 shared decoder blocks
-//! and the output boundary. Vision has a separate prepared-patch tower; GPU
-//! scatter/arbitrary multimodal positions and numerical admission remain open.
+//! and the output boundary. The single-image prepared composition connects
+//! the vision tower through GPU scatter and explicit MRoPE positions. Raw
+//! image processing, video, batching and numerical admission remain open.
 
 pub mod config;
 pub mod layout;
+pub mod multimodal_layout;
+#[cfg(feature = "qwen3_5-cuda")]
+pub mod position_table;
+#[cfg(feature = "qwen3_5-cuda")]
+pub mod multimodal;
 
 pub mod vision_geometry;
 #[cfg(feature = "qwen3_5-cuda")]

@@ -245,3 +245,38 @@ fn check_tensor(t: &CudaTensor, anchor: &CudaTensor, shape: &[usize]) -> Result<
     }
     Ok(())
 }
+
+impl Stack {
+    /// Explicit positions, fresh B1 prefill with the processor's all-ones
+    /// unpadded mask policy. No packed mask inference or continuation state.
+    /// The affine producer and its existing call graph remain unchanged.
+    pub fn prefill_positioned_unpadded_observed(
+        &self, input: &CudaTensor, positions: &super::position_table::PositionTable,
+        mut observed: impl FnMut(usize, &CudaTensor) -> Result<(), String>,
+    ) -> Result<embedding_boundary::Output, String> {
+        let shape = input.meta.shape().as_slice();
+        if shape.len() != 3 || shape[0] != 1 || !(1..=MAX_TOKENS).contains(&shape[1])
+            || shape[2] != HIDDEN {
+            return Err("positioned stack requires unpadded BF16 [1,T,4096], T1..256".into());
+        }
+        check_tensor(input, &self.input_anchor, shape)?;
+        positions.validate(input, shape[1])?;
+        let mut hidden = input.clone();
+        for (group_index, group) in self.groups.iter().enumerate() {
+            for (offset, block) in group.gdn.iter().enumerate() {
+                let layer = group_index * 4 + offset;
+                let gdn_decoder::Output { hidden: next, state } = block.prefill(&hidden, None)
+                    .map_err(|e| format!("layer {layer} GDN prefill: {e}"))?;
+                drop(state);
+                hidden = next;
+                observed(layer, &hidden)?;
+            }
+            let layer = group_index * 4 + 3;
+            hidden = group.attention.prefill_positioned(&hidden, positions)
+                .map_err(|e| format!("layer {layer} positioned attention prefill: {e}"))?;
+            observed(layer, &hidden)?;
+        }
+        self.endpoint.finish_unpadded(&hidden)
+            .map_err(|e| format!("shared output boundary: {e}"))
+    }
+}

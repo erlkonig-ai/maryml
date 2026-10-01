@@ -25,6 +25,9 @@ src/models/qwen3_5/vision_frontend.rs
 src/models/qwen3_5/vision_block.rs
 src/models/qwen3_5/vision_merger.rs
 src/models/qwen3_5/vision_tower.rs
+src/models/qwen3_5/multimodal_layout.rs
+src/models/qwen3_5/position_table.rs
+src/models/qwen3_5/multimodal.rs
 src/bin/wemm_prepared_gate.rs
 scripts/wemm_prepared_reference.py
 scripts/wemm_prepared_sources.txt
