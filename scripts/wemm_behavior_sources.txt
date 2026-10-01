@@ -28,6 +28,8 @@ src/models/qwen3_5/vision_tower.rs
 src/models/qwen3_5/multimodal_layout.rs
 src/models/qwen3_5/position_table.rs
 src/models/qwen3_5/multimodal.rs
+src/models/qwen3_5/input_codec.rs
+src/models/qwen3_5/image_prepare.rs
 scripts/wemm_prepared_reference.py
 src/bin/wemm_behavior.rs
 src/bin/wemm_behavior/sources.rs

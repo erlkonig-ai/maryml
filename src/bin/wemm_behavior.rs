@@ -1,6 +1,7 @@
 //! Fixed prepared-fixture behavioral probe. No reference-coordinate gate.
 //! `pack PREPARED.json NEW_INPUTS.pile NEW_FIXTURE.json`
 //! `run MODEL.pile ROOT CONFIG.json FIXTURE.json INPUTS.pile HF.json NEW_REPORT.json`
+//! `run-native-input MODEL.pile ROOT CONFIG.json FIXTURE.json ASSETS_DIR HF.json NEW_REPORT.json`
 //! All model math is native CUDA; host work is metadata and byte transport.
 use anyhow::{Context, Result, ensure};
 use burn::tensor::DType;
@@ -73,6 +74,101 @@ struct Item {
     pixels_sha256: Option<String>,
     #[serde(default)]
     tensor_handle: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    source_path: Option<String>,
+    #[serde(default)]
+    sha256: Option<String>,
+    #[serde(default)]
+    crop_xyxy: Option<[usize; 4]>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InputMode {
+    AliasedPrepared,
+    #[cfg(feature = "wemm-input")]
+    NativeCodec,
+}
+#[cfg(feature = "wemm-input")]
+struct NativeInput {
+    codec: mary::models::qwen3_5::input_codec::InputCodec,
+    gpu: mary::models::qwen3_5::image_prepare::GpuPreparer,
+}
+#[cfg(feature = "wemm-input")]
+impl NativeInput {
+    fn new(assets: &Path) -> Result<Self> {
+        use mary::models::qwen3_5::{image_prepare::GpuPreparer, input_codec::InputCodec};
+        let codec = InputCodec::from_assets(
+            &fs::read(assets.join("tokenizer.json"))?,
+            &fs::read(assets.join("chat_template.jinja"))?,
+        )
+        .map_err(anyhow::Error::msg)?;
+        Ok(Self {
+            codec,
+            gpu: GpuPreparer::new(CudaDevice { index: 0 }).map_err(anyhow::Error::msg)?,
+        })
+    }
+    fn prepare(
+        &self,
+        item: &Item,
+    ) -> Result<(
+        Vec<u32>,
+        Option<mary::models::qwen3_5::image_prepare::PreparedPixels>,
+    )> {
+        use mary::models::qwen3_5::image_prepare::{Crop, DecodedRgba};
+        let tokens = if item.modality == "text" {
+            self.codec.text(
+                item.text
+                    .as_deref()
+                    .context("native input requires original text")?,
+            )
+        } else {
+            self.codec.image()
+        }
+        .map_err(anyhow::Error::msg)?;
+        ensure!(
+            tokens.as_slice() == item.ids,
+            "native tokenizer differs from frozen fixture: {}",
+            item.id
+        );
+        let pixels = if item.modality == "image" {
+            let path = Path::new(
+                item.source_path
+                    .as_deref()
+                    .context("native image source path")?,
+            );
+            ensure!(
+                fs::metadata(path)?.len() <= 64 * 1024 * 1024,
+                "bounded encoded image"
+            );
+            let raw = fs::read(path)?;
+            ensure!(
+                Some(hash(&raw)) == item.sha256,
+                "native source image changed: {}",
+                item.id
+            );
+            let decoded = DecodedRgba::decode(&raw).map_err(anyhow::Error::msg)?;
+            let crop = item.crop_xyxy.map(|[left, top, right, bottom]| Crop {
+                left,
+                top,
+                right,
+                bottom,
+            });
+            let pixels = self
+                .gpu
+                .prepare(&decoded, crop)
+                .map_err(anyhow::Error::msg)?;
+            // Synchronize without reading tensor values. Preparation timing
+            // includes actual GPU completion; the SAME tensor goes to model.
+            cubecl::future::block_on(pixels.tensor().client.sync())
+                .map_err(|e| anyhow::anyhow!("native preparation sync: {e:?}"))?;
+            Some(pixels)
+        } else {
+            None
+        };
+        Ok((tokens.as_slice().to_vec(), pixels))
+    }
 }
 fn items(value: &Value) -> Result<Vec<Item>> {
     ensure!(
@@ -174,10 +270,10 @@ struct Selected {
     shape: Vec<u64>,
     sha256: String,
 }
-fn run(args: &[std::ffi::OsString]) -> Result<()> {
+fn run(args: &[std::ffi::OsString], mode: InputMode) -> Result<()> {
     ensure!(
         args.len() == 7,
-        "run MODEL ROOT CONFIG FIXTURE INPUTS HF NEW_REPORT"
+        "run[-native-input] MODEL ROOT CONFIG FIXTURE INPUTS_OR_ASSETS HF NEW_REPORT"
     );
     let started_unix_ns = SystemTime::now()
         .duration_since(UNIX_EPOCH)?
@@ -210,14 +306,16 @@ fn run(args: &[std::ffi::OsString]) -> Result<()> {
         hf["fixture_sha256"] == hash(&fixture_bytes) && hf["checkpoint_sha256"] == CHECKPOINT,
         "HF fixture/checkpoint identity"
     );
-    ensure!(
-        fs::metadata(&args[4])?.len() < 4 * 1024 * 1024,
-        "oversized input pile"
-    );
-    ensure!(
-        fixture["input_pile_sha256"] == hash(&fs::read(&args[4])?),
-        "fixture pile identity"
-    );
+    if mode == InputMode::AliasedPrepared {
+        ensure!(
+            fs::metadata(&args[4])?.len() < 4 * 1024 * 1024,
+            "oversized input pile"
+        );
+        ensure!(
+            fixture["input_pile_sha256"] == hash(&fs::read(&args[4])?),
+            "fixture pile identity"
+        );
+    }
     ensure!(!Path::new(&args[6]).exists(), "preserve old output");
     let weights: Vec<Weight> = serde_json::from_value(hf["weights"].clone())?;
     ensure!(weights.len() == 759, "HF must bind all759 roles");
@@ -226,10 +324,23 @@ fn run(args: &[std::ffi::OsString]) -> Result<()> {
         weights.iter().all(|w| names.insert(&w.name)),
         "duplicate HF role"
     );
+    let input_init = Instant::now();
+    #[cfg(feature = "wemm-input")]
+    let native_input = if mode == InputMode::NativeCodec {
+        Some(NativeInput::new(Path::new(&args[4]))?)
+    } else {
+        None
+    };
+    let input_init_ms = input_init.elapsed().as_secs_f64() * 1000.;
+    let expected_aliases = if mode == InputMode::AliasedPrepared {
+        762
+    } else {
+        759
+    };
     let started = Instant::now();
     let model = mary::persist::read_model_pile(Path::new(&args[0]))?;
-    let mut aliases =
-        CudaBf16Aliases::new(CudaDevice { index: 0 }, 762).map_err(anyhow::Error::msg)?;
+    let mut aliases = CudaBf16Aliases::new(CudaDevice { index: 0 }, expected_aliases)
+        .map_err(anyhow::Error::msg)?;
     let mut selected = Vec::with_capacity(759);
     // SAFETY: both operator-owned piles remain genuine immutable prefixes
     // including preceding mmap pages until process/CUDA teardown.
@@ -261,28 +372,42 @@ fn run(args: &[std::ffi::OsString]) -> Result<()> {
     }
     .map_err(anyhow::Error::msg)?;
     ensure!(selected.len() == 759, "native roles");
-    let mut input_store = Pile::new(PileFile::open_read_only(Path::new(&args[4]))?);
-    let input_snapshot = input_store.snapshot()?;
+    let mut input_store = if mode == InputMode::AliasedPrepared {
+        Some(Pile::new(PileFile::open_read_only(Path::new(&args[4]))?))
+    } else {
+        None
+    };
+    let input_snapshot = input_store
+        .as_mut()
+        .map(|store| store.snapshot())
+        .transpose()?;
     let mut pixels = Vec::with_capacity(3); // finite call fixture, not a model catalogue
-    for item in inputs.iter().filter(|i| i.modality == "image") {
-        let handle = Handle::<Tensor<BF16, 2>>::from_hash(Hash::<Blake3>::from_hex(
-            item.tensor_handle
-                .as_deref()
-                .context("typed tensor handle")?,
-        )?);
-        let blob: Blob<Tensor<BF16, 2>> = input_snapshot.get(handle)?;
-        let tensor = unsafe { aliases.bind_pile_leaf(blob.clone()) }.map_err(anyhow::Error::msg)?;
-        ensure!(
-            tensor.meta.shape().as_slice() == [256, 1536] && tensor.dtype == DType::BF16,
-            "fixture tensor shape"
-        );
-        let view = mary::leaf::read_leaf(blob)?; // binder checked header arithmetic first
-        ensure!(
-            Some(hash(view.payload())) == item.pixels_sha256,
-            "typed input differs from HF prepared bytes"
-        );
-        pixels.push((item.id.clone(), tensor));
+    if let Some(input_snapshot) = &input_snapshot {
+        for item in inputs.iter().filter(|i| i.modality == "image") {
+            let handle = Handle::<Tensor<BF16, 2>>::from_hash(Hash::<Blake3>::from_hex(
+                item.tensor_handle
+                    .as_deref()
+                    .context("typed tensor handle")?,
+            )?);
+            let blob: Blob<Tensor<BF16, 2>> = input_snapshot.get(handle)?;
+            let tensor =
+                unsafe { aliases.bind_pile_leaf(blob.clone()) }.map_err(anyhow::Error::msg)?;
+            ensure!(
+                tensor.meta.shape().as_slice() == [256, 1536] && tensor.dtype == DType::BF16,
+                "fixture tensor shape"
+            );
+            let view = mary::leaf::read_leaf(blob)?; // binder checked header arithmetic first
+            ensure!(
+                Some(hash(view.payload())) == item.pixels_sha256,
+                "typed input differs from HF prepared bytes"
+            );
+            pixels.push((item.id.clone(), tensor));
+        }
     }
+    ensure!(
+        aliases.stats().registrations == expected_aliases,
+        "unexpected model/input alias count"
+    );
     let bind_ms = started.elapsed().as_secs_f64() * 1000.;
     let mut vectors = Vec::with_capacity(22);
     for reverse in [false, true] {
@@ -294,17 +419,37 @@ fn run(args: &[std::ffi::OsString]) -> Result<()> {
         for index in order {
             let item = &inputs[index];
             let start = Instant::now();
+            #[cfg(feature = "wemm-input")]
+            let native_prepared = native_input
+                .as_ref()
+                .map(|prep| prep.prepare(item))
+                .transpose()?;
+            let mut ids = item.ids.as_slice();
+            #[cfg(feature = "wemm-input")]
+            if let Some((tokens, _)) = &native_prepared {
+                ids = tokens;
+            }
+            let prepare_ms = start.elapsed().as_secs_f64() * 1000.;
+            let forward_start = Instant::now();
             let embedding = if item.modality == "text" {
                 model
-                    .embed_text(&item.ids)
+                    .embed_text(ids)
                     .map_err(anyhow::Error::msg)?
                     .endpoint
                     .embedding
             } else {
-                let pixel = &pixels.iter().find(|(id, _)| id == &item.id).unwrap().1;
+                let mut pixel = pixels
+                    .iter()
+                    .find(|(id, _)| id == &item.id)
+                    .map(|(_, tensor)| tensor);
+                #[cfg(feature = "wemm-input")]
+                if let Some((_, Some(prepared))) = &native_prepared {
+                    pixel = Some(prepared.tensor());
+                }
+                let pixel = pixel.context("selected image tensor")?;
                 model
                     .embed_image(
-                        &item.ids,
+                        ids,
                         pixel,
                         Grid {
                             frames: 1,
@@ -316,7 +461,7 @@ fn run(args: &[std::ffi::OsString]) -> Result<()> {
                     .endpoint
                     .embedding
             };
-            let forward_dispatch_ms = start.elapsed().as_secs_f64() * 1000.;
+            let forward_dispatch_ms = forward_start.elapsed().as_secs_f64() * 1000.;
             ensure!(
                 embedding.dtype == DType::BF16 && embedding.meta.shape().as_slice() == [1, 4096],
                 "embedding shape"
@@ -328,6 +473,7 @@ fn run(args: &[std::ffi::OsString]) -> Result<()> {
                 .map_err(|e| anyhow::anyhow!("read:{e:?}"))?
                 .to_vec();
             let readback_wait_ms = readback_start.elapsed().as_secs_f64() * 1000.;
+            let forward_ms = forward_start.elapsed().as_secs_f64() * 1000.;
             let elapsed_ms = start.elapsed().as_secs_f64() * 1000.;
             ensure!(raw.len() == 8192, "embedding bytes");
             let bits: Vec<u16> = raw
@@ -339,6 +485,7 @@ fn run(args: &[std::ffi::OsString]) -> Result<()> {
                 "nonfinite BF16 embedding"
             );
             vectors.push(json!({"id":item.id,"pass":if reverse {"reverse"}else{"forward"},"bits":bits,"sha256":hash(&raw),"elapsed_ms":elapsed_ms,
+                "prepare_ms":prepare_ms,"forward_ms":forward_ms,
                 "forward_dispatch_ms":forward_dispatch_ms,"readback_wait_ms":readback_wait_ms}));
             println!(
                 "{} {} {:.1}ms",
@@ -361,9 +508,10 @@ fn run(args: &[std::ffi::OsString]) -> Result<()> {
         Path::new(&args[6]),
         &json!({"schema":"wemm-behavior-embeddings-v1","engine":"native-CUDA-BF16","checkpoint_sha256":CHECKPOINT,
         "fixture_sha256":hash(&fixture_bytes),"hf_report_sha256":hash(&hf_bytes),"native_sources":source,"selected_roles":selected,
-        "model_root":format!("{root:?}"),"alias_registrations":aliases.stats().registrations,"bind_ms":bind_ms,"embeddings":vectors,
+        "model_root":format!("{root:?}"),"alias_registrations":aliases.stats().registrations,"bind_ms":bind_ms,"input_init_ms":input_init_ms,"embeddings":vectors,
+        "input_preparation":if mode==InputMode::AliasedPrepared {"aliased retained Torch BF16 patches; fixture IDs"} else {"native pinned tokenizer and CUDA aspect-fit256 preparation; direct GPU tensor, no input pile or pixel readback"},
         "reverse_order_byte_exact":reproducible,"process":process,
-        "timing":"bind_ms includes selection, payload hashing and input aliasing; elapsed_ms is each forward plus readback wait; forward_dispatch_ms is host call duration, not GPU-only kernel time",
+        "timing":"input_init_ms is one-time codec/runtime init; bind_ms includes selection, payload hashing and any input aliasing; prepare_ms includes tokenization, source read/decode/hash and synchronized GPU prep in native-input mode; forward_ms includes forward+embedding readback; elapsed_ms includes both; dispatch is not GPU-only time",
         "scope":"B1 serial calls, fresh state; no vectorized-batch or cross-host claim; coordinate parity diagnostic only"}),
     )?;
     ensure!(
@@ -433,9 +581,11 @@ fn main() -> Result<()> {
             Path::new(&args[2]),
             Path::new(&args[3]),
         ),
-        Some("run") => run(&args[1..]),
+        Some("run") => run(&args[1..], InputMode::AliasedPrepared),
+        #[cfg(feature = "wemm-input")]
+        Some("run-native-input") => run(&args[1..], InputMode::NativeCodec),
         _ => anyhow::bail!(
-            "pack PREPARED NEW_PILE NEW_FIXTURE | run MODEL ROOT CONFIG FIXTURE INPUTS HF NEW_REPORT"
+            "pack PREPARED NEW_PILE NEW_FIXTURE | run MODEL ROOT CONFIG FIXTURE INPUTS HF NEW_REPORT | run-native-input MODEL ROOT CONFIG FIXTURE ASSETS_DIR HF NEW_REPORT (wemm-input feature)"
         ),
     }
 }

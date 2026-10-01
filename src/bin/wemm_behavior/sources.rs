@@ -104,6 +104,14 @@ pub const SOURCES: &[(&str, &[u8])] = &[
         include_bytes!("../../../src/models/qwen3_5/multimodal.rs"),
     ),
     (
+        "src/models/qwen3_5/input_codec.rs",
+        include_bytes!("../../../src/models/qwen3_5/input_codec.rs"),
+    ),
+    (
+        "src/models/qwen3_5/image_prepare.rs",
+        include_bytes!("../../../src/models/qwen3_5/image_prepare.rs"),
+    ),
+    (
         "scripts/wemm_prepared_reference.py",
         include_bytes!("../../../scripts/wemm_prepared_reference.py"),
     ),
