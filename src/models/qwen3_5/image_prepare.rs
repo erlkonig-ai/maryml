@@ -9,7 +9,10 @@
 //! Filter/edge/order reference: PyTorch cf30153c4c131c8164ee7798e5022d810682e2cb,
 //! aten/src/ATen/native/cuda/{UpSample.cuh,UpSampleBilinear2d.cu}: a=-0.5,
 //! clipped normalized support, horizontal F32 before vertical F32. Equality
-//! to the retained Torch CUDA BF16 fixtures is an explicit unexecuted gate.
+//! to the retained Torch CUDA BF16 fixtures is diagnostic, not model admission.
+//! The three frozen fixtures differed in 114/6/6 BF16 words; fresh native
+//! preparation repeats were byte-identical. Exact comparison remains failed
+//! in the retained test evidence; this integration does not waive or tune it.
 use super::vision_geometry::Grid;
 use burn::tensor::DType;
 use burn_cubecl::tensor::CubeTensor;
