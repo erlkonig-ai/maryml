@@ -4,7 +4,7 @@
 //! disk, and a fresh process reconstructs the model from the pile alone.
 //!
 //! `persist_safetensors_to_pile` ingests every `*.safetensors` shard into the pile
-//! (each tensor a content-addressed f32 leaf via [`crate::ingest::save_safetensors`]),
+//! (each tensor a content-addressed leaf at the selected storage dtype),
 //! publishing the resulting fragment into Mary's signed model collection. The
 //! weight *blobs* are written straight into the pile's storage (the `Pile` is itself a
 //! `BlobStorePut`), so there is no giant in-memory buffer — only the small fact
@@ -14,14 +14,13 @@
 //! `load_keymap_from_pile` opens the pile fresh, materializes the sole model
 //! collection, finds every model entity (the ones
 //! carrying `attrs::model_name`), and materializes the union keymap via
-//! [`crate::ingest::load_keymap`]. The f32 blobs store weights exactly, so the
-//! round-trip is lossless.
+//! [`crate::ingest::load_keymap`]. Native BF16 consumers instead read typed
+//! payload views, preserving the stored width and bits. BF16 checkpoint files
+//! are mapped during import and must remain unchanged until it returns.
 
 #[cfg(feature = "import")]
 use crate::ingest::LeafDtype;
 use crate::ingest::load_keymap;
-#[cfg(feature = "import")]
-use crate::nn::weight_loader::read_safetensors_file;
 use anyhow::Context;
 #[cfg(any(feature = "import", feature = "qwen3tts", feature = "tokenizer"))]
 use ed25519_dalek::SigningKey;
@@ -47,6 +46,25 @@ fn shard_paths(dir: &Path) -> anyhow::Result<Vec<std::path::PathBuf>> {
         anyhow::bail!("no .safetensors shards in {dir:?}");
     }
     Ok(shards)
+}
+
+/// Native BF16 imports hold a read-only source mapping, not a shard-sized
+/// allocation. Checkpoint files must remain unchanged for the import's duration.
+#[cfg(feature = "import")]
+fn read_import_safetensors(path: &Path, dtype: LeafDtype) -> anyhow::Result<anybytes::Bytes> {
+    if dtype == LeafDtype::Bf16 {
+        let file = std::fs::File::open(path)
+            .with_context(|| format!("open safetensors file {path:?}"))?;
+        // SAFETY: checkpoint inputs are read-only for the duration of import.
+        // Bytes owns the mapping, keeping each borrowed tensor payload alive.
+        let mapped = unsafe { memmap2::Mmap::map(&file) }
+            .with_context(|| format!("map safetensors file {path:?}"))?;
+        Ok(anybytes::Bytes::from_source(mapped))
+    } else {
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("read safetensors file {path:?}"))?;
+        Ok(anybytes::Bytes::from_source(bytes))
+    }
 }
 
 /// Persist every safetensors shard under `safetensors_dir` into a real on-disk
@@ -112,6 +130,8 @@ pub fn persist_safetensors_files_to_pile(
 /// quantization, and shard names are queryable non-core coordinates on it.
 ///
 /// `quantization` tags the weight format ("native" for the faithful import).
+/// BF16 requires safetensors and borrows mapped payloads; checkpoint files
+/// must remain unchanged until this function returns.
 #[cfg(feature = "import")]
 pub fn ingest_model_fragment(
     pile: &mut Pile,
@@ -122,9 +142,13 @@ pub fn ingest_model_fragment(
 ) -> anyhow::Result<Fragment> {
     // Detect the container the directory actually ships (safetensors / gguf /
     // pytorch pickle) and gather its weight files. Every format funnels into the
-    // SAME content-addressed member path below, so the model-root id stays the
-    // pure hash of the f32 tensors regardless of source format.
+    // SAME content-addressed member graph below. The selected storage dtype
+    // determines its bytes; native BF16 never enters the f32 decoder path.
     let (fmt, weight_files) = crate::formats::detect_format(model_dir)?;
+    anyhow::ensure!(
+        dtype != LeafDtype::Bf16 || fmt == crate::formats::WeightFormat::Safetensors,
+        "native BF16 import requires safetensors; {fmt:?} would decode tensors into f32"
+    );
     let files: Vec<(std::path::PathBuf, String)> = weight_files
         .into_iter()
         .map(|p| {
@@ -158,12 +182,12 @@ pub fn ingest_model_fragment(
     let mut members: Vec<Id> = Vec::new();
     let mut facts = TribleSet::new();
     let mut provenance: Vec<String> = Vec::new();
+    // Ephemeral duplicate-name check for this one import operation.
     let mut tensor_names = BTreeSet::new();
     for (path, name) in &files {
         let (mut shard_members, shard_facts) = match fmt {
             crate::formats::WeightFormat::Safetensors => {
-                let bytes = std::fs::read(path)
-                    .with_context(|| format!("read safetensors file {path:?}"))?;
+                let bytes = read_import_safetensors(path, dtype)?;
                 eprintln!(
                     "[persist] ingesting {name} ({} bytes, safetensors)...",
                     bytes.len()
@@ -183,8 +207,13 @@ pub fn ingest_model_fragment(
                         );
                     }
                 }
-                crate::ingest::ingest_members(&bytes, pile, dtype, |_| true)
-                    .map_err(|e| anyhow::anyhow!("ingest {path:?}: {e}"))?
+                match dtype {
+                    LeafDtype::Bf16 => crate::ingest::ingest_bf16_members(&bytes, pile, |_| true),
+                    LeafDtype::F32 | LeafDtype::F16 => {
+                        crate::ingest::ingest_members(&bytes, pile, dtype, |_| true)
+                    }
+                }
+                .map_err(|e| anyhow::anyhow!("ingest {path:?}: {e}"))?
             }
             crate::formats::WeightFormat::Gguf | crate::formats::WeightFormat::Pickle => {
                 let tensors = crate::formats::extract_tensors(fmt, path)
@@ -366,6 +395,8 @@ pub fn ingest_safetensors_file_filtered_fragment(
 /// `(name, f32 bytes, shape)` member representation. The caller supplies the
 /// detected format explicitly, so a signed cohort never changes decoder merely
 /// because another artifact later appears beside the chosen file.
+/// Native BF16 accepts only safetensors and borrows its mapped bytes. The
+/// checkpoint file must remain unchanged for the duration of this call.
 #[cfg(feature = "import")]
 pub fn ingest_weight_file_filtered_fragment(
     pile: &mut Pile,
@@ -376,6 +407,10 @@ pub fn ingest_weight_file_filtered_fragment(
     quantization: &str,
     keep: impl Fn(&str) -> bool,
 ) -> anyhow::Result<Fragment> {
+    anyhow::ensure!(
+        dtype != LeafDtype::Bf16 || format == crate::formats::WeightFormat::Safetensors,
+        "native BF16 import requires safetensors; {format:?} would decode tensors into f32"
+    );
     // Validate the caller's observed prefix before writing imported blobs. A
     // corrupt tail must remain an explicit operator repair, never an importer
     // side effect.
@@ -389,10 +424,14 @@ pub fn ingest_weight_file_filtered_fragment(
 
     let (members, facts) = match format {
         crate::formats::WeightFormat::Safetensors => {
-            let bytes =
-                std::fs::read(file).with_context(|| format!("read safetensors file {file:?}"))?;
-            crate::ingest::ingest_members(&bytes, pile, dtype, keep)
-                .map_err(|error| anyhow::anyhow!("ingest {file:?}: {error}"))?
+            let bytes = read_import_safetensors(file, dtype)?;
+            match dtype {
+                LeafDtype::Bf16 => crate::ingest::ingest_bf16_members(&bytes, pile, keep),
+                LeafDtype::F32 | LeafDtype::F16 => {
+                    crate::ingest::ingest_members(&bytes, pile, dtype, keep)
+                }
+            }
+            .map_err(|error| anyhow::anyhow!("ingest {file:?}: {error}"))?
         }
         crate::formats::WeightFormat::Gguf | crate::formats::WeightFormat::Pickle => {
             let tensors = crate::formats::extract_tensors(format, file)
@@ -461,6 +500,30 @@ mod filtered_native_import_tests {
             .iter()
             .flat_map(|value| value.to_le_bytes())
             .collect()
+    }
+
+    #[test]
+    fn native_bf16_file_source_is_an_owning_mmap() {
+        let fixture = TempFixture::new();
+        let path = fixture.dir.join("source.safetensors");
+        let raw = [0x01u8, 0x00, 0x7f, 0x7f, 0x81, 0xff, 0x80, 0x3f];
+        serialize_to_file(
+            [("w", TensorView::new(Dtype::BF16, vec![4], &raw).unwrap())],
+            &None,
+            &path,
+        )
+        .unwrap();
+        let bytes = read_import_safetensors(&path, LeafDtype::Bf16).unwrap();
+        assert!(bytes.clone().downcast_to_owner::<memmap2::Mmap>().is_ok());
+        let tensors = safetensors::SafeTensors::deserialize(&bytes).unwrap();
+        let tensor = tensors.tensor("w").unwrap();
+        let start = tensor.data().as_ptr() as usize - bytes.as_ptr() as usize;
+        let payload = bytes.slice(start..start + raw.len());
+        assert_eq!(payload.as_ptr(), tensor.data().as_ptr());
+        drop(tensor);
+        drop(tensors);
+        drop(bytes);
+        assert_eq!(&payload[..], &raw);
     }
 
     fn pickle_binunicode(out: &mut Vec<u8>, value: &str) {
@@ -981,10 +1044,10 @@ fn persist_files_to_pile(
     // in-memory carryover), accumulating only the model graph.
     let mut fragment = Fragment::empty();
     for (path, name) in files {
-        let bytes = read_safetensors_file(path);
+        let bytes = read_import_safetensors(path, dtype)?;
         eprintln!("[persist] ingesting {name} ({} bytes)...", bytes.len());
         let frag =
-            crate::ingest::save_safetensors_filtered(&bytes, name, &mut pile, dtype, |_| true)
+            crate::ingest::save_safetensors_filtered_bytes(&bytes, name, &mut pile, dtype, |_| true)
                 .map_err(|e| anyhow::anyhow!("ingest {path:?}: {e}"))?;
         fragment += frag;
     }
@@ -1019,13 +1082,13 @@ pub fn persist_safetensors_file_filtered_to_pile(
             .map_err(|e| anyhow::anyhow!("create pile {pile_path:?}: {e}"))?;
     }
     let (mut pile, _collection) = open_preflighted_model_graph_pile(pile_path, signing_key)?;
-    let bytes = read_safetensors_file(file);
+    let bytes = read_import_safetensors(file, dtype)?;
     eprintln!(
         "[persist] ingesting {entity_name} (filtered from {} bytes)...",
         bytes.len()
     );
     let frag =
-        crate::ingest::save_safetensors_filtered(&bytes, entity_name, &mut pile, dtype, keep)
+        crate::ingest::save_safetensors_filtered_bytes(&bytes, entity_name, &mut pile, dtype, keep)
             .map_err(|e| anyhow::anyhow!("ingest {file:?}: {e}"))?;
 
     crate::model_collection::publish_model_fragment(&mut pile, signing_key, frag)

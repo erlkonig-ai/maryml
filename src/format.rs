@@ -179,8 +179,10 @@ pub fn put_raw(
 
 /// Store a flat f32 buffer DOWN-CAST to f16 as a half-width leaf. Halves the
 /// pile for 16-bit-native weights and stores them in the GPU's dtype, so the
-/// load needs no conversion. f32→f16 is lossless for weights that originated
-/// as bf16 (f16's 10-bit mantissa covers bf16's 7).
+/// load needs no conversion when the intended runtime dtype is f16. This is
+/// NOT generally lossless for bf16 sources: f16 has more mantissa bits but a
+/// smaller exponent range, so small bf16 values may round or underflow and
+/// large ones may overflow. A native bf16 model needs bf16 leaves instead.
 ///
 /// Under the V3 pile every record is 256-aligned and the tensor header is
 /// exactly 256 wide, so the payload lands GPU-ready for zero-copy aliasing.
@@ -197,6 +199,26 @@ pub fn put_raw_f16(
         shape,
         payload,
         "f16 leaf",
+    )?)
+}
+
+/// Store native BF16 bytes without a floating-point conversion.
+///
+/// `payload` can borrow an input mapping. Only the tensor encoding allocates
+/// the stored header plus payload; no f32 or f16 staging buffer is created.
+/// The bytes must be little-endian BF16, as in safetensors and the tensor
+/// encoding. Shape and payload length are checked by that encoding.
+pub fn put_raw_bf16(
+    blobs: &mut impl BlobStorePut,
+    payload: anybytes::Bytes,
+    shape: &[u64],
+) -> Result<Fragment, BlobErr> {
+    Ok(crate::leaf::put_leaf(
+        blobs,
+        crate::leaf::Elem::Bf16,
+        shape,
+        payload,
+        "bf16 leaf",
     )?)
 }
 

@@ -12,6 +12,7 @@
 //! # many models in one shared MODEL_PILE — each a signed collection member:
 //! mary import openai/clip-vit-base-patch32 --pile models.pile --key model.key
 //! mary import HuggingFaceTB/SmolLM2-135M --pile models.pile --key model.key --dtype f16
+//! mary import ./bf16-model --pile models.pile --key model.key --name bf16_model --dtype bf16
 //! mary import ./my-model-dir --pile models.pile --key model.key --name my_model
 //! ```
 //!
@@ -28,6 +29,8 @@
 //! / `--name`) or by its entity id. Re-importing with the same signer is
 //! byte-idempotent. The resulting pile is self-contained: no weight files are
 //! needed at load time.
+//! `--dtype bf16` requires native BF16 safetensors and preserves their bytes;
+//! GGUF and pickle remain supported by the f32/f16 conversion modes.
 //!
 //! Existing imported leaves can be assembled explicitly with `mary root
 //! --members-file members.txt --pile models.pile --key model.key`. The file
@@ -122,8 +125,8 @@ struct ImportArgs {
     /// Import never generates or infers an author identity.
     #[arg(long)]
     key: PathBuf,
-    /// Leaf storage dtype. `f32` is lossless (the faithful original, whatever
-    /// width the source used); `f16` halves the pile for 16-bit-native weights.
+    /// Leaf storage dtype. `f32` converts float sources to f32; `f16` converts
+    /// to IEEE half; `bf16` preserves native BF16 safetensors bytes exactly.
     #[arg(long, value_enum, default_value_t = Dtype::F32)]
     dtype: Dtype,
     /// The model's canonical `source` label in the model collection (a
@@ -161,6 +164,7 @@ struct KeysArgs {
 enum Dtype {
     F32,
     F16,
+    Bf16,
 }
 
 impl From<Dtype> for LeafDtype {
@@ -168,6 +172,7 @@ impl From<Dtype> for LeafDtype {
         match d {
             Dtype::F32 => LeafDtype::F32,
             Dtype::F16 => LeafDtype::F16,
+            Dtype::Bf16 => LeafDtype::Bf16,
         }
     }
 }
@@ -321,6 +326,7 @@ fn import(a: ImportArgs) -> anyhow::Result<()> {
     let dt = match a.dtype {
         Dtype::F32 => "f32",
         Dtype::F16 => "f16",
+        Dtype::Bf16 => "bf16",
     };
     // The model's `source` LABEL: an explicit `--name`, else the hf-id argument.
     // A local directory has no hf-id, so `--name` is required there.
@@ -393,6 +399,28 @@ fn lowercase_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn import_accepts_native_bf16_storage() {
+        let cli = Cli::try_parse_from([
+            "mary",
+            "import",
+            "./checkpoint",
+            "--name",
+            "fixture/bf16",
+            "--pile",
+            "models.pile",
+            "--key",
+            "model.key",
+            "--dtype",
+            "bf16",
+        ])
+        .unwrap();
+        let Cmd::Import(args) = cli.cmd else {
+            panic!("expected import command");
+        };
+        assert_eq!(LeafDtype::from(args.dtype), LeafDtype::Bf16);
+    }
 
     #[test]
     fn commit_hex_is_exact_and_lowercase() {

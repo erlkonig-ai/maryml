@@ -8,7 +8,7 @@
 
 use crate::format::attrs;
 #[cfg(feature = "import")]
-use crate::format::{put_raw, put_raw_f16};
+use crate::format::{put_raw, put_raw_bf16, put_raw_f16};
 #[cfg(feature = "import")]
 use crate::nn::weight_loader::get_tensor_f32;
 #[cfg(feature = "import")]
@@ -20,14 +20,14 @@ use triblespace::prelude::*;
 #[cfg(feature = "import")]
 type Err = Box<dyn std::error::Error>;
 
-/// Width at which tensor leaves are stored in the pile. `F16` halves the pile and
-/// matches the GPU dtype (the prerequisite for zero-copy load); use it for models
-/// whose native weights are 16-bit (e.g. bf16 Gemma). `F32` is the lossless
-/// default for precision-sensitive small models (the embedders).
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// Storage element format. `F32` and `F16` use the legacy conversion importer.
+/// `Bf16` requires native BF16 safetensors and preserves their exact bytes;
+/// it never converts BF16 through IEEE f16's narrower exponent range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LeafDtype {
     F32,
     F16,
+    Bf16,
 }
 
 /// Ingest a single-file safetensors blob into the pile as a model graph. Returns
@@ -60,7 +60,38 @@ pub fn save_safetensors_filtered(
     dtype: LeafDtype,
     keep: impl Fn(&str) -> bool,
 ) -> Result<Fragment, Err> {
-    let (members, mut facts) = ingest_members(bytes, blobs, dtype, keep)?;
+    let (members, facts) = ingest_members(bytes, blobs, dtype, keep)?;
+    named_file_root(blobs, model_name, members, facts)
+}
+
+/// The shared-bytes counterpart to [`save_safetensors_filtered`]. Native BF16
+/// payloads borrow the source backing through [`ingest_bf16_members`], avoiding
+/// the borrowed-slice interface's copy. Other storage dtypes keep their existing
+/// conversion behavior. Root identity and file-name annotations are identical
+/// for the two input interfaces.
+#[cfg(feature = "import")]
+pub fn save_safetensors_filtered_bytes(
+    bytes: &anybytes::Bytes,
+    model_name: &str,
+    blobs: &mut impl BlobStorePut,
+    dtype: LeafDtype,
+    keep: impl Fn(&str) -> bool,
+) -> Result<Fragment, Err> {
+    let (members, facts) = match dtype {
+        LeafDtype::Bf16 => ingest_bf16_members(bytes, blobs, keep)?,
+        LeafDtype::F32 | LeafDtype::F16 => ingest_members(bytes, blobs, dtype, keep)?,
+    };
+    named_file_root(blobs, model_name, members, facts)
+}
+
+/// Both file input interfaces publish the same member-only root and label.
+#[cfg(feature = "import")]
+fn named_file_root(
+    blobs: &mut impl BlobStorePut,
+    model_name: &str,
+    members: Vec<Id>,
+    mut facts: TribleSet,
+) -> Result<Fragment, Err> {
     let mn = blobs.put::<UTF8String, _>(model_name.to_string())?;
     let model = entity! { _ @ attrs::member*: members.iter() };
     let model_root_id = model.root().expect("model root");
@@ -78,13 +109,16 @@ pub fn save_safetensors_filtered(
 /// shard's members). Each tensor is a typed tensor leaf reached by a
 /// `{kind, safetensor_path, weight}` module; identical tensors dedup by content.
 ///
-/// This is the safetensors extractor: it decodes the container to
+/// The legacy F32/F16 extractor decodes the container to
 /// `(name, f32-data, shape)` tuples and hands them to the format-agnostic
 /// [`ingest_tensors`]. Other formats (GGUF, pytorch pickle — see
 /// [`crate::formats`]) produce the SAME tuples and reuse `ingest_tensors`, so a
 /// model imported from any format lands in the identical content-addressed graph
 /// (the member ids, and hence the model-root id, are the pure hash of the
-/// `(name, f32-bytes, shape)` set, format-independent).
+/// `(name, f32-bytes, shape)` set, format-independent). `Bf16` instead stores
+/// one tensor's native bytes at a time and rejects selected non-BF16 tensors.
+/// With an owned input mapping, prefer [`ingest_bf16_members`] to avoid even
+/// the per-tensor input copy required by this borrowed-slice interface.
 #[cfg(feature = "import")]
 pub fn ingest_members(
     bytes: &[u8],
@@ -92,6 +126,11 @@ pub fn ingest_members(
     dtype: LeafDtype,
     keep: impl Fn(&str) -> bool,
 ) -> Result<(Vec<Id>, TribleSet), Err> {
+    if dtype == LeafDtype::Bf16 {
+        return ingest_bf16_members_with(bytes, blobs, keep, |data| {
+            anybytes::Bytes::from_source(data.to_vec())
+        });
+    }
     let st = SafeTensors::deserialize(bytes)?;
     let tensors = st
         .names()
@@ -114,6 +153,68 @@ pub fn ingest_members(
     ingest_tensors(tensors.into_iter(), blobs, dtype)
 }
 
+/// Import selected native BF16 safetensors from shared bytes (for example an
+/// `anybytes::Bytes` backed by an mmap), borrowing one payload at a time.
+///
+/// No tensor is decoded into floats. The only weight allocation is the
+/// header-plus-payload blob currently being written by the tensor encoding.
+/// The importer retains member IDs and facts, not a collection of weight
+/// buffers. All selected tensors must be BF16; callers can use `keep` to omit
+/// integer buffers or other components explicitly. Errors do not roll back
+/// blobs already written, but no partial member graph is returned.
+#[cfg(feature = "import")]
+pub fn ingest_bf16_members(
+    bytes: &anybytes::Bytes,
+    blobs: &mut impl BlobStorePut,
+    keep: impl Fn(&str) -> bool,
+) -> Result<(Vec<Id>, TribleSet), Err> {
+    ingest_bf16_members_with(bytes, blobs, keep, |data| {
+        // SafeTensors returns slices into the same input buffer. Byte offsets
+        // let Bytes retain that buffer's owner without copying the payload.
+        let start = data.as_ptr() as usize - bytes.as_ptr() as usize;
+        bytes.slice(start..start + data.len())
+    })
+}
+
+#[cfg(feature = "import")]
+fn ingest_bf16_members_with(
+    bytes: &[u8],
+    blobs: &mut impl BlobStorePut,
+    keep: impl Fn(&str) -> bool,
+    payload: impl Fn(&[u8]) -> anybytes::Bytes,
+) -> Result<(Vec<Id>, TribleSet), Err> {
+    let st = SafeTensors::deserialize(bytes)?;
+    let mut members = Vec::new();
+    let mut facts = TribleSet::new();
+    for name in st.names().into_iter().filter(|name| keep(name)) {
+        let view = st.tensor(name)?;
+        if view.dtype() != safetensors::Dtype::BF16 {
+            return Err(format!(
+                "{name}: native BF16 import requires BF16, found {:?}; no conversion performed",
+                view.dtype()
+            )
+            .into());
+        }
+        let shape: Vec<u64> = view.shape().iter().map(|&d| d as u64).collect();
+        let leaf = put_raw_bf16(blobs, payload(view.data()), &shape)?;
+        let leaf_id = leaf.root().expect("leaf root");
+        facts += leaf.into_facts();
+        let kind = match shape.len() {
+            1 => "vector",
+            2 => "matrix",
+            3 => "conv",
+            _ => "tensor",
+        };
+        let name_h = blobs.put::<UTF8String, _>(name.to_string())?;
+        let module = entity! { _ @
+            attrs::kind: kind, attrs::safetensor_path: name_h, attrs::weight: leaf_id
+        };
+        members.push(module.root().expect("module root"));
+        facts += module.into_facts();
+    }
+    Ok((members, facts))
+}
+
 /// Ingest a stream of already-decoded `(name, f32-data, shape)` tensors into
 /// content-addressed member MODULES — the FORMAT-AGNOSTIC core shared by every
 /// importer (safetensors, GGUF, pytorch pickle). Each tensor becomes a
@@ -129,6 +230,9 @@ pub fn ingest_tensors(
     blobs: &mut impl BlobStorePut,
     dtype: LeafDtype,
 ) -> Result<(Vec<Id>, TribleSet), Err> {
+    if dtype == LeafDtype::Bf16 {
+        return Err("native BF16 import requires safetensors bytes, not decoded f32 tensors".into());
+    }
     let mut members: Vec<Id> = Vec::new();
     let mut facts = TribleSet::new();
     for (name, data, shape) in tensors {
@@ -136,6 +240,7 @@ pub fn ingest_tensors(
         let leaf = match dtype {
             LeafDtype::F32 => put_raw(blobs, &data, &shp)?,
             LeafDtype::F16 => put_raw_f16(blobs, &data, &shp)?,
+            LeafDtype::Bf16 => unreachable!("rejected before consuming any tensors"),
         };
         let leaf_id = leaf.root().expect("leaf root");
         facts += leaf.into_facts();

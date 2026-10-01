@@ -4,6 +4,8 @@
 
 pub mod f5;
 
+pub mod qwen3_5;
+
 // Qwen2.5-VL text backbone (BiQwen2_5 / nomic-embed-multimodal-7b). Reuses
 // gemma's RoPE table, so it rides the `gemma` feature.
 #[cfg(feature = "gemma")]

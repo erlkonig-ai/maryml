@@ -10,6 +10,8 @@
 #[cfg(all(any(feature = "qwen3tts", feature = "voxtral"), target_os = "macos"))]
 pub mod alias;
 pub mod backend;
+#[cfg(feature = "cuda-bf16-alias")]
+pub mod cuda_bf16_alias;
 pub mod mxfp4;
 pub mod norm;
 pub mod npy;

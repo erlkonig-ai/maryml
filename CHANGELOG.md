@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Add the native BF16 WeMM prepared-token decoder leg: typed opaque-root role
+  queries, zero-copy pile aliases, GPU embedding gather, all 32 Qwen3.5 layers,
+  and the shared embedding boundary. A separate prepared-patch vision tower
+  composes the 27 vision blocks. No image scatter, arbitrary decoder MRoPE,
+  batching, Files deployment, or numerical admission is implied. The source-bound
+  HF CUDA gate keeps layer-level budgets and records every selected weight.
+  Native BF16 safetensors import preserves bytes without an F16 detour; newer
+  acquiring model-collection and persistence boundaries remain intact.
+
 - Build reservation heartbeats work with macOS and GNU sed and fail if the
   heartbeat cannot be written, rather than announcing a successful refresh.
 
