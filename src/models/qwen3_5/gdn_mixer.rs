@@ -7,11 +7,12 @@
 //! Masks are refused, including B=1, rather than inheriting the reference's
 //! B>1 padding-mask shortcut. Text input norm/residual/MLP are outside this unit.
 //!
-//! The fixed-order GPU projection deliberately does not call Burn's
-//! shape-dependent Cube/autotuned matmul. One thread sums each dot product in
-//! increasing input-coordinate order, in F32, then rounds once to BF16.
-//! Batch/token counts do not select a reduction tree. This is a correctness
-//! implementation; performance and cross-device bit identity are unestablished.
+//! Projection uses a forced, fixed BF16 MMA blueprint with F32 accumulation
+//! when K is divisible by 16 and N by 8. Other shapes retain the serial F32
+//! GPU dot product. Neither dispatch nor the reduction tile depends on B/T/M.
+//! This is an experimental accelerated path: execution/reproducibility and
+//! performance must be measured before promotion; cross-device identity is
+//! not claimed. It does not call Burn's autotuned matmul.
 //! Inputs/weights are never uploaded, read on the host, or mutated here.
 //! Resident tensor producers must honor CubeCL's ordinary client/handle and
 //! stream-ordering contract. Result covers descriptor errors, not allocation,
@@ -280,9 +281,13 @@ fn projection_kernel(
     }
 }
 
-/// Fixed-order resident BF16 linear projection: [B,T,I] x [O,I] -> [B,T,O].
-/// Exposed for a direct nonsquare/transposition and batch-invariance gate.
+/// Resident BF16 linear projection: [B,T,I] x [O,I] -> [B,T,O].
+/// K/N-only dispatch; no CPU fallback, autotuning, or split-K reduction.
 pub fn project(input: &CudaTensor, weight: &CudaTensor) -> Result<CudaTensor, String> {
+    project_impl(input, weight, false)
+}
+
+fn project_impl(input: &CudaTensor, weight: &CudaTensor, serial: bool) -> Result<CudaTensor, String> {
     let s = input.meta.shape().as_slice();
     let w = weight.meta.shape().as_slice();
     if s.len() != 3 || w.len() != 2 || s[2] != w[1] {
@@ -292,6 +297,9 @@ pub fn project(input: &CudaTensor, weight: &CudaTensor) -> Result<CudaTensor, St
     let nw = check(weight, input, "projection weight", w, DType::BF16)?;
     let shape = [s[0], s[1], w[0]];
     let no = count(&shape)?;
+    if !serial && fixed_mma_shape(s[2], w[0]) {
+        return project_mma(input, weight, shape, no);
+    }
     let output = input.client.empty(no * 2);
     let cube = CubeDim::new_1d(64);
     // SAFETY: checked contiguous BF16 inputs, u32-indexed extents and disjoint
@@ -302,6 +310,102 @@ pub fn project(input: &CudaTensor, weight: &CudaTensor) -> Result<CudaTensor, St
             ArrayArg::from_raw_parts(input.handle.clone(), ni),
             ArrayArg::from_raw_parts(weight.handle.clone(), nw),
             ArrayArg::from_raw_parts(output.clone(), no), no, s[2], w[0],
+        );
+    }
+    Ok(CubeTensor::new_contiguous(input.client.clone(), input.device.clone(), shape.into(), output, DType::BF16))
+}
+
+fn fixed_mma_shape(k: usize, n: usize) -> bool {
+    k > 0 && n > 0 && k.is_multiple_of(16) && n.is_multiple_of(8)
+}
+
+fn projection_elems() -> cubek::matmul::definition::MatmulGlobalElems {
+    use cubecl::ir::{ElemType, FloatKind, StorageType};
+    let bf16 = StorageType::Scalar(ElemType::Float(FloatKind::BF16));
+    cubek::matmul::definition::MatmulGlobalElems {
+        lhs: bf16,
+        rhs: bf16,
+        out: StorageType::Scalar(ElemType::Float(FloatKind::F32)),
+    }
+}
+
+/// Dependency trace (cubek-matmul 0.2.0): Strategy::SimpleCyclicMma passes
+/// Forced through stamp_kind unchanged; SimpleAlgorithm::expand_blueprint
+/// clones Forced directly, never entering either M-dependent infer function.
+/// launch_tiling chooses IO vector widths from contiguous K/K/N and strides
+/// K/K/N, not M. Rank-2 row/column-major bindings are not materialized copies.
+/// The row-major global grid owns disjoint M/N partitions; SimpleMatmul walks
+/// K stages within each partition, with no atomic or split-K output reduction.
+/// Bounds checks are always enabled, even for complete tiles, so crossing an
+/// M tile boundary does not switch to a different arithmetic configuration.
+fn projection_blueprint(m: usize, n: usize, k: usize) -> Result<cubek::matmul::definition::TilingBlueprint, String> {
+    use cubek::matmul::{
+        components::{stage::PartitionBuffering, tile::TileMatmulKind},
+        definition::{MatmulProblem, TilingBlueprint, TilingScheme},
+    };
+    use cubek::std::cube_count::{CubeCountStrategy, GlobalOrder, HypercubeBlueprint};
+    let problem = MatmulProblem::from_shapes_and_strides(
+        [m, k].into(), [k, n].into(), [m, n].into(),
+        [k, 1].into(), [1, k].into(), [n, 1].into(),
+        projection_elems(), cubecl::ir::AddressType::U32, None, None,
+    ).map_err(|e| format!("fixed projection problem: {e:?}"))?;
+    let scheme = TilingScheme::builder()
+        .with_tile_size((16, 8, 16).into())
+        .with_partition_size((2, 1, 4).into())
+        .with_stage_size((2, 2, 1).into())
+        .build().map_err(str::to_owned)?;
+    let grid = HypercubeBlueprint::builder()
+        .global_order(GlobalOrder::RowMajor)
+        .cube_count_strategy(CubeCountStrategy::FromProblem)
+        .build();
+    let mut blueprint = TilingBlueprint::builder(TileMatmulKind::Mma, scheme, 32, &problem)
+        .partition_buffering(PartitionBuffering::Single)
+        .hypercube_blueprint(grid)
+        .build();
+    blueprint.check_m_bounds = true;
+    blueprint.check_n_bounds = true;
+    blueprint.check_k_bounds = true;
+    Ok(blueprint)
+}
+
+#[cube(launch_unchecked)]
+fn projection_round(input: &Array<f32>, output: &mut Array<bf16>, n: usize) {
+    let i = ABSOLUTE_POS as usize;
+    if i < n { output[i] = bf16::cast_from(input[i]); }
+}
+
+// Called only after the public descriptor/device/extent checks. Weight storage
+// remains the original aliased BF16 [N,K] handle: [K,N] strides [1,K] is a view,
+// not a transpose/cast/copy. F32 is accumulator/output scratch, never weights.
+fn project_mma(input: &CudaTensor, weight: &CudaTensor, shape: [usize; 3], no: usize) -> Result<CudaTensor, String> {
+    use cubek::matmul::{definition::MatmulElems, launch::Strategy, routines::BlueprintStrategy};
+    use cubek::std::InputBinding;
+    fn binding(handle: &cubecl::server::Handle, shape: [usize; 2], strides: [usize; 2]) -> TensorBinding<CudaRuntime> {
+        TensorBinding {
+            handle: handle.clone().binding(), shape: shape.into(), strides: strides.into(),
+            runtime: core::marker::PhantomData,
+        }
+    }
+    let (m, n, k) = (shape[0] * shape[1], shape[2], input.meta.shape()[2]);
+    let globals = projection_elems();
+    let mut dtypes = MatmulElems::from_globals(&globals);
+    let scratch = input.client.empty(no.checked_mul(4).ok_or("F32 output byte extent overflow")?);
+    let strategy = Strategy::SimpleCyclicMma(BlueprintStrategy::Forced(projection_blueprint(m, n, k)?));
+    cubek::matmul::launch::launch_ref(
+        &strategy, &input.client,
+        InputBinding::new(binding(&input.handle, [m, k], [k, 1]), globals.lhs),
+        InputBinding::new(binding(&weight.handle, [k, n], [1, k]), globals.rhs),
+        binding(&scratch, [m, n], [n, 1]), &mut dtypes,
+    ).map_err(|e| format!("fixed BF16 projection [{m},{k}] x [{n},{k}]^T: {e:?}"))?;
+    // Setup errors are not retried through another algorithm: that could make
+    // arithmetic depend on resources or M. Unsupported K/N is selected above.
+    let output = input.client.empty(no * 2);
+    let cube = CubeDim::new_1d(128);
+    // SAFETY: both handles own `no` elements, input F32/output BF16, one writer.
+    unsafe {
+        projection_round::launch_unchecked::<CudaRuntime>(
+            &input.client, cubecl::calculate_cube_count_elemwise(&input.client, no, cube), cube,
+            ArrayArg::from_raw_parts(scratch, no), ArrayArg::from_raw_parts(output.clone(), no), no,
         );
     }
     Ok(CubeTensor::new_contiguous(input.client.clone(), input.device.clone(), shape.into(), output, DType::BF16))
@@ -332,4 +436,145 @@ fn channels(input: &CudaTensor, start: usize, width: usize) -> Result<CudaTensor
         );
     }
     Ok(CubeTensor::new_contiguous(input.client.clone(), input.device.clone(), shape.into(), output, DType::BF16))
+}
+
+#[cfg(test)]
+mod projection_tests {
+    use super::*;
+    use cubecl::cuda::CudaDevice;
+
+    #[test]
+    fn forced_projection_blueprint_is_independent_of_rows_and_tails() {
+        let expected = projection_blueprint(1, 40, 48).unwrap();
+        for m in [2, 15, 16, 17, 63, 64, 65, 116, 130, 256] {
+            assert_eq!(projection_blueprint(m, 40, 48).unwrap(), expected);
+        }
+        assert!(expected.check_m_bounds && expected.check_n_bounds && expected.check_k_bounds);
+        assert_eq!(expected.tiling_scheme.elements_per_stage_along_m(), 64);
+        assert_eq!(expected.tiling_scheme.elements_per_stage_along_n(), 16);
+        assert_eq!(expected.tiling_scheme.elements_per_stage_along_k(), 64);
+    }
+
+    #[test]
+    fn projection_shape_dispatch_is_explicit_and_accumulation_is_f32() {
+        for (k, n) in [(16, 8), (48, 40), (4096, 32), (4096, 12288), (12288, 4096)] {
+            assert!(fixed_mma_shape(k, n));
+        }
+        for (k, n) in [(0, 8), (16, 0), (7, 5), (17, 8), (16, 9)] {
+            assert!(!fixed_mma_shape(k, n));
+        }
+        let dtypes = cubek::matmul::definition::MatmulElems::from_globals(&projection_elems());
+        assert_eq!(dtypes.acc_stage, projection_elems().out);
+        assert_eq!(dtypes.acc_register, projection_elems().out);
+        assert_eq!(dtypes.lhs_register, projection_elems().lhs);
+        assert_eq!(dtypes.rhs_register, projection_elems().rhs);
+    }
+
+    #[cube(launch_unchecked)]
+    fn fixture_values(out: &mut Array<bf16>, rows: &Array<u32>, n: usize, width: usize) {
+        let i = ABSOLUTE_POS as usize;
+        if i < n {
+            // Numeric fixture generation is GPU-only. Host rows are integer
+            // identities, not activation or weight payloads.
+            let row = rows[i / width] as usize;
+            let phase = f32::cast_from(((i % width) * 13 + row * 7) % 251) / 32.0f32;
+            out[i] = bf16::cast_from(phase.sin() * 0.125f32);
+        }
+    }
+
+    fn fixture(shape: &[usize], rows: &[u32]) -> CudaTensor {
+        let device = CudaDevice { index: 0 };
+        let client = CudaRuntime::client(&device);
+        let n = count(shape).unwrap();
+        let width = *shape.last().unwrap();
+        assert_eq!(rows.len() * width, n);
+        let row_bytes: Vec<u8> = rows.iter().flat_map(|x| x.to_le_bytes()).collect();
+        let row_handle = client.create_from_slice(&row_bytes);
+        let handle = client.empty(n * 2);
+        let cube = CubeDim::new_1d(128);
+        // SAFETY: integer row table has one entry per output row, exact sizes.
+        unsafe {
+            fixture_values::launch_unchecked::<CudaRuntime>(
+                &client, cubecl::calculate_cube_count_elemwise(&client, n, cube), cube,
+                ArrayArg::from_raw_parts(handle.clone(), n),
+                ArrayArg::from_raw_parts(row_handle, rows.len()), n, width,
+            );
+        }
+        CubeTensor::new_contiguous(client, device, shape.into(), handle, DType::BF16)
+    }
+
+    fn bytes(tensor: CudaTensor) -> Vec<u8> {
+        tensor.client.read_one(tensor.handle).unwrap().to_vec()
+    }
+
+    fn compare_gpu_oracle(input: &CudaTensor, weight: &CudaTensor) -> Vec<u8> {
+        let actual = bytes(project(input, weight).unwrap());
+        assert_eq!(actual, bytes(project(input, weight).unwrap()), "fresh-call byte identity");
+        let oracle = bytes(project_impl(input, weight, true).unwrap());
+        let mut differing = 0usize;
+        let mut worst = 0.0f32;
+        let mut outside = 0usize;
+        for (a, b) in actual.chunks_exact(2).zip(oracle.chunks_exact(2)) {
+            differing += usize::from(a != b);
+            let a = bf16::from_bits(u16::from_le_bytes([a[0], a[1]])).to_f32();
+            let b = bf16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32();
+            assert!(a.is_finite() && b.is_finite());
+            // Readback diagnostics only: the reference dot products ran on
+            // GPU. This fixture's fixed budget is not a model error envelope,
+            // and exact equality to the old serial arithmetic is not required.
+            let scaled = (a - b).abs() / (0.001 + 0.01 * b.abs());
+            worst = worst.max(scaled);
+            outside += usize::from(scaled > 1.0);
+        }
+        eprintln!("projection {:?} x {:?}: serial differing_words={differing}, worst_scaled={worst}, outside={outside}", input.meta.shape(), weight.meta.shape());
+        assert_eq!(outside, 0, "fixed synthetic GPU-oracle budget");
+        actual
+    }
+
+    #[test]
+    #[ignore = "reserved CUDA: fixed projection layout/repeat/batch experiment"]
+    fn fixed_projection_matches_gpu_oracle_and_preserves_row_bits() {
+        // Nonsquare transposed weight, N/K stage tails, and the explicit small
+        // unaligned GPU fallback. M crosses both tile and stage boundaries.
+        for (k, n) in [(48, 40), (7, 5)] {
+            let weight = fixture(&[n, k], &(0..n as u32).collect::<Vec<_>>());
+            let single = fixture(&[1, 1, k], &[777]);
+            let wanted = compare_gpu_oracle(&single, &weight);
+            for m in [17, 64, 65, 130] {
+                let mut rows: Vec<u32> = (0..m as u32).collect();
+                for position in [0, 15, m - 1] {
+                    rows[position] = 777;
+                    let input = fixture(&[1, m, k], &rows);
+                    let output = compare_gpu_oracle(&input, &weight);
+                    assert_eq!(&output[position * n * 2..(position + 1) * n * 2], &wanted);
+                    rows.reverse();
+                    let reversed = fixture(&[1, m, k], &rows);
+                    let reversed = bytes(project(&reversed, &weight).unwrap());
+                    for row in 0..m {
+                        assert_eq!(&output[row * n * 2..(row + 1) * n * 2], &reversed[(m - 1 - row) * n * 2..(m - row) * n * 2]);
+                    }
+                    rows.reverse();
+                }
+            }
+            let rows: Vec<u32> = (0..130).collect();
+            let a = fixture(&[1, 130, k], &rows);
+            // Reinterpret the SAME GPU bytes, no activation copy, with another
+            // valid batch/token factorization.
+            let b = reshape(a.clone(), &[2, 65, k]);
+            assert_eq!(bytes(project(&a, &weight).unwrap()), bytes(project(&b, &weight).unwrap()));
+        }
+    }
+
+    #[test]
+    #[ignore = "reserved CUDA: finite real WeMM projection dimensions, not model retrieval"]
+    fn fixed_projection_real_dimensions_match_gpu_oracle() {
+        for (k, n, m) in [(4096, 32, 65), (4096, 4096, 2), (4096, 8192, 2), (4096, 12288, 2), (12288, 4096, 2)] {
+            let weight = fixture(&[n, k], &(0..n as u32).collect::<Vec<_>>());
+            let rows: Vec<u32> = (0..m as u32).collect();
+            let input = fixture(&[1, m, k], &rows);
+            let output = compare_gpu_oracle(&input, &weight);
+            let single = fixture(&[1, 1, k], &[rows[m - 1]]);
+            assert_eq!(&output[(m - 1) * n * 2..m * n * 2], &bytes(project(&single, &weight).unwrap()));
+        }
+    }
 }

@@ -142,7 +142,7 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 [features]
 # Native BF16 Qwen3.5 operators; no Fusion or timing-based autotune backend.
 qwen3_5-gpu = ["dep:cubecl", "dep:burn-cubecl"]
-qwen3_5-cuda = ["qwen3_5-gpu", "cuda-bf16-alias"]
+qwen3_5-cuda = ["qwen3_5-gpu", "cuda-bf16-alias", "dep:cubek"]
 qwen3_5-real-layer-trace = ["qwen3_5-cuda"]
 cuda-bf16-alias = ["dep:cubecl", "cubecl?/cuda", "dep:burn-cubecl", "burn/cuda", "dep:memmap2"]
 wemm-prepared-gate = ["qwen3_5-cuda", "dep:sha2"]
