@@ -550,8 +550,9 @@ mod tests {
     /// is `burn::backend::Cuda`). On a Spark:
     /// `cargo test --release --features inkling-cuda --lib models::inkling::rawcuda -- --nocapture`
     #[test]
+    #[cfg(feature = "inkling-cuda")]
     fn scale_matches_the_eager_path() {
-        use super::super::seam::{Bk, client_of, handle_of, tensor_of};
+        use crate::models::inkling::seam::{Bk, client_of, handle_of, tensor_of};
         use burn::tensor::{Tensor, TensorData};
 
         let dev = Default::default();

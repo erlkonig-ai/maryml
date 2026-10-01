@@ -22,6 +22,10 @@ pub mod npz;
 /// collections arrange its rows into blobs; accelerator backends consume its
 /// read-only plane views.
 pub mod nvfp4_cosine;
+// Share the existing raw CUDA launcher without enabling the Inkling model.
+#[cfg(feature = "nvfp4-encode-cuda")]
+#[path = "../models/inkling/rawcuda.rs"]
+pub(crate) mod raw_cuda;
 #[cfg(feature = "q4")]
 pub mod q4;
 pub mod weight_loader;

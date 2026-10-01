@@ -1,10 +1,15 @@
 [package]
-name = "mary"
+name = "maryml"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.89"
-description = "Neural-network models as content-addressed graphs in TribleSpace. A tensor is a self-describing Array<F32> leaf; a module is an entity; composition is role-edges. Named for Mary — both Mary Wollstonecraft Shelley, who wrote the creature into being, and her mother Mary Wollstonecraft. The format in which dead weights become a living, recomposable model-graph; the franken-stitch is the spark."
+rust-version = "1.92"
+description = "Neural-network models as content-addressed graphs in TribleSpace. A tensor is a self-describing typed leaf; a module is an entity; composition is role-edges. Named for Mary — both Mary Wollstonecraft Shelley, who wrote the creature into being, and her mother Mary Wollstonecraft. The format in which dead weights become a living, recomposable model-graph; the franken-stitch is the spark."
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/erlkonig-ai/maryml"
+
+[lib]
+name = "mary"
+path = "src/lib.rs"
 
 [dependencies]
 # `madvise(MADV_DONTNEED)` + `posix_fadvise(POSIX_FADV_DONTNEED)` for the startup copy: on a unified-memory part the
@@ -12,7 +17,7 @@ license = "MIT OR Apache-2.0"
 # to hand each leaf's source pages back as it goes. See
 # `models::inkling::pile::SourceRelease`.
 libc = "0.2"
-burn = { version = "0.21.0", default-features = false, features = ["wgpu", "metal", "autodiff"] }
+burn = { version = "0.21.0", default-features = false, features = ["wgpu", "metal", "autodiff"], package = "maryml-burn", path = "../burn-fork/crates/burn" }
 # Kernel fusion for the qwen3tts decode loop, WITHOUT flipping burn-wgpu's
 # global "fusion" flag: that flag rewrites the `Metal` alias to the Fusion
 # wrapper, which breaks gemma's zero-copy CubeTensor seam (persist.rs). These
@@ -20,10 +25,10 @@ burn = { version = "0.21.0", default-features = false, features = ["wgpu", "meta
 # qwen3tts declares its own fused alias (nn::backend::BFused) and everything
 # else keeps the raw backend. (burn 0.21's top-level "fusion" feature is
 # unresolvable on crates.io — it pulls a pre-release burn-cpu.)
-burn-fusion = { version = "0.21.0", optional = true }
-burn-cubecl = { version = "0.21.0", default-features = false, features = ["fusion"], optional = true }
+burn-fusion = { version = "0.21.0", optional = true, package = "maryml-burn-fusion", path = "../burn-fork/crates/burn-fusion" }
+burn-cubecl = { version = "0.21.0", default-features = false, features = ["fusion"], optional = true, package = "maryml-burn-cubecl", path = "../burn-fork/crates/burn-cubecl" }
 triblespace = { version = "0.47.0", path = "../triblespace-rs", default-features = false }
-anybytes = "0.20"
+anybytes = { version = "0.20.3", path = "../anybytes" }
 # safetensors is IMPORT-ONLY: runtime builds load weights exclusively from
 # piles. Only the `import` feature (persist importers + parity gates) compiles
 # a safetensors reader — inference/serve builds cannot reach one.
@@ -96,22 +101,22 @@ rand = "0.8"
 libm = { version = "0.2", optional = true }
 
 # Gemma 4 multimodal port (mary::models::gemma) deps — all optional, gated behind `gemma`.
-burn-train = { version = "0.21.0", optional = true }
-burn-ndarray = { version = "0.21.0", optional = true }
-cubecl = { version = "0.10.0", default-features = false, features = ["std"], optional = true }
+burn-train = { version = "0.21.0", optional = true, package = "maryml-burn-train", path = "../burn-fork/crates/burn-train" }
+burn-ndarray = { version = "0.21.0", optional = true, package = "maryml-burn-ndarray", path = "../burn-fork/crates/burn-ndarray" }
+cubecl = { version = "0.10.0", default-features = false, features = ["std"], optional = true, package = "maryml-cubecl", path = "../cubecl-fork/crates/cubecl" }
 # The C++ backend's kernel-description types, for ONE thing: `models::inkling::rawcuda`
 # hands the CUDA runtime a hand-written source string, and the runtime still
 # wants the `ComputeKernel` repr a generated kernel carries (it reads the
 # dynamic shared-memory size off it). The five type names that build an empty
 # one live here. Same feature shape as cubecl-cuda's own dependency on it.
-cubecl-cpp = { version = "0.10.0", default-features = false, features = ["cuda"], optional = true }
+cubecl-cpp = { version = "0.10.0", default-features = false, features = ["cuda"], optional = true, package = "maryml-cubecl-cpp", path = "../cubecl-fork/crates/cubecl-cpp" }
 # The tuned matmul kernels burn itself dispatches to, reached DIRECTLY. The
 # inkling lane holds raw cubecl handles rather than Burn tensors (the weights
 # are the pile's own BF16 mapping), so it cannot call `Tensor::matmul`; but
 # `cubek::matmul::launch::launch_ref` takes bindings, which is exactly what a
 # handle is. Already in the graph via burn-cubecl -- naming it here adds no
 # crate, only the ability to call it.
-cubek = { version = "0.2", default-features = false, features = ["std", "stdlib", "matmul"], optional = true }
+cubek = { version = "0.2.0", default-features = false, features = ["std", "stdlib", "matmul"], optional = true, package = "maryml-cubek", path = "../cubek-fork/crates/cubek" }
 wgpu = { version = "29", optional = true }
 pollster = { version = "0.4", optional = true }
 memmap2 = { version = "0.9", optional = true }
@@ -146,7 +151,7 @@ qwen3_5-cuda = ["qwen3_5-gpu", "cuda-bf16-alias", "dep:cubek"]
 qwen3_5-real-layer-trace = ["qwen3_5-cuda"]
 cuda-bf16-alias = ["dep:cubecl", "cubecl?/cuda", "dep:burn-cubecl", "burn/cuda", "dep:memmap2"]
 wemm-prepared-gate = ["qwen3_5-cuda", "dep:sha2"]
-wemm-input = ["qwen3_5-cuda", "dep:image", "dep:tokenizers", "dep:sha2"]
+wemm-input = ["qwen3_5-cuda", "dep:image", "dep:tokenizers", "dep:sha2", "dep:cudarc"]
 wemm-layer1-reset = ["qwen3_5-real-layer-trace", "dep:sha2"]
 # THE RESIDENT MIND, whole: `models::inkling::engine` (a Session, the
 # checkpoint's tokenizer, the incremental detokenizer and the host-side rank
@@ -173,6 +178,9 @@ cuda-backend = ["q4", "cubecl?/cuda"]
 # downstream. A portable-f64 CUDA implementation remains test-only as a proof
 # oracle.
 nvfp4-cuda = ["dep:cubecl", "cubecl?/cuda"]
+# Direct native BF16 device rows to the canonical two-stage search encoding.
+nvfp4-encode-cuda = ["nvfp4-cuda", "dep:burn-cubecl", "dep:cubecl-cpp"]
+nvfp4-score-cuda = ["nvfp4-encode-cuda"]
 # Investigation-only: burn's REAL Cuda backend, for backend_matmul_probe.
 burn-cuda-bench = ["burn/cuda", "burn/autotune"]
 
@@ -925,66 +933,18 @@ required-features = ["embed"]
 # the graph here only, so the Mac build never sees cudarc; `nn::backend::speak`
 # and `nn::q4::Rt` select CUDA under `all(target_os = "linux", feature = "qwen3tts")`.
 [target.'cfg(target_os = "linux")'.dependencies]
-burn = { version = "0.21.0", default-features = false, features = ["wgpu", "metal", "autodiff", "cuda"] }
-cubecl = { version = "0.10.0", default-features = false, features = ["std", "cuda"], optional = true }
+burn = { version = "0.21.0", default-features = false, features = ["wgpu", "metal", "autodiff", "cuda"], package = "maryml-burn", path = "../burn-fork/crates/burn" }
+cubecl = { version = "0.10.0", default-features = false, features = ["std", "cuda"], optional = true, package = "maryml-cubecl", path = "../cubecl-fork/crates/cubecl" }
 
 [dev-dependencies]
 ciborium = "0.2"
-burn-ndarray = "0.21.0"
+burn-ndarray = { version = "0.21.0", package = "maryml-burn-ndarray", path = "../burn-fork/crates/burn-ndarray" }
 
+# SOURCE-BUILD-ONLY: retain the tested network readiness repair.
+# Registry consumers intentionally use upstream netwatch without these fixes.
+# Root patches are not inherited; this source/registry difference is deliberate.
 [patch.crates-io]
-
-# Section freezes are immutable views, not durability barriers. Keep the same
-# AnyBytes lineage at every build root; dependency patch tables are ignored.
-anybytes = { git = "https://github.com/triblespace/anybytes.git", rev = "066c32a7cfcc470a6750c849499c1e88a0e0c50a" }
-
-# Keep the current TribleSpace transport's tested multi-sender wakeup fix when
-# Mary owns the build; Cargo ignores patches from dependency manifests.
 netwatch = { git = "https://github.com/erlkonig-ai/net-tools.git", rev = "10ab7b328809103be74f6ca24258249715fae52b" }
-
-# CubeCL 0.10 emitted generic aliases and registration statements by iterating
-# randomized HashMaps. Pin the deterministic macro expansion fix so independent
-# cohort builds produce the same executable code.
-cubecl-macros = { git = "https://github.com/erlkonig-ai/cubecl", rev = "8b2aa74e2514e39562df6e384a271c2ef9e53b06" }
-
-# burn, forked for a matmul defect: launch_matmul bound the non-quantized
-# rhs with the LHS dtype, so mixed-dtype matmul silently returned about half
-# the correct value (f32 x BF16) or NaN (BF16 x f32). See
-# erlkonig-ai/burn branch fix/matmul-rhs-dtype. Pin the exact revision so a
-# Mary checkout is self-contained instead of depending on an adjacent clone.
-# All members are patched together because the Burn workspace uses
-# path+version deps: patching a subset yields two copies of burn-tensor.
-burn = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-autodiff = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-backend = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-core = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-cubecl = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-cubecl-fusion = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-cuda = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-dataset = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-derive = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-dispatch = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-flex = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-fusion = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-ir = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-ndarray = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-nn = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-optim = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-rl = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-std = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-tensor = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-train = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-vision = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-wgpu = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-# Forked to add a zero-copy "register an externally-created GPU buffer as a
-# tensor handle" seam (mmap'd f16 pile pages -> Metal newBufferWithBytesNoCopy ->
-# wgpu buffer -> cubecl handle). Unmodified baseline first; patched below.
-cubecl-runtime = { path = "../cubecl-graph/cubecl-runtime" }
-cubecl-cuda = { path = "../cubecl-graph/cubecl-cuda" }
-cubecl-wgpu = { path = "../cubecl-graph/cubecl-wgpu" }
-# Local triblespace-core: V3 uniform 256-byte headers — every record 256-aligned,
-# so mmap'd blobs sit at GPU-ready offsets for zero-copy aliasing (cat-merge safe).
-triblespace-core = { path = "../triblespace-rs/triblespace-core" }
 
 # Silent gate harness for the mary::speak seam (pile-loaded; no audio device).
 [[bin]]

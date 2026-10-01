@@ -2,6 +2,61 @@
 
 ## Unreleased
 
+## 0.1.0 - 2026-10-01
+
+- Publish under the package name `maryml`; the Rust library and the optional
+  `mary` command retain their existing names. Path consumers keep their
+  `mary` dependency alias by declaring `package = "maryml"`.
+- Native WeMM input preparation and the composed BF16 CUDA model are exercised
+  on a bounded 11-input behavioral fixture (nine scorable retrieval items).
+  The opt-in fixed-MMA projection path preserves the fixture's behavior and
+  same-compute-class byte identity across the tested order/process repeats.
+  On that GB10 fixture its measured warm speedup is about 12–57× for text and
+  6.5× for the image case. These are fixture measurements, not throughput
+  guarantees or a claim of numerical identity with the reference. The same
+  22 BF16 fixture outputs subsequently matched byte-for-byte on both GB10
+  Sparks. The GPU NVFP4 encoder/scorer and opt-in Files text/image adapter
+  passed their bounded native gates; a complete Metal model remains open.
+  The component-level reference discrepancies recorded during development
+  are not reclassified as passing by this behavioral result.
+
+- Add an opt-in CUDA 4096-D BF16 query/reconstructed-cosine API with owned
+  uploaded NVFP4 byte planes and canonical eight-lane FP64 scoring. Query
+  normalization/rotation stays on the GPU; handle deduplication and maximum
+  selection remain storage policy. This is not an upper-bound scanner or
+  exact source reranker and does not change the persisted row recipe.
+
+- Expose native WeMM's actual selected root, validated asset content handles
+  and bound CUDA device for runtime identity checks; query device name and
+  compute capability from the driver rather than host architecture. Add a
+  read-only model-pile opener sharing the existing frozen collection reader.
+  A read-only descriptor is not an external immutability guarantee: zero-copy
+  callers retain the explicit immutable-prefix custody obligation. The Files
+  integration gate exercised the loaded root/assets/device binding with 759
+  roles and no rebinding, including refusal before a partial overlength leaf.
+
+- Add a bounded direct BF16 `[1,4096]` CUDA encoder for the existing two-stage
+  NVFP4 row recipe. Normalization, signed Hadamard transform, quantization and
+  outward error certification stay on GPU with explicit arithmetic order;
+  only completed encoded bytes/status return to the host. CPU arithmetic is
+  used solely by the new byte/certificate oracle tests. No collection identity,
+  Files mapping, query scorer or model-selection behavior changes.
+
+- Expose a resident native CUDA WeMM facade over the existing shared model,
+  pinned tokenizer/template and GPU image preparation. Text and single-image
+  calls return the GPU BF16 `[1,4096]` embedding without host numeric work or
+  readback. The caller keeps one bounded alias session; load failures report
+  its registration counts and do not claim to unregister partial loads.
+  Keep the decoder's fixed eight groups heap-backed to avoid large inline
+  array copies overflowing ordinary debug/test-thread constructor stacks.
+  Executed on one GB10: library check, three metadata tests and the fixed
+  11-input text/image facade test pass on the default test stack; all 22
+  forward/reverse outputs match the retained native BF16 bytes, with 759
+  selected roles, no rebinding and the source reader dropped before forwards.
+  Earlier test compile and inline-stack failures remain preserved. The 680 s
+  debug test includes provenance hashing, construction and all forwards, not
+  a production inference benchmark; whole-file model hashing took 9 s.
+
 - Native BF16 WeMM constructors accept caller-owned exact-get readers while
   preserving selected model facts/slots and genuine immutable pile backing.
   Decoder client validation shares its already-bound final norm instead of

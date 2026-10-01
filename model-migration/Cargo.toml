@@ -19,9 +19,9 @@ license = "MIT OR Apache-2.0"
 # (selection). The dependency points one way only — mary knows nothing of this
 # crate. PersonaPlex currently shares Mary's lean `qwen3tts` module gate; using
 # that gate avoids pulling the runtime-only Accelerate oracle dependencies.
-mary = { path = "..", features = ["qwen3tts"] }
+mary = { package = "maryml", version = "0.1.0", path = "..", features = ["qwen3tts"] }
 triblespace = { version = "0.47.0", path = "../../triblespace-rs", default-features = false }
-anybytes = "0.20"
+anybytes = { version = "0.20.3", path = "../../anybytes" }
 anyhow = "1"
 # A migration signs the native commit it publishes, so the key type is not
 # optional here the way it is for a pure reader.
@@ -34,46 +34,8 @@ clap = { version = "4", features = ["derive"] }
 name = "mary-model-migrate"
 path = "src/main.rs"
 
-# Mirrors mary's patch table, because patches only apply from the workspace
-# root of the build being run and this crate is now its own root. Paths gain
-# one `../` for the extra directory level. Keep in sync with ../Cargo.toml
-# until this crate deliberately diverges onto an older lineage.
+# SOURCE-BUILD-ONLY: retain the tested network readiness repair.
+# Registry consumers intentionally use upstream netwatch without these fixes.
+# Root patches are not inherited; this source/registry difference is deliberate.
 [patch.crates-io]
-
-# burn, forked for a matmul defect: launch_matmul bound the non-quantized
-# rhs with the LHS dtype, so mixed-dtype matmul silently returned about half
-# the correct value (f32 x BF16) or NaN (BF16 x f32). See
-# erlkonig-ai/burn branch fix/matmul-rhs-dtype. Pin the exact revision so this
-# standalone workspace does not depend on an adjacent clone. All members are
-# patched together to keep one burn-tensor identity in the graph.
-burn = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-autodiff = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-backend = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-core = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-cubecl = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-cubecl-fusion = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-cuda = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-dataset = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-derive = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-dispatch = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-flex = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-fusion = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-ir = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-ndarray = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-nn = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-optim = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-rl = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-std = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-tensor = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-train = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-vision = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-wgpu = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-# Forked to add a zero-copy "register an externally-created GPU buffer as a
-# tensor handle" seam (mmap'd f16 pile pages -> Metal newBufferWithBytesNoCopy ->
-# wgpu buffer -> cubecl handle). Unmodified baseline first; patched below.
-cubecl-runtime = { path = "../../cubecl-graph/cubecl-runtime" }
-cubecl-cuda = { path = "../../cubecl-graph/cubecl-cuda" }
-cubecl-wgpu = { path = "../../cubecl-graph/cubecl-wgpu" }
-# Local triblespace-core: V3 uniform 256-byte headers — every record 256-aligned,
-# so mmap'd blobs sit at GPU-ready offsets for zero-copy aliasing (cat-merge safe).
-triblespace-core = { path = "../../triblespace-rs/triblespace-core" }
+netwatch = { git = "https://github.com/erlkonig-ai/net-tools.git", rev = "10ab7b328809103be74f6ca24258249715fae52b" }

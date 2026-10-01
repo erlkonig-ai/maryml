@@ -1400,7 +1400,7 @@ mod tests {
     // Real-data validation against an actual HuggingFace tokenizer.json (30k+
     // vocabs, byte-level BPE emoji tokens over the 32-byte inline ceiling).
     // Ignored by default; run pointed at a file:
-    //   TOK_JSON=<path> TOK_VOCAB=<n> cargo test -p mary --lib \
+    //   TOK_JSON=<path> TOK_VOCAB=<n> cargo test -p maryml --lib \
     //     tokenizer::tests::real_tokenizer_bulk -- --ignored --nocapture
     #[test]
     #[ignore]
@@ -1444,7 +1444,7 @@ mod tests {
     // ingested TribleSet — kills cross-run ingest variance, isolating the pure
     // planner cost of the two query shapes. Runs on whatever engine triblespace
     // links (currently the residual/agglomerative planner).
-    //   TOK_JSON=<path> cargo test -p mary --lib tokenizer::tests::real_load_ab \
+    //   TOK_JSON=<path> cargo test -p maryml --lib tokenizer::tests::real_load_ab \
     //     -- --ignored --nocapture
     #[test]
     #[ignore]

@@ -58,7 +58,9 @@ struct Group {
 /// model/session, including repeated constructions. Dropping the stack does
 /// NOT revoke CubeCL's runtime-owned external memory registrations.
 pub struct Stack {
-    groups: [Group; GROUPS],
+    // Keep the architecture's exact group count without copying its large
+    // bound weight descriptors through every enclosing constructor's stack.
+    groups: Box<[Group; GROUPS]>,
     endpoint: Boundary,
     // Same final-norm alias, not an extra model role. The frozen blocks hide
     // their weights, so this anchor permits input-client validation BEFORE L0.
@@ -100,7 +102,7 @@ impl Stack {
             // SAFETY: forwards the caller's same genuine-prefix obligation.
             bound.push(unsafe { bind_group(snapshot, group, index * 4, aliases)? });
         }
-        let groups = bound.try_into()
+        let groups = bound.into_boxed_slice().try_into()
             .map_err(|_| "internal fixed group count mismatch".to_string())?;
         Ok(Self { groups, endpoint, input_anchor })
     }
@@ -272,5 +274,21 @@ impl Stack {
         }
         self.endpoint.finish_unpadded(&hidden)
             .map_err(|e| format!("shared output boundary: {e}"))
+    }
+}
+
+#[cfg(test)]
+mod representation_tests {
+    use super::*;
+
+    #[test]
+    fn fixed_groups_are_heap_backed_without_an_inline_array() {
+        // Field-type evidence keeps the fixed architecture while making the
+        // owning model handle small. No model/device is needed for this check.
+        let _: fn(&Stack) -> &Box<[Group; GROUPS]> = |stack| &stack.groups;
+        assert_eq!(
+            std::mem::size_of::<Box<[Group; GROUPS]>>(),
+            std::mem::size_of::<*const [Group; GROUPS]>(),
+        );
     }
 }

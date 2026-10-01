@@ -1048,6 +1048,12 @@ pub fn read_f32(bytes: &[u8]) -> f32 {
 #[cfg(feature = "nvfp4-cuda")]
 pub mod cuda;
 
+#[cfg(feature = "nvfp4-encode-cuda")]
+pub mod cuda_encode;
+
+#[cfg(feature = "nvfp4-score-cuda")]
+pub mod cuda_score;
+
 #[cfg(test)]
 mod tests {
     use super::*;

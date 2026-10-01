@@ -1,5 +1,12 @@
 # mary
 
+The Cargo package is named `maryml`; its Rust library and optional CLI are
+still named `mary`. Consumers can retain the familiar dependency alias:
+
+```toml
+mary = { package = "maryml", version = "0.1.0" }
+```
+
 **A model is data — so store it like data.**
 
 Model weights ship as opaque, multi-gigabyte blobs: a `safetensors` here, an

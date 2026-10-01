@@ -1937,6 +1937,19 @@ pub fn read_model_pile(path: &Path) -> anyhow::Result<ModelPileSource> {
     read
 }
 
+/// Read the same frozen model collection observation through a read-only file
+/// descriptor. This exposes no writer, but is NOT proof against another
+/// process modifying the file. GPU alias callers still owe the genuine
+/// immutable-prefix custody contract through CUDA runtime teardown.
+pub fn read_model_pile_read_only(path: &Path) -> anyhow::Result<ModelPileSource> {
+    let file = triblespace::core::repo::pile::PileFile::open_read_only(path)
+        .map_err(|e| anyhow::anyhow!("open read-only {path:?}: {e:?}"))?;
+    let mut pile = Pile::new(file);
+    let read = read_model_collections(&mut pile, path);
+    let _ = pile.close();
+    read
+}
+
 fn read_model_collections(pile: &mut Pile, path: &Path) -> anyhow::Result<ModelPileSource> {
     // This used to be a seqlock: sample `Pile::store_revision`, read both
     // collections, sample again, and retry the whole thing whenever an append

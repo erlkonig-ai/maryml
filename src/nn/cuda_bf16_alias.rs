@@ -104,6 +104,12 @@ impl CudaBf16Aliases {
         self.stats
     }
 
+    /// The actual device this registration session owns. Consumers creating
+    /// related GPU operators must not invent a second client/device pairing.
+    pub fn device(&self) -> &CudaDevice {
+        &self.device
+    }
+
     /// Bind exactly the typed BF16 payload, including odd element counts.
     /// Empty tensors, malformed/oversized shapes, non-pile backing, misaligned
     /// payloads and exhausted registration budgets are descriptive refusals.

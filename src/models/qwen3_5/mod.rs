@@ -19,6 +19,8 @@ pub mod multimodal_layout;
 pub mod input_codec;
 #[cfg(feature = "wemm-input")]
 pub mod image_prepare;
+#[cfg(feature = "wemm-input")]
+pub mod native;
 #[cfg(feature = "qwen3_5-cuda")]
 pub mod position_table;
 #[cfg(feature = "qwen3_5-cuda")]

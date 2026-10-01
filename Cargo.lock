@@ -153,8 +153,7 @@ dependencies = [
 
 [[package]]
 name = "anybytes"
-version = "0.20.2"
-source = "git+https://github.com/triblespace/anybytes.git?rev=066c32a7cfcc470a6750c849499c1e88a0e0c50a#066c32a7cfcc470a6750c849499c1e88a0e0c50a"
+version = "0.20.3"
 dependencies = [
  "bytes",
  "memmap2",
@@ -535,390 +534,6 @@ name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
-
-[[package]]
-name = "burn"
-version = "0.21.0"
-source = "git+https://github.com/erlkonig-ai/burn?rev=21adb25bb5277a1ff65179fa61442d8330d494d9#21adb25bb5277a1ff65179fa61442d8330d494d9"
-dependencies = [
- "burn-autodiff",
- "burn-core",
- "burn-cpu",
- "burn-cuda",
- "burn-dispatch",
- "burn-ndarray",
- "burn-nn",
- "burn-optim",
- "burn-rocm",
- "burn-std",
- "burn-vision",
- "burn-wgpu",
-]
-
-[[package]]
-name = "burn-autodiff"
-version = "0.21.0"
-source = "git+https://github.com/erlkonig-ai/burn?rev=21adb25bb5277a1ff65179fa61442d8330d494d9#21adb25bb5277a1ff65179fa61442d8330d494d9"
-dependencies = [
- "burn-backend",
- "burn-std",
- "derive-new",
- "hashbrown 0.16.1",
- "log",
- "num-traits",
- "portable-atomic",
- "spin",
-]
-
-[[package]]
-name = "burn-backend"
-version = "0.21.0"
-source = "git+https://github.com/erlkonig-ai/burn?rev=21adb25bb5277a1ff65179fa61442d8330d494d9#21adb25bb5277a1ff65179fa61442d8330d494d9"
-dependencies = [
- "burn-std",
- "bytemuck",
- "cubecl",
- "derive-new",
- "enumset",
- "hashbrown 0.16.1",
- "num-traits",
- "portable-atomic-util",
- "rand 0.10.2",
- "rand_distr",
- "serde",
- "spin",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "burn-core"
-version = "0.21.0"
-source = "git+https://github.com/erlkonig-ai/burn?rev=21adb25bb5277a1ff65179fa61442d8330d494d9#21adb25bb5277a1ff65179fa61442d8330d494d9"
-dependencies = [
- "ahash",
- "bincode",
- "burn-dataset",
- "burn-derive",
- "burn-std",
- "burn-tensor",
- "data-encoding",
- "derive-new",
- "flate2",
- "half",
- "hashbrown 0.16.1",
- "log",
- "num-traits",
- "portable-atomic",
- "portable-atomic-util",
- "rand 0.10.2",
- "regex",
- "rmp-serde",
- "serde",
- "serde_json",
- "spin",
- "uuid",
-]
-
-[[package]]
-name = "burn-cpu"
-version = "0.21.0"
-source = "git+https://github.com/erlkonig-ai/burn?rev=21adb25bb5277a1ff65179fa61442d8330d494d9#21adb25bb5277a1ff65179fa61442d8330d494d9"
-dependencies = [
- "burn-backend",
- "burn-cubecl",
- "cubecl",
-]
-
-[[package]]
-name = "burn-cubecl"
-version = "0.21.0"
-source = "git+https://github.com/erlkonig-ai/burn?rev=21adb25bb5277a1ff65179fa61442d8330d494d9#21adb25bb5277a1ff65179fa61442d8330d494d9"
-dependencies = [
- "burn-backend",
- "burn-cubecl-fusion",
- "burn-fusion",
- "burn-ir",
- "burn-std",
- "cubecl",
- "cubek",
- "derive-new",
- "futures-lite",
- "log",
- "serde",
- "text_placeholder",
-]
-
-[[package]]
-name = "burn-cubecl-fusion"
-version = "0.21.0"
-source = "git+https://github.com/erlkonig-ai/burn?rev=21adb25bb5277a1ff65179fa61442d8330d494d9#21adb25bb5277a1ff65179fa61442d8330d494d9"
-dependencies = [
- "burn-backend",
- "burn-fusion",
- "burn-ir",
- "burn-std",
- "cubecl",
- "cubek",
- "derive-new",
- "hashbrown 0.16.1",
- "serde",
- "spin",
-]
-
-[[package]]
-name = "burn-cuda"
-version = "0.21.0"
-source = "git+https://github.com/erlkonig-ai/burn?rev=21adb25bb5277a1ff65179fa61442d8330d494d9#21adb25bb5277a1ff65179fa61442d8330d494d9"
-dependencies = [
- "burn-backend",
- "burn-cubecl",
- "cubecl",
-]
-
-[[package]]
-name = "burn-dataset"
-version = "0.21.0"
-source = "git+https://github.com/erlkonig-ai/burn?rev=21adb25bb5277a1ff65179fa61442d8330d494d9#21adb25bb5277a1ff65179fa61442d8330d494d9"
-dependencies = [
- "csv",
- "derive-new",
- "dirs 6.0.0",
- "rand 0.10.2",
- "rmp-serde",
- "sanitize-filename",
- "serde",
- "serde_json",
- "strum",
- "tempfile",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "burn-derive"
-version = "0.21.0"
-source = "git+https://github.com/erlkonig-ai/burn?rev=21adb25bb5277a1ff65179fa61442d8330d494d9#21adb25bb5277a1ff65179fa61442d8330d494d9"
-dependencies = [
- "derive-new",
- "proc-macro2",
- "quote",
- "syn 2.0.118",
-]
-
-[[package]]
-name = "burn-dispatch"
-version = "0.21.0"
-source = "git+https://github.com/erlkonig-ai/burn?rev=21adb25bb5277a1ff65179fa61442d8330d494d9#21adb25bb5277a1ff65179fa61442d8330d494d9"
-dependencies = [
- "burn-autodiff",
- "burn-backend",
- "burn-cuda",
- "burn-ndarray",
- "burn-wgpu",
- "paste",
-]
-
-[[package]]
-name = "burn-flex"
-version = "0.21.0"
-source = "git+https://github.com/erlkonig-ai/burn?rev=21adb25bb5277a1ff65179fa61442d8330d494d9#21adb25bb5277a1ff65179fa61442d8330d494d9"
-dependencies = [
- "aligned-vec",
- "burn-backend",
- "burn-ir",
- "burn-std",
- "bytemuck",
- "gemm",
- "half",
- "libm",
- "macerator",
- "num-traits",
- "rayon",
-]
-
-[[package]]
-name = "burn-fusion"
-version = "0.21.0"
-source = "git+https://github.com/erlkonig-ai/burn?rev=21adb25bb5277a1ff65179fa61442d8330d494d9#21adb25bb5277a1ff65179fa61442d8330d494d9"
-dependencies = [
- "burn-backend",
- "burn-ir",
- "burn-std",
- "derive-new",
- "hashbrown 0.16.1",
- "log",
- "serde",
- "smallvec",
- "spin",
- "tracing",
-]
-
-[[package]]
-name = "burn-ir"
-version = "0.21.0"
-source = "git+https://github.com/erlkonig-ai/burn?rev=21adb25bb5277a1ff65179fa61442d8330d494d9#21adb25bb5277a1ff65179fa61442d8330d494d9"
-dependencies = [
- "burn-backend",
- "hashbrown 0.16.1",
- "serde",
-]
-
-[[package]]
-name = "burn-ndarray"
-version = "0.21.0"
-source = "git+https://github.com/erlkonig-ai/burn?rev=21adb25bb5277a1ff65179fa61442d8330d494d9#21adb25bb5277a1ff65179fa61442d8330d494d9"
-dependencies = [
- "atomic_float",
- "blas-src",
- "burn-autodiff",
- "burn-backend",
- "burn-ir",
- "burn-std",
- "bytemuck",
- "const-random",
- "itertools 0.14.0",
- "libm",
- "macerator",
- "matrixmultiply",
- "ndarray",
- "num-traits",
- "paste",
- "portable-atomic",
- "portable-atomic-util",
- "rand 0.10.2",
- "rayon",
- "seq-macro",
-]
-
-[[package]]
-name = "burn-nn"
-version = "0.21.0"
-source = "git+https://github.com/erlkonig-ai/burn?rev=21adb25bb5277a1ff65179fa61442d8330d494d9#21adb25bb5277a1ff65179fa61442d8330d494d9"
-dependencies = [
- "burn-core",
- "num-traits",
-]
-
-[[package]]
-name = "burn-optim"
-version = "0.21.0"
-source = "git+https://github.com/erlkonig-ai/burn?rev=21adb25bb5277a1ff65179fa61442d8330d494d9#21adb25bb5277a1ff65179fa61442d8330d494d9"
-dependencies = [
- "burn-core",
- "derive-new",
- "hashbrown 0.16.1",
- "log",
- "num-traits",
- "serde",
-]
-
-[[package]]
-name = "burn-rl"
-version = "0.21.0"
-source = "git+https://github.com/erlkonig-ai/burn?rev=21adb25bb5277a1ff65179fa61442d8330d494d9#21adb25bb5277a1ff65179fa61442d8330d494d9"
-dependencies = [
- "burn-core",
- "burn-optim",
- "derive-new",
- "log",
- "rand 0.10.2",
-]
-
-[[package]]
-name = "burn-rocm"
-version = "0.21.0"
-source = "git+https://github.com/erlkonig-ai/burn?rev=21adb25bb5277a1ff65179fa61442d8330d494d9#21adb25bb5277a1ff65179fa61442d8330d494d9"
-dependencies = [
- "burn-backend",
- "burn-cubecl",
- "cubecl",
-]
-
-[[package]]
-name = "burn-std"
-version = "0.21.0"
-source = "git+https://github.com/erlkonig-ai/burn?rev=21adb25bb5277a1ff65179fa61442d8330d494d9#21adb25bb5277a1ff65179fa61442d8330d494d9"
-dependencies = [
- "bytemuck",
- "bytes",
- "cubecl",
- "cubecl-common",
- "cubecl-zspace",
- "half",
- "num-traits",
- "serde",
- "smallvec",
- "spin",
-]
-
-[[package]]
-name = "burn-tensor"
-version = "0.21.0"
-source = "git+https://github.com/erlkonig-ai/burn?rev=21adb25bb5277a1ff65179fa61442d8330d494d9#21adb25bb5277a1ff65179fa61442d8330d494d9"
-dependencies = [
- "burn-backend",
- "burn-std",
- "colored",
- "derive-new",
- "num-traits",
- "serde",
-]
-
-[[package]]
-name = "burn-train"
-version = "0.21.0"
-source = "git+https://github.com/erlkonig-ai/burn?rev=21adb25bb5277a1ff65179fa61442d8330d494d9#21adb25bb5277a1ff65179fa61442d8330d494d9"
-dependencies = [
- "async-channel",
- "burn-core",
- "burn-flex",
- "burn-optim",
- "burn-rl",
- "derive-new",
- "log",
- "nvml-wrapper",
- "rand 0.10.2",
- "ratatui",
- "rstest",
- "serde",
- "sysinfo",
- "systemstat",
- "thiserror 2.0.18",
- "tracing-appender",
- "tracing-core",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "burn-vision"
-version = "0.21.0"
-source = "git+https://github.com/erlkonig-ai/burn?rev=21adb25bb5277a1ff65179fa61442d8330d494d9#21adb25bb5277a1ff65179fa61442d8330d494d9"
-dependencies = [
- "aligned-vec",
- "bon",
- "burn-cubecl",
- "burn-ir",
- "burn-tensor",
- "bytemuck",
- "cubecl",
- "derive-new",
- "half",
- "image",
- "macerator",
- "ndarray",
- "num-traits",
- "paste",
- "serde",
-]
-
-[[package]]
-name = "burn-wgpu"
-version = "0.21.0"
-source = "git+https://github.com/erlkonig-ai/burn?rev=21adb25bb5277a1ff65179fa61442d8330d494d9#21adb25bb5277a1ff65179fa61442d8330d494d9"
-dependencies = [
- "burn-backend",
- "burn-cubecl",
- "cubecl",
-]
 
 [[package]]
 name = "by_address"
@@ -1479,23 +1094,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cubecl"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fd203fef6e359472e4cb8f6c0ef3eca062815a1edd560eb6d6c1d5c1397838d9"
-dependencies = [
- "cubecl-core",
- "cubecl-cpu",
- "cubecl-cuda",
- "cubecl-hip",
- "cubecl-ir",
- "cubecl-runtime",
- "cubecl-std",
- "cubecl-wgpu",
- "half",
-]
-
-[[package]]
 name = "cubecl-common"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1538,110 +1136,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cubecl-core"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a7522e7acf25d7848032c7b5270780f9f2abe84e13c7ed6345aa27ba70c312ca"
-dependencies = [
- "bitflags 2.13.0",
- "bytemuck",
- "cubecl-common",
- "cubecl-ir",
- "cubecl-macros",
- "cubecl-runtime",
- "cubecl-zspace",
- "derive-new",
- "derive_more",
- "enumset",
- "float-ord",
- "half",
- "hashbrown 0.16.1",
- "log",
- "num-traits",
- "paste",
- "serde",
- "serde_json",
- "tracing",
- "variadics_please",
-]
-
-[[package]]
-name = "cubecl-cpp"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "411af04828cbf4583ecd388579fb30cd7a644eec19a334bb8f0d9d08522e1458"
-dependencies = [
- "bytemuck",
- "cubecl-common",
- "cubecl-core",
- "cubecl-opt",
- "cubecl-runtime",
- "derive-new",
- "half",
- "itertools 0.14.0",
- "log",
-]
-
-[[package]]
-name = "cubecl-cpu"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f572143f54e42a49ee0635a4ec36005f639e62be029e4f49890c808985981b35"
-dependencies = [
- "bytemuck",
- "cubecl-common",
- "cubecl-core",
- "cubecl-opt",
- "cubecl-runtime",
- "cubecl-std",
- "derive-new",
- "half",
- "log",
- "paste",
- "serde",
- "sysinfo",
- "tracel-llvm",
- "tracel-llvm-bundler",
-]
-
-[[package]]
-name = "cubecl-cuda"
-version = "0.10.0"
-dependencies = [
- "bytemuck",
- "cubecl-common",
- "cubecl-core",
- "cubecl-cpp",
- "cubecl-runtime",
- "cudarc",
- "derive-new",
- "half",
- "log",
- "serde",
- "tracing",
-]
-
-[[package]]
-name = "cubecl-hip"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c6b510a9348f06ecd56b32cf10eb6241639e927a87f5c09ec61cc7a7610d5a3"
-dependencies = [
- "bytemuck",
- "cubecl-common",
- "cubecl-core",
- "cubecl-cpp",
- "cubecl-hip-sys",
- "cubecl-runtime",
- "derive-new",
- "half",
- "log",
- "paste",
- "serde",
- "tracing",
-]
-
-[[package]]
 name = "cubecl-hip-sys"
 version = "7.2.5321100"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1674,22 +1168,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cubecl-macros"
-version = "0.10.0"
-source = "git+https://github.com/erlkonig-ai/cubecl?rev=8b2aa74e2514e39562df6e384a271c2ef9e53b06#8b2aa74e2514e39562df6e384a271c2ef9e53b06"
-dependencies = [
- "cubecl-common",
- "darling 0.23.0",
- "derive-new",
- "ident_case",
- "inflections",
- "prettyplease",
- "proc-macro2",
- "quote",
- "syn 2.0.118",
-]
-
-[[package]]
 name = "cubecl-macros-internal"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1702,96 +1180,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cubecl-opt"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0a599c6c3efefdcee8636994c90e58ef696c7efbed2d18b5b5ad8d5f29923abb"
-dependencies = [
- "cubecl-common",
- "cubecl-core",
- "cubecl-ir",
- "float-ord",
- "log",
- "num",
- "petgraph",
- "smallvec",
- "stable-vec",
- "type-map",
-]
-
-[[package]]
-name = "cubecl-runtime"
-version = "0.10.0"
-dependencies = [
- "ahash",
- "async-channel",
- "bytemuck",
- "cfg-if",
- "cfg_aliases",
- "cubecl-common",
- "cubecl-ir",
- "cubecl-zspace",
- "derive-new",
- "derive_more",
- "dirs 6.0.0",
- "enumset",
- "hashbrown 0.16.1",
- "log",
- "md5",
- "serde",
- "serde_json",
- "spin",
- "thiserror 2.0.18",
- "toml",
- "tracing",
- "wasm-bindgen-futures",
- "web-time",
-]
-
-[[package]]
-name = "cubecl-std"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b391b584a4897683dd9fc0767f96337ac712b733126ce0f68a9ee8a2df073d2d"
-dependencies = [
- "cubecl-common",
- "cubecl-core",
- "cubecl-runtime",
- "half",
- "num-traits",
- "paste",
- "serde",
- "spin",
- "variadics_please",
-]
-
-[[package]]
-name = "cubecl-wgpu"
-version = "0.10.0"
-dependencies = [
- "async-channel",
- "bytemuck",
- "cfg-if",
- "cfg_aliases",
- "cubecl-common",
- "cubecl-core",
- "cubecl-cpp",
- "cubecl-ir",
- "cubecl-runtime",
- "derive-new",
- "derive_more",
- "half",
- "hashbrown 0.16.1",
- "log",
- "objc2",
- "objc2-metal",
- "sanitize-filename",
- "tracing",
- "wasm-bindgen-futures",
- "wgpu",
-]
-
-[[package]]
 name = "cubecl-zspace"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1800,141 +1188,6 @@ dependencies = [
  "derive-new",
  "serde",
  "smallvec",
-]
-
-[[package]]
-name = "cubek"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba62fb5043d5eb723017415eec57c541f41901beea984500e2e16b57d75fa717"
-dependencies = [
- "cubecl",
- "cubek-attention",
- "cubek-convolution",
- "cubek-fft",
- "cubek-interpolate",
- "cubek-matmul",
- "cubek-quant",
- "cubek-random",
- "cubek-reduce",
- "cubek-std",
-]
-
-[[package]]
-name = "cubek-attention"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75ca5c363f05a9297b9d1c0e90959cc5f9fd90bc596e4e537f26f20602ec63a5"
-dependencies = [
- "bytemuck",
- "cubecl",
- "cubecl-common",
- "cubek-matmul",
- "cubek-std",
- "half",
- "serde",
-]
-
-[[package]]
-name = "cubek-convolution"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "70f2755a8eb9ea5509c17edac78e4a9dc4be89c433d8e2ee709703a93b96f749"
-dependencies = [
- "bytemuck",
- "cubecl",
- "cubecl-common",
- "cubek-matmul",
- "cubek-std",
- "derive-new",
- "enumset",
- "half",
- "serde",
-]
-
-[[package]]
-name = "cubek-fft"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8dd7c2972363332dc4609067a2ccc21856308d98089e676d3f0c52747ae61a5b"
-dependencies = [
- "cubecl",
-]
-
-[[package]]
-name = "cubek-interpolate"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fbf4fca4512b2cf37bdca68c2eea8a8711836526be89b5f66be006c958a2032c"
-dependencies = [
- "cubecl",
- "cubecl-common",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "cubek-matmul"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83a4cea5f0f439907dc953c7638a6204b3f055f1bcbd10db91dfc5faa030ac1c"
-dependencies = [
- "bytemuck",
- "cubecl",
- "cubecl-common",
- "cubek-std",
- "half",
- "serde",
-]
-
-[[package]]
-name = "cubek-quant"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "802ff1b5f19597a7b7cb308c7c69e9eef28b78d57dab7794c816bb8f7d3d1b85"
-dependencies = [
- "cubecl",
- "cubecl-common",
- "half",
- "serde",
-]
-
-[[package]]
-name = "cubek-random"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8dfecce959bdbeb3b355120e586d1ea9e45a0fc7f2ca354f4260a571952551be"
-dependencies = [
- "cubecl",
- "cubecl-common",
- "half",
- "num-traits",
- "rand 0.10.2",
- "serde",
-]
-
-[[package]]
-name = "cubek-reduce"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "86758b84452b06e9121f25200da13b4909ecd6235cefb5f33f459bea24dac41a"
-dependencies = [
- "cubecl",
- "cubek-std",
- "half",
- "num-traits",
- "serde",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "cubek-std"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a587d0a44b6f14f4c3711ac10717179b48adb59203b2b2bffe334876bf713187"
-dependencies = [
- "cubecl",
- "cubecl-common",
- "half",
 ]
 
 [[package]]
@@ -3626,8 +2879,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jerky"
-version = "0.9.0"
-source = "git+https://github.com/triblespace/jerky.git?rev=a03b927dc9d1fac0e6085f1275cd8f8504c36648#a03b927dc9d1fac0e6085f1275cd8f8504c36648"
+version = "0.10.0"
 dependencies = [
  "anybytes",
  "num-traits",
@@ -4005,24 +3257,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "670fdfda89751bc4a84ac13eaa63e205cf0fd22b4c9a5fbfa085b63c1f1d3a30"
 
 [[package]]
-name = "mary"
+name = "maryml"
 version = "0.1.0"
 dependencies = [
  "anybytes",
  "anyhow",
  "blake3",
- "burn",
- "burn-cubecl",
- "burn-fusion",
- "burn-ndarray",
- "burn-train",
  "bytes",
  "ciborium",
  "clap",
  "cpal",
- "cubecl",
- "cubecl-cpp",
- "cubek",
  "cudarc",
  "ed25519-dalek",
  "fancy-regex 0.14.0",
@@ -4032,6 +3276,14 @@ dependencies = [
  "image",
  "libc",
  "libm",
+ "maryml-burn",
+ "maryml-burn-cubecl",
+ "maryml-burn-fusion",
+ "maryml-burn-ndarray",
+ "maryml-burn-train",
+ "maryml-cubecl",
+ "maryml-cubecl-cpp",
+ "maryml-cubek",
  "memmap2",
  "pollster",
  "rand 0.8.7",
@@ -4046,6 +3298,693 @@ dependencies = [
  "triblespace",
  "wgpu",
  "zip",
+]
+
+[[package]]
+name = "maryml-burn"
+version = "0.21.0"
+dependencies = [
+ "maryml-burn-autodiff",
+ "maryml-burn-core",
+ "maryml-burn-cpu",
+ "maryml-burn-cuda",
+ "maryml-burn-dispatch",
+ "maryml-burn-ndarray",
+ "maryml-burn-nn",
+ "maryml-burn-optim",
+ "maryml-burn-rocm",
+ "maryml-burn-std",
+ "maryml-burn-vision",
+ "maryml-burn-wgpu",
+]
+
+[[package]]
+name = "maryml-burn-autodiff"
+version = "0.21.0"
+dependencies = [
+ "derive-new",
+ "hashbrown 0.16.1",
+ "log",
+ "maryml-burn-backend",
+ "maryml-burn-std",
+ "num-traits",
+ "portable-atomic",
+ "spin",
+]
+
+[[package]]
+name = "maryml-burn-backend"
+version = "0.21.0"
+dependencies = [
+ "bytemuck",
+ "derive-new",
+ "enumset",
+ "hashbrown 0.16.1",
+ "maryml-burn-std",
+ "maryml-cubecl",
+ "num-traits",
+ "portable-atomic-util",
+ "rand 0.10.2",
+ "rand_distr",
+ "serde",
+ "spin",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "maryml-burn-core"
+version = "0.21.0"
+dependencies = [
+ "ahash",
+ "bincode",
+ "data-encoding",
+ "derive-new",
+ "flate2",
+ "half",
+ "hashbrown 0.16.1",
+ "log",
+ "maryml-burn-dataset",
+ "maryml-burn-derive",
+ "maryml-burn-std",
+ "maryml-burn-tensor",
+ "num-traits",
+ "portable-atomic",
+ "portable-atomic-util",
+ "rand 0.10.2",
+ "regex",
+ "rmp-serde",
+ "serde",
+ "serde_json",
+ "spin",
+ "uuid",
+]
+
+[[package]]
+name = "maryml-burn-cpu"
+version = "0.21.0"
+dependencies = [
+ "maryml-burn-backend",
+ "maryml-burn-cubecl",
+ "maryml-cubecl",
+]
+
+[[package]]
+name = "maryml-burn-cubecl"
+version = "0.21.0"
+dependencies = [
+ "derive-new",
+ "futures-lite",
+ "log",
+ "maryml-burn-backend",
+ "maryml-burn-cubecl-fusion",
+ "maryml-burn-fusion",
+ "maryml-burn-ir",
+ "maryml-burn-std",
+ "maryml-cubecl",
+ "maryml-cubek",
+ "serde",
+ "text_placeholder",
+]
+
+[[package]]
+name = "maryml-burn-cubecl-fusion"
+version = "0.21.0"
+dependencies = [
+ "derive-new",
+ "hashbrown 0.16.1",
+ "maryml-burn-backend",
+ "maryml-burn-fusion",
+ "maryml-burn-ir",
+ "maryml-burn-std",
+ "maryml-cubecl",
+ "maryml-cubek",
+ "serde",
+ "spin",
+]
+
+[[package]]
+name = "maryml-burn-cuda"
+version = "0.21.0"
+dependencies = [
+ "maryml-burn-backend",
+ "maryml-burn-cubecl",
+ "maryml-cubecl",
+]
+
+[[package]]
+name = "maryml-burn-dataset"
+version = "0.21.0"
+dependencies = [
+ "csv",
+ "derive-new",
+ "dirs 6.0.0",
+ "rand 0.10.2",
+ "rmp-serde",
+ "sanitize-filename",
+ "serde",
+ "serde_json",
+ "strum",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "maryml-burn-derive"
+version = "0.21.0"
+dependencies = [
+ "derive-new",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.118",
+]
+
+[[package]]
+name = "maryml-burn-dispatch"
+version = "0.21.0"
+dependencies = [
+ "maryml-burn-autodiff",
+ "maryml-burn-backend",
+ "maryml-burn-cuda",
+ "maryml-burn-ndarray",
+ "maryml-burn-wgpu",
+ "paste",
+]
+
+[[package]]
+name = "maryml-burn-flex"
+version = "0.21.0"
+dependencies = [
+ "aligned-vec",
+ "bytemuck",
+ "gemm",
+ "half",
+ "libm",
+ "macerator",
+ "maryml-burn-backend",
+ "maryml-burn-ir",
+ "maryml-burn-std",
+ "num-traits",
+ "rayon",
+]
+
+[[package]]
+name = "maryml-burn-fusion"
+version = "0.21.0"
+dependencies = [
+ "derive-new",
+ "hashbrown 0.16.1",
+ "log",
+ "maryml-burn-backend",
+ "maryml-burn-ir",
+ "maryml-burn-std",
+ "serde",
+ "smallvec",
+ "spin",
+ "tracing",
+]
+
+[[package]]
+name = "maryml-burn-ir"
+version = "0.21.0"
+dependencies = [
+ "hashbrown 0.16.1",
+ "maryml-burn-backend",
+ "serde",
+]
+
+[[package]]
+name = "maryml-burn-ndarray"
+version = "0.21.0"
+dependencies = [
+ "atomic_float",
+ "blas-src",
+ "bytemuck",
+ "const-random",
+ "itertools 0.14.0",
+ "libm",
+ "macerator",
+ "maryml-burn-autodiff",
+ "maryml-burn-backend",
+ "maryml-burn-ir",
+ "maryml-burn-std",
+ "matrixmultiply",
+ "ndarray",
+ "num-traits",
+ "paste",
+ "portable-atomic",
+ "portable-atomic-util",
+ "rand 0.10.2",
+ "rayon",
+ "seq-macro",
+]
+
+[[package]]
+name = "maryml-burn-nn"
+version = "0.21.0"
+dependencies = [
+ "maryml-burn-core",
+ "num-traits",
+]
+
+[[package]]
+name = "maryml-burn-optim"
+version = "0.21.0"
+dependencies = [
+ "derive-new",
+ "hashbrown 0.16.1",
+ "log",
+ "maryml-burn-core",
+ "num-traits",
+ "serde",
+]
+
+[[package]]
+name = "maryml-burn-rl"
+version = "0.21.0"
+dependencies = [
+ "derive-new",
+ "log",
+ "maryml-burn-core",
+ "maryml-burn-optim",
+ "rand 0.10.2",
+]
+
+[[package]]
+name = "maryml-burn-rocm"
+version = "0.21.0"
+dependencies = [
+ "maryml-burn-backend",
+ "maryml-burn-cubecl",
+ "maryml-cubecl",
+]
+
+[[package]]
+name = "maryml-burn-std"
+version = "0.21.0"
+dependencies = [
+ "bytemuck",
+ "bytes",
+ "cubecl-common",
+ "cubecl-zspace",
+ "half",
+ "maryml-cubecl",
+ "num-traits",
+ "serde",
+ "smallvec",
+ "spin",
+]
+
+[[package]]
+name = "maryml-burn-tensor"
+version = "0.21.0"
+dependencies = [
+ "colored",
+ "derive-new",
+ "maryml-burn-backend",
+ "maryml-burn-std",
+ "num-traits",
+ "serde",
+]
+
+[[package]]
+name = "maryml-burn-train"
+version = "0.21.0"
+dependencies = [
+ "async-channel",
+ "derive-new",
+ "log",
+ "maryml-burn-core",
+ "maryml-burn-flex",
+ "maryml-burn-optim",
+ "maryml-burn-rl",
+ "nvml-wrapper",
+ "rand 0.10.2",
+ "ratatui",
+ "rstest",
+ "serde",
+ "sysinfo",
+ "systemstat",
+ "thiserror 2.0.18",
+ "tracing-appender",
+ "tracing-core",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "maryml-burn-vision"
+version = "0.21.0"
+dependencies = [
+ "aligned-vec",
+ "bon",
+ "bytemuck",
+ "derive-new",
+ "half",
+ "image",
+ "macerator",
+ "maryml-burn-cubecl",
+ "maryml-burn-ir",
+ "maryml-burn-tensor",
+ "maryml-cubecl",
+ "ndarray",
+ "num-traits",
+ "paste",
+ "serde",
+]
+
+[[package]]
+name = "maryml-burn-wgpu"
+version = "0.21.0"
+dependencies = [
+ "maryml-burn-backend",
+ "maryml-burn-cubecl",
+ "maryml-cubecl",
+]
+
+[[package]]
+name = "maryml-cubecl"
+version = "0.10.0"
+dependencies = [
+ "cubecl-ir",
+ "half",
+ "maryml-cubecl-core",
+ "maryml-cubecl-cpu",
+ "maryml-cubecl-cuda",
+ "maryml-cubecl-hip",
+ "maryml-cubecl-runtime",
+ "maryml-cubecl-std",
+ "maryml-cubecl-wgpu",
+]
+
+[[package]]
+name = "maryml-cubecl-core"
+version = "0.10.0"
+dependencies = [
+ "bitflags 2.13.0",
+ "bytemuck",
+ "cubecl-common",
+ "cubecl-ir",
+ "cubecl-zspace",
+ "derive-new",
+ "derive_more",
+ "enumset",
+ "float-ord",
+ "half",
+ "hashbrown 0.16.1",
+ "log",
+ "maryml-cubecl-macros",
+ "maryml-cubecl-runtime",
+ "num-traits",
+ "paste",
+ "serde",
+ "serde_json",
+ "tracing",
+ "variadics_please",
+]
+
+[[package]]
+name = "maryml-cubecl-cpp"
+version = "0.10.0"
+dependencies = [
+ "bytemuck",
+ "cubecl-common",
+ "derive-new",
+ "half",
+ "itertools 0.14.0",
+ "log",
+ "maryml-cubecl-core",
+ "maryml-cubecl-opt",
+ "maryml-cubecl-runtime",
+]
+
+[[package]]
+name = "maryml-cubecl-cpu"
+version = "0.10.0"
+dependencies = [
+ "bytemuck",
+ "cubecl-common",
+ "derive-new",
+ "half",
+ "log",
+ "maryml-cubecl-core",
+ "maryml-cubecl-opt",
+ "maryml-cubecl-runtime",
+ "maryml-cubecl-std",
+ "paste",
+ "serde",
+ "sysinfo",
+ "tracel-llvm",
+ "tracel-llvm-bundler",
+]
+
+[[package]]
+name = "maryml-cubecl-cuda"
+version = "0.10.0"
+dependencies = [
+ "bytemuck",
+ "cubecl-common",
+ "cudarc",
+ "derive-new",
+ "half",
+ "log",
+ "maryml-cubecl-core",
+ "maryml-cubecl-cpp",
+ "maryml-cubecl-runtime",
+ "serde",
+ "tracing",
+]
+
+[[package]]
+name = "maryml-cubecl-hip"
+version = "0.10.0"
+dependencies = [
+ "bytemuck",
+ "cubecl-common",
+ "cubecl-hip-sys",
+ "derive-new",
+ "half",
+ "log",
+ "maryml-cubecl-core",
+ "maryml-cubecl-cpp",
+ "maryml-cubecl-runtime",
+ "paste",
+ "serde",
+ "tracing",
+]
+
+[[package]]
+name = "maryml-cubecl-macros"
+version = "0.10.0"
+dependencies = [
+ "cubecl-common",
+ "darling 0.23.0",
+ "derive-new",
+ "ident_case",
+ "inflections",
+ "prettyplease",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.118",
+]
+
+[[package]]
+name = "maryml-cubecl-opt"
+version = "0.10.0"
+dependencies = [
+ "cubecl-common",
+ "cubecl-ir",
+ "float-ord",
+ "log",
+ "maryml-cubecl-core",
+ "num",
+ "petgraph",
+ "smallvec",
+ "stable-vec",
+ "type-map",
+]
+
+[[package]]
+name = "maryml-cubecl-runtime"
+version = "0.10.0"
+dependencies = [
+ "ahash",
+ "async-channel",
+ "bytemuck",
+ "cfg-if",
+ "cfg_aliases",
+ "cubecl-common",
+ "cubecl-ir",
+ "cubecl-zspace",
+ "derive-new",
+ "derive_more",
+ "dirs 6.0.0",
+ "enumset",
+ "hashbrown 0.16.1",
+ "log",
+ "md5",
+ "serde",
+ "serde_json",
+ "spin",
+ "thiserror 2.0.18",
+ "toml",
+ "tracing",
+ "wasm-bindgen-futures",
+ "web-time",
+]
+
+[[package]]
+name = "maryml-cubecl-std"
+version = "0.10.0"
+dependencies = [
+ "cubecl-common",
+ "half",
+ "maryml-cubecl-core",
+ "maryml-cubecl-runtime",
+ "num-traits",
+ "paste",
+ "serde",
+ "spin",
+ "variadics_please",
+]
+
+[[package]]
+name = "maryml-cubecl-wgpu"
+version = "0.10.0"
+dependencies = [
+ "async-channel",
+ "bytemuck",
+ "cfg-if",
+ "cfg_aliases",
+ "cubecl-common",
+ "cubecl-ir",
+ "derive-new",
+ "derive_more",
+ "half",
+ "hashbrown 0.16.1",
+ "log",
+ "maryml-cubecl-core",
+ "maryml-cubecl-cpp",
+ "maryml-cubecl-runtime",
+ "objc2",
+ "objc2-metal",
+ "sanitize-filename",
+ "tracing",
+ "wasm-bindgen-futures",
+ "wgpu",
+]
+
+[[package]]
+name = "maryml-cubek"
+version = "0.2.0"
+dependencies = [
+ "maryml-cubecl",
+ "maryml-cubek-attention",
+ "maryml-cubek-convolution",
+ "maryml-cubek-fft",
+ "maryml-cubek-interpolate",
+ "maryml-cubek-matmul",
+ "maryml-cubek-quant",
+ "maryml-cubek-random",
+ "maryml-cubek-reduce",
+ "maryml-cubek-std",
+]
+
+[[package]]
+name = "maryml-cubek-attention"
+version = "0.2.0"
+dependencies = [
+ "bytemuck",
+ "cubecl-common",
+ "half",
+ "maryml-cubecl",
+ "maryml-cubek-matmul",
+ "maryml-cubek-std",
+ "serde",
+]
+
+[[package]]
+name = "maryml-cubek-convolution"
+version = "0.2.0"
+dependencies = [
+ "bytemuck",
+ "cubecl-common",
+ "derive-new",
+ "enumset",
+ "half",
+ "maryml-cubecl",
+ "maryml-cubek-matmul",
+ "maryml-cubek-std",
+ "serde",
+]
+
+[[package]]
+name = "maryml-cubek-fft"
+version = "0.2.0"
+dependencies = [
+ "maryml-cubecl",
+]
+
+[[package]]
+name = "maryml-cubek-interpolate"
+version = "0.2.0"
+dependencies = [
+ "cubecl-common",
+ "maryml-cubecl",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "maryml-cubek-matmul"
+version = "0.2.0"
+dependencies = [
+ "bytemuck",
+ "cubecl-common",
+ "half",
+ "maryml-cubecl",
+ "maryml-cubek-std",
+ "serde",
+]
+
+[[package]]
+name = "maryml-cubek-quant"
+version = "0.2.0"
+dependencies = [
+ "cubecl-common",
+ "half",
+ "maryml-cubecl",
+ "serde",
+]
+
+[[package]]
+name = "maryml-cubek-random"
+version = "0.2.0"
+dependencies = [
+ "cubecl-common",
+ "half",
+ "maryml-cubecl",
+ "num-traits",
+ "rand 0.10.2",
+ "serde",
+]
+
+[[package]]
+name = "maryml-cubek-reduce"
+version = "0.2.0"
+dependencies = [
+ "half",
+ "maryml-cubecl",
+ "maryml-cubek-std",
+ "num-traits",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "maryml-cubek-std"
+version = "0.2.0"
+dependencies = [
+ "cubecl-common",
+ "half",
+ "maryml-cubecl",
 ]
 
 [[package]]
