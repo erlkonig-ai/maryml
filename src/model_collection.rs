@@ -1165,7 +1165,7 @@ mod tests {
         }.into_facts().to_blob();
         let data = repo.put::<SimpleArchive, _>(TribleSet::new()).unwrap();
         repo.insert(CollectionRecord::Commit(CollectionCommit::sign(
-            &key, absent.get_handle().transmute(), data, data,
+            &key, absent.get_handle().transmute(), data.hash(), data,
         ))).unwrap();
         let before = repo.snapshot().unwrap();
         assert_eq!(model_graph_collections_in(&before).unwrap(), vec![collection]);
