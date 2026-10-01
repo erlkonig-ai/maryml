@@ -146,6 +146,7 @@ qwen3_5-cuda = ["qwen3_5-gpu", "cuda-bf16-alias"]
 qwen3_5-real-layer-trace = ["qwen3_5-cuda"]
 cuda-bf16-alias = ["dep:cubecl", "cubecl?/cuda", "dep:burn-cubecl", "burn/cuda", "dep:memmap2"]
 wemm-prepared-gate = ["qwen3_5-cuda", "dep:sha2"]
+wemm-layer1-reset = ["qwen3_5-real-layer-trace", "dep:sha2"]
 # THE RESIDENT MIND, whole: `models::inkling::engine` (a Session, the
 # checkpoint's tokenizer, the incremental detokenizer and the host-side rank
 # link) plus `models::inkling::resident` (the turn vocabulary and the
@@ -1262,3 +1263,7 @@ required-features = ["wemm-prepared-gate"]
 [[bin]]
 name = "wemm_image_gate"
 required-features = ["wemm-prepared-gate"]
+
+[[bin]]
+name = "wemm_layer1_reset"
+required-features = ["wemm-layer1-reset"]
