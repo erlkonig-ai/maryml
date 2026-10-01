@@ -1267,3 +1267,7 @@ required-features = ["wemm-prepared-gate"]
 [[bin]]
 name = "wemm_layer1_reset"
 required-features = ["wemm-layer1-reset"]
+
+[[bin]]
+name = "wemm_behavior"
+required-features = ["wemm-prepared-gate"]

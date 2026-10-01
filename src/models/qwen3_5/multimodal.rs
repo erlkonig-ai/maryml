@@ -44,6 +44,12 @@ pub struct Output {
 }
 
 impl PreparedMultimodal {
+    /// Text-only input through this same selected multimodal model. Weights
+    /// remain bound once; each call has fresh decoder state, as image calls do.
+    pub fn embed_text(&self, ids: &[u32]) -> Result<super::prepared::Output, String> {
+        self.decoder.embed_unpadded(ids)
+    }
+
     /// All 759 roles come from this ONE opaque root and frozen observation;
     /// the constructor never discovers/reselects a model between modalities.
     /// `selected` is immediate provenance exhaust, not a retained catalogue.

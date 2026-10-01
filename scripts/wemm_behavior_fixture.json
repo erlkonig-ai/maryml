@@ -1,0 +1,139 @@
+{
+  "source_manifest_sha256": "9ba0849ce4466a510f661ad6dd53c818ee4b46cd0b00c3c71342de64985a38b4",
+  "sources": {
+    "bloom.pdf": {
+      "files": "748d362bdf64d7ed0d603944347e38986505d8cf71bc51243f4256547081af42",
+      "page": 1
+    },
+    "attention.pdf": {
+      "files": "8110b31b13b21ea79c3cf668f3c5dc2aa20a20927d9956343f2442f0536d6600",
+      "page": 1,
+      "sha256": "bdfaa68d8984f0dc02beaca527b76f207d99b666d31d1da728ee0728182df697",
+      "export": "attention.png",
+      "export_method": "existing pdftoppm -scale-to 768 page raster, 594x768; crop specified separately"
+    },
+    "emotion.pdf": {
+      "files": "46989c6159c40c585c28158735450e1f0415591df95eeb9f7bd59760eeabfa07",
+      "page": 1
+    },
+    "hopfield.pdf": {
+      "files": "ca95003ace58ee2a5dc7d9f4fe0d7e7e20d3aec8c8af2136f1c67491007857bf",
+      "page": 2,
+      "sha256": "91c4eabd371fd81f92acb7efeb8818d6c3ae16011342ac301d4839e96e3fa234",
+      "export": "hopfield2.png",
+      "export_method": "existing pdftoppm -scale-to 768 page raster, 543x768; crop specified separately"
+    },
+    "ferris.png": {
+      "path": "gorbie_commonmark/egui_commonmark/examples/cuddlyferris.png"
+    },
+    "gorbie.png": {
+      "path": "GORBIE/assets/screenshot.png"
+    }
+  },
+  "items": [
+    {
+      "id": "bloom-query",
+      "group": "bloom",
+      "role": "query",
+      "modality": "text",
+      "text": "Find the paper about saving hash-table space by allowing false positive membership tests."
+    },
+    {
+      "id": "bloom-short",
+      "group": "bloom",
+      "role": "document",
+      "modality": "text",
+      "text": "Bloom filters trade a small false-positive rate for compact set-membership tests."
+    },
+    {
+      "id": "bloom-long",
+      "group": "bloom",
+      "role": "document",
+      "modality": "text",
+      "text": "Burton Bloom's paper examines space and time costs in hash coding. It considers testing messages for membership in a stored set, especially when most messages are not members. Permitting some false positive answers can reduce the size of the hash area while keeping rejection fast. A more expensive secondary test can catch the occasional false match. The key trade-off is not exact lookup with less memory for free: an allowable error frequency becomes a third design parameter alongside space and rejection time. This is why compact probabilistic membership structures are useful in front of expensive storage lookups."
+    },
+    {
+      "id": "attention-query",
+      "group": "attention",
+      "role": "query",
+      "modality": "text",
+      "text": "Which paper introduced a translation architecture based entirely on attention instead of recurrence or convolutions?"
+    },
+    {
+      "id": "attention-page",
+      "group": "attention",
+      "role": "document",
+      "modality": "image",
+      "path": "attention.png",
+      "sha256": "3595ca2d14cd95df40fc18265e035d739cb66fd32cd6b208672951e301eca9a6",
+      "source_document": "attention.pdf",
+      "crop_xyxy": [132, 395, 463, 562],
+      "crop_description": "Full abstract only, exclusive right/bottom pixel bounds; matches attention-extract. Glyphs remain small at fit256: judge saved prepared preview before interpreting a retrieval failure."
+    },
+    {
+      "id": "attention-extract",
+      "group": "attention",
+      "role": "document",
+      "modality": "text",
+      "path": "attention.txt",
+      "sha256": "1e08f8a59f7ce5fad3e168c3f0b66c6db55aa5544e4e045105b7bc866504cf6b",
+      "excerpt": {
+        "start": "The dominant sequence transduction models",
+        "end": "large and limited training data.",
+        "normalization": "Unicode whitespace collapsed to single spaces; markers each occur exactly once; inclusive explicit excerpt, never token truncation"
+      }
+    },
+    {
+      "id": "ferris-query",
+      "group": "ferris",
+      "role": "query",
+      "modality": "text",
+      "text": "Show me the friendly red crab mascot with two large black eyes."
+    },
+    {
+      "id": "ferris-image",
+      "group": "ferris",
+      "role": "document",
+      "modality": "image",
+      "path": "ferris.png",
+      "sha256": "fb51d3ef25faae2bda5637b6cb788f208acd4df589c9d5a4fb8155252626552c"
+    },
+    {
+      "id": "ferris-short",
+      "group": "ferris",
+      "role": "document",
+      "modality": "text",
+      "text": "Ferris is drawn here as a small bright red crab with black oval eyes and white highlights."
+    },
+    {
+      "id": "emotion-short",
+      "group": "emotion",
+      "role": "document",
+      "modality": "text",
+      "text": "A circumplex model maps emotion onto valence and arousal signals derived from expected free energy."
+    },
+    {
+      "id": "hopfield-page",
+      "group": "hopfield",
+      "role": "document",
+      "modality": "image",
+      "path": "hopfield2.png",
+      "sha256": "d2ef7c6c7f492efe61d707fae3504263c76a3ba69d7d614bfbed8e8300fb9ded",
+      "source_document": "hopfield.pdf",
+      "crop_xyxy": [117, 301, 505, 377],
+      "crop_description": "Figure42.1 feedforward versus feedback network drawings and caption; not the whole page."
+    }
+  ],
+  "schema": "wemm-behavior-fixture-v1",
+  "scope": "11 fixed local inputs; exploratory behavior/repro/performance smoke, not benchmark or universal threshold calibration",
+  "limitations": [
+    "Existing 2026-09-27 probe material, not an unseen heldout set.",
+    "Ferris is a repository illustration, not a photograph.",
+    "Prepared images use explicit GPU bicubic aspect-preserving fit and white padding to256x256. This low resolution limits PDF reading; not the original processor image budget.",
+    "Native B1 fresh-state calls only; reverse order tests item isolation, not vectorized-batch invariance."
+  ],
+  "reciprocal_queries": [
+    "attention-page",
+    "ferris-image"
+  ]
+}
