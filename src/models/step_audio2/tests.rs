@@ -82,7 +82,9 @@ fn tokenizer_json() -> Vec<u8> {
             "lstrip":false,"rstrip":false,"normalized":true,"special":false}),
         );
     }
-    serde_json::to_vec(&serde_json::json!({"version":"1.0","truncation":null,"padding":null,
+    serde_json::to_vec(&serde_json::json!({"version":"1.0","truncation":null,
+        "padding":{"strategy":"BatchLongest","direction":"Right","pad_to_multiple_of":null,
+            "pad_id":151643,"pad_type_id":0,"pad_token":"<|endoftext|>"},
         "added_tokens":added,"normalizer":{"type":"NFC"},"pre_tokenizer":{"type":"WhitespaceSplit"},
         "post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":vocab,"unk_token":"[UNK]"}})).unwrap()
 }
