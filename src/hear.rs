@@ -34,6 +34,10 @@ pub type Backend = hear::FusedHalf;
 /// `Listening`; start a new one (for example at a pause) to go on.
 pub const MAX_TOKENS: usize = 8192;
 
+/// Silence streamed once by [`Ears::load`] to compile the stream's kernels:
+/// two seconds at 16 kHz.
+pub const WARM_UP_SAMPLES: usize = 32_000;
+
 /// The resident ears: the realtime transcriber, weights on the GPU.
 pub struct Ears {
     stt: RealtimeTranscriber<Backend>,
@@ -41,14 +45,24 @@ pub struct Ears {
 
 impl Ears {
     /// Load the Voxtral cohort and its tokenizer from the native pile at
-    /// `pile` onto the default device of [`Backend`].
+    /// `pile` onto the default device of [`Backend`], then stream
+    /// [`WARM_UP_SAMPLES`] of silence through a throwaway [`Listening`] at
+    /// the default 480 ms delay, so the kernels a stream compiles on first
+    /// use (the prefill above all) are compiled here rather than inside the
+    /// caller's first utterance.
     pub fn load(pile: &Path) -> anyhow::Result<Self> {
         let snapshot = crate::model_collection::load_model_collection_local_latest(pile)?;
         let tekken = Tekken::from_snapshot(&snapshot)?;
         let loader = crate::models::voxtral::VoxtralWeights::from_snapshot(snapshot)?.into_loader();
         let device = hear::Device::default();
         let stt = RealtimeTranscriber::load(&loader, tekken, MAX_TOKENS, &device);
-        Ok(Self { stt })
+        let ears = Self { stt };
+        {
+            let mut warm = ears.listen(480);
+            warm.push(&vec![0.0; WARM_UP_SAMPLES]);
+            warm.finish();
+        }
+        Ok(ears)
     }
 
     /// Start a stream with text delayed `delay_ms` behind the audio (a
@@ -198,14 +212,21 @@ mod tests {
         assert_eq!(rate, 16000);
         let expect = std::fs::read_to_string(expect).unwrap();
 
+        let started = std::time::Instant::now();
         let ears = Ears::load(Path::new(&pile)).unwrap();
+        let loaded = started.elapsed();
         let mut listening = ears.listen(480);
         let mut text = String::new();
         for chunk in audio.chunks(SAMPLES_PER_TOK) {
             text += &listening.push(chunk);
         }
         text += &listening.finish();
-        eprintln!("heard: {text:?}");
+        eprintln!(
+            "heard: {text:?}\nload incl. warm-up {:.1} s; {:.2} s of audio heard in {:.1} s",
+            loaded.as_secs_f64(),
+            audio.len() as f64 / 16000.0,
+            (started.elapsed() - loaded).as_secs_f64()
+        );
 
         let words = |s: &str| -> Vec<String> {
             s.split_whitespace()
