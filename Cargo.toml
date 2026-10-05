@@ -145,6 +145,8 @@ cpal = { version = "0.17", optional = true }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 
 [features]
+# Step-Audio2 Mini's pile assets and text/speech token codec. No model runtime.
+step-audio2 = ["tokenizer"]
 # Native BF16 Qwen3.5 operators; no Fusion or timing-based autotune backend.
 qwen3_5-gpu = ["dep:cubecl", "dep:burn-cubecl"]
 qwen3_5-cuda = ["qwen3_5-gpu", "cuda-bf16-alias", "dep:cubek"]
@@ -404,6 +406,10 @@ dev-tools = ["import"]
 [[bin]]
 name = "mary"
 required-features = ["import", "hub"]
+
+[[bin]]
+name = "step_audio2_import"
+required-features = ["step-audio2", "import"]
 
 # Totality gate for the K3 checkpoint layout: walks the real safetensors headers
 # and asserts the tensor-name/module-slot mapping is a bijection. Header-only -
