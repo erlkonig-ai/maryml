@@ -16,6 +16,8 @@
 //!            (fold sources + the embed table; folded results are new GPU
 //!            buffers, the embed stays file-backed for the process life)
 //!
+//! The Tekken tokenizer is read from the same pile as the weights.
+//!
 //! Mic mode (mic capture rides the shared `listen` feature, so build
 //! voxtral,listen):
 //!   cargo run --release --features voxtral,listen --bin voxtral_listen -- \
@@ -32,6 +34,7 @@ use mary::models::voxtral::fast::RealtimeTranscriber;
 use mary::models::voxtral::pipeline::{
     StreamedToken, StreamingTranscriber, SttPipeline, Transcriber,
 };
+use mary::models::voxtral::tokenizer::Tekken;
 use mary::nn::backend::{B, BFused, BFusedHalf, BHalf};
 use std::io::Write;
 use std::path::PathBuf;
@@ -52,7 +55,6 @@ fn set_interactive_qos() {
 
 struct Args {
     pile: PathBuf,
-    tekken: PathBuf,
     delay_ms: usize,
     chunk_ms: usize,
     fast: bool,
@@ -74,13 +76,6 @@ fn main() -> anyhow::Result<()> {
 
     let args = Args {
         pile: mary::paths::model(arg("--pile").as_deref(), "voxtral_mini.pile")?,
-        tekken: PathBuf::from(arg("--tekken").unwrap_or_else(|| {
-            let home = std::env::var("HOME").unwrap();
-            format!(
-                "{home}/.cache/huggingface/hub/models--mistralai--Voxtral-Mini-4B-Realtime-2602/\
-                 snapshots/2769294da9567371363522aac9bbcfdd19447add/tekken.json"
-            )
-        })),
         delay_ms: arg("--delay-ms").map(|s| s.parse().unwrap()).unwrap_or(480),
         chunk_ms: arg("--chunk-ms").map(|s| s.parse().unwrap()).unwrap_or(80),
         fast: flag("--fast"),
@@ -98,11 +93,12 @@ fn main() -> anyhow::Result<()> {
     );
     let t0 = std::time::Instant::now();
     let snapshot = mary::model_collection::load_model_collection_local_latest(&args.pile)?;
+    let tekken = Tekken::from_snapshot(&snapshot)?;
     let loader = mary::models::voxtral::VoxtralWeights::from_snapshot(snapshot)?.into_loader();
     let max_tokens = 8192;
     match lane.as_str() {
         "raw" => {
-            let stt = Transcriber::<B>::load(&loader, &args.tekken, max_tokens, &dev)?;
+            let stt = Transcriber::<B>::load(&loader, tekken, max_tokens, &dev);
             drop(loader);
             eprintln!(
                 "[listen] loaded in {:.1}s; delay {} ms",
@@ -112,7 +108,7 @@ fn main() -> anyhow::Result<()> {
             go(&stt, &args)
         }
         "fused" => {
-            let stt = Transcriber::<BFused>::load(&loader, &args.tekken, max_tokens, &dev)?;
+            let stt = Transcriber::<BFused>::load(&loader, tekken, max_tokens, &dev);
             drop(loader);
             eprintln!(
                 "[listen] loaded in {:.1}s; delay {} ms",
@@ -122,7 +118,7 @@ fn main() -> anyhow::Result<()> {
             go(&stt, &args)
         }
         "fold" => {
-            let stt = RealtimeTranscriber::<BFused>::load(&loader, &args.tekken, max_tokens, &dev)?;
+            let stt = RealtimeTranscriber::<BFused>::load(&loader, tekken, max_tokens, &dev);
             drop(loader);
             eprintln!(
                 "[listen] loaded in {:.1}s; delay {} ms",
@@ -132,8 +128,7 @@ fn main() -> anyhow::Result<()> {
             go(&stt, &args)
         }
         "half" => {
-            let stt =
-                RealtimeTranscriber::<BFusedHalf>::load(&loader, &args.tekken, max_tokens, &dev)?;
+            let stt = RealtimeTranscriber::<BFusedHalf>::load(&loader, tekken, max_tokens, &dev);
             drop(loader);
             eprintln!(
                 "[listen] loaded in {:.1}s; delay {} ms",
@@ -143,7 +138,7 @@ fn main() -> anyhow::Result<()> {
             go(&stt, &args)
         }
         "rawhalf" => {
-            let stt = RealtimeTranscriber::<BHalf>::load(&loader, &args.tekken, max_tokens, &dev)?;
+            let stt = RealtimeTranscriber::<BHalf>::load(&loader, tekken, max_tokens, &dev);
             drop(loader);
             eprintln!(
                 "[listen] loaded in {:.1}s; delay {} ms",

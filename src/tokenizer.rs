@@ -96,7 +96,7 @@ impl<'a, B: BlobStorePut> BlobStorePut for CountingBlobs<'a, B> {
 // kinds). Minted 2026-07-16 (compass 67b09f72). `ty::*` are the type
 // discriminants (role-agnostic — the *edge* gives the role); `flag::*` the bools.
 #[allow(dead_code)]
-mod ty {
+pub(crate) mod ty {
     use triblespace::macros::id_hex;
     use triblespace::prelude::Id;
     pub const BERT_NORMALIZER: Id = id_hex!("AC009EBADB3488042EDCD3D2C8648342");
@@ -142,7 +142,7 @@ mod ty {
     pub const PIECE_UNUSED: Id = id_hex!("DD28C23E8DE557BC00F0451A8ED7C1C6");
 }
 #[allow(dead_code)]
-mod flag {
+pub(crate) mod flag {
     use triblespace::macros::id_hex;
     use triblespace::prelude::Id;
     pub const CLEAN_TEXT: Id = id_hex!("C3A27148CDE4AC009B47E1EE141D477B");

@@ -38,6 +38,7 @@ use mary::models::voxtral::fast::RealtimeTranscriber;
 use mary::models::voxtral::pipeline::{
     SttPipeline, Transcriber, pad_audio, prompt_ids, transcribe,
 };
+use mary::models::voxtral::tokenizer::Tekken;
 use mary::nn::backend::{B, BFused, BFusedHalf, BHalf};
 use mary::nn::npy;
 use std::path::{Path, PathBuf};
@@ -87,13 +88,6 @@ fn main() {
         });
     let gold = PathBuf::from(arg("--gold").unwrap_or_else(|| "golden/voxtral".into()));
     let long = args.iter().any(|a| a == "--long");
-    let tekken = PathBuf::from(arg("--tekken").unwrap_or_else(|| {
-        let home = std::env::var("HOME").unwrap();
-        format!(
-            "{home}/.cache/huggingface/hub/models--mistralai--Voxtral-Mini-4B-Realtime-2602/\
-             snapshots/2769294da9567371363522aac9bbcfdd19447add/tekken.json"
-        )
-    }));
 
     let lane = arg("--lane").unwrap_or_else(|| "raw".into());
     let dev = Default::default();
@@ -101,35 +95,33 @@ fn main() {
     let t0 = std::time::Instant::now();
     let snapshot = mary::model_collection::load_model_collection_local_latest(&pile)
         .expect("load native Voxtral snapshot");
+    let tekken = Tekken::from_snapshot(&snapshot).expect("Tekken tokenizer in the Voxtral pile");
     let loader = mary::models::voxtral::VoxtralWeights::from_snapshot(snapshot)
         .expect("select complete native Voxtral cohort")
         .into_loader();
     match lane.as_str() {
         "raw" => {}
         "fold" => {
-            let stt = RealtimeTranscriber::<BFused>::load(&loader, &tekken, 4096, &dev)
-                .expect("stt load");
+            let stt = RealtimeTranscriber::<BFused>::load(&loader, tekken, 4096, &dev);
             drop(loader);
             eprintln!("loaded in {:.1}s", t0.elapsed().as_secs_f64());
             return fast_lane_gates(&stt, &gold, long, /*exact*/ true);
         }
         "half" => {
-            let stt = RealtimeTranscriber::<BFusedHalf>::load(&loader, &tekken, 4096, &dev)
-                .expect("stt load");
+            let stt = RealtimeTranscriber::<BFusedHalf>::load(&loader, tekken, 4096, &dev);
             drop(loader);
             eprintln!("loaded in {:.1}s", t0.elapsed().as_secs_f64());
             return fast_lane_gates(&stt, &gold, long, /*exact*/ false);
         }
         "rawhalf" => {
-            let stt =
-                RealtimeTranscriber::<BHalf>::load(&loader, &tekken, 4096, &dev).expect("stt load");
+            let stt = RealtimeTranscriber::<BHalf>::load(&loader, tekken, 4096, &dev);
             drop(loader);
             eprintln!("loaded in {:.1}s", t0.elapsed().as_secs_f64());
             return fast_lane_gates(&stt, &gold, long, /*exact*/ false);
         }
         other => panic!("unknown --lane {other} (raw|fold|half|rawhalf)"),
     }
-    let stt = Transcriber::<B>::load(&loader, &tekken, 4096, &dev).expect("stt load");
+    let stt = Transcriber::<B>::load(&loader, tekken, 4096, &dev);
     drop(loader);
     eprintln!("loaded in {:.1}s", t0.elapsed().as_secs_f64());
 

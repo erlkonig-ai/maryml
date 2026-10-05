@@ -7,6 +7,10 @@
 //! - `native`: the exact f32 checkpoint (bf16 → f32 is lossless);
 //! - `f16`: the full `f16::from_f32` derivation used by the realtime lanes.
 //!
+//! Beside them sits the Tekken tokenizer graph from the directory's
+//! `tekken.json`, named after the same source, gated byte-for-byte against the
+//! file for every piece.
+//!
 //! The derivation reads the frozen exact root and writes back through the same
 //! open pile one tensor at a time. Runtime selection uses one immutable native
 //! collection snapshot; there is no Repository branch, sibling pile, random
@@ -23,6 +27,7 @@
 
 use mary::ingest::LeafDtype;
 use mary::leaf::Elem;
+use mary::models::voxtral::tokenizer::{Tekken, TekkenSource};
 use mary::models::voxtral::{QUANTIZATION_F16, SOURCE, VoxtralWeights};
 use mary::selection::{ModelSelector, SelectedModelIndex};
 use safetensors::{Dtype, SafeTensors};
@@ -116,6 +121,24 @@ fn verify_alignment(
     Ok(())
 }
 
+/// Every id the source assigns bytes to decodes to exactly those bytes from
+/// the pile, and the pile names no id the source does not.
+fn verify_tekken(source: &TekkenSource, stored: &Tekken) -> anyhow::Result<usize> {
+    for id in source.piece_ids() {
+        anyhow::ensure!(
+            source.piece(id) == Some(stored.piece(id)),
+            "Tekken piece {id} differs between tekken.json and the pile"
+        );
+    }
+    let pieces = source.piece_ids().len();
+    anyhow::ensure!(
+        stored.len() == pieces,
+        "the pile's Tekken has {} pieces, tekken.json {pieces}",
+        stored.len()
+    );
+    Ok(pieces)
+}
+
 fn run() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 4 {
@@ -183,9 +206,18 @@ fn run() -> anyhow::Result<()> {
                 QUANTIZATION_F16,
             )?;
 
+        // The tokenizer travels in the same pile: `tekken.json` is read here
+        // and never again at runtime.
+        eprintln!("[voxtral] importing Tekken tokenizer");
+        let tekken_source = TekkenSource::parse(&std::fs::read(model_dir.join("tekken.json"))?)?;
+        let tokenizer = tekken_source.to_fragment(SOURCE, &mut pile)?;
+        mary::model_collection::publish_model_fragment(&mut pile, &signing_key, tokenizer)?;
+
         // Gate the exact local prefix the live runtime admits, including any
         // previously published coordinate conflicts or invalid native records.
         let complete = mary::model_collection::snapshot_model_collection_local_latest(&mut pile)?;
+        let tekken = Tekken::from_snapshot(&complete)?;
+        let tekken_gate = verify_tekken(&tekken_source, &tekken)?;
         let weights = VoxtralWeights::from_snapshot(complete)?;
         anyhow::ensure!(
             weights.roots() == (exact_root, f16_root),
@@ -199,7 +231,7 @@ fn run() -> anyhow::Result<()> {
             f16_gate == (derived_count, derived_elements),
             "derived counters disagree with the admitted cohort"
         );
-        Ok((exact_root, f16_root, f16_gate))
+        Ok((exact_root, f16_root, f16_gate, tekken_gate))
     })();
 
     // `close` is the sole durability boundary, on success and on an import
@@ -207,7 +239,7 @@ fn run() -> anyhow::Result<()> {
     let close = pile
         .close()
         .map_err(|error| anyhow::anyhow!("close model pile {pile_path:?}: {error}"));
-    let (exact_root, f16_root, (tensors, elements)) = match (imported, close) {
+    let (exact_root, f16_root, (tensors, elements), pieces) = match (imported, close) {
         (Ok(result), Ok(())) => result,
         (Err(error), Ok(())) => return Err(error),
         (Ok(_), Err(error)) => return Err(error),
@@ -220,7 +252,8 @@ fn run() -> anyhow::Result<()> {
     println!(
         "Voxtral native cohort valid: exact={exact_root}, f16={f16_root}; \
          {tensors} tensors / {elements} elements source- and f16-bit-identical; \
-         all payloads 256-aligned; pile {:.2} GiB in {:.1}s",
+         all payloads 256-aligned; Tekken {pieces} pieces byte-identical to tekken.json; \
+         pile {:.2} GiB in {:.1}s",
         size as f64 / (1_u64 << 30) as f64,
         started.elapsed().as_secs_f64(),
     );

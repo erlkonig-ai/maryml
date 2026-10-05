@@ -578,17 +578,17 @@ pub struct RealtimeTranscriber<B: Backend> {
 impl<B: Backend> RealtimeTranscriber<B> {
     pub fn load(
         loader: &WeightLoader,
-        tekken_path: &std::path::Path,
+        tekken: Tekken,
         max_tokens: usize,
         device: &B::Device,
-    ) -> anyhow::Result<Self> {
-        Ok(Self {
+    ) -> Self {
+        Self {
             mel: VoxtralMel::new(device),
             encoder: FastEncoder::load(loader, max_tokens * DOWNSAMPLE, device),
             decoder: FastDecoder::load(loader, max_tokens, device),
-            tekken: Tekken::load(tekken_path)?,
+            tekken,
             device: device.clone(),
-        })
+        }
     }
 }
 

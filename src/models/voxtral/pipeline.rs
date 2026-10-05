@@ -140,17 +140,17 @@ pub struct Transcription {
 impl<B: Backend> Transcriber<B> {
     pub fn load(
         loader: &WeightLoader,
-        tekken_path: &std::path::Path,
+        tekken: Tekken,
         max_tokens: usize,
         device: &B::Device,
-    ) -> anyhow::Result<Self> {
-        Ok(Self {
+    ) -> Self {
+        Self {
             mel: VoxtralMel::new(device),
             encoder: AudioEncoder::load(loader, max_tokens * DOWNSAMPLE, device),
             decoder: Decoder::load(loader, max_tokens, device),
-            tekken: Tekken::load(tekken_path)?,
+            tekken,
             device: device.clone(),
-        })
+        }
     }
 
     /// Offline transcription of a full 16 kHz clip at the given delay.
