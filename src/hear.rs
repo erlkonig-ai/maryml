@@ -1,9 +1,9 @@
 //! `mary::hear` — the production ears seam: Voxtral-Mini-4B-Realtime
 //! streaming speech-to-text, loaded whole from one native model pile (the
 //! exact/f16 weight cohort AND the Tekken tokenizer, see the `voxtral_persist`
-//! bin), running the folded f16 realtime lane on the hearing backend
-//! ([`crate::nn::backend::hear`]: CUDA under `voxtral-cuda`, the wgpu lane
-//! otherwise).
+//! bin), running the folded f16 realtime layout on the hearing backend
+//! ([`crate::nn::backend::hear`]: raw CUDA under `voxtral-cuda`, the fused
+//! wgpu lane otherwise; see [`Backend`]).
 //!
 //! One [`Ears`] per process holds the model; each utterance or stream is a
 //! [`Listening`] borrowed from it. Feed 16 kHz mono f32 samples with
@@ -25,7 +25,15 @@ use crate::models::voxtral::pipeline::StreamingTranscriber;
 use crate::models::voxtral::tokenizer::Tekken;
 use crate::nn::backend::hear;
 
-/// The backend the ears run on: the folded layout on fusion f16.
+/// The backend the ears run on, always the folded f16 layout. On CUDA it is
+/// the raw (unfused) backend: on sky (GB10) it measured p50 263-267 / p95
+/// 281-284 ms of compute per 80 ms frame against 282 / 302-309 for the fusion
+/// backend (voxtral_listen `--lane rawhalf` vs `--lane half`, warm passes, same
+/// clip). Elsewhere it stays the fusion backend, the lane the Mac measured
+/// realtime on.
+#[cfg(feature = "voxtral-cuda")]
+pub type Backend = hear::RawHalf;
+#[cfg(not(feature = "voxtral-cuda"))]
 pub type Backend = hear::FusedHalf;
 
 /// Decoder positions one [`Listening`] may use: the RoPE tables are built for
