@@ -119,6 +119,17 @@ fn mini_geometry_has_biases_ordinary_qwen2_shapes_and_large_ffn() {
         })
         .unwrap();
     assert_eq!(count, 339);
+    json["text_config"]["use_sliding_window"] = true.into();
+    assert!(Config::from_json(&json).is_err());
+    json["text_config"]["use_sliding_window"] = false.into();
+    assert!(Config::from_json(&json).is_ok());
+    json["text_config"]["tie_word_embeddings"] = true.into();
+    assert!(Config::from_json(&json).is_err());
+    json["text_config"]["tie_word_embeddings"] = false.into();
+    json["text_config"]["layer_types"] = serde_json::json!(["sliding_attention"]);
+    assert!(Config::from_json(&json).is_err());
+    json["text_config"]["layer_types"] = serde_json::json!(["full_attention"]);
+    assert!(Config::from_json(&json).is_ok());
     json["model_type"] = "qwen3_5".into();
     assert!(Config::from_json(&json).is_err());
 }
@@ -331,4 +342,40 @@ fn actual_pinned_tokenizer_cold_reopen() {
     )
     .unwrap();
     compare_codec(&bytes, &assets.codec);
+}
+
+#[test]
+#[ignore = "explicit imported pile and artifact IDs only; no checkpoint or GPU"]
+fn imported_decoder_cold_reopen() {
+    assert!(std::env::var_os("STEP_AUDIO2_CHECKPOINT").is_none());
+    let path = PathBuf::from(std::env::var_os("STEP_AUDIO2_PILE").expect("explicit model pile"));
+    let read_id =
+        |name: &str| Id::from_hex(&std::env::var(name).expect("explicit stored ID")).unwrap();
+    let ids = load::Artifacts {
+        model_root: read_id("STEP_AUDIO2_MODEL_ROOT"),
+        config_root: read_id("STEP_AUDIO2_CONFIG_ROOT"),
+        tokenizer_asset: read_id("STEP_AUDIO2_TOKENIZER_ASSET"),
+    };
+    let source = crate::persist::read_model_pile_read_only(&path).unwrap();
+    let assets = load::Assets::from_frozen(&source.facts, &source.store, ids).unwrap();
+    load::validate_decoder(&source.facts, &source.store, ids.model_root, &assets.config).unwrap();
+    let prompt = assets
+        .codec
+        .speech_prompt("Speak softly.", "Hello.")
+        .unwrap();
+    assert_eq!(prompt.first(), Some(&BOT));
+    assert_eq!(prompt.last(), Some(&TTS_START));
+    assert_eq!(
+        assets
+            .codec
+            .decode_tokens(&[AUDIO_START + 123], true)
+            .unwrap(),
+        "<audio_123>"
+    );
+    eprintln!(
+        "cold native decoder: {} parameters; {} prompt IDs; selected model {:X}",
+        assets.config.parameter_count().unwrap(),
+        prompt.len(),
+        ids.model_root
+    );
 }
