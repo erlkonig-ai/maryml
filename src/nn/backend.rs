@@ -60,7 +60,7 @@ pub mod speak {
 /// `voxtral-cuda` selects CUDA — on the GB10 the wgpu lane is Vulkan, with no
 /// tensor cores under it (see [`speak`]); without the feature these are the
 /// wgpu aliases above, so the Mac's Metal lane and any Linux build that does
-/// not opt in are unchanged. voxtral_listen runs its lanes on it.
+/// not opt in are unchanged. `mary::hear` and voxtral_listen run on it.
 #[cfg(all(feature = "voxtral", feature = "voxtral-cuda"))]
 pub mod hear {
     pub use burn::backend::cuda::CudaDevice as Device;

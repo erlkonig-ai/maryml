@@ -26,6 +26,10 @@ pub mod format;
 /// so every format lands in one content-addressed graph. Import-only.
 #[cfg(feature = "import")]
 pub mod formats;
+/// In-process Voxtral-Mini-4B-Realtime speech-to-text (the production ears):
+/// weights and tokenizer from one native pile, 16 kHz samples in, text out.
+#[cfg(feature = "voxtral")]
+pub mod hear;
 pub mod ingest;
 /// A checkpoint's JSON sidecars — `config.json`, `hf_quant_config.json`, the
 /// chat template — as FACTS rather than stored files, so a pile stops needing
