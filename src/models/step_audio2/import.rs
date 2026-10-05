@@ -141,8 +141,11 @@ pub fn ingest_checkpoint(pile: &mut Pile, directory: &Path, revision: &str) -> R
         config_root,
         tokenizer_asset,
     };
-    load::validate_decoder(fragment.facts(), pile, model_root, &config)?;
-    load::Assets::from_frozen(fragment.facts(), pile, artifacts)?;
+    let observation = pile
+        .snapshot()
+        .context("freeze imported blob observation")?;
+    load::validate_decoder(fragment.facts(), &observation, model_root, &config)?;
+    load::Assets::from_frozen(fragment.facts(), &observation, artifacts)?;
     Ok(Candidate {
         fragment,
         artifacts,
