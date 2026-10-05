@@ -161,8 +161,10 @@ impl VoxtralWeights<PileSnapshot> {
     /// Consume the validated cohort into the platform's lazy runtime loader.
     ///
     /// macOS uses one `AliasedPile` over the shared reader. Other platforms
-    /// materialize the exact index into the existing portable pile loader,
-    /// visiting the source mapping one tensor at a time.
+    /// load from the exact index's typed leaves, which view the pile's mapping:
+    /// each tensor is decoded when the model asks for it, so the host holds
+    /// one tensor's f32 copy at a time. Materializing the whole index up front
+    /// held all 4.43 G elements as f32 (16.5 GiB) before the first upload.
     pub fn into_loader(self) -> WeightLoader {
         #[cfg(target_os = "macos")]
         {
@@ -174,12 +176,7 @@ impl VoxtralWeights<PileSnapshot> {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let keymap = self
-                .exact
-                .into_iter()
-                .map(|(name, leaf)| (name, leaf.to_f32_shape()))
-                .collect();
-            WeightLoader::Pile(keymap)
+            WeightLoader::Typed(self.exact)
         }
     }
 }
