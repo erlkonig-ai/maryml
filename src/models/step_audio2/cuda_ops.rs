@@ -467,11 +467,8 @@ pub(super) fn greedy(logits: &Tensor) -> Result<u32, String> {
         .client
         .read_one(out)
         .map_err(|e| format!("CUDA token readback: {e:?}"))?;
-    let id = u32::from_ne_bytes(
-        bytes[..4]
-            .try_into()
-            .map_err(|_| "short CUDA token readback")?,
-    );
+    let word = bytes.get(..4).ok_or("short CUDA token readback")?;
+    let id = u32::from_ne_bytes(word.try_into().map_err(|_| "short CUDA token readback")?);
     if id == u32::MAX {
         return Err("nonfinite CUDA logits; generation refused".into());
     }
