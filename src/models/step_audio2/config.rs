@@ -36,6 +36,18 @@ impl Config {
             text.get("tie_word_embeddings").is_none_or(|v| v == false),
             "Step requires an untied LM head"
         );
+        ensure!(
+            text.get("use_sliding_window").is_none_or(|v| v == false),
+            "sliding-window attention is unsupported"
+        );
+        if let Some(layers) = text.get("layer_types") {
+            ensure!(
+                layers
+                    .as_array()
+                    .is_some_and(|layers| layers.iter().all(|v| v == "full_attention")),
+                "only full causal attention layers are supported"
+            );
+        }
         if let Some(groups) = text.get("num_attention_groups") {
             ensure!(
                 groups == &text["num_key_value_heads"],
