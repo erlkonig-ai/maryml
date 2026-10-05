@@ -107,8 +107,7 @@ impl Listening<'_> {
     /// Feed 16 kHz mono samples; returns the text that became final. Samples
     /// past the position budget are dropped and [`Self::is_full`] turns true.
     pub fn push(&mut self, samples: &[f32]) -> String {
-        let room = self.budget - self.accepted;
-        let samples = &samples[..samples.len().min(room)];
+        let samples = &samples[..samples.len().min(self.room())];
         self.accepted += samples.len();
         self.feed(samples)
     }
@@ -134,6 +133,12 @@ impl Listening<'_> {
     /// new [`Ears::listen`] to keep listening.
     pub fn is_full(&self) -> bool {
         self.accepted == self.budget
+    }
+
+    /// Samples [`Self::push`] still accepts, so a caller can hand the rest
+    /// of its audio to the next stream instead of losing it.
+    pub fn room(&self) -> usize {
+        self.budget - self.accepted
     }
 
     /// Everything transcribed so far.
