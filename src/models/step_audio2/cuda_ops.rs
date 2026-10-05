@@ -23,7 +23,7 @@ fn tensor(t: &Tensor, shape: &[usize], handle: cubecl::server::Handle) -> Tensor
     )
 }
 pub(super) fn reshape(t: Tensor, shape: &[usize]) -> Tensor {
-    assert_eq!(count(&t), shape.iter().product());
+    assert_eq!(count(&t), shape.iter().product::<usize>());
     CubeTensor::new_contiguous(t.client, t.device, shape.into(), t.handle, t.dtype)
 }
 
@@ -43,7 +43,7 @@ fn gather_kernel(
 pub(super) fn gather(weight: &Tensor, ids: &[u32]) -> Tensor {
     let h = weight.meta.shape()[1];
     let n = ids.len() * h;
-    let input = weight.client.create(u32::as_bytes(ids));
+    let input = weight.client.create_from_slice(u32::as_bytes(ids));
     let out = weight.client.empty(n * 2);
     // SAFETY: caller checks all IDs against vocabulary and bounded [T,H].
     unsafe {
@@ -274,7 +274,7 @@ fn score_kernel(
         let key = i % total;
         let token = row / heads;
         let kh = (row % heads) / (heads / kv);
-        let mut value = -3.4028235e38f32;
+        let mut value = f32::cast_from(-3.4028235e38f32);
         if key <= past + token {
             let mut sum = 0.0f32;
             for j in 0..d {
@@ -297,7 +297,7 @@ fn softmax_kernel(
     let row = ABSOLUTE_POS as usize;
     if row < rows {
         let available = past + row / heads + 1;
-        let mut max = -3.4028235e38f32;
+        let mut max = f32::cast_from(-3.4028235e38f32);
         for key in 0..available {
             let value = scores[row * total + key];
             if value > max {
@@ -428,7 +428,7 @@ pub(super) fn last(x: &Tensor) -> Tensor {
 #[cube(launch_unchecked)]
 fn argmax_kernel(logits: &Array<bf16>, out: &mut Array<u32>, vocab: usize) {
     if ABSOLUTE_POS == 0 {
-        let mut best = -3.4028235e38f32;
+        let mut best = f32::cast_from(-3.4028235e38f32);
         let mut index = 0u32;
         let mut invalid = false;
         for i in 0..vocab {
@@ -488,7 +488,7 @@ pub(super) fn smoke() -> Result<(), String> {
             client.clone(),
             device.clone(),
             shape.into(),
-            client.create(bf16::as_bytes(&values)),
+            client.create_from_slice(bf16::as_bytes(&values)),
             DType::BF16,
         )
     };
