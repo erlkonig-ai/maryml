@@ -4,17 +4,23 @@
 //! benchmarks):
 //!   cargo run --release --features voxtral --bin voxtral_listen -- \
 //!     [--pile <voxtral_native.pile>] --wav clip.wav [--delay-ms 480] \
-//!     [--chunk-ms 80] [--fast] [--expect-text file.txt] [--lane half]
+//!     [--chunk-ms 80] [--fast] [--expect-text file.txt] [--lane half] [--passes N]
 //!
-//! Lanes (one backend per process — two fusion runtimes thrash each other):
-//!   raw      parity-first layout on the raw Metal f32 backend (trust anchor)
+//! `--passes N` streams the clip N times, each a fresh stream over the same
+//! loaded model, with a report per pass: pass 1 carries the kernel compiles
+//! and autotune, later passes are the warm steady state.
+//!
+//! Lanes (one backend per process — two fusion runtimes thrash each other).
+//! The backend family is `nn::backend::hear`: CUDA when built with
+//! `voxtral-cuda`, wgpu (Metal on the Mac, Vulkan on Linux) otherwise.
+//!   raw      parity-first layout on the raw f32 backend (trust anchor)
 //!   fused    same layout on the fusion-wrapped f32 backend
 //!   fold     folded fast layout (wide qkv, norms in matmul rows), fusion f32
 //!   half     folded fast layout, fusion f16 (default — the realtime lane)
-//!   rawhalf  folded fast layout, RAW (unfused) Metal f16 — loads ZERO-COPY:
-//!            f16 leaves alias the native collection mmap straight onto the GPU
-//!            (fold sources + the embed table; folded results are new GPU
-//!            buffers, the embed stays file-backed for the process life)
+//!   rawhalf  folded fast layout, RAW (unfused) f16 — on the Mac it loads
+//!            ZERO-COPY: f16 leaves alias the native collection mmap straight
+//!            onto the GPU (fold sources + the embed table; folded results are
+//!            new GPU buffers, the embed stays file-backed for the process life)
 //!
 //! The Tekken tokenizer is read from the same pile as the weights.
 //!
@@ -35,7 +41,7 @@ use mary::models::voxtral::pipeline::{
     StreamedToken, StreamingTranscriber, SttPipeline, Transcriber,
 };
 use mary::models::voxtral::tokenizer::Tekken;
-use mary::nn::backend::{B, BFused, BFusedHalf, BHalf};
+use mary::nn::backend::hear;
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -58,6 +64,7 @@ struct Args {
     delay_ms: usize,
     chunk_ms: usize,
     fast: bool,
+    passes: usize,
     wav: Option<String>,
     expect_text: Option<String>,
     mic: bool,
@@ -79,6 +86,7 @@ fn main() -> anyhow::Result<()> {
         delay_ms: arg("--delay-ms").map(|s| s.parse().unwrap()).unwrap_or(480),
         chunk_ms: arg("--chunk-ms").map(|s| s.parse().unwrap()).unwrap_or(80),
         fast: flag("--fast"),
+        passes: arg("--passes").map(|s| s.parse().unwrap()).unwrap_or(1),
         wav: arg("--wav"),
         expect_text: arg("--expect-text"),
         mic: flag("--mic") || arg("--mic-device").is_some(),
@@ -86,7 +94,7 @@ fn main() -> anyhow::Result<()> {
     };
     let lane = arg("--lane").unwrap_or_else(|| "half".into());
 
-    let dev = Default::default();
+    let dev = hear::Device::default();
     eprintln!(
         "[listen] loading stt from {:?} (lane {lane}) ...",
         args.pile
@@ -98,7 +106,7 @@ fn main() -> anyhow::Result<()> {
     let max_tokens = 8192;
     match lane.as_str() {
         "raw" => {
-            let stt = Transcriber::<B>::load(&loader, tekken, max_tokens, &dev);
+            let stt = Transcriber::<hear::Raw>::load(&loader, tekken, max_tokens, &dev);
             drop(loader);
             eprintln!(
                 "[listen] loaded in {:.1}s; delay {} ms",
@@ -108,7 +116,7 @@ fn main() -> anyhow::Result<()> {
             go(&stt, &args)
         }
         "fused" => {
-            let stt = Transcriber::<BFused>::load(&loader, tekken, max_tokens, &dev);
+            let stt = Transcriber::<hear::Fused>::load(&loader, tekken, max_tokens, &dev);
             drop(loader);
             eprintln!(
                 "[listen] loaded in {:.1}s; delay {} ms",
@@ -118,7 +126,7 @@ fn main() -> anyhow::Result<()> {
             go(&stt, &args)
         }
         "fold" => {
-            let stt = RealtimeTranscriber::<BFused>::load(&loader, tekken, max_tokens, &dev);
+            let stt = RealtimeTranscriber::<hear::Fused>::load(&loader, tekken, max_tokens, &dev);
             drop(loader);
             eprintln!(
                 "[listen] loaded in {:.1}s; delay {} ms",
@@ -128,7 +136,8 @@ fn main() -> anyhow::Result<()> {
             go(&stt, &args)
         }
         "half" => {
-            let stt = RealtimeTranscriber::<BFusedHalf>::load(&loader, tekken, max_tokens, &dev);
+            let stt =
+                RealtimeTranscriber::<hear::FusedHalf>::load(&loader, tekken, max_tokens, &dev);
             drop(loader);
             eprintln!(
                 "[listen] loaded in {:.1}s; delay {} ms",
@@ -138,7 +147,7 @@ fn main() -> anyhow::Result<()> {
             go(&stt, &args)
         }
         "rawhalf" => {
-            let stt = RealtimeTranscriber::<BHalf>::load(&loader, tekken, max_tokens, &dev);
+            let stt = RealtimeTranscriber::<hear::RawHalf>::load(&loader, tekken, max_tokens, &dev);
             drop(loader);
             eprintln!(
                 "[listen] loaded in {:.1}s; delay {} ms",
@@ -152,73 +161,14 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn go<B: burn::prelude::Backend, O: SttPipeline<B>>(stt: &O, args: &Args) -> anyhow::Result<()> {
-    let mut stream = StreamingTranscriber::new(stt, args.delay_ms);
-    let mut emitted: Vec<StreamedToken> = Vec::new();
-    let print_tokens = |stt: &O, toks: Vec<StreamedToken>, sink: &mut Vec<StreamedToken>| {
-        for t in toks {
-            let piece = stt.tekken().decode(&[t.id]);
-            print!("{piece}");
-            std::io::stdout().flush().ok();
-            sink.push(t);
-        }
-    };
-
     if let Some(wav_path) = &args.wav {
         let (audio, sr) = wav::read_pcm16_mono(std::path::Path::new(&wav_path));
         anyhow::ensure!(sr == 16000, "expected 16 kHz wav, got {sr}");
-        let chunk = SAMPLE_RATE * args.chunk_ms / 1000;
-        let chunk_ms = args.chunk_ms;
-        eprintln!(
-            "[listen] streaming {wav_path} ({:.1}s) in {chunk_ms} ms chunks{}",
-            audio.len() as f32 / SAMPLE_RATE as f32,
-            if args.fast {
-                " (unpaced)"
-            } else {
-                " (real-time paced)"
+        for pass in 1..=args.passes {
+            if args.passes > 1 {
+                eprintln!("[listen] pass {pass}/{}", args.passes);
             }
-        );
-        // warm the pipeline shapes (JIT/autotune) on the silence prefix
-        let toks = stream.push(&[]);
-        print_tokens(stt, toks, &mut emitted);
-
-        // After the clip, stream the same trailing silence the OFFLINE path
-        // right-pads with (align + delay+1+10 tokens) — the delayed tokens
-        // catch up and the transcript is comparable to the offline oracle.
-        let n_delay = args.delay_ms / 80;
-        let align = (SAMPLES_PER_TOK - (audio.len() % SAMPLES_PER_TOK)) % SAMPLES_PER_TOK;
-        let tail = align + (n_delay + 1 + OFFLINE_BUFFER_TOKENS) * SAMPLES_PER_TOK + N_FFT / 2;
-        let mut feed: Vec<f32> = Vec::with_capacity(audio.len() + tail);
-        feed.extend_from_slice(&audio);
-        feed.extend(std::iter::repeat(0f32).take(tail));
-
-        let wall0 = std::time::Instant::now();
-        let mut fed = 0usize;
-        while fed < feed.len() && !stream.is_finished() {
-            let end = (fed + chunk).min(feed.len());
-            if !args.fast {
-                // pace: chunk i may not be fed before wall time i*chunk_ms
-                let due = wall0 + std::time::Duration::from_millis((fed / chunk * chunk_ms) as u64);
-                if let Some(wait) = due.checked_duration_since(std::time::Instant::now()) {
-                    std::thread::sleep(wait);
-                }
-            }
-            let toks = stream.push(&feed[fed..end]);
-            print_tokens(stt, toks, &mut emitted);
-            fed = end;
-        }
-        println!();
-        report(&emitted, args.delay_ms);
-
-        if let Some(expect) = &args.expect_text {
-            let want = std::fs::read_to_string(expect)?;
-            let got = stream.text();
-            let (wa, hits, total) = word_accuracy(&got, &want);
-            println!(
-                "[listen] word match vs {expect}: {hits}/{total} = {wa:.1}% \
-                 (online mode has no right-pad; tail words may differ from the offline oracle)"
-            );
-            println!("[listen] ours:   {got:?}");
-            println!("[listen] oracle: {:?}", want.trim());
+            stream_file(stt, args, wav_path, &audio)?;
         }
         return Ok(());
     }
@@ -234,6 +184,82 @@ fn go<B: burn::prelude::Backend, O: SttPipeline<B>>(stt: &O, args: &Args) -> any
     }
 
     anyhow::bail!("pass --wav <file> or --mic (mic requires --features voxtral,listen)");
+}
+
+/// One fresh stream over the whole clip plus the offline path's trailing
+/// silence, with the latency report and the optional word check.
+fn stream_file<B: burn::prelude::Backend, O: SttPipeline<B>>(
+    stt: &O,
+    args: &Args,
+    wav_path: &str,
+    audio: &[f32],
+) -> anyhow::Result<()> {
+    let mut stream = StreamingTranscriber::new(stt, args.delay_ms);
+    let mut emitted: Vec<StreamedToken> = Vec::new();
+    let print_tokens = |stt: &O, toks: Vec<StreamedToken>, sink: &mut Vec<StreamedToken>| {
+        for t in toks {
+            let piece = stt.tekken().decode(&[t.id]);
+            print!("{piece}");
+            std::io::stdout().flush().ok();
+            sink.push(t);
+        }
+    };
+
+    let chunk = SAMPLE_RATE * args.chunk_ms / 1000;
+    let chunk_ms = args.chunk_ms;
+    eprintln!(
+        "[listen] streaming {wav_path} ({:.1}s) in {chunk_ms} ms chunks{}",
+        audio.len() as f32 / SAMPLE_RATE as f32,
+        if args.fast {
+            " (unpaced)"
+        } else {
+            " (real-time paced)"
+        }
+    );
+    // warm the pipeline shapes (JIT/autotune) on the silence prefix
+    let toks = stream.push(&[]);
+    print_tokens(stt, toks, &mut emitted);
+
+    // After the clip, stream the same trailing silence the OFFLINE path
+    // right-pads with (align + delay+1+10 tokens) — the delayed tokens
+    // catch up and the transcript is comparable to the offline oracle.
+    let n_delay = args.delay_ms / 80;
+    let align = (SAMPLES_PER_TOK - (audio.len() % SAMPLES_PER_TOK)) % SAMPLES_PER_TOK;
+    let tail = align + (n_delay + 1 + OFFLINE_BUFFER_TOKENS) * SAMPLES_PER_TOK + N_FFT / 2;
+    let mut feed: Vec<f32> = Vec::with_capacity(audio.len() + tail);
+    feed.extend_from_slice(audio);
+    feed.extend(std::iter::repeat(0f32).take(tail));
+
+    let wall0 = std::time::Instant::now();
+    let mut fed = 0usize;
+    while fed < feed.len() && !stream.is_finished() {
+        let end = (fed + chunk).min(feed.len());
+        if !args.fast {
+            // pace: chunk i may not be fed before wall time i*chunk_ms
+            let due = wall0 + std::time::Duration::from_millis((fed / chunk * chunk_ms) as u64);
+            if let Some(wait) = due.checked_duration_since(std::time::Instant::now()) {
+                std::thread::sleep(wait);
+            }
+        }
+        let toks = stream.push(&feed[fed..end]);
+        print_tokens(stt, toks, &mut emitted);
+        fed = end;
+    }
+    println!();
+    report(&emitted, args.delay_ms);
+
+    if let Some(expect) = &args.expect_text {
+        let want = std::fs::read_to_string(expect)?;
+        let got = stream.text();
+        let (wa, hits, total) = word_accuracy(&got, &want);
+        println!(
+            "[listen] word match vs {expect}: {hits}/{total} = {wa:.1}% \
+             (online mode has no right-pad; tail words may differ from the offline oracle)"
+        );
+        println!("[listen] ours:   {got:?}");
+        println!("[listen] oracle: {:?}", want.trim());
+    }
+    Ok(())
 }
 
 fn report(emitted: &[StreamedToken], delay_ms: usize) {

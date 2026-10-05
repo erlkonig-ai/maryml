@@ -332,6 +332,11 @@ speak = ["qwen3tts", "predictor-gpu", "megakernel"]
 # already unconditional); fusion deps for the BFused decode loop; memmap2
 # for the rawhalf lane's zero-copy leaf aliasing (MmapRaw owner downcast).
 voxtral = ["dep:burn-fusion", "dep:burn-cubecl", "dep:memmap2"]
+# Voxtral on CUDA: `nn::backend::hear` (what voxtral_listen's lanes run on)
+# becomes CubeBackend<CudaRuntime, ..> instead of the wgpu aliases. Opt-in
+# rather than target-implied: the wgpu lane stays buildable and measurable on
+# the same Linux box.
+voxtral-cuda = ["voxtral", "dep:cubecl", "cubecl?/cuda", "burn/cuda"]
 # Construct a `tokenizers::Tokenizer` DIRECTLY from a tokenizer graph
 # (mary::tokenizer::build_tokenizer + persist::load_tokenizer_from_pile) —
 # the load half of tokenizers-as-tribles: no tokenizer.json anywhere in the

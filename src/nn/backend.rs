@@ -55,3 +55,25 @@ pub mod speak {
     pub type Fused = super::BFused;
     pub type FusedHalf = super::BFusedHalf;
 }
+
+/// The EARS' backend family (Voxtral): the same five names as [`speak`].
+/// `voxtral-cuda` selects CUDA — on the GB10 the wgpu lane is Vulkan, with no
+/// tensor cores under it (see [`speak`]); without the feature these are the
+/// wgpu aliases above, so the Mac's Metal lane and any Linux build that does
+/// not opt in are unchanged. voxtral_listen runs its lanes on it.
+#[cfg(all(feature = "voxtral", feature = "voxtral-cuda"))]
+pub mod hear {
+    pub use burn::backend::cuda::CudaDevice as Device;
+    pub type Raw = burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime, f32, i32, u8>;
+    pub type RawHalf = burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime, half::f16, i32, u8>;
+    pub type Fused = burn_fusion::Fusion<Raw>;
+    pub type FusedHalf = burn_fusion::Fusion<RawHalf>;
+}
+#[cfg(all(feature = "voxtral", not(feature = "voxtral-cuda")))]
+pub mod hear {
+    pub use super::WgpuDevice as Device;
+    pub type Raw = super::B;
+    pub type RawHalf = super::BHalf;
+    pub type Fused = super::BFused;
+    pub type FusedHalf = super::BFusedHalf;
+}
