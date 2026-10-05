@@ -55,9 +55,15 @@ impl MiniCodec {
         );
         let tokenizer = tokenizers::Tokenizer::from_bytes(bytes)
             .map_err(|e| anyhow::anyhow!("decode stored tokenizer: {e}"))?;
+        // Upstream tokenizes each message as a batch of one with padding=True.
+        // Its serialized BatchLongest padding is therefore a no-op. Fixed or
+        // multiple-of padding would change the prompt; truncation would lose it.
         ensure!(
-            tokenizer.get_padding().is_none() && tokenizer.get_truncation().is_none(),
-            "Mini codec does not enable implicit padding/truncation"
+            tokenizer.get_padding().is_none_or(|p| {
+                matches!(p.strategy, tokenizers::PaddingStrategy::BatchLongest)
+                    && p.pad_to_multiple_of.is_none()
+            }) && tokenizer.get_truncation().is_none(),
+            "Mini codec requires untruncated single-message tokenization without added padding"
         );
         for (spelling, id) in [
             ("<|BOT|>", BOT),
