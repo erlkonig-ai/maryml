@@ -115,9 +115,16 @@ impl Listening<'_> {
     /// with) and return the remaining text, including any incomplete
     /// character as replacement text.
     pub fn finish(mut self) -> String {
+        self.finish_inner()
+    }
+
+    fn finish_inner(&mut self) -> String {
         let align = (SAMPLES_PER_TOK - self.accepted % SAMPLES_PER_TOK) % SAMPLES_PER_TOK;
         let tail = align + (self.n_delay + 1 + OFFLINE_BUFFER_TOKENS) * SAMPLES_PER_TOK + N_FFT / 2;
-        let mut text = self.feed(&vec![0.0; tail]);
+        for token in self.stream.push_finish(&vec![0.0; tail]) {
+            self.pending.extend_from_slice(self.tekken.piece(token.id));
+        }
+        let mut text = take_complete_utf8(&mut self.pending);
         text.push_str(&String::from_utf8_lossy(&self.pending));
         text
     }
@@ -216,6 +223,100 @@ mod tests {
             pending, b"\xe2\x82",
             "an incomplete euro sign keeps waiting"
         );
+    }
+
+    #[test]
+    #[cfg(all(feature = "voxtral-cuda", feature = "breeze"))]
+    #[ignore = "one Ears load, four admitted segments with eager/grouped finish host counters; separately admitted"]
+    fn loaded_tail_block_four_segments() -> anyhow::Result<()> {
+        use std::{fs::OpenOptions, io::Write, time::Instant};
+        use sha2::{Digest, Sha256};
+        let pile = std::env::var("MARY_HEARING_TAIL_BLOCK_PILE")?;
+        let wav = std::env::var("MARY_HEARING_TAIL_BLOCK_WAV")?;
+        let output = std::env::var("MARY_HEARING_TAIL_BLOCK_REPORT")?;
+        let mut file = OpenOptions::new().write(true).create_new(true).open(output)?;
+        let bytes = std::fs::read(&wav)?;
+        let wav_hash = format!("{:x}", Sha256::digest(&bytes));
+        anyhow::ensure!(wav_hash == "ff1f2b743163a4039d4dea695d617b2b7fd1073ca67cab164eedf762e4eeacb0",
+            "not the admitted WAV");
+        let (pcm,sr) = crate::models::f5::wav::read_pcm16_mono(Path::new(&wav));
+        anyhow::ensure!(sr==16000,"expected16k PCM");
+        let started = Instant::now();
+        let ears = Ears::load(Path::new(&pile))?;
+        let load_seconds = started.elapsed().as_secs_f64();
+        writeln!(file,"{}",serde_json::json!({"kind":"load","pile":pile,
+            "wav_sha256":wav_hash,"load_stock_warmup_seconds":load_seconds,
+            "scope":"host-only counters; stock warmup also exercises eligible grouped finish"}))?;
+        file.flush()?;
+        let mut rows = Vec::new();
+        for (index,(start,end)) in [(12160,23680),(32960,87680),(96000,146880),(158720,183360)]
+            .into_iter().enumerate() {
+            let samples = &pcm[start..end];
+            let mut hash = Sha256::new();
+            for sample in samples { hash.update(sample.to_le_bytes()); }
+            let sample_hash = format!("{:x}",hash.finalize());
+            for eager in [true,false] {
+                let api_start = Instant::now();
+                let mut listening = ears.listen(480);
+                let mut text = listening.push(samples);
+                let push_api_seconds = api_start.elapsed().as_secs_f64();
+                let before = listening.stream.tail_block_test_state();
+                let accepted = listening.accepted;
+                let cap = listening.is_full();
+                let align = (SAMPLES_PER_TOK-accepted%SAMPLES_PER_TOK)%SAMPLES_PER_TOK;
+                let tail = align+(listening.n_delay+1+OFFLINE_BUFFER_TOKENS)*SAMPLES_PER_TOK+N_FFT/2;
+                let finish_start = Instant::now();
+                let rest = if eager {
+                    // Literal old finish policy, compiled only into this test.
+                    let mut rest = listening.feed(&vec![0.0;tail]);
+                    rest.push_str(&String::from_utf8_lossy(&listening.pending));
+                    rest
+                } else {
+                    listening.finish_inner()
+                };
+                let after = listening.stream.tail_block_test_state();
+                drop(listening);
+                let finish_seconds = finish_start.elapsed().as_secs_f64();
+                text.push_str(&rest);
+                let row = serde_json::json!({"kind":"finish","segment":index,
+                    "policy":if eager {"old_eager"} else {"grouped"},
+                    "samples":samples.len(),"start_sample":start,"pcm_f32le_sha256":sample_hash,
+                    "accepted":accepted,"cap_before":cap,"delay_ms":480,"padding_budget":tail,
+                    "padding_fed":after.samples-before.samples,"encoded_delta":after.encoded-before.encoded,
+                    "encoder_calls_delta":after.encoder_calls-before.encoder_calls,
+                    "projector_calls_delta":after.projector_calls-before.projector_calls,
+                    "grouped_finishes_delta":after.grouped_finishes-before.grouped_finishes,
+                    "decoder_steps_delta":after.decoder_steps-before.decoder_steps,
+                    "before":before,"after":after,"raw_text":text,
+                    "push_api_seconds":push_api_seconds,"finish_seconds":finish_seconds,
+                    "api_seconds":push_api_seconds+finish_seconds});
+                writeln!(file,"{row}")?;
+                file.flush()?;
+                println!("TAIL_BLOCK_WITNESS {row}");
+                rows.push(row);
+            }
+        }
+        // Keep all raw evidence before route/state assertions; no words/speedup
+        // gate or tensor synchronization is hidden in these host-only checks.
+        for pair in rows.chunks_exact(2) {
+            for (i,row) in pair.iter().enumerate() {
+                anyhow::ensure!(row["cap_before"]==false && row["accepted"]==row["samples"],
+                    "input cap/acceptance changed");
+                anyhow::ensure!(row["padding_fed"]==row["padding_budget"],"padding not fully offered");
+                anyhow::ensure!(row["encoded_delta"]==18 && row["projector_calls_delta"]==18,
+                    "frontend/projector step count changed");
+                anyhow::ensure!(row["encoder_calls_delta"]==if i==0 {18} else {1},
+                    "wrong encoder call count");
+                anyhow::ensure!(row["grouped_finishes_delta"]==if i==0 {0} else {1},
+                    "finish specialization not selected as expected");
+                let before = row["before"]["encoder_positions"].as_array().unwrap();
+                let after = row["after"]["encoder_positions"].as_array().unwrap();
+                anyhow::ensure!(before.len()==32 && after.len()==32,"wrong layer count");
+                anyhow::ensure!(before.iter().zip(after).all(|(a,b)|
+                    b.as_u64().unwrap()==a.as_u64().unwrap()+72),"encoder positions changed");
+            }
+        }
+        Ok(())
     }
 
     #[test]

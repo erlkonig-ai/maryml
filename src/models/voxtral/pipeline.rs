@@ -266,6 +266,8 @@ pub struct StreamedToken {
     /// Wall time spent producing this token's audio embed (mel + stem +
     /// encoder step + projector — host submission; the GPU drain lands in
     /// `dec_ms`'s sync). The first emission carries the whole prompt's worth.
+    /// A grouped finish charges its shared frontend/encoder/projector submission
+    /// once to the first tail emission; later embeds in that block carry zero.
     pub enc_ms: f32,
     /// Wall time of the decoder step through the argmax readback (the
     /// per-frame GPU sync). First emission = prefill.
@@ -297,6 +299,12 @@ pub struct StreamingTranscriber<'a, B: Backend, O: SttPipeline<B>> {
     queue: std::collections::VecDeque<(Tensor<B, 3>, Instant, f32)>,
     pub tokens: Vec<u32>, // full sequence: prompt + generated
     finished: bool,       // saw EOS
+    #[cfg(test)]
+    encoder_calls: usize,
+    #[cfg(test)]
+    projector_calls: usize,
+    #[cfg(test)]
+    grouped_finishes: usize,
 }
 
 /// Immutable encoder-only silence prefix belonging to one loaded model/device
@@ -321,6 +329,12 @@ impl<'a, B: Backend, O: SttPipeline<B>> StreamingTranscriber<'a, B, O> {
             queue: std::collections::VecDeque::new(),
             tokens: Vec::new(),
             finished: false,
+            #[cfg(test)]
+            encoder_calls: 0,
+            #[cfg(test)]
+            projector_calls: 0,
+            #[cfg(test)]
+            grouped_finishes: 0,
             stt,
         }
     }
@@ -360,6 +374,56 @@ impl<'a, B: Backend, O: SttPipeline<B>> StreamingTranscriber<'a, B, O> {
         self.finished
     }
 
+    /// Finish-only specialization: same finite padding, frontend windows and
+    /// projector groups, but one causal encoder block for the known18-step tail.
+    /// All other requests retain push's exact original schedule.
+    pub(crate) fn push_finish(&mut self, new_samples: &[f32]) -> Vec<StreamedToken> {
+        let total = self.samples.len() + new_samples.len();
+        let ready = total.saturating_sub(N_FFT / 2 + 7 * HOP) / SAMPLES_PER_TOK + 1;
+        if self.finished || self.tokens.is_empty() || !self.queue.is_empty()
+            || self.prompt != prompt_ids(delay_tokens(480))
+            || ready.saturating_sub(self.tokens_encoded) != 18 {
+            return self.push(new_samples);
+        }
+        self.samples.extend_from_slice(new_samples);
+        let available = Instant::now();
+        let stems: Vec<_> = (0..18).map(|i| self.stem_step(self.tokens_encoded + i)).collect();
+        let hidden = self.stt.encode(Tensor::cat(stems, 1), &mut self.enc_caches);
+        #[cfg(test)]
+        { self.encoder_calls += 1; self.grouped_finishes += 1; }
+        for i in 0..18 {
+            // Keep each L4 projector's stacking and matmul shape unchanged.
+            let projected = self.stt.project(hidden.clone().narrow(1, i * DOWNSAMPLE, DOWNSAMPLE));
+            self.queue.push_back((projected, available, 0.0));
+            #[cfg(test)]
+            { self.projector_calls += 1; }
+        }
+        self.tokens_encoded += 18;
+        // One shared submission cost, charged once to the first queued embed.
+        // This is host submission time, not per-row GPU attribution.
+        self.queue.front_mut().unwrap().2 = available.elapsed().as_secs_f32() * 1000.0;
+        // No additional encoder row is ready; use the unchanged decoder drain.
+        self.push(&[])
+    }
+
+    /// Exactly the original context window/stem calculation for audio step k.
+    fn stem_step(&self, k: usize) -> Tensor<B, 3> {
+        let g0 = (8 * k).saturating_sub(DOWNSAMPLE);
+        let ctx = 8 * k - g0;
+        let s0 = (g0 * HOP) as isize - (N_FFT / 2) as isize;
+        let s1 = (8 * k + 7) * HOP + N_FFT / 2;
+        let slice: Vec<f32> = if s0 < 0 {
+            let mut v = vec![0f32; (-s0) as usize];
+            v.extend_from_slice(&self.samples[..s1]);
+            v
+        } else {
+            self.samples[s0 as usize..s1].to_vec()
+        };
+        let mel = self.stt.mel(&slice, false);
+        let stem = self.stt.stem(mel);
+        stem.clone().narrow(1, ctx / 2, DOWNSAMPLE)
+    }
+
     /// Feed new samples; returns any tokens that became ready.
     pub fn push(&mut self, new_samples: &[f32]) -> Vec<StreamedToken> {
         self.samples.extend_from_slice(new_samples);
@@ -376,23 +440,11 @@ impl<'a, B: Backend, O: SttPipeline<B>> StreamingTranscriber<'a, B, O> {
                 break;
             }
             let avail = Instant::now();
-            // mel frames [g0, 8k+8) from samples [g0·160−200, (8k+7)·160+200)
-            let g0 = (8 * k).saturating_sub(DOWNSAMPLE);
-            let ctx = 8 * k - g0; // 0 for the first token, 4 after
-            let s0 = (g0 * HOP) as isize - (N_FFT / 2) as isize;
-            let s1 = (8 * k + 7) * HOP + N_FFT / 2;
-            let slice: Vec<f32> = if s0 < 0 {
-                let mut v = vec![0f32; (-s0) as usize];
-                v.extend_from_slice(&self.samples[..s1]);
-                v
-            } else {
-                self.samples[s0 as usize..s1].to_vec()
-            };
-            let mel = self.stt.mel(&slice, false); // [1,128,ctx+8]
-            let stem = self.stt.stem(mel); // [1,(ctx+8)/2,1280]
-            let new = stem.clone().narrow(1, ctx / 2, DOWNSAMPLE);
+            let new = self.stem_step(k);
             let h = self.stt.encode(new, &mut self.enc_caches);
             let proj = self.stt.project(h);
+            #[cfg(test)]
+            { self.encoder_calls += 1; self.projector_calls += 1; }
             self.queue
                 .push_back((proj, avail, avail.elapsed().as_secs_f32() * 1000.0));
             self.tokens_encoded += 1;
@@ -479,6 +531,20 @@ pub(crate) struct PrefixTestState {
 }
 
 #[cfg(test)]
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct TailBlockTestState {
+    pub encoded: usize,
+    pub encoder_calls: usize,
+    pub projector_calls: usize,
+    pub grouped_finishes: usize,
+    pub decoder_steps: usize,
+    pub queued: usize,
+    pub samples: usize,
+    pub eos: bool,
+    pub encoder_positions: Vec<usize>,
+}
+
+#[cfg(test)]
 impl<B: Backend> EncoderPrefix<B, super::fast::FastCaches<B>> {
     pub(crate) fn test_snapshot(&self) -> (Vec<(usize, usize, Vec<f32>, Vec<f32>)>, Vec<Vec<f32>>) {
         let caches = [&self.caches.0[0], self.caches.0.last().unwrap()].into_iter()
@@ -503,6 +569,16 @@ impl<'a, B: Backend, O: SttPipeline<B, EncCaches = super::fast::FastCaches<B>>>
                 t.clone().into_data().iter::<f32>().collect()),
         }
     }
+
+    pub(crate) fn tail_block_test_state(&self) -> TailBlockTestState {
+        TailBlockTestState {
+            encoded: self.tokens_encoded, encoder_calls: self.encoder_calls,
+            projector_calls: self.projector_calls, grouped_finishes: self.grouped_finishes,
+            decoder_steps: self.tokens.len().saturating_sub(self.prompt.len()),
+            queued: self.queue.len(), samples: self.samples.len(), eos: self.finished,
+            encoder_positions: self.enc_caches.0.iter().map(|c| c.pos).collect(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -520,6 +596,10 @@ mod prefix_tests {
         encodes: Cell<usize>,
         windows: RefCell<Vec<Vec<f32>>>,
         decode_shapes: RefCell<Vec<(usize, usize)>>,
+        never_eos: Cell<bool>,
+        encode_rows: RefCell<Vec<usize>>,
+        projector_inputs: RefCell<Vec<Vec<f32>>>,
+        decoder_inputs: RefCell<Vec<Vec<f32>>>,
     }
 
     impl SttPipeline<Cpu> for Probe {
@@ -542,12 +622,19 @@ mod prefix_tests {
         fn new_dec_caches(&self) -> usize { 0 }
         fn encode(&self, x: Tensor<Cpu, 3>, caches: &mut FastCaches<Cpu>) -> Tensor<Cpu, 3> {
             self.encodes.set(self.encodes.get() + 1);
-            assert_eq!(x.dims(), [1, DOWNSAMPLE, 1]);
-            let kv = x.clone().reshape([1, 1, DOWNSAMPLE, 1]);
+            let rows = x.dims()[1];
+            assert!(rows == DOWNSAMPLE || rows == 18 * DOWNSAMPLE);
+            assert_eq!(x.dims(), [1, rows, 1]);
+            self.encode_rows.borrow_mut().push(rows);
+            let kv = x.clone().reshape([1, 1, rows, 1]);
             let _ = caches.0[0].update(kv.clone(), kv);
             x
         }
-        fn project(&self, hidden: Tensor<Cpu, 3>) -> Tensor<Cpu, 3> { hidden.sum_dim(1) }
+        fn project(&self, hidden: Tensor<Cpu, 3>) -> Tensor<Cpu, 3> {
+            assert_eq!(hidden.dims(), [1, DOWNSAMPLE, 1], "projector must remain L4");
+            self.projector_inputs.borrow_mut().push(hidden.clone().into_data().iter::<f32>().collect());
+            hidden.sum_dim(1)
+        }
         fn ada_scales(&self, delay: usize) -> AdaScales<Cpu> {
             AdaScales(vec![Tensor::full([1, 1, 1], delay as f32, &self.device)])
         }
@@ -555,12 +642,13 @@ mod prefix_tests {
         fn decode_step(&self, x: Tensor<Cpu, 3>, ada: &AdaScales<Cpu>, calls: &mut usize) -> Tensor<Cpu, 3> {
             let delay = ada.0[0].clone().into_data().iter::<f32>().next().unwrap() as usize;
             self.decode_shapes.borrow_mut().push((x.dims()[1], delay));
+            self.decoder_inputs.borrow_mut().push(x.clone().into_data().iter::<f32>().collect());
             *calls += 1;
             Tensor::full([1, 1, 1], *calls as f32, &self.device)
         }
         fn logits_last(&self, hidden: Tensor<Cpu, 3>) -> Tensor<Cpu, 1> {
             let calls = hidden.into_data().iter::<f32>().next().unwrap();
-            let id = if calls >= 2.0 { EOS as usize } else { 3 };
+            let id = if calls >= 2.0 && !self.never_eos.get() { EOS as usize } else { 3 };
             let mut logits = vec![0.0f32; 4];
             logits[id] = 1.0;
             Tensor::from_data(TensorData::new(logits, [4]), &self.device)
@@ -650,5 +738,109 @@ mod prefix_tests {
             assert!(reused.push(&[1.0; 40]).is_empty());
         }
         assert_eq!(seed.caches.0[0].pos, 124);
+    }
+
+    fn tail_samples(accepted: usize, delay: usize) -> Vec<f32> {
+        let align = (SAMPLES_PER_TOK - accepted % SAMPLES_PER_TOK) % SAMPLES_PER_TOK;
+        vec![0.0; align + (delay_tokens(delay) + 1 + OFFLINE_BUFFER_TOKENS) * SAMPLES_PER_TOK + N_FFT / 2]
+    }
+
+    #[test]
+    fn tail_block_replaces_18_encoder_calls_with_one_and_preserves_stage_order() {
+        let eager_probe = Probe::default();
+        let grouped_probe = Probe::default();
+        eager_probe.never_eos.set(true);
+        grouped_probe.never_eos.set(true);
+        let mut eager = StreamingTranscriber::new(&eager_probe, 480);
+        let mut grouped = StreamingTranscriber::new(&grouped_probe, 480);
+        let real: Vec<f32> = (0..11520).map(|i| (i / 160 % 13) as f32 / 1024.0).collect();
+        eager.push(&real);
+        grouped.push(&real);
+        let before_a = eager_probe.encodes.get();
+        let before_b = grouped_probe.encodes.get();
+        let tail = tail_samples(real.len(), 480);
+        let a = eager.push(&tail);
+        let b = grouped.push_finish(&tail);
+        assert_eq!(eager_probe.encodes.get() - before_a, 18);
+        assert_eq!(grouped_probe.encodes.get() - before_b, 1,
+            "eligible finish must group the18 encoder calls");
+        assert_eq!(grouped_probe.encode_rows.borrow().last(), Some(&72));
+        assert_eq!(*eager_probe.windows.borrow(), *grouped_probe.windows.borrow());
+        assert_eq!(*eager_probe.projector_inputs.borrow(), *grouped_probe.projector_inputs.borrow());
+        assert_eq!(*eager_probe.decoder_inputs.borrow(), *grouped_probe.decoder_inputs.borrow());
+        assert_eq!(*eager_probe.decode_shapes.borrow(), *grouped_probe.decode_shapes.borrow());
+        assert_eq!(eager.samples, grouped.samples);
+        assert_eq!(eager.tokens, grouped.tokens);
+        assert_eq!(a.iter().map(|t| (t.id,t.pos)).collect::<Vec<_>>(),
+            b.iter().map(|t| (t.id,t.pos)).collect::<Vec<_>>());
+        assert_eq!(a.len(), 18);
+        assert_eq!(grouped.enc_caches.0[0].pos, 58 * DOWNSAMPLE);
+        assert_eq!(eager.enc_caches.0[0].prefix_test_sample(), grouped.enc_caches.0[0].prefix_test_sample());
+        assert_eq!((grouped.queue.len(), grouped.grouped_finishes), (0,1));
+        assert_eq!(grouped.projector_calls, eager.projector_calls);
+        assert_eq!(grouped.tail_block_test_state().decoder_steps, eager.tail_block_test_state().decoder_steps);
+        assert!(b.iter().skip(1).all(|t| t.enc_ms == 0.0), "shared submission cost is charged once");
+    }
+
+    #[test]
+    fn tail_block_fallback_keeps_short_delay_count_queue_and_eos_behavior() {
+        // Unprefilled, nondefault, and non18 readiness counts must use push.
+        for (delay, count, tail_adjust) in [(480,0,0), (480,1,0), (480,39,0),
+            (480,40,0), (480,8999,0), (80,11520,0), (2400,50000,0),
+            (480,11520,-1280), (480,11520,1280)] {
+            let a_probe = Probe::default();
+            let b_probe = Probe::default();
+            a_probe.never_eos.set(true);
+            b_probe.never_eos.set(true);
+            let mut a = StreamingTranscriber::new(&a_probe, delay);
+            let mut b = StreamingTranscriber::new(&b_probe, delay);
+            let real = vec![0.25; count];
+            a.push(&real);
+            b.push(&real);
+            let len = (tail_samples(count,delay).len() as isize + tail_adjust) as usize;
+            let tail = vec![0.0;len];
+            let a_ids: Vec<_> = a.push(&tail).into_iter().map(|t| (t.id,t.pos)).collect();
+            let b_ids: Vec<_> = b.push_finish(&tail).into_iter().map(|t| (t.id,t.pos)).collect();
+            assert_eq!(b.grouped_finishes, 0);
+            assert_eq!(a_ids,b_ids);
+            assert_eq!(a.samples,b.samples);
+            assert_eq!(*a_probe.encode_rows.borrow(),*b_probe.encode_rows.borrow());
+            assert_eq!(*a_probe.windows.borrow(),*b_probe.windows.borrow());
+            assert_eq!(*a_probe.decoder_inputs.borrow(),*b_probe.decoder_inputs.borrow());
+            assert_eq!(a.enc_caches.0[0].prefix_test_sample(),b.enc_caches.0[0].prefix_test_sample());
+        }
+        let probe = Probe::default();
+        let mut ended = StreamingTranscriber::new(&probe,480);
+        ended.push(&vec![0.0;10280]);
+        assert!(ended.finished);
+        let before = probe.encodes.get();
+        let len = ended.samples.len();
+        let tail = tail_samples(10280,480);
+        assert!(ended.push_finish(&tail).is_empty());
+        assert_eq!(probe.encodes.get(),before);
+        assert_eq!(ended.samples.len(),len+tail.len(), "retain original already-EOS push behavior");
+        assert_eq!(ended.grouped_finishes,0);
+    }
+
+    #[test]
+    fn tail_block_preserves_eos_during_decoder_drain() {
+        let a_probe = Probe::default();
+        let b_probe = Probe::default();
+        let mut a = StreamingTranscriber::new(&a_probe,480);
+        let mut b = StreamingTranscriber::new(&b_probe,480);
+        assert!(a.push(&vec![0.0;8999]).is_empty());
+        assert!(b.push(&vec![0.0;8999]).is_empty());
+        assert_eq!(a.push(&[0.0]).len(),1);
+        assert_eq!(b.push(&[0.0]).len(),1);
+        let tail = tail_samples(9000,480);
+        let left = a.push(&tail);
+        let right = b.push_finish(&tail);
+        assert_eq!(left.len(),1);
+        assert_eq!((left[0].id,left[0].pos),(right[0].id,right[0].pos));
+        assert_eq!(right[0].id,EOS);
+        assert!(a.finished && b.finished);
+        assert_eq!((a.queue.len(),b.queue.len(),b.grouped_finishes),(17,17,1));
+        assert_eq!(a.tokens,b.tokens);
+        assert_eq!(a.enc_caches.0[0].prefix_test_sample(),b.enc_caches.0[0].prefix_test_sample());
     }
 }

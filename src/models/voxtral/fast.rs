@@ -244,6 +244,71 @@ fn build_mask<B: Backend>(
     ))
 }
 
+#[cfg(test)]
+mod tail_block_cache_tests {
+    use super::*;
+    use burn::tensor::TensorData;
+    type Cpu = burn_ndarray::NdArray<f32>;
+
+    #[test]
+    fn tail_block_mask_and_cache_keep_the_full_750_window_before_trimming() {
+        let device = Default::default();
+        // Actual window/block lengths, two heads and two sentinel channels:
+        // time slicing must retain each head's stride, not flat-truncate storage.
+        let kv = |start: usize, len: usize| {
+            let values: Vec<f32> = (0..2).flat_map(|head| (start..start+len)
+                .flat_map(move |time| (0..2).map(move |channel|
+                    (head * 10000 + time * 2 + channel) as f32))).collect();
+            Tensor::<Cpu,4>::from_data(TensorData::new(values,[1,2,len,2]),&device)
+        };
+        let read = |t: Tensor<Cpu,4>| t.into_data().iter::<f32>().collect::<Vec<_>>();
+        for pos in [748,750,1000] {
+            let mut seed = FastKv::new(ENC_WINDOW);
+            let initial = kv(0,pos);
+            let _ = seed.update(initial.clone(), initial.clone().neg());
+            let seed_before = read(seed.k.as_ref().unwrap().clone());
+            let mut block = seed.clone();
+            let mut sequential = seed.clone();
+            let stored = seed.stored();
+            let first_key = pos - stored;
+            let lk = block.next_lk(72);
+            let mask = build_mask::<Cpu>(72,lk,pos,ENC_WINDOW,&device).unwrap()
+                .into_data().iter::<bool>().collect::<Vec<_>>();
+            let added = kv(pos,72);
+            let (full_k,full_v) = block.update(added.clone(),added.neg());
+            assert_eq!(full_k.dims(),[1,2,stored+72,2], "attention receives untrimmed old+new");
+            assert_eq!(read(full_k),read(kv(first_key,stored+72)));
+            assert_eq!(read(full_v),read(kv(first_key,stored+72).neg()));
+            for step in 0..18 {
+                let q0 = pos + step*4;
+                let step_lk = sequential.next_lk(4);
+                let step_first = q0 - sequential.stored();
+                let step_mask = build_mask::<Cpu>(4,step_lk,q0,ENC_WINDOW,&device).unwrap()
+                    .into_data().iter::<bool>().collect::<Vec<_>>();
+                let rows = kv(q0,4);
+                let _ = sequential.update(rows.clone(),rows.neg());
+                for row in 0..4 {
+                    let query = q0+row;
+                    let whole_allowed: Vec<_> = (0..lk)
+                        .filter(|&j| !mask[(step*4+row)*lk+j]).map(|j|first_key+j).collect();
+                    let step_allowed: Vec<_> = (0..step_lk)
+                        .filter(|&j| !step_mask[row*step_lk+j]).map(|j|step_first+j).collect();
+                    let expected: Vec<_> = ((query+1).saturating_sub(ENC_WINDOW)..=query).collect();
+                    assert_eq!(whole_allowed,expected, "wrong causal/window visibility at {query}");
+                    assert_eq!(whole_allowed,step_allowed);
+                }
+            }
+            assert_eq!((block.pos,block.stored()),(pos+72,749));
+            assert_eq!((sequential.pos,sequential.stored()),(pos+72,749));
+            assert_eq!(read(block.k.as_ref().unwrap().clone()),read(kv(pos+72-749,749)));
+            assert_eq!(read(block.k.as_ref().unwrap().clone()),read(sequential.k.as_ref().unwrap().clone()));
+            assert_eq!(read(block.v.as_ref().unwrap().clone()),read(sequential.v.as_ref().unwrap().clone()));
+            assert_eq!(read(seed.k.as_ref().unwrap().clone()),seed_before);
+            assert_eq!(read(initial),read(kv(0,pos)));
+        }
+    }
+}
+
 /// Folded attention: wide fused qkv with pre-rotated rows, biases riding as
 /// `[b‖R(b)‖b_v]`, 1/√d in the q rows, GQA group-fold on single-token steps.
 struct FastAttention<B: Backend> {
