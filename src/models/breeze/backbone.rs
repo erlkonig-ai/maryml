@@ -9,7 +9,6 @@ use crate::models::qwen3_5::gdn_mixer::project;
 use anyhow::{Result, ensure};
 use burn::tensor::DType;
 use cubecl::{cuda::CudaRuntime, prelude::*};
-use half::bf16;
 pub(super) use ops::Tensor;
 use triblespace::core::repo::BlobStoreGet;
 
@@ -72,17 +71,7 @@ fn projection_elems() -> cubek::matmul::definition::MatmulGlobalElems {
     cubek::matmul::definition::MatmulGlobalElems {
         lhs: bf16,
         rhs: bf16,
-        out: StorageType::Scalar(ElemType::Float(FloatKind::F32)),
-    }
-}
-
-// Deliberately the existing gdn_mixer projection_round arithmetic/launch shape:
-// one F32 scratch value -> one BF16 output, after the complete reduction.
-#[cube(launch_unchecked)]
-fn projection_round(input: &Array<f32>, output: &mut Array<bf16>, n: usize) {
-    let i = ABSOLUTE_POS as usize;
-    if i < n {
-        output[i] = bf16::cast_from(input[i]);
+        out: bf16,
     }
 }
 
@@ -120,36 +109,25 @@ fn project_gemv(x: &Tensor, w: &Tensor) -> Result<Tensor> {
     let (k, n) = (s[2], ws[0]);
     let globals = projection_elems();
     let mut dtypes = MatmulElems::from_globals(&globals);
-    let scratch = x.client.empty(
-        n.checked_mul(4)
-            .ok_or_else(|| anyhow::anyhow!("GEMV scratch overflow"))?,
+    let output = x.client.empty(
+        n.checked_mul(2)
+            .ok_or_else(|| anyhow::anyhow!("GEMV output overflow"))?,
     );
     // Immutable BF16 [N,K] is only viewed as [K,N]/[1,K], never copied or
-    // cast. Cubek uses F32 register reduction and F32 output. Its setup checks
-    // plane/vector divisibility; setup errors propagate, with no MMA retry.
+    // cast. from_globals keeps F32 stage/register accumulation for BF16 output.
+    // This strategy consumes all K in F32, then casts once at its final store;
+    // no split-K/global partials, F32 scratch, or separate rounding launch.
+    // Fresh output never aliases either input. Setup errors still propagate,
+    // with no MMA retry after launch.
     cubek::matmul::launch::launch_ref(
         &Strategy::GemvPlaneParallel(Default::default()),
         &x.client,
         InputBinding::new(binding(&x.handle, [1, k], [k, 1]), globals.lhs),
         InputBinding::new(binding(&w.handle, [k, n], [1, k]), globals.rhs),
-        binding(&scratch, [1, n], [n, 1]),
+        binding(&output, [1, n], [n, 1]),
         &mut dtypes,
     )
     .map_err(|e| anyhow::anyhow!("Breeze BF16 GEMV [1,{k}] x [{n},{k}]^T: {e:?}"))?;
-    let output = x.client.empty(n * 2);
-    let cube = CubeDim::new_1d(128);
-    // SAFETY: validated bounded extents, F32 scratch and fresh BF16 output;
-    // one writer per output. Neither input nor aliased weight is a destination.
-    unsafe {
-        projection_round::launch_unchecked::<CudaRuntime>(
-            &x.client,
-            cubecl::calculate_cube_count_elemwise(&x.client, n, cube),
-            cube,
-            ArrayArg::from_raw_parts(scratch, n),
-            ArrayArg::from_raw_parts(output.clone(), n),
-            n,
-        );
-    }
     Ok(Tensor::new_contiguous(
         x.client.clone(),
         x.device.clone(),
@@ -347,6 +325,7 @@ impl Decoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use half::bf16;
     #[test]
     fn gemv_only_routes_one_row_and_keeps_f32_accumulation() {
         for k in [1024, 1152, 2048, 6144, 6912, 8192] {
@@ -368,10 +347,17 @@ mod tests {
         assert!(!gemv_vector_takes(&[1, 1, 1024], 0, 1));
         let globals = projection_elems();
         let types = cubek::matmul::definition::MatmulElems::from_globals(&globals);
+        use cubecl::ir::{ElemType, FloatKind, StorageType};
+        let bf16 = StorageType::Scalar(ElemType::Float(FloatKind::BF16));
+        let f32 = StorageType::Scalar(ElemType::Float(FloatKind::F32));
+        assert_eq!(globals.lhs, bf16);
+        assert_eq!(globals.rhs, bf16);
+        assert_eq!(globals.out, bf16);
+        assert_eq!(types.acc_global, bf16);
         assert_eq!(types.lhs_register, globals.lhs);
         assert_eq!(types.rhs_register, globals.rhs);
-        assert_eq!(types.acc_register, globals.out);
-        assert_eq!(types.acc_stage, globals.out);
+        assert_eq!(types.acc_register, f32);
+        assert_eq!(types.acc_stage, f32);
     }
 
     #[test]
@@ -478,6 +464,66 @@ mod tests {
             .flat_map(|v| v.to_bits().to_le_bytes())
             .collect();
         assert_eq!(read(&linear(&x, &w).unwrap()), expected);
+    }
+
+    #[test]
+    #[ignore = "reserved CUDA: actual-stride F32 accumulation and direct BF16 store, not model parity"]
+    fn gemv_cuda_direct_bf16_preserves_f32_accumulation() {
+        use cubecl::cuda::CudaDevice;
+        let device = CudaDevice { index: 0 };
+        let client = CudaRuntime::client(&device);
+        let (k, n) = (8192usize, 1024usize);
+        let plane = client.properties().hardware.plane_size_max as usize;
+        // Both inputs are unquantized BF16: reproduce Cubek's maximum valid
+        // input vector width, rather than assume which lanes see the terms.
+        let vector = client
+            .io_optimized_vector_sizes(2)
+            .filter(|&v| gemv_vector_takes(&[1, 1, k], plane, v))
+            .max()
+            .expect("production fixture requires a valid GEMV vector width");
+        let stride = plane.checked_mul(vector).unwrap();
+        assert!(k.is_multiple_of(stride) && k / stride >= 4);
+        let xv = vec![bf16::ONE; k];
+        let mut wv = vec![bf16::ZERO; n * k];
+        // Column 0 is cube 0 / plane 0, so its segment order is unswizzled.
+        // These terms occupy one lane/vector component on four successive
+        // iterations. F32 retains 3/512 at 256; a BF16 loop accumulator loses
+        // it and would finish at 1.0 (0x3f80), not the required 0x3f81.
+        for (segment, term) in [256.0, 3.0 / 512.0, -256.0, 1.0]
+            .into_iter()
+            .enumerate()
+        {
+            wv[segment * stride] = bf16::from_f32(term);
+        }
+        let upload = |values: &[bf16], shape: &[usize]| {
+            let bytes: Vec<u8> = values
+                .iter()
+                .flat_map(|v| v.to_bits().to_le_bytes())
+                .collect();
+            Tensor::new_contiguous(
+                client.clone(),
+                device.clone(),
+                shape.into(),
+                client.create_from_slice(&bytes),
+                DType::BF16,
+            )
+        };
+        let read = |t: &Tensor| t.client.read_one(t.handle.clone()).unwrap().to_vec();
+        let x = upload(&xv, &[1, 1, k]);
+        let w = upload(&wv, &[n, k]);
+        assert!(gemv_eligible(&x), "precision fixture must exercise GEMV");
+        let before_x = read(&x);
+        let before_w = read(&w);
+        let out = linear(&x, &w).unwrap();
+        assert_eq!(out.dtype, DType::BF16);
+        assert_eq!(out.meta.shape().as_slice(), [1, 1, n]);
+        let values = read(&out);
+        assert_eq!(values.len(), n * 2);
+        assert_eq!(bf16::from_f32(1.0 + 3.0 / 512.0).to_bits(), 0x3f81);
+        assert_eq!(u16::from_le_bytes([values[0], values[1]]), 0x3f81);
+        assert!(values[2..].iter().all(|&byte| byte == 0));
+        assert_eq!(read(&x), before_x);
+        assert_eq!(read(&w), before_w);
     }
 
     #[test]
