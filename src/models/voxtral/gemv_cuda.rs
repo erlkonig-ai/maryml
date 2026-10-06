@@ -6,10 +6,11 @@ use std::any::{Any, TypeId};
 
 use burn::tensor::{DType, Tensor, TensorPrimitive, backend::Backend};
 use burn_cubecl::tensor::CubeTensor;
-use cubecl::cuda::CudaRuntime;
+use cubecl::{cuda::CudaRuntime, prelude::*};
 use cubek::matmul::definition::{MatmulElems, MatmulGlobalElems, MatmulSetupError};
 use cubek::matmul::launch::Strategy;
 use cubek::std::InputBinding;
+use half::f16;
 
 use crate::nn::backend::hear::RawHalf;
 
@@ -101,6 +102,55 @@ fn eligible<B: Backend>(
         && w.covers(k * n, vector)
 }
 
+// This is a subset of the existing gate, never a new acceptance/fallback rule.
+// Fixed 32 lanes/vector8/4 planes match pinned Cubek's GPU default for K1280.
+// Other hardware/vector selections retain the original Cubek launch below.
+fn shared_m4_route<B: Backend>(
+    x: Layout, w: Layout, same_device: bool, plane: usize, vector: usize, gpu: bool,
+) -> bool {
+    gpu && plane == 32 && vector == 8
+        && x.shape == [1, 4, 1280] && w.shape == [1, 1280, 10240]
+        && eligible::<B>(x, w, same_device, plane, vector)
+}
+
+/// Four independent rows share each loaded weight vector in registers. The
+/// segment swizzle, vector accumulation, vector_sum, plane_sum, and final F16
+/// cast are the pinned Cubek VecMatColMajor order, separately for every row.
+/// Loop structure also follows the existing native bf16_gemv_rows precedent;
+/// no Inkling feature/import or shared kernel changes are needed.
+#[cube(launch_unchecked)]
+fn encoder_m4_shared_weights(
+    x: &Array<Vector<f16, Const<8>>>,
+    w: &Array<Vector<f16, Const<8>>>,
+    out: &mut Array<f16>,
+) {
+    let lane = UNIT_POS_X as usize;
+    let plane = UNIT_POS_Y as usize;
+    let col = CUBE_POS_X as usize * 4 + plane;
+    let mut acc0 = Vector::<f32, Const<8>>::cast_from(0.0f32);
+    let mut acc1 = Vector::<f32, Const<8>>::cast_from(0.0f32);
+    let mut acc2 = Vector::<f32, Const<8>>::cast_from(0.0f32);
+    let mut acc3 = Vector::<f32, Const<8>>::cast_from(0.0f32);
+    for segment in 0..5 {
+        let pos = (((segment + plane) % 5) * 32 + lane) * 8;
+        let weight = Vector::<f32, Const<8>>::cast_from(w[(col * 1280 + pos) / 8]);
+        acc0 += Vector::<f32, Const<8>>::cast_from(x[pos / 8]) * weight;
+        acc1 += Vector::<f32, Const<8>>::cast_from(x[(1280 + pos) / 8]) * weight;
+        acc2 += Vector::<f32, Const<8>>::cast_from(x[(2560 + pos) / 8]) * weight;
+        acc3 += Vector::<f32, Const<8>>::cast_from(x[(3840 + pos) / 8]) * weight;
+    }
+    let sum0 = f16::cast_from(plane_sum(Vector::vector_sum(acc0)));
+    let sum1 = f16::cast_from(plane_sum(Vector::vector_sum(acc1)));
+    let sum2 = f16::cast_from(plane_sum(Vector::vector_sum(acc2)));
+    let sum3 = f16::cast_from(plane_sum(Vector::vector_sum(acc3)));
+    if lane == 0 {
+        out[col] = sum0;
+        out[10240 + col] = sum1;
+        out[20480 + col] = sum2;
+        out[30720 + col] = sum3;
+    }
+}
+
 /// `None` means unsupported metadata, not a failed launch. Bindings preserve
 /// offsets and allocation ownership. Inputs remain read-only, output fresh;
 /// existing immutable-pile ownership must still outlive all queued GPU uses.
@@ -178,14 +228,33 @@ pub(super) fn try_project<B: Backend>(
     });
     let client = lhs.client.clone();
     let (ld, rd) = (lhs.dtype, rhs.dtype);
-    cubek::matmul::launch::launch_ref(
-        &Strategy::GemvPlaneParallel(Default::default()),
-        &client,
-        InputBinding::new(lhs.binding(), ld.into()),
-        InputBinding::new(rhs.binding(), rd.into()),
-        out.clone().binding(),
-        &mut dtypes,
-    )?;
+    if shared_m4_route::<B>(xl, wl, lhs.device == rhs.device, plane, vector,
+        client.properties().hardware.num_cpu_cores.is_none()) {
+        // SAFETY: the unchanged eligibility gate proved F16, same device,
+        // dense four-row input and column-major RHS, vector-aligned offsets,
+        // and full allocation spans. 2560 cubes x4 planes write all10240
+        // columns exactly once per row; every lane participates in reductions.
+        // Cloned handles preserve input offsets/ownership; output is fresh.
+        unsafe {
+            encoder_m4_shared_weights::launch_unchecked::<CudaRuntime>(
+                &client, CubeCount::new_1d(2560), CubeDim::new_2d(32, 4),
+                ArrayArg::from_raw_parts(lhs.handle.clone(), 4 * 1280),
+                ArrayArg::from_raw_parts(rhs.handle.clone(), 1280 * 10240),
+                ArrayArg::from_raw_parts(out.handle.clone(), 4 * 10240),
+            );
+        }
+        #[cfg(test)]
+        SHARED_M4_LAUNCHES.with(|n| n.set(n.get() + 1));
+    } else {
+        cubek::matmul::launch::launch_ref(
+            &Strategy::GemvPlaneParallel(Default::default()),
+            &client,
+            InputBinding::new(lhs.binding(), ld.into()),
+            InputBinding::new(rhs.binding(), rd.into()),
+            out.clone().binding(),
+            &mut dtypes,
+        )?;
+    }
     #[cfg(test)]
     record_encoder_route(xl.shape, wl.shape, true);
     let out = if encoder {
@@ -211,6 +280,7 @@ std::thread_local! {
     static ENCODER_ROUTES: std::cell::RefCell<[[u64; 3]; 2]> = const {
         std::cell::RefCell::new([[0; 3]; 2])
     };
+    static SHARED_M4_LAUNCHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -333,6 +403,154 @@ mod tests {
         w.strides = [k * n, 1, k];
         w.bytes = (k * n * 2) as u64;
         (x, w)
+    }
+
+    #[test]
+    fn shared_m4_route_keeps_existing_metadata_contract() {
+        let (x, w) = encoder_layouts(1280, 10240);
+        assert!(shared_m4_route::<RawHalf>(x, w, true, 32, 8, true));
+        assert!(!shared_m4_route::<hear::Raw>(x, w, true, 32, 8, true));
+        assert!(!shared_m4_route::<hear::FusedHalf>(x, w, true, 32, 8, true));
+        for (same, plane, vector, gpu) in [
+            (false, 32, 8, true), (true, 16, 8, true),
+            (true, 32, 4, true), (true, 32, 8, false),
+        ] {
+            assert!(!shared_m4_route::<RawHalf>(x, w, same, plane, vector, gpu));
+        }
+        // All earlier accepted routes remain eligible, but never share rows.
+        for (k, n, rows) in [(2048, 1280, 4), (5120, 1280, 4),
+            (3072, 6144, 1), (4096, 3072, 1), (9216, 3072, 1), (3072, 18432, 1)] {
+            let (mut a, b) = encoder_layouts(k, n);
+            a.shape[1] = rows;
+            assert!(eligible::<RawHalf>(a, b, true, 32, 8));
+            assert!(!shared_m4_route::<RawHalf>(a, b, true, 32, 8, true));
+        }
+        for shape in [[1, 1, 1280], [1, 3, 1280], [1, 72, 1280], [2, 4, 1280]] {
+            assert!(!shared_m4_route::<RawHalf>(Layout { shape, ..x }, w, true, 32, 8, true));
+        }
+        for a in [
+            Layout { strides: [5120, 1288, 1], bytes: x.bytes + 64, ..x },
+            Layout { strides: [5120, 1280, 2], ..x },
+            Layout { dtype: DType::F32, ..x }, Layout { quantized: true, ..x },
+            Layout { bytes: x.bytes - 2, ..x },
+            Layout { start: 2, bytes: x.bytes + 2, ..x },
+        ] {
+            assert!(!shared_m4_route::<RawHalf>(a, w, true, 32, 8, true));
+        }
+        for b in [
+            Layout { strides: [1280 * 10240, 10240, 1], ..w },
+            Layout { strides: [1280 * 10240, 1, 1288], ..w },
+            Layout { dtype: DType::BF16, ..w }, Layout { quantized: true, ..w },
+            Layout { bytes: w.bytes - 2, ..w }, Layout { end: u64::MAX, ..w },
+        ] {
+            assert!(!shared_m4_route::<RawHalf>(x, b, true, 32, 8, true));
+        }
+        assert!(shared_m4_route::<RawHalf>(
+            Layout { start: 32, end: 16, bytes: x.bytes + 48, ..x },
+            Layout { start: 32, end: 16, bytes: w.bytes + 48, ..w }, true, 32, 8, true));
+    }
+
+    #[test]
+    #[ignore = "shared M4 actual route + established analytical/offset/immutability controls; no model"]
+    fn cuda_shared_m4_rows_precision_offsets_and_route() {
+        SHARED_M4_LAUNCHES.with(|n| n.set(0));
+        // Four different rows, nonzero offset views, cancellation requiring
+        // F32 products/accumulation, F16 final rounding, and input guards.
+        cuda_encoder_m4_rows_broadcast_precision_and_immutable_offsets();
+        assert_eq!(SHARED_M4_LAUNCHES.with(|n| n.get()), 1,
+            "only K1280/N10240 must take the new kernel, not the other M4 shapes");
+    }
+
+    // Test-only old strategy, with the same metadata-only row view and output.
+    // No alternate runtime option or production counter is introduced.
+    fn original_m4_project(x: &Tensor<RawHalf, 3>, w: &Tensor<RawHalf, 3>) -> Tensor<RawHalf, 3> {
+        let (a, b) = (cube(x), cube(w));
+        let a = CubeTensor::new_contiguous(a.client.clone(), a.device.clone(),
+            [4, 1, 1280].into(), a.handle.clone(), a.dtype);
+        let out = burn_cubecl::ops::numeric::empty_device_contiguous_dtype(
+            a.client.clone(), a.device.clone(), [4, 1, 10240].into(), DType::F16);
+        let mut dtypes = MatmulElems::from_globals(&MatmulGlobalElems {
+            lhs: DType::F16.into(), rhs: DType::F16.into(), out: DType::F16.into(),
+        });
+        cubek::matmul::launch::launch_ref(&Strategy::GemvPlaneParallel(Default::default()),
+            &a.client, InputBinding::new(a.clone().binding(), a.dtype.into()),
+            InputBinding::new(b.clone().binding(), b.dtype.into()), out.clone().binding(),
+            &mut dtypes).unwrap();
+        Tensor::from_primitive(TensorPrimitive::Float(CubeTensor::new_contiguous(
+            out.client, out.device, [1, 4, 10240].into(), out.handle, DType::F16)))
+    }
+
+    #[test]
+    #[ignore = "dense independent rows against pinned original GEMV plus analytical probes; no model"]
+    fn cuda_shared_m4_dense_matches_original_and_preserves_inputs() {
+        let device = Default::default();
+        let (k, n) = (1280, 10240);
+        let input: Vec<f16> = (0..4).flat_map(|r| (0..k).map(move |i|
+            f16::from_f32(((i * 7 + r * 13) % 31) as f32 / 16.0 - 0.9375))).collect();
+        let weights: Vec<f16> = (0..n).flat_map(|c| (0..k).map(move |i|
+            f16::from_f32(((i * 3 + c * 5) % 23) as f32 / 32.0 - 0.34375))).collect();
+        let x = Tensor::<RawHalf, 3>::from_data(TensorData::new(input.clone(), [1, 4, k]), &device);
+        let w = Tensor::<RawHalf, 3>::from_data(TensorData::new(weights.clone(), [1, n, k]), &device)
+            .swap_dims(1, 2);
+        SHARED_M4_LAUNCHES.with(|v| v.set(0));
+        let candidate = try_project(&x, &w).unwrap().expect("new shared row route");
+        assert_eq!(SHARED_M4_LAUNCHES.with(|v| v.get()), 1);
+        let actual = read(candidate.clone());
+        let original = read(original_m4_project(&x, &w));
+        close(&actual, &original); // Existing finite/tolerance contract, not bit parity.
+        for r in 0..4 {
+            for c in [0, 1, 31, n / 2, n - 1] {
+                let sum: f64 = (0..k).map(|i| input[r * k + i].to_f64()
+                    * weights[c * k + i].to_f64()).sum();
+                close(&actual[r * n + c..r * n + c + 1], &[f16::from_f64(sum)]);
+            }
+        }
+        for r in 1..4 {
+            assert_ne!(&actual[..n], &actual[r * n..(r + 1) * n], "rows must stay independent");
+        }
+        // Reusing output must not mutate either queued input allocation.
+        let _ = read(candidate.mul_scalar(0.0));
+        assert_eq!(read(x), input);
+        assert_eq!(read(w.swap_dims(1, 2)), weights);
+    }
+
+    #[test]
+    #[ignore = "finite20-call ABBA hot reused-weight micro; no model/live speed prediction"]
+    fn cuda_shared_m4_hot_reused_weight_abba() {
+        use std::time::Instant;
+        let device = Default::default();
+        let (k, n) = (1280, 10240);
+        let input: Vec<f16> = (0..4).flat_map(|r| (0..k).map(move |i|
+            f16::from_f32(((i * 7 + r * 13) % 31) as f32 / 16.0 - 0.9375))).collect();
+        let weights: Vec<f16> = (0..n).flat_map(|c| (0..k).map(move |i|
+            f16::from_f32(((i * 3 + c * 5) % 23) as f32 / 32.0 - 0.34375))).collect();
+        let x = Tensor::<RawHalf, 3>::from_data(TensorData::new(input.clone(), [1, 4, k]), &device);
+        let w = Tensor::<RawHalf, 3>::from_data(TensorData::new(weights.clone(), [1, n, k]), &device)
+            .swap_dims(1, 2);
+        SHARED_M4_LAUNCHES.with(|v| v.set(0));
+        let old = read(original_m4_project(&x, &w));
+        close(&read(try_project(&x, &w).unwrap().unwrap()), &old);
+        assert_eq!(SHARED_M4_LAUNCHES.with(|v| v.get()), 1);
+        for (block, shared) in [false, true, true, false].into_iter().enumerate() {
+            RawHalf::sync(&device).unwrap();
+            let started = Instant::now();
+            let mut last = None;
+            for _ in 0..20 {
+                last = Some(if shared { try_project(&x, &w).unwrap().unwrap() }
+                    else { original_m4_project(&x, &w) });
+            }
+            RawHalf::sync(&device).unwrap();
+            let seconds = started.elapsed().as_secs_f64();
+            close(&read(last.unwrap()), &old);
+            println!("M4_SHARED_MICRO {}", serde_json::json!({
+                "block":block,"shared":shared,"calls":20,"seconds":seconds,
+                "us_per_call":seconds*1e6/20.0,"shape":[4,1280,10240],
+                "planes":4,"vector":8,"grid_x":if shared {2560}else{10240},
+                "scope":"host wall including dispatch/fresh output; block sync; hot reused weights; no model"}));
+        }
+        assert_eq!(SHARED_M4_LAUNCHES.with(|v| v.get()), 41);
+        assert_eq!(read(x), input);
+        assert_eq!(read(w.swap_dims(1, 2)), weights);
     }
 
     #[test]
