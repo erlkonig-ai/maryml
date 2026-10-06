@@ -51,7 +51,13 @@ fn geometry<B: Backend>(
 }
 
 #[cube(launch_unchecked)]
-fn rms_kernel(x: &Array<f16>, out: &mut Array<f16>, eps: f32, #[comptime] width: usize) {
+fn rms_kernel(
+    x: &Array<f16>,
+    out: &mut Array<f16>,
+    eps: f32,
+    units: usize,
+    #[comptime] width: usize,
+) {
     let row = CUBE_POS_X as usize;
     let lane = UNIT_POS_X as usize;
     let mut red = SharedMemory::<f32>::new(comptime!(UNITS as usize));
@@ -61,11 +67,13 @@ fn rms_kernel(x: &Array<f16>, out: &mut Array<f16>, eps: f32, #[comptime] width:
         let value = f32::cast_from(x[row * width + col]);
         // Match the original powf_scalar(2), not an alternate square opcode.
         sum += value.powf(2.0f32);
-        col += UNITS as usize;
+        col += units;
     }
     red[lane] = sum;
     sync_cube();
-    let mut stride = UNITS as usize / 2;
+    // A runtime scalar, as in the existing cooperative reducers: CubeCL
+    // rejects mutation of a value derived only from a compile-time constant.
+    let mut stride = units / 2;
     while stride > 0 {
         if lane < stride {
             red[lane] += red[lane + stride];
@@ -79,7 +87,7 @@ fn rms_kernel(x: &Array<f16>, out: &mut Array<f16>, eps: f32, #[comptime] width:
     while col < width {
         let value = f32::cast_from(x[row * width + col]);
         out[row * width + col] = f16::cast_from(value * inverse);
-        col += UNITS as usize;
+        col += units;
     }
 }
 
@@ -115,6 +123,7 @@ pub(super) fn try_rms<B: Backend>(x: &Tensor<B, 3>, eps: f64) -> Option<Tensor<B
             ArrayArg::from_raw_parts(cube.handle.clone(), count),
             ArrayArg::from_raw_parts(out.clone(), count),
             eps as f32,
+            UNITS as usize,
             width,
         );
     }
