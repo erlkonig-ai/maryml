@@ -23,6 +23,14 @@ const CONTROLS: [(&str, u32); 8] = [
     ("<ins_eos>", INS_EOS),
 ];
 
+/// Paired instruction guidance removes only the instruction from the negative
+/// branch. Both branches retain the same reference transcript/audio and target.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GuidedPrompt {
+    pub conditional: Vec<PromptSegment>,
+    pub negative: Option<Vec<PromptSegment>>,
+}
+
 pub struct BreezeTokenizer {
     tokenizer: Tokenizer,
 }
@@ -85,9 +93,36 @@ impl BreezeTokenizer {
         Ok((rendered, ids))
     }
 
-    /// CFG1 contract: direction selects the exact official ref_edit_tata target
-    /// segment. Non-unit CFG is a generator option, never implicitly simulated.
-    pub fn reference_prompt(
+    /// Pinned templates.py: ref_clone_tata has no negative builder; ref_edit_tata
+    /// uses ref_clone_tata as its negative, not an empty/text-only prompt.
+    pub fn reference_prompts(
+        &self,
+        reference_text: &str,
+        reference_codes: &[[u16; 16]],
+        text: &str,
+        direction: Option<&str>,
+        cfg_scale: f32,
+    ) -> Result<GuidedPrompt> {
+        ensure!(
+            cfg_scale.is_finite() && cfg_scale > 0.0,
+            "CFG scale must be finite and positive"
+        );
+        let direction = direction.filter(|value| !value.trim().is_empty());
+        ensure!(
+            cfg_scale == 1.0 || direction.is_some(),
+            "neutral ref_clone_tata has no negative prompt; use CFG1"
+        );
+        Ok(GuidedPrompt {
+            conditional: self.reference_branch(reference_text, reference_codes, text, direction)?,
+            negative: if cfg_scale != 1.0 {
+                Some(self.reference_branch(reference_text, reference_codes, text, None)?)
+            } else {
+                None
+            },
+        })
+    }
+
+    fn reference_branch(
         &self,
         reference_text: &str,
         reference_codes: &[[u16; 16]],
@@ -197,8 +232,9 @@ mod tests {
         let codec = BreezeTokenizer::from_bytes(&fixture()).unwrap();
         let codes = [[0u16; 16], [2047; 16]];
         let segments = codec
-            .reference_prompt("reference", &codes, "target", None)
-            .unwrap();
+            .reference_prompts("reference", &codes, "target", None, 1.0)
+            .unwrap()
+            .conditional;
         assert_eq!(segments.len(), 4);
         assert_eq!(
             texts(&segments),
@@ -222,17 +258,57 @@ mod tests {
         let codec = BreezeTokenizer::from_bytes(&fixture()).unwrap();
         let codes = [[1u16; 16]];
         let plain = codec
-            .reference_prompt("reference", &codes, "target", None)
-            .unwrap();
+            .reference_prompts("reference", &codes, "target", None, 1.0)
+            .unwrap()
+            .conditional;
         let edit = codec
-            .reference_prompt("reference", &codes, "target", Some("softly"))
-            .unwrap();
+            .reference_prompts("reference", &codes, "target", Some("softly"), 1.0)
+            .unwrap()
+            .conditional;
         let blank = codec
-            .reference_prompt("reference", &codes, "target", Some(" \n"))
-            .unwrap();
+            .reference_prompts("reference", &codes, "target", Some(" \n"), 1.0)
+            .unwrap()
+            .conditional;
         assert_eq!(texts(&plain)[0], texts(&edit)[0]);
         assert_eq!(texts(&edit)[1], [BOS, SPEAKER_ZERO, INS_BOS, 6, INS_EOS, 5]);
         assert_eq!(texts(&plain), texts(&blank));
+    }
+
+    #[test]
+    fn paired_negative_keeps_reference_and_removes_only_direction() {
+        let codec = BreezeTokenizer::from_bytes(&fixture()).unwrap();
+        let codes = [[7; 16], [8; 16]];
+        let prompt = codec
+            .reference_prompts("reference", &codes, "target", Some("softly"), 4.0)
+            .unwrap();
+        let negative = prompt.negative.unwrap();
+        assert_eq!(&prompt.conditional[..3], &negative[..3]);
+        assert_eq!(
+            texts(&prompt.conditional)[1],
+            [BOS, SPEAKER_ZERO, INS_BOS, 6, INS_EOS, 5]
+        );
+        assert_eq!(texts(&negative)[1], [BOS, SPEAKER_ZERO, 5]);
+        assert!(
+            codec
+                .reference_prompts("reference", &codes, "target", None, 4.0)
+                .is_err()
+        );
+        assert!(
+            codec
+                .reference_prompts("reference", &codes, "target", Some(" \n"), 4.0)
+                .is_err()
+        );
+        for scale in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            assert!(
+                codec
+                    .reference_prompts("reference", &codes, "target", Some("softly"), scale)
+                    .is_err()
+            );
+        }
+        let unit = codec
+            .reference_prompts("reference", &codes, "target", Some("softly"), 1.0)
+            .unwrap();
+        assert!(unit.negative.is_none());
     }
 
     #[test]
@@ -242,11 +318,13 @@ mod tests {
         let after = BreezeTokenizer::from_bytes(&serialized).unwrap();
         let codes = [[7u16; 16]];
         let first = before
-            .reference_prompt("reference", &codes, "target", None)
-            .unwrap();
+            .reference_prompts("reference", &codes, "target", None, 1.0)
+            .unwrap()
+            .conditional;
         let cold = after
-            .reference_prompt("reference", &codes, "target", None)
-            .unwrap();
+            .reference_prompts("reference", &codes, "target", None, 1.0)
+            .unwrap()
+            .conditional;
         assert_eq!(texts(&first), texts(&cold));
         let mut bad: serde_json::Value = serde_json::from_slice(&serialized).unwrap();
         bad["post_processor"] = serde_json::Value::Null;
@@ -259,18 +337,18 @@ mod tests {
         for text in ["", "<|AUDIO|>", "target<|audio_eos|>", "<bos>target"] {
             assert!(
                 codec
-                    .reference_prompt("reference", &[[0; 16]], text, None)
+                    .reference_prompts("reference", &[[0; 16]], text, None, 1.0)
                     .is_err()
             );
         }
         assert!(
             codec
-                .reference_prompt("reference", &[[2050; 16]], "target", None)
+                .reference_prompts("reference", &[[2050; 16]], "target", None, 1.0)
                 .is_err()
         );
         assert!(
             codec
-                .reference_prompt("reference", &[], "target", None)
+                .reference_prompts("reference", &[], "target", None, 1.0)
                 .is_err()
         );
     }

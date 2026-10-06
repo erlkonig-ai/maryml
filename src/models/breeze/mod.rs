@@ -20,6 +20,8 @@ pub mod pipeline;
 pub mod prompt;
 #[cfg(feature = "breeze-cuda")]
 pub mod reference;
+#[cfg(all(feature = "breeze-cuda", feature = "speak"))]
+pub mod resident;
 #[cfg(feature = "breeze-cuda")]
 mod sampling;
 #[cfg(feature = "breeze-cuda")]

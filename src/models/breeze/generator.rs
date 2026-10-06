@@ -1,12 +1,13 @@
 //! Pile-native B1 Breeze generator. No checkpoint file, Python model, hidden
 //! weight catalogue, CPU LLM or reference-prefixed acoustic output is reachable.
-//! Initial endpoint is CFG1; paired conditional/negative CFG is not simulated.
+//! CFG1 and paired conditional/negative guidance, with independent branch KV.
 use super::{
-    backbone::Decoder,
+    backbone::{Decoder, Kv},
     config::{Config, DecoderConfig},
     cuda_ops as ops,
     depth::Depth,
     load::{self, Artifacts},
+    prompt::GuidedPrompt,
     sampling::Sampler,
     text_encoder::TextEncoder,
 };
@@ -67,6 +68,9 @@ pub struct GenerationReport {
     pub decode_seconds: f64,
     pub callback_seconds: f64,
     pub total_seconds: f64,
+    pub cfg_scale: f32,
+    pub conditional_prompt_tokens: usize,
+    pub negative_prompt_tokens: Option<usize>,
 }
 
 /// A typed selector only for the duration of construction, not a retained
@@ -151,10 +155,14 @@ fn validate_geometry(c: &Config) -> Result<()> {
     );
     Ok(())
 }
-pub fn validate_request(prompt: &[PromptSegment], o: &GenerationOptions) -> Result<usize> {
+pub fn validate_request(prompt: &GuidedPrompt, o: &GenerationOptions) -> Result<usize> {
     ensure!(
-        o.cfg_scale == 1.0,
-        "native Breeze currently supports explicit CFG1 only, not ignored paired CFG"
+        o.cfg_scale.is_finite() && o.cfg_scale > 0.0,
+        "CFG scale must be finite and positive"
+    );
+    ensure!(
+        prompt.negative.is_some() == (o.cfg_scale != 1.0),
+        "nonunit CFG needs an explicit negative prompt; CFG1 must not carry an unused branch"
     );
     ensure!(
         (1..=1500).contains(&o.max_frames) && (1..=2048).contains(&o.max_context),
@@ -170,6 +178,14 @@ pub fn validate_request(prompt: &[PromptSegment], o: &GenerationOptions) -> Resu
             && o.repetition_penalty > 0.0,
         "invalid sampling options"
     );
+    let count = validate_branch(&prompt.conditional, o.max_context)?;
+    if let Some(negative) = &prompt.negative {
+        validate_branch(negative, o.max_context)?;
+    }
+    Ok(count)
+}
+
+fn validate_branch(prompt: &[PromptSegment], max_context: usize) -> Result<usize> {
     ensure!(!prompt.is_empty(), "empty prompt");
     let mut count = 0usize;
     for segment in prompt {
@@ -195,10 +211,19 @@ pub fn validate_request(prompt: &[PromptSegment], o: &GenerationOptions) -> Resu
             .ok_or_else(|| anyhow::anyhow!("prompt length overflow"))?;
     }
     ensure!(
-        count <= o.max_context,
+        count <= max_context,
         "prompt exceeds bounded context; no truncation"
     );
     Ok(count)
+}
+
+/// Per-request state of ONE branch. Separate prefills establish independent
+/// RoPE positions/caches even where prompt prefixes are identical. Never alias
+/// one branch's KV as the other's state, nor retain these across requests.
+struct Branch {
+    hidden: Tensor,
+    cache: Vec<Kv>,
+    past: usize,
 }
 
 pub struct Generator {
@@ -248,19 +273,7 @@ impl Generator {
         cubecl::future::block_on(self.head.client.sync())
             .map_err(|e| anyhow::anyhow!("Breeze CUDA sync: {e:?}"))
     }
-    pub fn generate(
-        &mut self,
-        prompt: &[PromptSegment],
-        options: GenerationOptions,
-        mut on_frame: impl FnMut([u16; 16]) -> Result<()>,
-    ) -> Result<GenerationReport> {
-        let prompt_len = validate_request(prompt, &options)?;
-        ensure!(
-            options.max_context <= self.config.max_context,
-            "request exceeds model context"
-        );
-        self.synchronize()?;
-        let started = Instant::now();
+    fn prefill(&self, prompt: &[PromptSegment]) -> Result<Branch> {
         let mut merged: Option<Tensor> = None;
         for segment in prompt {
             let x = match segment {
@@ -274,29 +287,62 @@ impl Generator {
             };
             merged = Some(ops::append(&x, merged.as_ref()));
         }
-        let (mut hidden, mut cache) = self.backbone.forward(
-            merged.ok_or_else(|| anyhow::anyhow!("empty merged prompt"))?,
-            0,
-            &[],
-        )?;
+        let merged = merged.ok_or_else(|| anyhow::anyhow!("empty merged prompt"))?;
+        let past = merged.meta.shape()[1];
+        let (hidden, cache) = self.backbone.forward(merged, 0, &[])?;
+        Ok(Branch {
+            hidden,
+            cache,
+            past,
+        })
+    }
+    pub fn generate(
+        &mut self,
+        prompt: &GuidedPrompt,
+        options: GenerationOptions,
+        mut on_frame: impl FnMut([u16; 16]) -> Result<()>,
+    ) -> Result<GenerationReport> {
+        let prompt_len = validate_request(prompt, &options)?;
+        ensure!(
+            options.max_context <= self.config.max_context,
+            "request exceeds model context"
+        );
+        self.synchronize()?;
+        let started = Instant::now();
+        let mut positive = self.prefill(&prompt.conditional)?;
+        let mut negative = prompt
+            .negative
+            .as_ref()
+            .map(|p| self.prefill(p))
+            .transpose()?;
+        let negative_prompt_tokens = negative.as_ref().map(|branch| branch.past);
         self.synchronize()?;
         let prefill_seconds = started.elapsed().as_secs_f64();
         let decode_start = Instant::now();
         let mut sampler = Sampler::new(options.seed);
         let mut backbone_ids = Vec::with_capacity(options.max_frames);
         let mut frames = 0usize;
-        let mut past = prompt_len;
         let mut callback_seconds = 0.0f64;
         let termination = loop {
-            let logits = ops::head(&hidden, &self.head, None);
-            let first = sampler.sample(&logits, &options, &backbone_ids, true)?;
+            let logits = ops::head(&positive.hidden, &self.head, None);
+            let negative_logits = negative
+                .as_ref()
+                .map(|b| ops::head(&b.hidden, &self.head, None));
+            let first = sampler.sample_guided(
+                &logits,
+                negative_logits.as_ref(),
+                &options,
+                &backbone_ids,
+                true,
+            )?;
             backbone_ids.push(first);
             if first == 2051 {
                 break Termination::Eos;
             }
             ensure!(first < 2048, "backbone emitted reserved codec ID");
             let frame = self.depth.frame(
-                &hidden,
+                &positive.hidden,
+                negative.as_ref().map(|b| &b.hidden),
                 first,
                 &self.audio_embedding,
                 &options,
@@ -309,12 +355,24 @@ impl Generator {
             if frames == options.max_frames {
                 break Termination::FrameLimit;
             }
-            if past == options.max_context {
+            if positive.past == options.max_context
+                || negative
+                    .as_ref()
+                    .is_some_and(|b| b.past == options.max_context)
+            {
                 break Termination::ContextLimit;
             }
             let input = ops::audio_embedding(&self.audio_embedding, &[frame], 2051);
-            (hidden, cache) = self.backbone.forward(input, past, &cache)?;
-            past += 1;
+            (positive.hidden, positive.cache) =
+                self.backbone
+                    .forward(input.clone(), positive.past, &positive.cache)?;
+            positive.past += 1;
+            if let Some(branch) = &mut negative {
+                // Exactly the SAME sampled complete frame goes to both branches.
+                (branch.hidden, branch.cache) =
+                    self.backbone.forward(input, branch.past, &branch.cache)?;
+                branch.past += 1;
+            }
         };
         self.synchronize()?;
         let decode_seconds = decode_start.elapsed().as_secs_f64() - callback_seconds;
@@ -326,6 +384,9 @@ impl Generator {
             decode_seconds,
             callback_seconds,
             total_seconds: started.elapsed().as_secs_f64(),
+            cfg_scale: options.cfg_scale,
+            conditional_prompt_tokens: prompt_len,
+            negative_prompt_tokens,
         })
     }
 }
@@ -334,23 +395,47 @@ impl Generator {
 mod tests {
     use super::*;
     #[test]
-    fn bounded_requests_refuse_silent_cfg_and_truncation() {
-        let p = [
-            PromptSegment::Text(vec![2, 100]),
-            PromptSegment::AudioFrames(vec![[17; 16]]),
-            PromptSegment::AudioEos,
-        ];
+    fn bounded_requests_refuse_missing_cfg_branch_and_truncation() {
+        let mut p = GuidedPrompt {
+            conditional: vec![
+                PromptSegment::Text(vec![2, 100]),
+                PromptSegment::AudioFrames(vec![[17; 16]]),
+                PromptSegment::AudioEos,
+            ],
+            negative: None,
+        };
         let mut o = GenerationOptions::default();
         assert_eq!(validate_request(&p, &o).unwrap(), 4);
         o.cfg_scale = 4.0;
         assert!(validate_request(&p, &o).is_err());
+        p.negative = Some(vec![PromptSegment::Text(vec![2, 101])]);
+        assert_eq!(validate_request(&p, &o).unwrap(), 4);
+        p.negative = Some(vec![PromptSegment::Text(vec![2; 2049])]);
+        assert!(validate_request(&p, &o).is_err());
+        p.negative = None;
         o.cfg_scale = 1.0;
         o.max_context = 3;
         assert!(validate_request(&p, &o).is_err());
         o.max_context = 4;
         assert!(validate_request(&p, &o).is_ok());
-        let bad = [PromptSegment::AudioFrames(vec![[2048; 16]])];
+        let bad = GuidedPrompt {
+            conditional: vec![PromptSegment::AudioFrames(vec![[2048; 16]])],
+            negative: None,
+        };
         assert!(validate_request(&bad, &o).is_err());
-        assert!(validate_request(&[], &o).is_err());
+        assert!(
+            validate_request(
+                &GuidedPrompt {
+                    conditional: vec![],
+                    negative: None
+                },
+                &o
+            )
+            .is_err()
+        );
+        for scale in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            o.cfg_scale = scale;
+            assert!(validate_request(&p, &o).is_err());
+        }
     }
 }

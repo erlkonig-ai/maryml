@@ -76,7 +76,7 @@ struct Args {
     repetition_penalty: f32,
     #[arg(long)]
     greedy: bool,
-    /// First generator supports 1 only and explicitly refuses other values.
+    /// Non-unit CFG uses an explicit direction and paired positive/negative branches.
     #[arg(long, default_value_t = 1.0)]
     cfg_scale: f32,
     /// Measure the real native CPU reference encoder and write its code receipt,
@@ -140,8 +140,14 @@ fn main() -> Result<()> {
         "bounded endpoint requires frames1..1500 and context1..2048"
     );
     ensure!(
-        args.cfg_scale == 1.0,
-        "this native slice supports CFG1 only, not paired CFG"
+        args.cfg_scale.is_finite()
+            && args.cfg_scale > 0.0
+            && (args.cfg_scale == 1.0
+                || args
+                    .direction
+                    .as_deref()
+                    .is_some_and(|text| !text.trim().is_empty())),
+        "CFG must be finite and positive; non-unit scale requires an explicit direction"
     );
     ensure!(
         args.temperature.is_finite()
@@ -195,11 +201,13 @@ fn main() -> Result<()> {
         &reference_text,
         &args.text,
         args.direction.as_deref(),
+        args.cfg_scale,
     )?;
     drop(encoder);
     if args.reference_only {
         let codes = prepared
             .prompt
+            .conditional
             .iter()
             .find_map(|segment| match segment {
                 PromptSegment::AudioFrames(codes) => Some(codes),
@@ -281,6 +289,8 @@ fn main() -> Result<()> {
         "temperature":args.temperature,"top_k":args.top_k,"top_p":args.top_p,
         "repetition_penalty":args.repetition_penalty,"do_sample":!args.greedy,"cfg_scale":args.cfg_scale,
         "termination":format!("{:?}",result.generation.termination),
+        "conditional_prompt_tokens":result.generation.conditional_prompt_tokens,
+        "negative_prompt_tokens":result.generation.negative_prompt_tokens,
         "raw_backbone_ids":result.generation.backbone_ids,"frames":result.frames,
         "sample_rate":SAMPLE_RATE,"samples":result.samples.len(),"audio_seconds":duration,
         "source_seconds":source_seconds,"encoder_load_seconds":encoder_load_seconds,

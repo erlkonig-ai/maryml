@@ -6,14 +6,14 @@ use std::{path::Path, time::Instant};
 
 use super::{
     audio::decode_generated,
-    generator::{GenerationOptions, GenerationReport, Generator, PromptSegment},
-    prompt::BreezeTokenizer,
+    generator::{GenerationOptions, GenerationReport, Generator},
+    prompt::{BreezeTokenizer, GuidedPrompt},
     reference::{encode_reference, read_wav},
 };
 use crate::models::qwen3tts::{codec::CodecDecoder, encoder::CodecEncoder};
 
 pub struct PreparedReference {
-    pub prompt: Vec<PromptSegment>,
+    pub prompt: GuidedPrompt,
     pub reference_samples: usize,
     pub reference_frames: usize,
     pub wav_read_seconds: f64,
@@ -30,6 +30,7 @@ pub fn prepare_reference(
     reference_text: &str,
     text: &str,
     direction: Option<&str>,
+    cfg_scale: f32,
 ) -> Result<PreparedReference> {
     let started = Instant::now();
     let samples = read_wav(reference_wav)?;
@@ -38,7 +39,7 @@ pub fn prepare_reference(
     let codes = encode_reference(encoder, &samples)?;
     let reference_encode_seconds = started.elapsed().as_secs_f64();
     let started = Instant::now();
-    let prompt = tokenizer.reference_prompt(reference_text, &codes, text, direction)?;
+    let prompt = tokenizer.reference_prompts(reference_text, &codes, text, direction, cfg_scale)?;
     Ok(PreparedReference {
         prompt,
         reference_samples: samples.len(),
@@ -60,7 +61,7 @@ pub struct Synthesis {
 /// state. Reference codes condition the LM but are never an output prefix.
 pub fn run<B: Backend>(
     generator: &mut Generator,
-    prompt: &[PromptSegment],
+    prompt: &GuidedPrompt,
     decoder: &CodecDecoder<B>,
     device: &B::Device,
     options: GenerationOptions,

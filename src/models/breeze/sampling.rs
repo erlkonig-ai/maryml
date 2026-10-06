@@ -6,7 +6,59 @@ use super::{
     generator::GenerationOptions,
 };
 use anyhow::{Result, ensure};
+use burn::tensor::DType;
 use cubecl::{cuda::CudaRuntime, prelude::*};
+
+#[cube(launch_unchecked)]
+fn cfg_kernel(
+    positive: &Array<f32>,
+    negative: &Array<f32>,
+    out: &mut Array<f32>,
+    n: usize,
+    scale: f32,
+) {
+    let i = ABSOLUTE_POS as usize;
+    if i < n {
+        out[i] = negative[i] + scale * (positive[i] - negative[i]);
+    }
+}
+
+/// Guidance is on raw F32 logits BEFORE reserved-token masking, repetition,
+/// temperature and sampling. It is not interpolation of hidden states or codes.
+fn cfg_logits(positive: &Tensor, negative: &Tensor, scale: f32) -> Result<Tensor> {
+    let n = count(positive);
+    ensure!(
+        (n == 2051 || n == 2052) && positive.meta.shape() == negative.meta.shape(),
+        "CFG head shape mismatch"
+    );
+    ensure!(
+        positive.dtype == DType::F32 && negative.dtype == DType::F32,
+        "CFG requires F32 logits"
+    );
+    ensure!(scale.is_finite() && scale > 0.0, "invalid CFG scale");
+    let out = positive.client.empty(n * 4);
+    // SAFETY: checked equal contiguous F32 heads, fresh writable result; neither
+    // branch's logits nor any immutable pile leaf is modified.
+    unsafe {
+        cfg_kernel::launch_unchecked::<CudaRuntime>(
+            &positive.client,
+            grid(positive, n),
+            CubeDim::new_1d(64),
+            ArrayArg::from_raw_parts(positive.handle.clone(), n),
+            ArrayArg::from_raw_parts(negative.handle.clone(), n),
+            ArrayArg::from_raw_parts(out.clone(), n),
+            n,
+            scale,
+        );
+    }
+    Ok(Tensor::new_contiguous(
+        positive.client.clone(),
+        positive.device.clone(),
+        positive.meta.shape().clone(),
+        out,
+        DType::F32,
+    ))
+}
 
 pub(super) struct Sampler {
     state: u64,
@@ -23,6 +75,28 @@ impl Sampler {
         z ^= z >> 31;
         // Midpoints avoid exact zero and one in the F32 transport.
         ((z >> 41) as f32 + 0.5) / 8388608.0
+    }
+    pub(super) fn sample_guided(
+        &mut self,
+        positive: &Tensor,
+        negative: Option<&Tensor>,
+        options: &GenerationOptions,
+        history: &[u32],
+        backbone: bool,
+    ) -> Result<u32> {
+        ensure!(
+            negative.is_some() == (options.cfg_scale != 1.0),
+            "CFG branch/scale mismatch"
+        );
+        match negative {
+            Some(negative) => self.sample(
+                &cfg_logits(positive, negative, options.cfg_scale)?,
+                options,
+                history,
+                backbone,
+            ),
+            None => self.sample(positive, options, history, backbone),
+        }
     }
     pub(super) fn sample(
         &mut self,
@@ -233,6 +307,78 @@ mod tests {
             let u = a.uniform();
             assert!(u > 0.0 && u < 1.0);
             assert_eq!(u, b.uniform());
+        }
+    }
+
+    #[test]
+    #[ignore = "actual CUDA device 0 requires ordinary Stars lock"]
+    fn cuda_paired_cfg_changes_both_heads_and_keeps_eos_rules() {
+        use cubecl::{Runtime, cuda::CudaDevice};
+        let device = CudaDevice { index: 0 };
+        let client = CudaRuntime::client(&device);
+        let make = |values: &[f32]| {
+            Tensor::new_contiguous(
+                client.clone(),
+                device.clone(),
+                [1, 1, values.len()].into(),
+                client.create_from_slice(f32::as_bytes(values)),
+                DType::F32,
+            )
+        };
+        for backbone in [true, false] {
+            let n = if backbone { 2052 } else { 2051 };
+            let mut positive = vec![-20.0; n];
+            let mut negative = vec![-20.0; n];
+            // Planted omission/reversal control: conditional alone picks7,
+            // reversed branches pick8, correct paired CFG4 must pick9.
+            positive[7] = 4.0;
+            negative[7] = 4.0;
+            positive[8] = 3.0;
+            negative[8] = 8.0;
+            positive[9] = 2.0;
+            negative[9] = -2.0;
+            // Reserved codec token must remain impossible after guidance.
+            positive[2048] = 100.0;
+            negative[2048] = -100.0;
+            let p = make(&positive);
+            let n = make(&negative);
+            let mut options = GenerationOptions::default();
+            options.do_sample = false;
+            let mut sampler = Sampler::new(42);
+            assert_eq!(
+                sampler
+                    .sample_guided(&p, None, &options, &[], backbone)
+                    .unwrap(),
+                7
+            );
+            options.cfg_scale = 4.0;
+            assert!(
+                sampler
+                    .sample_guided(&p, None, &options, &[], backbone)
+                    .is_err()
+            );
+            assert_eq!(
+                sampler
+                    .sample_guided(&p, Some(&n), &options, &[], backbone)
+                    .unwrap(),
+                9
+            );
+            if backbone {
+                positive[2051] = 2.0;
+                negative[2051] = -3.0;
+                assert_eq!(
+                    sampler
+                        .sample_guided(
+                            &make(&positive),
+                            Some(&make(&negative)),
+                            &options,
+                            &[],
+                            true
+                        )
+                        .unwrap(),
+                    2051
+                );
+            }
         }
     }
 }

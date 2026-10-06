@@ -30,7 +30,7 @@
 //! pile seam never depends on that machinery. See PORT_NOTES.md, "Zero-copy
 //! alias probe" + "the zero-copy RAW talker lane".)
 //!
-//! There is ONE generation path — a streaming one. [`synthesize_stream`]
+//! Qwen has one generation path — a streaming one. [`synthesize_stream`]
 //! returns an iterator of 24 kHz PCM chunks: frames go to a codec thread the
 //! moment they are sampled and are decoded in hop-sized windows with trailing
 //! left context (the `qwen3tts_stream` loop, productionized). [`synthesize`]
@@ -48,6 +48,11 @@
 //! same reference so the voice stays consistent); a short silence gap is
 //! emitted between passes. The Qwen2 BPE builds from the tokenizer files
 //! committed under `<mary>/assets/qwen3tts/`.
+//!
+//! With `breeze-cuda`, `Synthesizer::spawn_breeze` adds an explicitly selected
+//! native Breeze resident using the same request/completion transport. It
+//! currently emits a whole utterance batch, not low-latency streaming. Its
+//! tokenizer/weights are pile-only and its reference is encoded natively once.
 
 use std::collections::{HashMap, hash_map::Entry};
 use std::path::{Path, PathBuf};
@@ -426,11 +431,12 @@ fn env_f64(name: &str, default: f64) -> f64 {
 // first. So the talker JITs lazily in the prefill; the codec's own JIT
 // overlaps and is hidden.
 
-/// A live synthesis: iterate it for 24 kHz mono PCM chunks in `[-1, 1]` as
-/// they become ready (the first chunk arrives after prefill + `HOP` frames —
-/// seconds, not the whole utterance), then call [`finish`](Self::finish) to
-/// propagate any synthesis error. Dropping it early cancels the remaining
-/// generation of THIS utterance once the codec next tries to emit a chunk;
+/// A live synthesis: iterate it for 24 kHz mono f32 PCM chunks as
+/// they become ready, then call [`finish`](Self::finish) to propagate errors.
+/// Qwen's first chunk arrives after prefill + `HOP` frames; Breeze's initial
+/// resident sends one complete utterance only after batch decode. Dropping it
+/// early cancels Qwen once the codec next emits, whereas Breeze finishes the
+/// current bounded batch before observing the dropped output receiver;
 /// the [`Synthesizer`] it came from is untouched and serves the next one.
 pub struct SpeakStream {
     rx: mpsc::Receiver<Vec<f32>>,
@@ -485,7 +491,227 @@ pub struct Synthesizer {
     tx: mpsc::Sender<Request>,
 }
 
+#[cfg(feature = "breeze-cuda")]
+fn require_breeze_eos(
+    termination: crate::models::breeze::generator::Termination,
+    frames: usize,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        termination == crate::models::breeze::generator::Termination::Eos,
+        "Breeze utterance ended at {termination:?} after {frames} frames; no partial PCM emitted"
+    );
+    Ok(())
+}
+
+#[cfg(all(test, feature = "breeze-cuda"))]
+mod breeze_transport_tests {
+    use super::*;
+    use crate::models::breeze::resident::test_config;
+
+    #[test]
+    fn breeze_rejects_invalid_config_before_spawning_or_opening_assets() {
+        let mut config = test_config();
+        config.options.max_frames = 0;
+        // SAFETY: invalid inputs are refused before any file or CUDA access.
+        assert!(unsafe { Synthesizer::spawn_breeze(config) }.is_err());
+    }
+
+    #[test]
+    fn breeze_load_failure_reaches_each_existing_stream_finish() {
+        let config = test_config();
+        assert!(!config.pile.exists());
+        // SAFETY: this unique missing path fails before any tensor is bound;
+        // no aliased file/CUDA storage exists in this non-GPU routing control.
+        let synth = unsafe { Synthesizer::spawn_breeze(config) }.unwrap();
+        for text in ["First request.", "Second request."] {
+            let mut stream = synth.speak(text).unwrap();
+            assert!(stream.next().is_none());
+            let error = stream.finish().unwrap_err().to_string();
+            assert!(error.contains("Breeze resident failed to load"), "{error}");
+            assert!(error.contains("open read-only"), "{error}");
+        }
+        drop(synth);
+    }
+
+    #[test]
+    fn breeze_live_completion_refuses_caps_before_pcm_emission() {
+        use crate::models::breeze::generator::Termination;
+        for termination in [Termination::Eos, Termination::FrameLimit, Termination::ContextLimit] {
+            let (pcm, received) = mpsc::channel();
+            let result = require_breeze_eos(termination, 2).and_then(|()| {
+                pcm.send(vec![0.25f32]).map_err(anyhow::Error::msg)
+            });
+            drop(pcm);
+            if termination == Termination::Eos {
+                result.unwrap();
+                assert_eq!(received.recv().unwrap(), [0.25]);
+            } else {
+                let message = result.unwrap_err().to_string();
+                assert!(message.contains(&format!("{termination:?}")), "{message}");
+                assert!(message.contains("no partial PCM emitted"), "{message}");
+                assert!(received.recv().is_err());
+            }
+        }
+    }
+
+    /// Explicit real-model control, never part of the default test run.
+    #[test]
+    #[ignore = "real native Breeze CUDA; requires immutable-pile custody and fresh Stars reservation"]
+    fn breeze_resident_two_real_requests() -> anyhow::Result<()> {
+        use crate::models::breeze::{
+            audio::write_float_wav_new,
+            generator::GenerationOptions,
+            load::Artifacts,
+            resident::BreezeVoiceConfig,
+        };
+        use std::io::Write;
+        use triblespace::prelude::Id;
+
+        anyhow::ensure!(
+            std::env::var("BREEZE_RESIDENT_CUSTODY")?.as_str()
+                == "immutable-pile-through-cuda-runtime-teardown",
+            "explicit immutable alias custody is required"
+        );
+        let receipt_path = std::env::var("BREEZE_RESIDENT_IMPORT_RECEIPT")?;
+        let imported: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&receipt_path)?)?;
+        let field = |name: &str| -> anyhow::Result<&str> {
+            imported[name].as_str().ok_or_else(|| anyhow::anyhow!("missing {name}"))
+        };
+        let id = |name: &str| -> anyhow::Result<Id> {
+            Id::from_hex(field(name)?).ok_or_else(|| anyhow::anyhow!("invalid {name}"))
+        };
+        let reference_wav = PathBuf::from(std::env::var("BREEZE_RESIDENT_REFERENCE_WAV")?);
+        let transcript = PathBuf::from(std::env::var("BREEZE_RESIDENT_REFERENCE_TEXT")?);
+        let output = PathBuf::from(std::env::var("BREEZE_RESIDENT_OUTPUT")?);
+        std::fs::create_dir(&output)?; // exclusive new run; preserve old evidence
+        let config = BreezeVoiceConfig {
+            pile: PathBuf::from(field("pile")?),
+            artifacts: Artifacts {
+                model_root: id("model_root")?, config_root: id("config_root")?,
+                tokenizer_asset: id("tokenizer_asset")?,
+                external_codec_root: id("external_codec_root")?,
+                external_codec_config_root: id("external_codec_config_root")?,
+            },
+            reference_wav: reference_wav.clone(),
+            reference_text: std::fs::read_to_string(&transcript)?,
+            direction: None,
+            options: GenerationOptions { max_frames: 256, ..Default::default() },
+        };
+        // SAFETY: explicit test-runner custody covers real immutable bytes
+        // through CUDA process/runtime teardown, including any failure path.
+        let synth = unsafe { Synthesizer::spawn_breeze(config) }?;
+        let texts = [
+            "The rain has stopped, and the room is quiet. Shall we open the window?",
+            "There is a little sunlight on the table. I think this is a good place to begin.",
+        ];
+        let mut requests = Vec::new();
+        for (index, text) in texts.into_iter().enumerate() {
+            eprintln!("[breeze-control] request {} starts: {text}", index + 1);
+            let started = Instant::now();
+            let mut stream = synth.speak(text)?;
+            let mut pcm = Vec::new();
+            let mut chunks = 0usize;
+            for chunk in stream.by_ref() {
+                chunks += 1;
+                pcm.extend_from_slice(&chunk);
+            }
+            stream.finish()?;
+            let seconds = started.elapsed().as_secs_f64();
+            anyhow::ensure!(chunks == 1, "initial Breeze adapter must emit one batch");
+            anyhow::ensure!(
+                !pcm.is_empty() && pcm.len() <= 256 * 1920
+                    && pcm.len().is_multiple_of(1920) && pcm.iter().all(|x| x.is_finite()),
+                "invalid bounded native batch"
+            );
+            let wav = output.join(format!("resident-{:02}-float.wav", index + 1));
+            write_float_wav_new(&wav, &pcm)?;
+            requests.push(serde_json::json!({
+                "request":index+1,"text":text,"wav":wav,"chunks":chunks,
+                "samples":pcm.len(),"frames":pcm.len()/1920,"audio_seconds":pcm.len() as f64/24000.0,
+                "call_to_complete_seconds":seconds,"finish":"Ok",
+                "termination":"Eos",
+                "termination_evidence":"live completion rejects FrameLimit/ContextLimit before PCM and finish Ok",
+            }));
+            eprintln!("[breeze-control] request {} complete in {seconds:.6}s", index + 1);
+        }
+        drop(synth);
+        let report = serde_json::json!({
+            "scope":"two sequential real Synthesizer/SpeakStream requests; one resident/native reference load",
+            "import_receipt":receipt_path,"model_pile":field("pile")?,
+            "model_pile_import_sha256":field("pile_sha256")?,
+            "artifacts":{
+                "model_root":field("model_root")?,"config_root":field("config_root")?,
+                "tokenizer_asset":field("tokenizer_asset")?,
+                "external_codec_root":field("external_codec_root")?,
+                "external_codec_config_root":field("external_codec_config_root")?,
+            },
+            "reference_wav":reference_wav,"known_transcript":transcript,
+            "cfg_scale":1,"seed":42,"max_frames":256,"max_context":2048,
+            "load_once_evidence":"one [breeze] resident loaded once log and one model/reference file open",
+            "requests":requests,
+            "source_and_profile":"outer frozen-source/build receipt; require Mary test package opt-level3",
+            "no_oracle_reference_codes":true,"stateful_streaming":false,
+        });
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true)
+            .open(output.join("resident-two-requests.json"))?;
+        file.write_all(&serde_json::to_vec_pretty(&report)?)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        Ok(())
+    }
+}
+
 impl Synthesizer {
+    /// Resident native Breeze using this same request/PCM/error transport.
+    /// Models and native reference codes load once on the owning worker.
+    /// Unlike the Qwen constructor, Breeze currently emits one complete batch
+    /// per line: no PCM arrives until generation plus acoustic decoding ends.
+    /// Dropping a stream does not interrupt that batch's GPU work; its eventual
+    /// send fails, then the resident continues with the next queued request.
+    /// Frame/context caps are completion errors and emit no partial PCM.
+    ///
+    /// # Safety
+    /// The actual validated pile bytes and preceding aliased page prefixes must
+    /// remain immutable or append-only/untruncated through CUDA runtime/storage
+    /// teardown, including after the worker ends or load fails. Keeping a
+    /// snapshot/read-only FD alive alone cannot enforce that external custody.
+    #[cfg(feature = "breeze-cuda")]
+    pub unsafe fn spawn_breeze(
+        config: crate::models::breeze::resident::BreezeVoiceConfig,
+    ) -> anyhow::Result<Self> {
+        use crate::models::breeze::resident::BreezeResident;
+        config.validate()?;
+        let (tx, rx) = mpsc::channel::<Request>();
+        std::thread::Builder::new()
+            .name("speak-breeze".into())
+            .spawn(move || {
+                // SAFETY: explicit caller contract extends through runtime storage
+                // teardown, not merely through this worker or successful loading.
+                let mut resident = unsafe { BreezeResident::load(config) }
+                    .map_err(|error| format!("Breeze resident failed to load: {error:#}"));
+                while let Ok(req) = rx.recv() {
+                    let result = match &mut resident {
+                        Ok(resident) => resident.synthesize(&req.text).and_then(|output| {
+                            require_breeze_eos(output.generation.termination, output.frames.len())?;
+                            eprintln!(
+                                "[breeze] call-to-batch PCM: {:.3}s",
+                                req.called.elapsed().as_secs_f64()
+                            );
+                            req.pcm.send(output.samples).map_err(|_| {
+                                anyhow::anyhow!("Breeze utterance receiver was dropped")
+                            })
+                        }),
+                        Err(message) => Err(anyhow::anyhow!(message.clone())),
+                    };
+                    // Close PCM before completion, matching SpeakStream::finish.
+                    drop(req.pcm);
+                    let _ = req.done.send(result);
+                }
+            })?;
+        Ok(Self { tx })
+    }
+
     /// Load everything on a fresh generation thread and return immediately.
     /// Load errors surface on the FIRST utterance's [`SpeakStream::finish`]
     /// (and every later one), never silently.
@@ -513,8 +739,8 @@ impl Synthesizer {
         }
     }
 
-    /// Queue `text` and hand back its stream. Chunks arrive while generation
-    /// runs; call `finish` on the stream for the utterance's result.
+    /// Queue `text` and hand back its stream. Qwen emits incremental chunks;
+    /// Breeze currently emits a whole-line batch. Call `finish` for errors.
     pub fn speak(&self, text: &str) -> anyhow::Result<SpeakStream> {
         let (tx_pcm, rx_pcm) = mpsc::channel::<Vec<f32>>();
         let (tx_done, rx_done) = mpsc::channel::<anyhow::Result<()>>();

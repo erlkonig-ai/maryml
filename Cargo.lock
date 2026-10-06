@@ -7024,7 +7024,7 @@ dependencies = [
 
 [[package]]
 name = "triblespace"
-version = "0.47.0"
+version = "0.47.1"
 dependencies = [
  "triblespace-core",
  "triblespace-macros",
@@ -7032,7 +7032,7 @@ dependencies = [
 
 [[package]]
 name = "triblespace-core"
-version = "0.47.0"
+version = "0.47.1"
 dependencies = [
  "ahash",
  "anybytes",
