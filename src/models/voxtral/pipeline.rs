@@ -516,7 +516,7 @@ mod prefix_tests {
     // FastKv append/COW semantics. They are not a CPU model implementation.
     #[derive(Default)]
     struct Probe {
-        device: <Cpu as Backend>::Device,
+        device: burn_ndarray::NdArrayDevice,
         encodes: Cell<usize>,
         windows: RefCell<Vec<Vec<f32>>>,
         decode_shapes: RefCell<Vec<(usize, usize)>>,
@@ -525,7 +525,7 @@ mod prefix_tests {
     impl SttPipeline<Cpu> for Probe {
         type EncCaches = FastCaches<Cpu>;
         type DecCaches = usize;
-        fn device(&self) -> &<Cpu as Backend>::Device { &self.device }
+        fn device(&self) -> &burn_ndarray::NdArrayDevice { &self.device }
         fn tekken(&self) -> &Tekken { panic!("schedule fixture does not decode text") }
         fn mel(&self, samples: &[f32], center: bool) -> Tensor<Cpu, 3> {
             assert!(!center);
