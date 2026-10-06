@@ -79,6 +79,21 @@ fn linear_t<B: Backend>(
     wt.reshape([1, i, o])
 }
 
+/// Only the folded lane's O/down projections are candidates. Eligibility is
+/// checked against actual RawHalf storage; other cases keep Linear::forward.
+pub(super) fn output_projection<B: Backend>(linear: &Linear<B>, x: Tensor<B, 3>) -> Tensor<B, 3> {
+    #[cfg(feature = "voxtral-cuda")]
+    if let Some(y) = super::gemv_cuda::try_project(&x, &linear.weight_t)
+        .unwrap_or_else(|error| panic!("Voxtral O/down GEMV launch failed: {error:?}"))
+    {
+        return match &linear.bias {
+            Some(bias) => y + bias.clone(),
+            None => y,
+        };
+    }
+    linear.forward(x)
+}
+
 /// Sliding-window KV cache with absolute-position bookkeeping. Stores at most
 /// `window − 1` trailing keys: (a) every dropped key satisfies
 /// `q − j ≥ window` for all FUTURE queries (safe to drop), and (b) after an
@@ -285,7 +300,7 @@ impl<B: Backend> FastAttention<B> {
             let scores = q.matmul(k.swap_dims(2, 3)); // 1/√d pre-folded
             let probs = softmax(scores, 3);
             let out = probs.matmul(v).reshape([b, 1, h * d]);
-            return self.o_proj.forward(out);
+            return output_projection(&self.o_proj, out);
         }
 
         let expand = |t: Tensor<B, 4>| {
@@ -310,7 +325,7 @@ impl<B: Backend> FastAttention<B> {
         };
         let probs = softmax(scores, 3);
         let out = probs.matmul(v).swap_dims(1, 2).reshape([b, l, h * d]);
-        self.o_proj.forward(out)
+        output_projection(&self.o_proj, out)
     }
 }
 
@@ -347,7 +362,8 @@ impl<B: Backend> FastMlp<B> {
 
     fn forward(&self, h: Tensor<B, 3>) -> Tensor<B, 3> {
         let gu = h.matmul(self.gate_up_t.clone());
-        self.down.forward(
+        output_projection(
+            &self.down,
             silu(gu.clone().narrow(2, 0, self.inter)).mul(gu.narrow(2, self.inter, self.inter)),
         )
     }

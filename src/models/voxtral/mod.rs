@@ -185,6 +185,8 @@ pub mod config;
 pub mod decoder;
 pub mod encoder;
 pub mod fast;
+#[cfg(feature = "voxtral-cuda")]
+mod gemv_cuda;
 pub mod layers;
 pub mod mel;
 #[cfg(feature = "voxtral-cuda")]
