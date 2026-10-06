@@ -108,6 +108,12 @@ pub struct FastKv<B: Backend> {
     keep: usize,
 }
 
+impl<B: Backend> Clone for FastKv<B> {
+    fn clone(&self) -> Self {
+        Self { k: self.k.clone(), v: self.v.clone(), pos: self.pos, keep: self.keep }
+    }
+}
+
 impl<B: Backend> FastKv<B> {
     pub fn new(window: usize) -> Self {
         Self {
@@ -125,6 +131,16 @@ impl<B: Backend> FastKv<B> {
     /// Key count the next `update` of `l` positions will attend over.
     pub fn next_lk(&self, l: usize) -> usize {
         self.stored() + l
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prefix_test_sample(&self) -> (usize, usize, Vec<f32>, Vec<f32>) {
+        let sample = |t: &Option<Tensor<B, 4>>| t.as_ref().map_or_else(Vec::new, |t| {
+            let [_, _, len, width] = t.dims();
+            t.clone().narrow(1, 0, 1).narrow(2, len - 1, 1)
+                .narrow(3, 0, width.min(8)).into_data().iter::<f32>().collect()
+        });
+        (self.pos, self.stored(), sample(&self.k), sample(&self.v))
     }
 
     pub fn update(&mut self, k: Tensor<B, 4>, v: Tensor<B, 4>) -> (Tensor<B, 4>, Tensor<B, 4>) {
@@ -148,6 +164,57 @@ impl<B: Backend> FastKv<B> {
 
 /// Per-layer sliding-window caches for one stack.
 pub struct FastCaches<B: Backend>(pub Vec<FastKv<B>>);
+
+impl<B: Backend> Clone for FastCaches<B> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+#[cfg(all(test, feature = "voxtral-cuda"))]
+mod prefix_cache_tests {
+    use super::*;
+    use crate::nn::backend::hear::RawHalf;
+    use burn::tensor::TensorData;
+    use half::f16;
+
+    fn read(t: Tensor<RawHalf, 4>) -> Vec<f16> {
+        t.into_data().to_vec::<f16>().unwrap()
+    }
+
+    #[test]
+    #[ignore = "one actual encoder-cache geometry; managed-handle alias/append control, no model"]
+    fn cuda_prefix_cache_branches_append_without_mutating_seed() {
+        let device = Default::default();
+        let values: Vec<f16> = (0..ENC_HEADS * 124 * ENC_HEAD_DIM)
+            .map(|i| f16::from_f32((i % 17) as f32 / 16.0)).collect();
+        let original = Tensor::<RawHalf, 4>::from_data(
+            TensorData::new(values.clone(), [1, ENC_HEADS, 124, ENC_HEAD_DIM]), &device);
+        let mut seed = FastKv::new(ENC_WINDOW);
+        let _ = seed.update(original.clone(), original.clone());
+        let mut a = seed.clone();
+        let b = seed.clone();
+        let delta = Tensor::<RawHalf, 4>::full([1, ENC_HEADS, 4, ENC_HEAD_DIM], 2.0, &device);
+        let (ak, av) = a.update(delta.clone(), delta);
+        assert_eq!((a.pos, a.stored(), b.pos, b.stored(), seed.pos, seed.stored()),
+            (128,128,124,124,124,124));
+        assert_eq!(read(ak.clone().narrow(2,0,124)), values);
+        assert_eq!(read(av.clone().narrow(2,124,4)), vec![f16::from_f32(2.0); ENC_HEADS*4*ENC_HEAD_DIM]);
+        // A consumer may mutate its fresh append result; seed and other branch
+        // must retain their old tensor contents, not just unchanged positions.
+        let _ = read(ak.mul_scalar(-3.0));
+        assert_eq!(read(b.k.as_ref().unwrap().clone()), values);
+        assert_eq!(read(seed.v.as_ref().unwrap().clone()), values);
+        let mut b = b;
+        let delta = Tensor::<RawHalf, 4>::full([1, ENC_HEADS, 4, ENC_HEAD_DIM], -1.0, &device);
+        let (bk, _) = b.update(delta.clone(), delta);
+        assert_eq!(read(bk.narrow(2,124,4)), vec![f16::from_f32(-1.0); ENC_HEADS*4*ENC_HEAD_DIM]);
+        assert_eq!(read(a.v.as_ref().unwrap().clone().narrow(2,124,4)),
+            vec![f16::from_f32(2.0); ENC_HEADS*4*ENC_HEAD_DIM]);
+        assert_eq!(read(seed.k.as_ref().unwrap().clone()), values);
+        assert_eq!(read(original), values);
+    }
+}
 
 /// Block-causal + sliding-window mask over ABSOLUTE positions: query `i` sits
 /// at `pos + i`, key `j` at `(pos + l) − lk + j`. `None` when a single query

@@ -20,8 +20,8 @@ use std::path::Path;
 use crate::models::voxtral::config::{
     N_FFT, N_LEFT_PAD_TOKENS, OFFLINE_BUFFER_TOKENS, SAMPLES_PER_TOK, delay_tokens,
 };
-use crate::models::voxtral::fast::RealtimeTranscriber;
-use crate::models::voxtral::pipeline::StreamingTranscriber;
+use crate::models::voxtral::fast::{FastCaches, RealtimeTranscriber};
+use crate::models::voxtral::pipeline::{EncoderPrefix, StreamingTranscriber};
 use crate::models::voxtral::tokenizer::Tekken;
 use crate::nn::backend::hear;
 
@@ -46,9 +46,11 @@ pub const MAX_TOKENS: usize = 8192;
 /// two seconds at 16 kHz.
 pub const WARM_UP_SAMPLES: usize = 32_000;
 
-/// The resident ears: the realtime transcriber, weights on the GPU.
+/// The resident ears: model plus its immutable 31-step encoder silence prefix.
+/// Both stay on the same owner thread/device; no seed is reused across reloads.
 pub struct Ears {
     stt: RealtimeTranscriber<Backend>,
+    prefix: EncoderPrefix<Backend, FastCaches<Backend>>,
 }
 
 impl Ears {
@@ -64,30 +66,26 @@ impl Ears {
         let loader = crate::models::voxtral::VoxtralWeights::from_snapshot(snapshot)?.into_loader();
         let device = hear::Device::default();
         let stt = RealtimeTranscriber::load(&loader, tekken, MAX_TOKENS, &device);
-        let ears = Self { stt };
-        {
-            let mut warm = ears.listen(480);
+        let prefix = {
+            let mut stream = StreamingTranscriber::new(&stt, 480);
+            let prefix = stream.prepare_encoder_prefix();
+            // Continue this stream: stock warmup must not encode the prefix twice.
+            let mut warm = Listening::from_stream(stream, &stt.tekken, 480);
             warm.push(&vec![0.0; WARM_UP_SAMPLES]);
             warm.finish();
-        }
-        Ok(ears)
+            prefix
+        };
+        Ok(Self { stt, prefix })
     }
 
     /// Start a stream with text delayed `delay_ms` behind the audio (a
     /// multiple of 80 between 80 and 1200, or 2400; 480 is the model's
     /// default).
     pub fn listen(&self, delay_ms: usize) -> Listening<'_> {
-        let n_delay = delay_tokens(delay_ms);
-        let tail = (n_delay + 1 + OFFLINE_BUFFER_TOKENS) * SAMPLES_PER_TOK + SAMPLES_PER_TOK;
-        let budget = (MAX_TOKENS - N_LEFT_PAD_TOKENS - 1) * SAMPLES_PER_TOK - tail - N_FFT;
-        Listening {
-            stream: StreamingTranscriber::new(&self.stt, delay_ms),
-            tekken: &self.stt.tekken,
-            pending: Vec::new(),
-            accepted: 0,
-            budget,
-            n_delay,
-        }
+        Listening::from_stream(
+            StreamingTranscriber::from_encoder_prefix(&self.stt, delay_ms, &self.prefix),
+            &self.stt.tekken, delay_ms,
+        )
     }
 }
 
@@ -154,6 +152,18 @@ impl Listening<'_> {
     }
 }
 
+impl<'a> Listening<'a> {
+    fn from_stream(
+        stream: StreamingTranscriber<'a, Backend, RealtimeTranscriber<Backend>>,
+        tekken: &'a Tekken, delay_ms: usize,
+    ) -> Self {
+        let n_delay = delay_tokens(delay_ms);
+        let tail = (n_delay + 1 + OFFLINE_BUFFER_TOKENS) * SAMPLES_PER_TOK + SAMPLES_PER_TOK;
+        let budget = (MAX_TOKENS - N_LEFT_PAD_TOKENS - 1) * SAMPLES_PER_TOK - tail - N_FFT;
+        Self { stream, tekken, pending: Vec::new(), accepted: 0, budget, n_delay }
+    }
+}
+
 /// Remove and return the longest prefix of `pending` that ends on a character
 /// boundary; an incomplete trailing sequence stays for the next token's bytes.
 /// Bytes that can never become valid UTF-8 become U+FFFD.
@@ -206,6 +216,91 @@ mod tests {
             pending, b"\xe2\x82",
             "an incomplete euro sign keeps waiting"
         );
+    }
+
+    #[test]
+    #[cfg(all(feature = "voxtral-cuda", feature = "breeze"))]
+    #[ignore = "one native Ears load, tiny prefix/first40 witnesses and three short finishes; separately admitted"]
+    fn loaded_encoder_prefix_boundary_sessions_and_finish() -> anyhow::Result<()> {
+        use std::{fs::OpenOptions, time::Instant};
+        use crate::models::voxtral::pipeline::PrefixTestState;
+        let pile = std::env::var("MARY_HEARING_PREFIX_PILE")?;
+        let output = std::env::var("MARY_HEARING_PREFIX_REPORT")?;
+        let file = OpenOptions::new().write(true).create_new(true).open(output)?;
+        let started = Instant::now();
+        let ears = Ears::load(Path::new(&pile))?;
+        let loaded_seconds = started.elapsed().as_secs_f64();
+        let seed_before = ears.prefix.test_snapshot();
+        let state_ok = |state: &PrefixTestState, encoded, positions| {
+            state.encoded == encoded && state.queued == encoded && state.tokens == 0
+                && state.positions.len() == 32 && state.positions.iter().all(|&p| p == positions)
+        };
+        let mut zero = ears.listen(480);
+        let mut impulse = ears.listen(80);
+        let initial_zero = zero.stream.prefix_test_state();
+        let initial_impulse = impulse.stream.prefix_test_state();
+        let mut zero_text = zero.push(&[]);
+        let zero_empty = zero.stream.prefix_test_state();
+        zero_text += &zero.push(&[0.0; 39]);
+        let zero_39 = zero.stream.prefix_test_state();
+        zero_text += &zero.push(&[0.0]);
+        let zero_40 = zero.stream.prefix_test_state();
+        // The other branch must still be at the seed's private absolute pos.
+        let other_after_zero = impulse.stream.prefix_test_state();
+        let mut first = [0.0; 39];
+        first[0] = 1.0;
+        let mut impulse_text = impulse.push(&first);
+        let impulse_39 = impulse.stream.prefix_test_state();
+        impulse_text += &impulse.push(&[0.0]);
+        let impulse_40 = impulse.stream.prefix_test_state();
+        let seed_after_branches = ears.prefix.test_snapshot();
+        let zero_cap = zero.is_full();
+        let impulse_cap = impulse.is_full();
+        let zero_finished_before = zero.is_finished();
+        let impulse_finished_before = impulse.is_finished();
+        let zero_finish_started = Instant::now();
+        zero_text += &zero.finish();
+        let zero_finish_seconds = zero_finish_started.elapsed().as_secs_f64();
+        let impulse_finish_started = Instant::now();
+        impulse_text += &impulse.finish();
+        let impulse_finish_seconds = impulse_finish_started.elapsed().as_secs_f64();
+        let empty_started = Instant::now();
+        let empty = ears.listen(480);
+        let empty_cap = empty.is_full();
+        let empty_text = empty.finish();
+        let empty_seconds = empty_started.elapsed().as_secs_f64();
+        let seed_after_finishes = ears.prefix.test_snapshot();
+        let count = |s: &PrefixTestState| serde_json::json!({
+            "encoded":s.encoded,"queued":s.queued,"tokens":s.tokens,"positions":s.positions});
+        let impulse_visible = zero_40.last_embedding != impulse_40.last_embedding;
+        let result = serde_json::json!({"kind":"loaded_encoder_prefix_boundary_sessions_and_finish",
+            "pile":pile,"load_including_prefix_and_stock_warmup_seconds":loaded_seconds,
+            "initial_zero":count(&initial_zero),"initial_impulse":count(&initial_impulse),
+            "zero_empty":count(&zero_empty),"zero_39":count(&zero_39),"zero_40":count(&zero_40),
+            "other_after_zero":count(&other_after_zero),"impulse_39":count(&impulse_39),
+            "impulse_40":count(&impulse_40),"first_sample_impulse_visible":impulse_visible,
+            "seed_unchanged_after_branches":seed_before==seed_after_branches,
+            "seed_unchanged_after_finishes":seed_before==seed_after_finishes,
+            "raw_finishes":[
+                {"delay_ms":480,"input_samples":40,"text":zero_text,"cap_before_finish":zero_cap,
+                    "eos_before_finish":zero_finished_before,"finish_seconds":zero_finish_seconds},
+                {"delay_ms":80,"input_samples":40,"text":impulse_text,"cap_before_finish":impulse_cap,
+                    "eos_before_finish":impulse_finished_before,"finish_seconds":impulse_finish_seconds},
+                {"delay_ms":480,"input_samples":0,"text":empty_text,"cap_before_finish":empty_cap,
+                    "request_seconds":empty_seconds}],
+            "post_finish_eos":"not exposed by consuming public finish API; not inferred from text",
+            "scope":"first/last layer KV 8-value samples and8values per seed embedding; one full first40 projected vector, not model-wide parity"});
+        serde_json::to_writer_pretty(file, &result)?;
+        println!("ENCODER_PREFIX_WITNESS {result}");
+        for state in [&initial_zero,&initial_impulse,&zero_empty,&zero_39,&other_after_zero,&impulse_39] {
+            anyhow::ensure!(state_ok(state,31,124), "unexpected reusable prefix boundary: {state:?}");
+        }
+        anyhow::ensure!(state_ok(&zero_40,32,128) && state_ok(&impulse_40,32,128), "first40 step missing");
+        anyhow::ensure!(impulse_visible, "first real impulse hidden by reuse");
+        anyhow::ensure!(seed_before==seed_after_branches && seed_before==seed_after_finishes,
+            "shared prefix sample changed");
+        anyhow::ensure!(!zero_cap && !impulse_cap && !empty_cap, "unexpected short-request cap");
+        Ok(())
     }
 
     /// Opt-in end-to-end gate on a real pile and GPU: set

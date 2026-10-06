@@ -299,6 +299,15 @@ pub struct StreamingTranscriber<'a, B: Backend, O: SttPipeline<B>> {
     finished: bool,       // saw EOS
 }
 
+/// Immutable encoder-only silence prefix belonging to one loaded model/device
+/// and its owning thread. Ears owns it; never persist or share across reloads.
+/// Cloned cache containers append into fresh tensors; seed handles stay alive.
+/// No decoder, samples, delay conditioning or request timestamps are retained.
+pub(crate) struct EncoderPrefix<B: Backend, C> {
+    caches: C,
+    embeddings: Vec<Tensor<B, 3>>,
+}
+
 impl<'a, B: Backend, O: SttPipeline<B>> StreamingTranscriber<'a, B, O> {
     pub fn new(stt: &'a O, delay_ms: usize) -> Self {
         let n_delay = delay_tokens(delay_ms);
@@ -314,6 +323,37 @@ impl<'a, B: Backend, O: SttPipeline<B>> StreamingTranscriber<'a, B, O> {
             finished: false,
             stt,
         }
+    }
+
+    /// Called once on the fresh load-time warmup stream, which then continues
+    /// normally. Preserve the original 31 M4 calls, not one large encoder pass.
+    pub(crate) fn prepare_encoder_prefix(&mut self) -> EncoderPrefix<B, O::EncCaches>
+    where O::EncCaches: Clone {
+        assert_eq!(self.tokens_encoded, 0, "prefix preparation needs a fresh stream");
+        assert_eq!(self.samples.len(), N_LEFT_PAD_TOKENS * SAMPLES_PER_TOK);
+        assert!(self.tokens.is_empty() && self.queue.is_empty() && !self.finished);
+        assert!(self.push(&[]).is_empty(), "encoder prefix must not decode");
+        // k31 needs the first40 real samples; it must never enter the seed.
+        assert_eq!(self.tokens_encoded, N_LEFT_PAD_TOKENS - 1);
+        assert_eq!(self.queue.len(), self.tokens_encoded);
+        EncoderPrefix {
+            caches: self.enc_caches.clone(),
+            embeddings: self.queue.iter().map(|(t, _, _)| t.clone()).collect(),
+        }
+    }
+
+    /// The caller must use the seed from this same loaded model/device/owner.
+    /// Only Ears uses this in production. Each request owns its mutable state.
+    pub(crate) fn from_encoder_prefix(
+        stt: &'a O, delay_ms: usize, prefix: &EncoderPrefix<B, O::EncCaches>,
+    ) -> Self where O::EncCaches: Clone {
+        let mut stream = Self::new(stt, delay_ms);
+        stream.enc_caches = prefix.caches.clone();
+        stream.tokens_encoded = prefix.embeddings.len();
+        let available = Instant::now();
+        stream.queue = prefix.embeddings.iter()
+            .map(|t| (t.clone(), available, 0.0)).collect();
+        stream
     }
 
     pub fn is_finished(&self) -> bool {
@@ -425,5 +465,190 @@ impl<'a, B: Backend, O: SttPipeline<B>> StreamingTranscriber<'a, B, O> {
     /// Transcript so far.
     pub fn text(&self) -> String {
         self.stt.tekken().decode(&self.tokens)
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, PartialEq)]
+pub(crate) struct PrefixTestState {
+    pub encoded: usize,
+    pub queued: usize,
+    pub tokens: usize,
+    pub positions: Vec<usize>,
+    pub last_embedding: Vec<f32>,
+}
+
+#[cfg(test)]
+impl<B: Backend> EncoderPrefix<B, super::fast::FastCaches<B>> {
+    pub(crate) fn test_snapshot(&self) -> (Vec<(usize, usize, Vec<f32>, Vec<f32>)>, Vec<Vec<f32>>) {
+        let caches = [&self.caches.0[0], self.caches.0.last().unwrap()].into_iter()
+            .map(|c| c.prefix_test_sample()).collect();
+        let embeds = self.embeddings.iter().map(|t| {
+            t.clone().narrow(2, 0, t.dims()[2].min(8))
+                .into_data().iter::<f32>().collect()
+        }).collect();
+        (caches, embeds)
+    }
+}
+
+#[cfg(test)]
+impl<'a, B: Backend, O: SttPipeline<B, EncCaches = super::fast::FastCaches<B>>>
+    StreamingTranscriber<'a, B, O>
+{
+    pub(crate) fn prefix_test_state(&self) -> PrefixTestState {
+        PrefixTestState {
+            encoded: self.tokens_encoded, queued: self.queue.len(), tokens: self.tokens.len(),
+            positions: self.enc_caches.0.iter().map(|c| c.pos).collect(),
+            last_embedding: self.queue.back().map_or_else(Vec::new, |(t, _, _)|
+                t.clone().into_data().iter::<f32>().collect()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod prefix_tests {
+    use super::*;
+    use super::super::fast::{FastCaches, FastKv};
+    use std::cell::{Cell, RefCell};
+    type Cpu = burn_ndarray::NdArray<f32>;
+
+    // Tiny deterministic stages exercise the REAL streaming schedule and
+    // FastKv append/COW semantics. They are not a CPU model implementation.
+    #[derive(Default)]
+    struct Probe {
+        device: <Cpu as Backend>::Device,
+        encodes: Cell<usize>,
+        windows: RefCell<Vec<Vec<f32>>>,
+        decode_shapes: RefCell<Vec<(usize, usize)>>,
+    }
+
+    impl SttPipeline<Cpu> for Probe {
+        type EncCaches = FastCaches<Cpu>;
+        type DecCaches = usize;
+        fn device(&self) -> &<Cpu as Backend>::Device { &self.device }
+        fn tekken(&self) -> &Tekken { panic!("schedule fixture does not decode text") }
+        fn mel(&self, samples: &[f32], center: bool) -> Tensor<Cpu, 3> {
+            assert!(!center);
+            self.windows.borrow_mut().push(samples.to_vec());
+            let frames = (samples.len() - N_FFT) / HOP + 1;
+            Tensor::full([1, 1, frames], samples.iter().sum::<f32>(), &self.device)
+        }
+        fn stem(&self, mel: Tensor<Cpu, 3>) -> Tensor<Cpu, 3> {
+            let frames = mel.dims()[2] / 2;
+            let value = mel.into_data().iter::<f32>().next().unwrap();
+            Tensor::full([1, frames, 1], value, &self.device)
+        }
+        fn new_enc_caches(&self) -> FastCaches<Cpu> { FastCaches(vec![FastKv::new(ENC_WINDOW)]) }
+        fn new_dec_caches(&self) -> usize { 0 }
+        fn encode(&self, x: Tensor<Cpu, 3>, caches: &mut FastCaches<Cpu>) -> Tensor<Cpu, 3> {
+            self.encodes.set(self.encodes.get() + 1);
+            assert_eq!(x.dims(), [1, DOWNSAMPLE, 1]);
+            let kv = x.clone().reshape([1, 1, DOWNSAMPLE, 1]);
+            let _ = caches.0[0].update(kv.clone(), kv);
+            x
+        }
+        fn project(&self, hidden: Tensor<Cpu, 3>) -> Tensor<Cpu, 3> { hidden.sum_dim(1) }
+        fn ada_scales(&self, delay: usize) -> AdaScales<Cpu> {
+            AdaScales(vec![Tensor::full([1, 1, 1], delay as f32, &self.device)])
+        }
+        fn embed(&self, ids: &[u32]) -> Tensor<Cpu, 3> { Tensor::zeros([1, ids.len(), 1], &self.device) }
+        fn decode_step(&self, x: Tensor<Cpu, 3>, ada: &AdaScales<Cpu>, calls: &mut usize) -> Tensor<Cpu, 3> {
+            let delay = ada.0[0].clone().into_data().iter::<f32>().next().unwrap() as usize;
+            self.decode_shapes.borrow_mut().push((x.dims()[1], delay));
+            *calls += 1;
+            Tensor::full([1, 1, 1], *calls as f32, &self.device)
+        }
+        fn logits_last(&self, hidden: Tensor<Cpu, 3>) -> Tensor<Cpu, 1> {
+            let calls = hidden.into_data().iter::<f32>().next().unwrap();
+            let id = if calls >= 2.0 { EOS as usize } else { 3 };
+            let mut logits = vec![0.0f32; 4];
+            logits[id] = 1.0;
+            Tensor::from_data(TensorData::new(logits, [4]), &self.device)
+        }
+    }
+
+    #[test]
+    fn encoder_prefix_reuse_skips_completed_work() {
+        let probe = Probe::default();
+        let mut warm = StreamingTranscriber::new(&probe, 480);
+        let seed = warm.prepare_encoder_prefix();
+        assert_eq!(probe.encodes.get(), 31);
+        assert_eq!(warm.prefix_test_state().positions, [124]);
+        assert_eq!(seed.embeddings.len(), 31);
+        assert!(warm.push(&[0.0; 40]).is_empty());
+        assert_eq!(probe.encodes.get(), 32, "warmup continues without redoing prefix");
+
+        let before = Instant::now();
+        let mut request = StreamingTranscriber::from_encoder_prefix(&probe, 480, &seed);
+        let after = Instant::now();
+        assert!(request.queue.iter().all(|(_, at, cost)| *at >= before && *at <= after && *cost == 0.0));
+        assert_eq!(request.samples.len(), N_LEFT_PAD_TOKENS * SAMPLES_PER_TOK);
+        assert!(request.push(&[]).is_empty());
+        // Genuine behavior: old whole-prefix scheduling spends another31 calls.
+        assert_eq!(probe.encodes.get(), 32, "new request must reuse completed encoder work");
+        assert!(request.push(&[0.0; 39]).is_empty());
+        assert_eq!(probe.encodes.get(), 32);
+        assert!(request.push(&[0.0]).is_empty());
+        assert_eq!(probe.encodes.get(), 33);
+        assert_eq!(request.prefix_test_state().positions, [128]);
+    }
+
+    #[test]
+    fn encoder_prefix_boundary_keeps_first_real_impulse() {
+        let probe = Probe::default();
+        let mut fresh = StreamingTranscriber::new(&probe, 480);
+        let seed = fresh.prepare_encoder_prefix();
+        let original = seed.test_snapshot();
+        let mut zero = StreamingTranscriber::from_encoder_prefix(&probe, 480, &seed);
+        let mut impulse = StreamingTranscriber::from_encoder_prefix(&probe, 480, &seed);
+        let mut first = [0.0; 39];
+        first[0] = 1.0;
+        let before = probe.encodes.get();
+        assert!(impulse.push(&first).is_empty());
+        assert_eq!(probe.encodes.get(), before);
+        assert_eq!(impulse.prefix_test_state().encoded, 31);
+        assert!(impulse.push(&[0.0]).is_empty());
+        assert_eq!(probe.encodes.get(), before + 1);
+        assert_eq!(probe.windows.borrow().last().unwrap().iter().sum::<f32>(), 1.0);
+        assert_eq!(impulse.prefix_test_state().last_embedding, [4.0]);
+        assert_eq!(zero.prefix_test_state().positions, [124]);
+        assert!(zero.push(&[0.0; 40]).is_empty());
+        assert_eq!(zero.prefix_test_state().last_embedding, [0.0]);
+        assert_eq!(seed.test_snapshot(), original);
+        assert_eq!(fresh.prefix_test_state().positions, [124]);
+        // Advancing/consuming one queue never consumes another's31 seed slots.
+        assert_eq!(fresh.queue.len(), 31);
+        assert_eq!(zero.queue.len(), 32);
+        assert_eq!(impulse.queue.len(), 32);
+    }
+
+    #[test]
+    fn encoder_prefix_preserves_delay_prefill_empty_short_and_eos() {
+        let probe = Probe::default();
+        let mut warm = StreamingTranscriber::new(&probe, 480);
+        let seed = warm.prepare_encoder_prefix();
+        for (delay, samples) in [(80, Vec::new()), (480, vec![1.0]), (2400, vec![0.0; 40])] {
+            let mut fresh = StreamingTranscriber::new(&probe, delay);
+            let mut reused = StreamingTranscriber::from_encoder_prefix(&probe, delay, &seed);
+            assert!(fresh.push(&samples).is_empty());
+            assert!(reused.push(&samples).is_empty());
+            let n_delay = delay_tokens(delay);
+            let align = (SAMPLES_PER_TOK - samples.len() % SAMPLES_PER_TOK) % SAMPLES_PER_TOK;
+            let tail = vec![0.0; align + (n_delay + 1 + OFFLINE_BUFFER_TOKENS) * SAMPLES_PER_TOK + N_FFT / 2];
+            probe.decode_shapes.borrow_mut().clear();
+            let a: Vec<_> = fresh.push(&tail).into_iter().map(|t| t.id).collect();
+            let expected_shapes = probe.decode_shapes.borrow().clone();
+            probe.decode_shapes.borrow_mut().clear();
+            let b: Vec<_> = reused.push(&tail).into_iter().map(|t| t.id).collect();
+            assert_eq!(a, b);
+            assert_eq!(fresh.tokens, reused.tokens);
+            assert_eq!(expected_shapes, *probe.decode_shapes.borrow());
+            assert_eq!(expected_shapes[0], (prompt_ids(n_delay).len(), n_delay));
+            assert_eq!(expected_shapes[1], (1, n_delay));
+            assert!(fresh.is_finished() && reused.is_finished());
+            assert!(fresh.push(&[1.0; 40]).is_empty());
+            assert!(reused.push(&[1.0; 40]).is_empty());
+        }
+        assert_eq!(seed.caches.0[0].pos, 124);
     }
 }
