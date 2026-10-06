@@ -50,7 +50,11 @@ use crate::nn::weight_loader::WeightLoader;
 
 /// Weightless RMS normalization: `x · rsqrt(mean(x²)+eps)`; the variance
 /// chain runs in f32 and casts back.
-fn rms<B: Backend>(x: Tensor<B, 3>, eps: f64) -> Tensor<B, 3> {
+pub(super) fn rms<B: Backend>(x: Tensor<B, 3>, eps: f64) -> Tensor<B, 3> {
+    #[cfg(feature = "voxtral-cuda")]
+    if let Some(normalized) = super::norm_cuda::try_rms(&x, eps) {
+        return normalized;
+    }
     let dt = x.dtype();
     let x32 = x.cast(FloatDType::F32);
     let var = x32.clone().powf_scalar(2.0).mean_dim(2);

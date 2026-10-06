@@ -187,6 +187,8 @@ pub mod encoder;
 pub mod fast;
 pub mod layers;
 pub mod mel;
+#[cfg(feature = "voxtral-cuda")]
+mod norm_cuda;
 pub mod pipeline;
 pub mod tokenizer;
 
