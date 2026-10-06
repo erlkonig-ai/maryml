@@ -14,16 +14,33 @@ pub(super) use ops::Tensor;
 use triblespace::core::repo::BlobStoreGet;
 
 pub(super) fn linear(x: &Tensor, w: &Tensor) -> Result<Tensor> {
-    if single_row(x.meta.shape().as_slice()) {
+    if gemv_eligible(x) {
         project_gemv(x, w)
     } else {
-        // Keep the existing M>1 projection, including depth's M=2 prefill.
+        // Keep M>1 and unsupported small K on the old path BEFORE launch.
         project(x, w).map_err(anyhow::Error::msg)
     }
 }
 
 fn single_row(shape: &[usize]) -> bool {
     shape.len() == 3 && shape[0] == 1 && shape[1] == 1
+}
+
+fn gemv_vector_takes(shape: &[usize], plane: usize, vector: usize) -> bool {
+    single_row(shape)
+        && shape[2] > 0
+        && plane
+            .checked_mul(vector)
+            .is_some_and(|stride| stride > 0 && shape[2].is_multiple_of(stride))
+}
+
+fn gemv_eligible(x: &Tensor) -> bool {
+    // Match Cubek's documented/preflight K divisibility and BF16 vector-size
+    // choice. This is shape/capability dispatch, not catch-and-retry on error.
+    let plane = x.client.properties().hardware.plane_size_max as usize;
+    x.client
+        .io_optimized_vector_sizes(2)
+        .any(|vector| gemv_vector_takes(x.meta.shape().as_slice(), plane, vector))
 }
 
 // Same descriptor boundary as the existing projection; no hidden contiguous
@@ -340,6 +357,15 @@ mod tests {
         }
         assert!(!single_row(&[1, 1024]));
         assert!(!single_row(&[]));
+        for k in [2, 16, 48] {
+            assert!(!gemv_vector_takes(&[1, 1, k], 32, 1));
+        }
+        assert!(gemv_vector_takes(&[1, 1, 1024], 32, 8));
+        assert!(gemv_vector_takes(&[1, 1, 1152], 32, 4));
+        assert!(!gemv_vector_takes(&[1, 1, 1152], 32, 8));
+        assert!(!gemv_vector_takes(&[1, 2, 1024], 32, 8));
+        assert!(!gemv_vector_takes(&[1, 1, 0], 32, 1));
+        assert!(!gemv_vector_takes(&[1, 1, 1024], 0, 1));
         let globals = projection_elems();
         let types = cubek::matmul::definition::MatmulElems::from_globals(&globals);
         assert_eq!(types.lhs_register, globals.lhs);
@@ -417,6 +443,10 @@ mod tests {
             }
             let x = upload(&xv, &[1, 1, k]);
             let w = upload(&wv, &[n, k]);
+            assert!(
+                gemv_eligible(&x),
+                "production/tail fixture must exercise GEMV"
+            );
             let before_x = read(&x);
             let before_w = read(&w);
             let out = linear(&x, &w).unwrap();
@@ -439,6 +469,15 @@ mod tests {
             wrong_dtype.dtype = DType::F16;
             assert!(linear(&x, &wrong_dtype).is_err());
         }
+        // Preserve small operator fixtures with a pre-launch old-path choice.
+        let x = upload(&[bf16::from_f32(2.0), bf16::from_f32(3.0)], &[1, 1, 2]);
+        let w = upload(&[bf16::ONE; 6], &[3, 2]);
+        assert!(!gemv_eligible(&x));
+        let expected: Vec<u8> = [bf16::from_f32(5.0); 3]
+            .iter()
+            .flat_map(|v| v.to_bits().to_le_bytes())
+            .collect();
+        assert_eq!(read(&linear(&x, &w).unwrap()), expected);
     }
 
     #[test]
