@@ -1,5 +1,5 @@
 //! Isolated O/down/gate-up/wide-QKV GEMV: existing Cubek kernel, no repacking.
-//! Exact RawHalf, F16, M=1; O/down, decoder gate-up and decoder wide QKV only.
+//! Exact RawHalf, F16: decoder M1 or four dense encoder rows as shared-RHS GEMVs.
 //! Unsupported metadata keeps the original matmul. Launch errors propagate.
 
 use std::any::{Any, TypeId};
@@ -60,6 +60,16 @@ impl Layout {
     }
 }
 
+// Three exact encoder geometries; wide QKV and gate/up share the first.
+fn encoder_m4_slot(x: [usize; 3], w: [usize; 3]) -> Option<usize> {
+    match (x, w) {
+        ([1, 4, 1280], [1, 1280, 10240]) => Some(0),
+        ([1, 4, 2048], [1, 2048, 1280]) => Some(1),
+        ([1, 4, 5120], [1, 5120, 1280]) => Some(2),
+        _ => None,
+    }
+}
+
 fn eligible<B: Backend>(
     x: Layout,
     w: Layout,
@@ -78,14 +88,16 @@ fn eligible<B: Backend>(
         && w.dtype == DType::F16
         && !x.quantized
         && !w.quantized
-        && matches!((k, n), (4096, 3072) | (9216, 3072) | (3072, 18432) | (3072, 11264))
-        && x.shape == [1, 1, k]
+        && ((matches!((k, n), (4096, 3072) | (9216, 3072) | (3072, 18432) | (3072, 11264))
+            && x.shape == [1, 1, k])
+            || (encoder_m4_slot(x.shape, w.shape).is_some() && x.strides[1] == k))
         && w.shape == [1, k, n]
         && x.strides[2] == 1
         && w.strides[1] == 1
         && w.strides[2] == k
         && k % tile == 0
-        && x.covers(k, vector)
+        // Exact shapes above bound these products; no arbitrary-size view.
+        && x.covers(x.shape[1] * k, vector)
         && w.covers(k * n, vector)
 }
 
@@ -112,6 +124,7 @@ pub(super) fn try_project<B: Backend>(
     };
     let plane = lhs.client.properties().hardware.plane_size_max as usize;
     let k = x.dims()[2];
+    let (xl, wl) = (Layout::of(&lhs), Layout::of(&rhs));
     // Same selection as pinned Cubek for equal F16 operands. Check offsets
     // against that selected width, rather than allowing an implicit copy.
     let Some(vector) = lhs
@@ -124,18 +137,40 @@ pub(super) fn try_project<B: Backend>(
         })
         .max()
     else {
+        #[cfg(test)]
+        record_encoder_route(xl.shape, wl.shape, false);
         return Ok(None);
     };
     if !eligible::<B>(
-        Layout::of(&lhs),
-        Layout::of(&rhs),
+        xl,
+        wl,
         lhs.device == rhs.device,
         plane,
         vector,
     ) {
+        #[cfg(test)]
+        record_encoder_route(xl.shape, wl.shape, false);
         return Ok(None);
     }
-    let out = burn_cubecl::kernel::matmul::init_matmul_output(&lhs, &rhs, DType::F16);
+    let encoder = encoder_m4_slot(xl.shape, wl.shape).is_some();
+    let n = wl.shape[2];
+    // Only metadata changes. The gate proved four contiguous rows; cloning
+    // the original handle preserves offsets and allocation ownership. Cubek
+    // broadcasts the unchanged [1,K,N] RHS batch with a zero batch stride.
+    let lhs = if encoder {
+        CubeTensor::new_contiguous(lhs.client.clone(), lhs.device.clone(),
+            [4, 1, k].into(), lhs.handle.clone(), lhs.dtype)
+    } else {
+        lhs
+    };
+    let out = if encoder {
+        // Explicit contiguous output permits a metadata-only restoration even
+        // if the runtime's ordinary empty_tensor policy would pad row pitch.
+        burn_cubecl::ops::numeric::empty_device_contiguous_dtype(
+            lhs.client.clone(), lhs.device.clone(), [4, 1, n].into(), DType::F16)
+    } else {
+        burn_cubecl::kernel::matmul::init_matmul_output(&lhs, &rhs, DType::F16)
+    };
     let mut dtypes = MatmulElems::from_globals(&MatmulGlobalElems {
         lhs: lhs.dtype.into(),
         rhs: rhs.dtype.into(),
@@ -151,6 +186,14 @@ pub(super) fn try_project<B: Backend>(
         out.clone().binding(),
         &mut dtypes,
     )?;
+    #[cfg(test)]
+    record_encoder_route(xl.shape, wl.shape, true);
+    let out = if encoder {
+        CubeTensor::new_contiguous(out.client.clone(), out.device.clone(),
+            [1, 4, n].into(), out.handle.clone(), out.dtype)
+    } else {
+        out
+    };
     let projected = Tensor::<RawHalf, 3>::from_primitive(TensorPrimitive::Float(out));
     Ok(Some(
         (&projected as &dyn Any)
@@ -158,6 +201,23 @@ pub(super) fn try_project<B: Backend>(
             .expect("both inputs established the exact RawHalf type")
             .clone(),
     ))
+}
+
+// Diagnostic-only owner-thread counts. Non-test production examples have no
+// counter, environment switch, log or altered dispatch. Failed launches never
+// count as accepted; the ignored normal-API witness also reads final text.
+#[cfg(test)]
+std::thread_local! {
+    static ENCODER_ROUTES: std::cell::RefCell<[[u64; 3]; 2]> = const {
+        std::cell::RefCell::new([[0; 3]; 2])
+    };
+}
+
+#[cfg(test)]
+fn record_encoder_route(x: [usize; 3], w: [usize; 3], accepted: bool) {
+    if let Some(slot) = encoder_m4_slot(x, w) {
+        ENCODER_ROUTES.with(|counts| counts.borrow_mut()[usize::from(!accepted)][slot] += 1);
+    }
 }
 
 /// Test-only, once per loaded weight. Uses a real owned activation tensor's
@@ -198,11 +258,12 @@ pub(super) fn observe_loaded_weight(
     if a.quantized || b.quantized {
         reasons.push("quantization");
     }
-    if !matches!((k, n), (4096, 3072) | (9216, 3072) | (3072, 18432) | (3072, 11264))
-        || a.shape != [1, 1, k] || b.shape != [1, k, n] {
+    let encoder = encoder_m4_slot(a.shape, b.shape).is_some();
+    if (!matches!((k, n), (4096, 3072) | (9216, 3072) | (3072, 18432) | (3072, 11264))
+        || a.shape != [1, 1, k] || b.shape != [1, k, n]) && !encoder {
         reasons.push("shape");
     }
-    if a.strides[2] != 1 {
+    if a.strides[2] != 1 || (encoder && a.strides[1] != k) {
         reasons.push("activation_stride");
     }
     if b.strides[1] != 1 || b.strides[2] != k {
@@ -211,7 +272,7 @@ pub(super) fn observe_loaded_weight(
     match vector {
         None => reasons.push("vector_divisibility"),
         Some(v) => {
-            if !a.covers(k, v) {
+            if !a.covers(a.shape[1].saturating_mul(k), v) {
                 reasons.push("activation_bounds_alignment");
             }
             if !b.covers(k.saturating_mul(n), v) {
@@ -259,6 +320,217 @@ mod tests {
                 quantized: false,
             },
         )
+    }
+
+    // ENCODER_M4_CPU_CONTROLS_BEGIN: transplant this block unchanged onto cf2
+    // to execute the same positive routing expectation against its old gate.
+    fn encoder_layouts(k: usize, n: usize) -> (Layout, Layout) {
+        let (mut x, mut w) = layouts(k);
+        x.shape = [1, 4, k];
+        x.strides = [4 * k, k, 1];
+        x.bytes = (4 * k * 2) as u64;
+        w.shape = [1, k, n];
+        w.strides = [k * n, 1, k];
+        w.bytes = (k * n * 2) as u64;
+        (x, w)
+    }
+
+    #[test]
+    fn encoder_m4_geometry_routes_only_dense_rows() {
+        for (k, n) in [(1280, 10240), (2048, 1280), (5120, 1280)] {
+            let (x, w) = encoder_layouts(k, n);
+            // This assertion fails at cf2; no launched fallback counts as RED.
+            assert!(eligible::<RawHalf>(x, w, true, 32, 8));
+            assert!(!eligible::<hear::Raw>(x, w, true, 32, 8));
+            assert!(!eligible::<hear::FusedHalf>(x, w, true, 32, 8));
+            assert!(!eligible::<RawHalf>(x, w, false, 32, 8));
+            for shape in [[1, 1, k], [1, 3, k], [1, 5, k], [2, 4, k]] {
+                assert!(!eligible::<RawHalf>(Layout { shape, ..x }, w, true, 32, 8));
+            }
+            for bad_w in [
+                Layout { shape: [1, k, n - 1], ..w },
+                Layout { shape: [2, k, n], ..w },
+                Layout { strides: [k * n, n, 1], ..w },
+                Layout { strides: [k * n, 1, k + 16], ..w },
+                Layout { dtype: DType::BF16, ..w },
+                Layout { quantized: true, ..w },
+            ] {
+                assert!(!eligible::<RawHalf>(x, bad_w, true, 32, 8));
+            }
+        }
+        // Existing decoder M4 prefill is still excluded, even though its M1
+        // counterpart remains eligible. Do not make this a generic M4 route.
+        for (k, n) in [(4096, 3072), (9216, 3072), (3072, 18432), (3072, 11264)] {
+            let (x, w) = encoder_layouts(k, n);
+            assert!(!eligible::<RawHalf>(x, w, true, 32, 8));
+            assert!(eligible::<RawHalf>(Layout { shape: [1, 1, k], ..x }, w, true, 32, 8));
+        }
+    }
+
+    #[test]
+    fn encoder_m4_view_bounds_reject_offsets_and_row_gaps() {
+        for (k, n) in [(1280, 10240), (2048, 1280), (5120, 1280)] {
+            let (x, w) = encoder_layouts(k, n);
+            assert!(eligible::<RawHalf>(
+                Layout { strides: [99 * k, k, 1], start: 32, end: 16,
+                    bytes: x.bytes + 48, ..x },
+                Layout { strides: [0, 1, k], start: 32, end: 16,
+                    bytes: w.bytes + 48, ..w }, true, 32, 8));
+            for bad_x in [
+                Layout { strides: [4 * k, k + 8, 1], bytes: x.bytes + 64, ..x },
+                Layout { strides: [4 * k, 0, 1], ..x },
+                Layout { strides: [4 * k, k, 2], ..x },
+                Layout { dtype: DType::F32, ..x },
+                Layout { quantized: true, ..x },
+                Layout { bytes: x.bytes - 2, ..x },
+                Layout { start: 2, bytes: x.bytes + 2, ..x },
+                Layout { end: x.bytes + 1, ..x },
+            ] {
+                assert!(!eligible::<RawHalf>(bad_x, w, true, 32, 8));
+            }
+            for bad_w in [
+                Layout { bytes: w.bytes - 2, ..w },
+                Layout { start: 2, bytes: w.bytes + 2, ..w },
+                Layout { start: u64::MAX, ..w },
+                Layout { end: w.bytes + 1, ..w },
+            ] {
+                assert!(!eligible::<RawHalf>(x, bad_w, true, 32, 8));
+            }
+            for (plane, vector) in [(0, 8), (32, 0), (31, 8), (32, 7), (usize::MAX, 8)] {
+                assert!(!eligible::<RawHalf>(x, w, true, plane, vector));
+            }
+        }
+    }
+    // ENCODER_M4_CPU_CONTROLS_END
+
+    #[test]
+    #[ignore = "three actual encoder shapes; row/broadcast/offset/F32 controls, no model weights"]
+    fn cuda_encoder_m4_rows_broadcast_precision_and_immutable_offsets() {
+        let device = Default::default();
+        for (k, n) in [(1280, 10240), (2048, 1280), (5120, 1280)] {
+            let probe = cube(&Tensor::<RawHalf, 3>::zeros([1, 4, k], &device));
+            let plane = probe.client.properties().hardware.plane_size_max as usize;
+            let vector = probe.client.io_optimized_vector_sizes(2)
+                .filter(|v| k % (plane * v) == 0).max().unwrap();
+            let segment = plane * vector;
+            assert!(segment > 4 && 2 * segment + 4 < k);
+            let mut padded = vec![f16::ZERO; 6 * k];
+            padded[..k].fill(f16::from_f32(-7.0));
+            padded[5 * k..].fill(f16::from_f32(9.0));
+            for row in 0..4 {
+                let x = &mut padded[(row + 1) * k..(row + 2) * k];
+                x[0] = f16::from_f32(256.0);
+                x[1] = f16::from_f32(256.0);
+                x[2] = f16::from_f32((row + 1) as f32);
+                x[3] = f16::from_f32((row + 1) as f32 / 4.0);
+                // Same vector lane across successive K segments. At column0
+                // plane0 starts at segment0: half accumulation would lose 1.
+                x[4] = f16::from_f32(4096.0);
+                x[segment + 4] = f16::ONE;
+                x[2 * segment + 4] = f16::from_f32(-4096.0);
+                x[k / 2] = f16::from_f32(row as f32 + 0.125);
+                x[k - 1] = f16::from_f32(row as f32 + 0.5);
+            }
+            let mut weights = vec![f16::ZERO; (n + 2) * k];
+            weights[..k].fill(f16::from_f32(-11.0));
+            weights[(n + 1) * k..].fill(f16::from_f32(13.0));
+            for col in 0..n {
+                let w = &mut weights[(col + 1) * k..(col + 2) * k];
+                match col % 8 {
+                    0 => { w[4] = f16::ONE; w[segment + 4] = f16::ONE; w[2 * segment + 4] = f16::ONE; }
+                    1 => w[k - 1] = f16::ONE,
+                    2 => { w[0] = f16::from_f32(256.0); w[1] = f16::from_f32(-256.0); w[2] = f16::ONE; }
+                    3 => w[3] = f16::from_f32(0.25),
+                    4 => w[2] = f16::from_f32(1.0 / 3.0),
+                    5 => { w[k / 2] = f16::from_f32(0.5); w[k - 1] = f16::from_f32(0.25); }
+                    6 => (),
+                    _ => w[2] = f16::from_f32(-0.5),
+                }
+            }
+            let expected: Vec<f16> = (0..4).flat_map(|row| (0..n).map(move |col| {
+                let r = row as f32;
+                f16::from_f32(match col % 8 {
+                    0 => 1.0,
+                    1 => r + 0.5,
+                    2 => r + 1.0,
+                    3 => (r + 1.0) / 16.0,
+                    4 => (r + 1.0) * f16::from_f32(1.0 / 3.0).to_f32(),
+                    5 => (r + 0.125) * 0.5 + (r + 0.5) * 0.25,
+                    6 => 0.0,
+                    _ => -(r + 1.0) * 0.5,
+                })
+            })).collect();
+            let full_x = Tensor::<RawHalf, 3>::from_data(
+                TensorData::new(padded.clone(), [1, 6, k]), &device);
+            let x = full_x.clone().narrow(1, 1, 4);
+            let full_w = Tensor::<RawHalf, 3>::from_data(
+                TensorData::new(weights.clone(), [1, n + 2, k]), &device);
+            let w = full_w.clone().narrow(1, 1, n).swap_dims(1, 2);
+            assert_eq!(&cube(&x).meta.strides()[1..], &[k, 1]);
+            assert_eq!(&cube(&w).meta.strides()[1..], &[1, k]);
+            assert!(cube(&x).handle.offset_start.unwrap_or(0) > 0);
+            assert!(cube(&w).handle.offset_start.unwrap_or(0) > 0);
+            let result = try_project(&x, &w).unwrap().expect("actual M4 encoder must launch");
+            assert_eq!(result.dims(), [1, 4, n]);
+            assert_eq!(result.dtype(), DType::F16);
+            assert_eq!(read(result.clone()), expected);
+            assert_eq!(f16::from_f32(4096.0 + 1.0), f16::from_f32(4096.0));
+            assert!(f16::from_f32(256.0 * 256.0).is_infinite());
+            let _ = read(result.mul_scalar(0.0));
+            assert_eq!(read(full_x), padded);
+            assert_eq!(read(full_w), weights);
+            // Original fallback, no repack of incompatible numerical weights.
+            let row_major = Tensor::<RawHalf, 3>::from_data(w.clone().into_data(), &device);
+            assert_eq!(cube(&row_major).meta.strides()[2], 1);
+            assert!(try_project(&x, &row_major).unwrap().is_none());
+            assert!(try_project(&x.clone().narrow(1, 0, 1), &w).unwrap().is_none());
+            assert!(try_project(&x.cast(FloatDType::F32), &w).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "breeze")] // Existing comparison closure supplies sha2.
+    #[ignore = "one real Ears load and exact 3.42s segment; separately admitted model reservation"]
+    fn loaded_encoder_m4_normal_api_routes() -> anyhow::Result<()> {
+        use sha2::{Digest, Sha256};
+        use std::{fs::OpenOptions, path::PathBuf, time::Instant};
+        let pile = PathBuf::from(std::env::var("MARY_HEARING_ENCODER_PILE")?);
+        let pcm = PathBuf::from(std::env::var("MARY_HEARING_ENCODER_PCM")?);
+        let report = PathBuf::from(std::env::var("MARY_HEARING_ENCODER_REPORT")?);
+        let bytes = std::fs::read(&pcm)?;
+        anyhow::ensure!(bytes.len() == 218_880, "exact 54720-sample segment required");
+        let hash = format!("{:x}", Sha256::digest(&bytes));
+        anyhow::ensure!(hash == "9ae4519a6d1e82a1a164471227061416ba2c4ccf43becff848c11b597e54d6b0",
+            "segment PCM identity differs");
+        let samples: Vec<f32> = bytes.chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+        let file = OpenOptions::new().write(true).create_new(true).open(report)?;
+        let started = Instant::now();
+        let ears = crate::hear::Ears::load(&pile)?; // Includes unchanged stock warmup.
+        let load_seconds = started.elapsed().as_secs_f64();
+        ENCODER_ROUTES.with(|counts| *counts.borrow_mut() = [[0; 3]; 2]);
+        let started = Instant::now();
+        let mut listening = ears.listen(480);
+        anyhow::ensure!(listening.room() >= samples.len(), "segment exceeds normal room");
+        let mut text = listening.push(&samples);
+        let full_before_finish = listening.is_full();
+        let finished_before_finish = listening.is_finished();
+        text.push_str(&listening.finish());
+        let process_seconds = started.elapsed().as_secs_f64();
+        let [accepted, rejected] = ENCODER_ROUTES.with(|counts| *counts.borrow());
+        let result = serde_json::json!({"kind":"actual_encoder_m4_normal_api_routes",
+            "pile":pile,"pcm":pcm,"pcm_f32le_sha256":hash,"samples":samples.len(),
+            "geometry_order":[[1280,10240],[2048,1280],[5120,1280]],
+            "accepted":accepted,"rejected":rejected,"text":text,
+            "full_before_finish":full_before_finish,"finished_before_finish":finished_before_finish,
+            "load_including_stock_warmup_seconds":load_seconds,"process_seconds":process_seconds,
+            "scope":"test-only dispatch counters on real encoder activations; production example has no counters"});
+        serde_json::to_writer_pretty(file, &result)?; // Preserve evidence before assertions.
+        println!("ENCODER_M4_ACTUAL_ROUTES {result}");
+        anyhow::ensure!(accepted.iter().all(|&n| n > 0), "an encoder geometry did not route");
+        anyhow::ensure!(rejected == [0; 3], "some encoder activations fell back");
+        anyhow::ensure!(!full_before_finish, "unexpected context cap");
+        Ok(())
     }
 
     #[test]
