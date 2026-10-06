@@ -1,5 +1,5 @@
-//! Isolated O/down GEMV experiment: existing Cubek kernel, no repacking.
-//! Exact RawHalf, F16, [1,1,K] @ column-major [1,K,3072], K=4096/9216.
+//! Isolated O/down/gate-up GEMV experiment: existing Cubek kernel, no repacking.
+//! Exact RawHalf, F16, M=1; (K,N)=(4096,3072)/(9216,3072)/(3072,18432).
 //! Unsupported metadata keeps the original matmul. Launch errors propagate.
 
 use std::any::{Any, TypeId};
@@ -68,6 +68,7 @@ fn eligible<B: Backend>(
     vector: usize,
 ) -> bool {
     let k = x.shape[2];
+    let n = w.shape[2];
     let Some(tile) = plane.checked_mul(vector).filter(|&v| v != 0) else {
         return false;
     };
@@ -77,15 +78,15 @@ fn eligible<B: Backend>(
         && w.dtype == DType::F16
         && !x.quantized
         && !w.quantized
-        && matches!(k, 4096 | 9216)
+        && matches!((k, n), (4096, 3072) | (9216, 3072) | (3072, 18432))
         && x.shape == [1, 1, k]
-        && w.shape == [1, k, 3072]
+        && w.shape == [1, k, n]
         && x.strides[2] == 1
         && w.strides[1] == 1
         && w.strides[2] == k
         && k % tile == 0
         && x.covers(k, vector)
-        && w.covers(k * 3072, vector)
+        && w.covers(k * n, vector)
 }
 
 /// `None` means unsupported metadata, not a failed launch. Bindings preserve
@@ -175,6 +176,7 @@ pub(super) fn observe_loaded_weight(
     let (a, b) = (Layout::of(&lhs), Layout::of(&rhs));
     let plane = lhs.client.properties().hardware.plane_size_max as usize;
     let k = a.shape[2];
+    let n = b.shape[2];
     let vector = lhs
         .client
         .io_optimized_vector_sizes(2)
@@ -196,7 +198,8 @@ pub(super) fn observe_loaded_weight(
     if a.quantized || b.quantized {
         reasons.push("quantization");
     }
-    if !matches!(k, 4096 | 9216) || a.shape != [1, 1, k] || b.shape != [1, k, 3072] {
+    if !matches!((k, n), (4096, 3072) | (9216, 3072) | (3072, 18432))
+        || a.shape != [1, 1, k] || b.shape != [1, k, n] {
         reasons.push("shape");
     }
     if a.strides[2] != 1 {
@@ -211,7 +214,7 @@ pub(super) fn observe_loaded_weight(
             if !a.covers(k, v) {
                 reasons.push("activation_bounds_alignment");
             }
-            if !b.covers(k.saturating_mul(3072), v) {
+            if !b.covers(k.saturating_mul(n), v) {
                 reasons.push("weight_bounds_alignment");
             }
         }
@@ -368,6 +371,105 @@ mod tests {
         }
     }
 
+    #[test]
+    fn gate_up_geometry_is_exact_rawhalf_m1() {
+        let k = 3072;
+        let n = 18432;
+        let (x, mut w) = layouts(k);
+        w.shape = [1, k, n];
+        w.strides = [k * n, 1, k];
+        w.bytes = (k * n * 2) as u64;
+        // RED before this extension: the parent permits only K=4096/9216.
+        assert!(eligible::<RawHalf>(x, w, true, 32, 8));
+        assert!(!eligible::<hear::Raw>(x, w, true, 32, 8));
+        assert!(!eligible::<hear::FusedHalf>(x, w, true, 32, 8));
+        assert!(!eligible::<RawHalf>(x, w, false, 32, 8));
+        for bad_x in [
+            Layout {
+                shape: [1, 4, k],
+                ..x
+            },
+            Layout {
+                shape: [2, 1, k],
+                ..x
+            },
+            Layout {
+                strides: [k, k, 2],
+                ..x
+            },
+            Layout {
+                dtype: DType::F32,
+                ..x
+            },
+            Layout {
+                bytes: x.bytes - 2,
+                ..x
+            },
+            Layout {
+                start: 2,
+                bytes: x.bytes + 2,
+                ..x
+            },
+            Layout {
+                quantized: true,
+                ..x
+            },
+        ] {
+            assert!(!eligible::<RawHalf>(bad_x, w, true, 32, 8));
+        }
+        for bad_w in [
+            Layout {
+                shape: [1, k, n - 1],
+                ..w
+            },
+            Layout {
+                shape: [1, k, 3072],
+                ..w
+            },
+            Layout {
+                shape: [1, k, 11264],
+                ..w
+            },
+            Layout {
+                shape: [1, k, 131072],
+                ..w
+            },
+            Layout {
+                strides: [k * n, n, 1],
+                ..w
+            },
+            Layout {
+                strides: [k * n, 1, k + 16],
+                ..w
+            },
+            Layout {
+                dtype: DType::BF16,
+                ..w
+            },
+            Layout {
+                bytes: w.bytes - 2,
+                ..w
+            },
+            Layout {
+                start: w.bytes + 1,
+                ..w
+            },
+            Layout {
+                quantized: true,
+                ..w
+            },
+        ] {
+            assert!(!eligible::<RawHalf>(x, bad_w, true, 32, 8));
+        }
+        for (plane, vector) in [(0, 8), (32, 0), (31, 8), (32, 7), (usize::MAX, 8)] {
+            assert!(!eligible::<RawHalf>(x, w, true, plane, vector));
+        }
+        for old_k in [4096, 9216] {
+            let (old_x, old_w) = layouts(old_k);
+            assert!(eligible::<RawHalf>(old_x, old_w, true, 32, 8));
+        }
+    }
+
     fn cube(t: &Tensor<RawHalf, 3>) -> CubeTensor<CudaRuntime> {
         let TensorPrimitive::Float(c) = t.clone().into_primitive() else {
             panic!("float")
@@ -420,6 +522,66 @@ mod tests {
             },
             _ => (((row * 3 + col * 7) % 31) as f32 - 15.0) / 1024.0,
         })
+    }
+
+    #[test]
+    #[ignore = "finite gate/up GEMV precision/layout control; no model weights"]
+    fn cuda_gate_up_transpose_precision_offsets_and_inputs() {
+        let device = Default::default();
+        let (k, n) = (3072, 18432);
+        let input = x_values(k);
+        let padded: Vec<f16> = vec![f16::from_f32(-7.0); k]
+            .into_iter()
+            .chain(input.iter().copied())
+            .chain(vec![f16::from_f32(9.0); k])
+            .collect();
+        let full_x =
+            Tensor::<RawHalf, 3>::from_data(TensorData::new(padded.clone(), [1, 3, k]), &device);
+        let x = full_x.clone().narrow(1, 1, 1);
+        let weights: Vec<f16> = (0..n + 2)
+            .flat_map(|r| (0..k).map(move |c| w_value(r, c, k)))
+            .collect();
+        let full_w = Tensor::<RawHalf, 3>::from_data(
+            TensorData::new(weights.clone(), [1, n + 2, k]),
+            &device,
+        );
+        let w = full_w.clone().narrow(1, 1, n).swap_dims(1, 2);
+        assert_eq!(&cube(&w).meta.strides()[1..], &[1, k]);
+        assert!(cube(&x).handle.offset_start.unwrap_or(0) > 0);
+        assert!(cube(&w).handle.offset_start.unwrap_or(0) > 0);
+        let result = try_project(&x, &w)
+            .unwrap()
+            .expect("gate/up must launch GEMV");
+        assert_eq!(result.dims(), [1, 1, n]);
+        assert_eq!(result.dtype(), DType::F16);
+        let got = read(result.clone());
+        let analytic: Vec<f16> = weights[k..(n + 1) * k]
+            .chunks_exact(k)
+            .map(|row| {
+                f16::from_f64(
+                    row.iter()
+                        .zip(&input)
+                        .map(|(a, b)| a.to_f64() * b.to_f64())
+                        .sum::<f64>(),
+                )
+            })
+            .collect();
+        close(&got, &analytic);
+        close(&got, &read(x.clone().matmul(w.clone())));
+        for r in (1..n).step_by(4) {
+            assert_eq!(got[r], f16::ONE);
+        }
+        assert!(f16::from_f32(256.0 * 256.0).is_infinite());
+        // Fresh output must not overwrite either offset input allocation.
+        let _ = read(result.mul_scalar(0.0));
+        assert_eq!(read(full_x), padded);
+        assert_eq!(read(full_w), weights);
+        let row_major = Tensor::<RawHalf, 3>::from_data(w.clone().into_data(), &device);
+        assert_eq!(cube(&row_major).meta.strides()[2], 1);
+        assert!(try_project(&x, &row_major).unwrap().is_none());
+        let prefill = Tensor::<RawHalf, 3>::ones([1, 4, k], &device);
+        assert!(try_project(&prefill, &w).unwrap().is_none());
+        assert!(try_project(&x.cast(FloatDType::F32), &w).unwrap().is_none());
     }
 
     #[test]

@@ -361,7 +361,14 @@ impl<B: Backend> FastMlp<B> {
     }
 
     fn forward(&self, h: Tensor<B, 3>) -> Tensor<B, 3> {
-        let gu = h.matmul(self.gate_up_t.clone());
+        // Only exact decoder M1 geometry/layout can take this local path.
+        // Encoder, prefill and unsupported backends keep the original matmul.
+        #[cfg(feature = "voxtral-cuda")]
+        let projected = super::gemv_cuda::try_project(&h, &self.gate_up_t)
+            .unwrap_or_else(|error| panic!("Voxtral gate/up GEMV launch failed: {error:?}"));
+        #[cfg(not(feature = "voxtral-cuda"))]
+        let projected: Option<Tensor<B, 3>> = None;
+        let gu = projected.unwrap_or_else(|| h.matmul(self.gate_up_t.clone()));
         output_projection(
             &self.down,
             silu(gu.clone().narrow(2, 0, self.inter)).mul(gu.narrow(2, self.inter, self.inter)),
@@ -659,6 +666,92 @@ impl<B: Backend> SttPipeline<B> for RealtimeTranscriber<B> {
 }
 
 #[cfg(all(test, feature = "voxtral-cuda"))]
+mod gate_up_tests {
+    use super::*;
+    use crate::nn::backend::hear::RawHalf;
+    use burn::tensor::TensorData;
+    use half::f16;
+
+    fn read(t: Tensor<RawHalf, 3>) -> Vec<f16> {
+        t.into_data().to_vec::<f16>().unwrap()
+    }
+
+    #[test]
+    #[ignore = "finite native gate/up MLP ordering/fallback control; no model weights"]
+    fn cuda_gate_up_mlp_order_and_layout_fallbacks() {
+        let device = Default::default();
+        let (k, inter) = (3072, 9216);
+        let input: Vec<f16> = (0..k)
+            .map(|i| f16::from_f32((i % 17) as f32 / 8.0 - 1.0))
+            .collect();
+        let h = Tensor::<RawHalf, 3>::from_data(TensorData::new(input.clone(), [1, 1, k]), &device);
+        let mut gu = vec![f16::ZERO; 2 * inter * k];
+        for row in 0..inter {
+            gu[row * k + row % k] = f16::from_f32(1.5);
+            gu[(inter + row) * k + (row * 7 + 3) % k] = f16::from_f32(-2.0);
+        }
+        let gu_tensor = Tensor::<RawHalf, 3>::from_data(
+            TensorData::new(gu.clone(), [1, 2 * inter, k]),
+            &device,
+        )
+        .swap_dims(1, 2);
+        assert!(
+            super::super::gemv_cuda::try_project(&h, &gu_tensor)
+                .unwrap()
+                .is_some()
+        );
+        // Sparse down selects known post-SiLU products; it remains the same
+        // existing O/down path, with a separate F16 bias after projection.
+        let mut down = vec![f16::ZERO; k * inter];
+        for row in 0..k {
+            down[row * inter + row] = f16::ONE;
+        }
+        let down_tensor =
+            Tensor::<RawHalf, 3>::from_data(TensorData::new(down.clone(), [1, k, inter]), &device)
+                .swap_dims(1, 2);
+        let mlp = FastMlp {
+            gate_up_t: gu_tensor.clone(),
+            down: Linear {
+                weight_t: down_tensor.clone(),
+                bias: Some(Tensor::<RawHalf, 3>::full([1, 1, k], 0.0625, &device)),
+            },
+            inter,
+        };
+        let old_gu = h.clone().matmul(gu_tensor.clone());
+        let expected =
+            read(mlp.down.forward(
+                silu(old_gu.clone().narrow(2, 0, inter)).mul(old_gu.narrow(2, inter, inter)),
+            ));
+        // Row0 is SiLU(-1.5)*1.25 + bias, unlike swapping gate/up or
+        // applying SiLU after their product; the difference exceeds tolerance.
+        assert!(expected[0].to_f32() < -0.25);
+        let check = |actual: Vec<f16>| {
+            for (a, b) in actual.iter().zip(&expected) {
+                let (a, b) = (a.to_f32(), b.to_f32());
+                assert!(a.is_finite() && b.is_finite());
+                assert!((a - b).abs() <= 0.002 + 0.002 * b.abs(), "{a}/{b}");
+            }
+            assert_eq!(actual.len(), k);
+        };
+        check(read(mlp.forward(h.clone())));
+        let row_major = Tensor::<RawHalf, 3>::from_data(gu_tensor.clone().into_data(), &device);
+        assert!(
+            super::super::gemv_cuda::try_project(&h, &row_major)
+                .unwrap()
+                .is_none()
+        );
+        let fallback = FastMlp {
+            gate_up_t: row_major,
+            ..mlp
+        };
+        check(read(fallback.forward(h.clone())));
+        assert_eq!(read(h), input);
+        assert_eq!(read(gu_tensor.swap_dims(1, 2)), gu);
+        assert_eq!(read(down_tensor.swap_dims(1, 2)), down);
+    }
+}
+
+#[cfg(all(test, feature = "voxtral-cuda"))]
 mod gemv_loaded_tests {
     use super::*;
     use crate::nn::backend::hear::{Device, RawHalf};
@@ -666,7 +759,7 @@ mod gemv_loaded_tests {
 
     #[test]
     #[ignore = "one real native decoder load; separately admitted model reservation and explicit pile/output required"]
-    fn loaded_odown_eligibility_once() -> anyhow::Result<()> {
+    fn loaded_decoder_projection_eligibility_once() -> anyhow::Result<()> {
         let pile = PathBuf::from(std::env::var("MARY_HEARING_GEMV_PILE")?);
         let output = PathBuf::from(std::env::var("MARY_HEARING_GEMV_OBSERVATION")?);
         let file = OpenOptions::new().write(true).create_new(true).open(output)?;
@@ -683,21 +776,23 @@ mod gemv_loaded_tests {
         // M1 eligibility only; no claim about each live activation is inferred.
         let o_input = Tensor::<RawHalf,3>::zeros([1,1,4096], &device);
         let down_input = Tensor::<RawHalf,3>::zeros([1,1,9216], &device);
+        let gate_up_input = Tensor::<RawHalf,3>::zeros([1,1,3072], &device);
         RawHalf::sync(&device).map_err(|error| anyhow::anyhow!("owned fixture sync: {error:?}"))?;
         let mut records = Vec::new();
         for (layer, item) in decoder.layers.iter().enumerate() {
             for (role, x, weight) in [
                 ("o", &o_input, &item.attn.o_proj.weight_t),
                 ("down", &down_input, &item.mlp.down.weight_t),
+                ("gate_up", &gate_up_input, &item.mlp.gate_up_t),
             ] {
                 let mut record = super::super::gemv_cuda::observe_loaded_weight(x,weight);
                 record["layer"] = serde_json::json!(layer);
                 record["role"] = serde_json::json!(role);
-                println!("ODOWN_ELIGIBILITY {record}");
+                println!("DECODER_PROJECTION_ELIGIBILITY {record}");
                 records.push(record);
             }
         }
-        assert_eq!(records.len(),52);
+        assert_eq!(records.len(),78);
         let accepted = records.iter().filter(|r| r["accepted"] == true).count();
         let mut rejected_by_reason = serde_json::Map::new();
         for record in &records {
@@ -707,15 +802,15 @@ mod gemv_loaded_tests {
                 rejected_by_reason.insert(key.to_owned(),serde_json::json!(count+1));
             }
         }
-        let report = serde_json::json!({"kind":"loaded_odown_eligibility", "pile":pile,
-            "records":records,"accepted":accepted,"rejected":52-accepted,
+        let report = serde_json::json!({"kind":"loaded_decoder_projection_eligibility", "pile":pile,
+            "records":records,"accepted":accepted,"rejected":78-accepted,
             "rejected_by_reason":rejected_by_reason,"load_seconds":loaded_seconds,
             "scope":"one native decoder load; real owned M1 fixture metadata; no GEMV, VAD, warmup or transcription"});
         serde_json::to_writer_pretty(file,&report)?;
-        println!("ODOWN_ELIGIBILITY_SUMMARY accepted={accepted} rejected={}",52-accepted);
+        println!("DECODER_PROJECTION_ELIGIBILITY_SUMMARY accepted={accepted} rejected={}",78-accepted);
         // Drop device readers before the native pile owner. The externally
         // supplied pile must remain immutable through process/runtime teardown.
-        drop((o_input,down_input,decoder));
+        drop((o_input,down_input,gate_up_input,decoder));
         drop(loader);
         Ok(())
     }
