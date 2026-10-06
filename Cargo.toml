@@ -145,6 +145,10 @@ cpal = { version = "0.17", optional = true }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 
 [features]
+# Breeze-TTS-2 exact mixed-dtype native assets; runtime is explicitly opt-in.
+breeze = ["tokenizer", "dep:sha2"]
+breeze-cuda = ["breeze", "qwen3_5-cuda", "qwen3tts"]
+breeze-cli = ["breeze-cuda", "dep:clap"]
 # Step-Audio2 Mini's pile assets and text/speech token codec. No model runtime.
 step-audio2 = ["tokenizer"]
 # Token-only Qwen2 CUDA decoder; reuses BF16 projections, not Qwen3.5 blocks.
@@ -413,6 +417,14 @@ required-features = ["import", "hub"]
 [[bin]]
 name = "step_audio2_import"
 required-features = ["step-audio2", "import"]
+
+[[bin]]
+name = "breeze_import"
+required-features = ["breeze", "import"]
+
+[[bin]]
+name = "breeze_say"
+required-features = ["breeze-cli"]
 
 [[bin]]
 name = "step_audio2_tokens"

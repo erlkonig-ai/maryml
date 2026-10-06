@@ -255,6 +255,13 @@ impl std::ops::Deref for HostF32 {
 /// the safetensors variants exist only under `import` for the importers and
 /// parity gates.
 pub enum WeightLoader {
+    /// One explicitly selected exact-F32 model in an immutable observation.
+    /// Requests query the stored root/name/typed-leaf relation at point of use;
+    /// there is no retained key catalogue or union across unrelated models.
+    Selected {
+        snapshot: crate::model_collection::ModelPileSnapshot,
+        root: triblespace::prelude::Id,
+    },
     #[cfg(feature = "import")]
     SingleFile(SingleFileLoader),
     #[cfg(feature = "import")]
@@ -431,6 +438,13 @@ fn upload_f16<B: Backend>(bytes: anybytes::Bytes, device: &B::Device) -> Tensor<
 }
 
 impl WeightLoader {
+    pub fn selected(
+        snapshot: crate::model_collection::ModelPileSnapshot,
+        root: triblespace::prelude::Id,
+    ) -> Self {
+        Self::Selected { snapshot, root }
+    }
+
     /// Auto-detect and create from a directory.
     /// Looks for `diffusion_pytorch_model.safetensors.index.json` (multi-shard)
     /// or `diffusion_pytorch_model.safetensors` (single-file).
@@ -502,6 +516,13 @@ impl WeightLoader {
         device: &B::Device,
     ) -> Tensor<B, D> {
         match self {
+            WeightLoader::Selected { snapshot, root } => {
+                let (data, shape) = selected_f32_rank::<D>(snapshot, *root, name)
+                    .unwrap_or_else(|e| panic!("selected model tensor {name}: {e}"))
+                    .unwrap_or_else(|| panic!("selected model lacks F32 rank-{D} tensor {name}"));
+                let dims: [usize; D] = shape.try_into().expect("typed rank");
+                Tensor::<B, 1>::from_floats(&data[..], device).reshape(dims)
+            }
             #[cfg(feature = "import")]
             WeightLoader::SingleFile(loader) => loader.load_tensor(name, device),
             #[cfg(feature = "import")]
@@ -549,6 +570,12 @@ impl WeightLoader {
     /// the CPU (Accelerate) instead of a Burn backend.
     pub fn load_f32(&self, name: &str) -> (Vec<f32>, Vec<usize>) {
         match self {
+            WeightLoader::Selected { snapshot, root } => {
+                let (data, shape) = selected_f32(snapshot, *root, name)
+                    .unwrap_or_else(|e| panic!("selected model tensor {name}: {e}"))
+                    .unwrap_or_else(|| panic!("selected model lacks F32 tensor {name}"));
+                (data.to_vec(), shape)
+            }
             #[cfg(feature = "import")]
             WeightLoader::SingleFile(loader) => {
                 let st = SafeTensors::deserialize(&loader.bytes).unwrap();
@@ -589,6 +616,8 @@ impl WeightLoader {
     /// [`Self::load_f32`] (an owned copy, same bytes).
     pub fn view_f32(&self, name: &str) -> Option<(anybytes::View<[f32]>, Vec<usize>)> {
         match self {
+            WeightLoader::Selected { snapshot, root } => selected_f32(snapshot, *root, name)
+                .unwrap_or_else(|e| panic!("selected model tensor {name}: {e}")),
             // Serves on every platform, for every model — see the variant docs.
             WeightLoader::Typed(map) => {
                 let leaf = map.get(name)?;
@@ -616,6 +645,9 @@ impl WeightLoader {
 
     pub fn has_weight(&self, name: &str) -> bool {
         match self {
+            WeightLoader::Selected { snapshot, root } => selected_f32(snapshot, *root, name)
+                .unwrap_or_else(|e| panic!("selected model tensor {name}: {e}"))
+                .is_some(),
             #[cfg(feature = "import")]
             WeightLoader::SingleFile(loader) => loader.tensor_names().iter().any(|n| n == name),
             #[cfg(feature = "import")]
@@ -626,6 +658,68 @@ impl WeightLoader {
             WeightLoader::Aliased(pile) => pile.leaf(name).is_some(),
         }
     }
+}
+
+fn selected_f32_rank<const R: usize>(
+    snapshot: &crate::model_collection::ModelPileSnapshot,
+    root: triblespace::prelude::Id,
+    name: &str,
+) -> anyhow::Result<Option<(anybytes::View<[f32]>, Vec<usize>)>> {
+    use triblespace::core::blob::{
+        Blob,
+        encodings::tensor::{Tensor as NativeTensor, elements::F32},
+    };
+    use triblespace::prelude::*;
+    let path: Blob<blobencodings::UTF8String> = name.to_owned().to_blob();
+    let path = path.get_handle();
+    for (handle,) in find!((handle: Inline<inlineencodings::Handle<NativeTensor<F32, R>>>),
+    pattern!(snapshot.facts(), [
+        { root @ crate::format::attrs::member: _?member },
+        { _?member @ crate::format::attrs::safetensor_path: path, crate::format::attrs::weight: _?weight },
+        { _?weight @ crate::leaf::leaf::<F32, R>(): ?handle }
+    ])) {
+        let blob: Blob<NativeTensor<F32, R>> = snapshot
+            .store()
+            .get(handle)
+            .map_err(|e| anyhow::anyhow!("{name}: read selected F32 leaf: {e}"))?;
+        let leaf = crate::leaf::read_leaf(blob)?;
+        let shape = leaf
+            .dims()
+            .iter()
+            .map(|&d| usize::try_from(d))
+            .collect::<Result<Vec<_>, _>>()?;
+        let view = leaf
+            .payload()
+            .clone()
+            .view::<[f32]>()
+            .map_err(|e| anyhow::anyhow!("{name}: F32 view: {e}"))?;
+        return Ok(Some((view, shape)));
+    }
+    Ok(None)
+}
+
+fn selected_f32(
+    snapshot: &crate::model_collection::ModelPileSnapshot,
+    root: triblespace::prelude::Id,
+    name: &str,
+) -> anyhow::Result<Option<(anybytes::View<[f32]>, Vec<usize>)>> {
+    // CPU codec callers ask for raw host values rather than a compile-time
+    // rank. Probe only supported native F32 types; unrelated facts coexist.
+    macro_rules! rank {
+        ($r:literal) => {
+            if let Some(value) = selected_f32_rank::<$r>(snapshot, root, name)? {
+                return Ok(Some(value));
+            }
+        };
+    }
+    rank!(0);
+    rank!(1);
+    rank!(2);
+    rank!(3);
+    rank!(4);
+    rank!(5);
+    rank!(6);
+    Ok(None)
 }
 
 #[cfg(all(test, feature = "import"))]

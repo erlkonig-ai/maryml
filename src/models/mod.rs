@@ -6,6 +6,9 @@ pub mod f5;
 
 pub mod qwen3_5;
 
+#[cfg(feature = "breeze")]
+pub mod breeze;
+
 #[cfg(feature = "step-audio2")]
 pub mod step_audio2;
 
