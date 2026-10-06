@@ -50,7 +50,11 @@ use crate::nn::weight_loader::WeightLoader;
 
 /// Weightless RMS normalization: `x · rsqrt(mean(x²)+eps)`; the variance
 /// chain runs in f32 and casts back.
-fn rms<B: Backend>(x: Tensor<B, 3>, eps: f64) -> Tensor<B, 3> {
+pub(super) fn rms<B: Backend>(x: Tensor<B, 3>, eps: f64) -> Tensor<B, 3> {
+    #[cfg(feature = "voxtral-cuda")]
+    if let Some(normalized) = super::norm_cuda::try_rms(&x, eps) {
+        return normalized;
+    }
     let dt = x.dtype();
     let x32 = x.cast(FloatDType::F32);
     let var = x32.clone().powf_scalar(2.0).mean_dim(2);
@@ -73,6 +77,21 @@ fn linear_t<B: Backend>(
         None => wt,
     };
     wt.reshape([1, i, o])
+}
+
+/// Only the folded lane's O/down projections are candidates. Eligibility is
+/// checked against actual RawHalf storage; other cases keep Linear::forward.
+pub(super) fn output_projection<B: Backend>(linear: &Linear<B>, x: Tensor<B, 3>) -> Tensor<B, 3> {
+    #[cfg(feature = "voxtral-cuda")]
+    if let Some(y) = super::gemv_cuda::try_project(&x, &linear.weight_t)
+        .unwrap_or_else(|error| panic!("Voxtral O/down GEMV launch failed: {error:?}"))
+    {
+        return match &linear.bias {
+            Some(bias) => y + bias.clone(),
+            None => y,
+        };
+    }
+    linear.forward(x)
 }
 
 /// Sliding-window KV cache with absolute-position bookkeeping. Stores at most
@@ -281,7 +300,7 @@ impl<B: Backend> FastAttention<B> {
             let scores = q.matmul(k.swap_dims(2, 3)); // 1/√d pre-folded
             let probs = softmax(scores, 3);
             let out = probs.matmul(v).reshape([b, 1, h * d]);
-            return self.o_proj.forward(out);
+            return output_projection(&self.o_proj, out);
         }
 
         let expand = |t: Tensor<B, 4>| {
@@ -306,7 +325,7 @@ impl<B: Backend> FastAttention<B> {
         };
         let probs = softmax(scores, 3);
         let out = probs.matmul(v).swap_dims(1, 2).reshape([b, l, h * d]);
-        self.o_proj.forward(out)
+        output_projection(&self.o_proj, out)
     }
 }
 
@@ -343,7 +362,8 @@ impl<B: Backend> FastMlp<B> {
 
     fn forward(&self, h: Tensor<B, 3>) -> Tensor<B, 3> {
         let gu = h.matmul(self.gate_up_t.clone());
-        self.down.forward(
+        output_projection(
+            &self.down,
             silu(gu.clone().narrow(2, 0, self.inter)).mul(gu.narrow(2, self.inter, self.inter)),
         )
     }
@@ -635,5 +655,68 @@ impl<B: Backend> SttPipeline<B> for RealtimeTranscriber<B> {
     }
     fn logits_last(&self, hidden: Tensor<B, 3>) -> Tensor<B, 1> {
         self.decoder.logits_last(hidden)
+    }
+}
+
+#[cfg(all(test, feature = "voxtral-cuda"))]
+mod gemv_loaded_tests {
+    use super::*;
+    use crate::nn::backend::hear::{Device, RawHalf};
+    use std::{fs::OpenOptions, path::PathBuf, time::Instant};
+
+    #[test]
+    #[ignore = "one real native decoder load; separately admitted model reservation and explicit pile/output required"]
+    fn loaded_odown_eligibility_once() -> anyhow::Result<()> {
+        let pile = PathBuf::from(std::env::var("MARY_HEARING_GEMV_PILE")?);
+        let output = PathBuf::from(std::env::var("MARY_HEARING_GEMV_OBSERVATION")?);
+        let file = OpenOptions::new().write(true).create_new(true).open(output)?;
+        let started = Instant::now();
+        // Existing native cohort selector/loader, kept alive through decoder
+        // and all observation tensors. No source checkpoint or host-model copy.
+        let snapshot = crate::model_collection::load_model_collection_local_latest(&pile)?;
+        let loader = super::super::VoxtralWeights::from_snapshot(snapshot)?.into_loader();
+        let device = Device::default();
+        let decoder = FastDecoder::<RawHalf>::load(&loader, crate::hear::MAX_TOKENS, &device);
+        RawHalf::sync(&device).map_err(|error| anyhow::anyhow!("decoder load sync: {error:?}"))?;
+        let loaded_seconds = started.elapsed().as_secs_f64();
+        // Genuine owned tensors, not fabricated input bindings. They establish
+        // M1 eligibility only; no claim about each live activation is inferred.
+        let o_input = Tensor::<RawHalf,3>::zeros([1,1,4096], &device);
+        let down_input = Tensor::<RawHalf,3>::zeros([1,1,9216], &device);
+        RawHalf::sync(&device).map_err(|error| anyhow::anyhow!("owned fixture sync: {error:?}"))?;
+        let mut records = Vec::new();
+        for (layer, item) in decoder.layers.iter().enumerate() {
+            for (role, x, weight) in [
+                ("o", &o_input, &item.attn.o_proj.weight_t),
+                ("down", &down_input, &item.mlp.down.weight_t),
+            ] {
+                let mut record = super::super::gemv_cuda::observe_loaded_weight(x,weight);
+                record["layer"] = serde_json::json!(layer);
+                record["role"] = serde_json::json!(role);
+                println!("ODOWN_ELIGIBILITY {record}");
+                records.push(record);
+            }
+        }
+        assert_eq!(records.len(),52);
+        let accepted = records.iter().filter(|r| r["accepted"] == true).count();
+        let mut rejected_by_reason = serde_json::Map::new();
+        for record in &records {
+            for reason in record["reasons"].as_array().expect("reason list") {
+                let key = reason.as_str().expect("reason string");
+                let count = rejected_by_reason.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
+                rejected_by_reason.insert(key.to_owned(),serde_json::json!(count+1));
+            }
+        }
+        let report = serde_json::json!({"kind":"loaded_odown_eligibility", "pile":pile,
+            "records":records,"accepted":accepted,"rejected":52-accepted,
+            "rejected_by_reason":rejected_by_reason,"load_seconds":loaded_seconds,
+            "scope":"one native decoder load; real owned M1 fixture metadata; no GEMV, VAD, warmup or transcription"});
+        serde_json::to_writer_pretty(file,&report)?;
+        println!("ODOWN_ELIGIBILITY_SUMMARY accepted={accepted} rejected={}",52-accepted);
+        // Drop device readers before the native pile owner. The externally
+        // supplied pile must remain immutable through process/runtime teardown.
+        drop((o_input,down_input,decoder));
+        drop(loader);
+        Ok(())
     }
 }
