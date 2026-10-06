@@ -542,15 +542,21 @@ mod tests {
             let alignment = cube(&x).client.properties().memory.alignment as usize;
             assert!(alignment >= 2 && alignment <= 4096 && alignment % 2 == 0);
             let lanes = alignment / 2 + 1;
-            let strided = Tensor::<RawHalf, 3>::from_data(
+            let base = Tensor::<RawHalf, 3>::from_data(
                 TensorData::new(vec![f16::ONE; lanes * k], [1, k, lanes]),
                 &device,
-            )
-            .swap_dims(1, 2)
-            .narrow(1, 0, 1);
+            );
+            // Optimized allocation can pad the physical row pitch beyond
+            // logical `lanes`. Preserve and inspect that actual owned view.
+            let pitch = cube(&base).meta.strides()[1];
+            assert!(pitch >= lanes && pitch > 1);
+            let strided = base.clone().swap_dims(1, 2).narrow(1, 0, 1);
             assert_eq!(strided.dims(), [1, 1, k]);
-            assert_eq!(cube(&strided).meta.strides()[2], lanes);
+            assert_eq!(cube(&strided).meta.strides()[2], pitch);
+            assert!(cube(&strided).meta.strides()[2] > 1);
             assert!(try_project(&strided, &w).unwrap().is_none());
+            assert_eq!(read(strided), vec![f16::ONE; k]);
+            assert_eq!(read(base), vec![f16::ONE; lanes * k]);
         }
     }
 }
