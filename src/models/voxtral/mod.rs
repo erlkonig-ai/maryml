@@ -194,6 +194,8 @@ pub mod mel;
 #[cfg(feature = "voxtral-cuda")]
 mod norm_cuda;
 pub mod pipeline;
+#[cfg(feature = "voxtral-cuda")]
+mod swiglu_cuda;
 pub mod tokenizer;
 
 #[cfg(test)]

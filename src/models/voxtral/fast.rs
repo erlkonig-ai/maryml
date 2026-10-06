@@ -530,10 +530,12 @@ impl<B: Backend> FastMlp<B> {
         #[cfg(not(feature = "voxtral-cuda"))]
         let projected: Option<Tensor<B, 3>> = None;
         let gu = projected.unwrap_or_else(|| h.matmul(self.gate_up_t.clone()));
-        output_projection(
-            &self.down,
-            silu(gu.clone().narrow(2, 0, self.inter)).mul(gu.narrow(2, self.inter, self.inter)),
-        )
+        #[cfg(feature = "voxtral-cuda")]
+        let activated = super::swiglu_cuda::swiglu(gu, self.inter);
+        #[cfg(not(feature = "voxtral-cuda"))]
+        let activated = silu(gu.clone().narrow(2, 0, self.inter))
+            .mul(gu.narrow(2, self.inter, self.inter));
+        output_projection(&self.down, activated)
     }
 }
 
