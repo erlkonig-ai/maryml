@@ -145,6 +145,15 @@ cpal = { version = "0.17", optional = true }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 
 [features]
+# Breeze-TTS-2 exact mixed-dtype native assets; runtime is explicitly opt-in.
+breeze = ["tokenizer", "dep:sha2"]
+breeze-cuda = ["breeze", "qwen3_5-cuda", "qwen3tts"]
+breeze-cli = ["breeze-cuda", "dep:clap"]
+# Step-Audio2 Mini's pile assets and text/speech token codec. No model runtime.
+step-audio2 = ["tokenizer"]
+# Token-only Qwen2 CUDA decoder; reuses BF16 projections, not Qwen3.5 blocks.
+step-audio2-cuda = ["step-audio2", "qwen3_5-cuda"]
+step-audio2-cli = ["step-audio2-cuda", "dep:clap"]
 # Native BF16 Qwen3.5 operators; no Fusion or timing-based autotune backend.
 qwen3_5-gpu = ["dep:cubecl", "dep:burn-cubecl"]
 qwen3_5-cuda = ["qwen3_5-gpu", "cuda-bf16-alias", "dep:cubek"]
@@ -410,6 +419,22 @@ dev-tools = ["import"]
 [[bin]]
 name = "mary"
 required-features = ["import", "hub"]
+
+[[bin]]
+name = "step_audio2_import"
+required-features = ["step-audio2", "import"]
+
+[[bin]]
+name = "breeze_import"
+required-features = ["breeze", "import"]
+
+[[bin]]
+name = "breeze_say"
+required-features = ["breeze-cli"]
+
+[[bin]]
+name = "step_audio2_tokens"
+required-features = ["step-audio2-cli"]
 
 # Totality gate for the K3 checkpoint layout: walks the real safetensors headers
 # and asserts the tensor-name/module-slot mapping is a bijection. Header-only -

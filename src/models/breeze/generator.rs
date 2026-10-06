@@ -1,0 +1,356 @@
+//! Pile-native B1 Breeze generator. No checkpoint file, Python model, hidden
+//! weight catalogue, CPU LLM or reference-prefixed acoustic output is reachable.
+//! Initial endpoint is CFG1; paired conditional/negative CFG is not simulated.
+use super::{
+    backbone::Decoder,
+    config::{Config, DecoderConfig},
+    cuda_ops as ops,
+    depth::Depth,
+    load::{self, Artifacts},
+    sampling::Sampler,
+    text_encoder::TextEncoder,
+};
+use crate::nn::cuda_bf16_alias::CudaBf16Aliases;
+use anyhow::{Result, ensure};
+use ops::Tensor;
+use std::time::Instant;
+use triblespace::{
+    core::repo::BlobStoreGet,
+    prelude::{Id, TribleSet},
+};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PromptSegment {
+    Text(Vec<u32>),
+    AudioFrames(Vec<[u16; 16]>),
+    AudioEos,
+}
+#[derive(Clone, Debug)]
+pub struct GenerationOptions {
+    pub max_frames: usize,
+    pub max_context: usize,
+    pub seed: u64,
+    pub temperature: f32,
+    pub top_k: usize,
+    pub top_p: f32,
+    pub repetition_penalty: f32,
+    pub do_sample: bool,
+    pub cfg_scale: f32,
+}
+impl Default for GenerationOptions {
+    fn default() -> Self {
+        Self {
+            max_frames: 1500,
+            max_context: 2048,
+            seed: 42,
+            temperature: 0.9,
+            top_k: 50,
+            top_p: 1.0,
+            repetition_penalty: 1.1,
+            do_sample: true,
+            cfg_scale: 1.0,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Termination {
+    Eos,
+    FrameLimit,
+    ContextLimit,
+}
+#[derive(Debug)]
+pub struct GenerationReport {
+    pub termination: Termination,
+    pub frames: usize,
+    pub backbone_ids: Vec<u32>,
+    pub prefill_seconds: f64,
+    pub decode_seconds: f64,
+    pub callback_seconds: f64,
+    pub total_seconds: f64,
+}
+
+/// A typed selector only for the duration of construction, not a retained
+/// catalogue. Each consumer asks for its fixed leaf with explicit opaque root.
+pub(super) struct Binder<'a, R> {
+    pub facts: &'a TribleSet,
+    pub reader: &'a R,
+    pub root: Id,
+    pub aliases: &'a mut CudaBf16Aliases,
+}
+impl<R: BlobStoreGet> Binder<'_, R> {
+    pub(super) unsafe fn weight<const N: usize>(
+        &mut self,
+        name: &str,
+        shape: [u64; N],
+    ) -> Result<Tensor> {
+        let (_, blob) = load::tensor_bf16(self.facts, self.reader, self.root, name, shape)?;
+        // SAFETY: forwarded genuine mapped immutable-prefix contract from caller.
+        let value = unsafe { self.aliases.bind_pile_leaf(blob) }.map_err(anyhow::Error::msg)?;
+        ensure!(
+            !value.handle.can_mut(),
+            "weight alias unexpectedly writable"
+        );
+        Ok(value)
+    }
+}
+
+fn validate_geometry(c: &Config) -> Result<()> {
+    fn decoder(c: &DecoderConfig, want: (usize, usize, usize, usize, usize, usize)) -> Result<()> {
+        ensure!(
+            (
+                c.hidden_size,
+                c.intermediate_size,
+                c.num_hidden_layers,
+                c.num_attention_heads,
+                c.num_key_value_heads,
+                c.head_dim
+            ) == want,
+            "unsupported bounded Breeze transformer geometry"
+        );
+        ensure!(
+            c.rms_norm_eps.is_finite() && c.rms_norm_eps > 0.0,
+            "invalid norm epsilon"
+        );
+        Ok(())
+    }
+    decoder(&c.text.decoder, (1152, 6912, 26, 4, 1, 256))?;
+    decoder(&c.backbone, (2048, 6144, 28, 16, 8, 128))?;
+    decoder(&c.depth.decoder, (1024, 8192, 12, 8, 2, 128))?;
+    ensure!(
+        c.text.vocab_size == 262158
+            && c.text_vocab_size == 262158
+            && c.audio_vocab_size == 2051
+            && c.num_codebooks == 16,
+        "unsupported vocabulary geometry"
+    );
+    ensure!(
+        c.text.layer_types.len() == 26
+            && c.text
+                .layer_types
+                .iter()
+                .all(|s| s == "full_attention" || s == "sliding_attention"),
+        "invalid encoder layer types"
+    );
+    ensure!(
+        c.text.sliding_window > 0
+            && c.text.sliding_window <= 2048
+            && c.text.query_pre_attn_scalar.is_finite()
+            && c.text.query_pre_attn_scalar > 0.0,
+        "invalid encoder attention geometry"
+    );
+    ensure!(
+        c.depth.audio_embed_size == 2048
+            && c.depth.backbone_hidden_size == 2048
+            && c.tie_codebooks_embeddings
+            && c.codebook_eos_token_id == 0,
+        "unsupported tied audio embedding geometry"
+    );
+    ensure!(
+        c.max_context >= 1 && c.text.eoi_token_index < 262158,
+        "invalid context/EOI identity"
+    );
+    Ok(())
+}
+pub fn validate_request(prompt: &[PromptSegment], o: &GenerationOptions) -> Result<usize> {
+    ensure!(
+        o.cfg_scale == 1.0,
+        "native Breeze currently supports explicit CFG1 only, not ignored paired CFG"
+    );
+    ensure!(
+        (1..=1500).contains(&o.max_frames) && (1..=2048).contains(&o.max_context),
+        "invalid bounded frame/context limit"
+    );
+    ensure!(
+        o.temperature.is_finite()
+            && o.temperature > 0.0
+            && o.top_p.is_finite()
+            && o.top_p > 0.0
+            && o.top_p <= 1.0
+            && o.repetition_penalty.is_finite()
+            && o.repetition_penalty > 0.0,
+        "invalid sampling options"
+    );
+    ensure!(!prompt.is_empty(), "empty prompt");
+    let mut count = 0usize;
+    for segment in prompt {
+        let n = match segment {
+            PromptSegment::Text(ids) => {
+                ensure!(
+                    !ids.is_empty() && ids.iter().all(|&id| id < 262158),
+                    "empty/out-of-vocabulary text segment"
+                );
+                ids.len()
+            }
+            PromptSegment::AudioFrames(frames) => {
+                ensure!(
+                    !frames.is_empty() && frames.iter().flatten().all(|&code| code < 2048),
+                    "empty/reserved reference frame"
+                );
+                frames.len()
+            }
+            PromptSegment::AudioEos => 1,
+        };
+        count = count
+            .checked_add(n)
+            .ok_or_else(|| anyhow::anyhow!("prompt length overflow"))?;
+    }
+    ensure!(
+        count <= o.max_context,
+        "prompt exceeds bounded context; no truncation"
+    );
+    Ok(count)
+}
+
+pub struct Generator {
+    config: Config,
+    text: TextEncoder,
+    backbone: Decoder,
+    depth: Depth,
+    audio_embedding: Tensor,
+    head: Tensor,
+}
+impl Generator {
+    /// # Safety
+    /// All selected leaves must be genuine validated mapped pile blobs. Their
+    /// backing files INCLUDING preceding partial pages must stay immutable or
+    /// append-only and untruncated through CUDA client/runtime STORAGE TEARDOWN,
+    /// not merely until Generator/reader/binder drop or synchronization. Runtime
+    /// external registrations retain mmap owners. Partial construction failure
+    /// also retains registrations; a read-only FD is not external immutability.
+    pub unsafe fn from_pile<R: BlobStoreGet>(
+        facts: &TribleSet,
+        reader: &R,
+        ids: Artifacts,
+        config: Config,
+        aliases: &mut CudaBf16Aliases,
+    ) -> Result<Self> {
+        validate_geometry(&config)?;
+        let mut b = Binder {
+            facts,
+            reader,
+            root: ids.model_root,
+            aliases,
+        };
+        // SAFETY: same genuine pile/root/binder and immutable lifetime premise.
+        Ok(unsafe {
+            Self {
+                text: TextEncoder::bind(&mut b, config.text.clone(), config.backbone.hidden_size)?,
+                backbone: Decoder::bind(&mut b, config.backbone.clone(), "backbone_model", true)?,
+                depth: Depth::bind(&mut b, config.depth.clone(), config.audio_vocab_size)?,
+                audio_embedding: b
+                    .weight("depth_decoder.model.embed_tokens.weight", [32816, 2048])?,
+                head: b.weight("lm_head.weight", [2052, 2048])?,
+                config,
+            }
+        })
+    }
+    pub fn synchronize(&self) -> Result<()> {
+        cubecl::future::block_on(self.head.client.sync())
+            .map_err(|e| anyhow::anyhow!("Breeze CUDA sync: {e:?}"))
+    }
+    pub fn generate(
+        &mut self,
+        prompt: &[PromptSegment],
+        options: GenerationOptions,
+        mut on_frame: impl FnMut([u16; 16]) -> Result<()>,
+    ) -> Result<GenerationReport> {
+        let prompt_len = validate_request(prompt, &options)?;
+        ensure!(
+            options.max_context <= self.config.max_context,
+            "request exceeds model context"
+        );
+        self.synchronize()?;
+        let started = Instant::now();
+        let mut merged: Option<Tensor> = None;
+        for segment in prompt {
+            let x = match segment {
+                PromptSegment::Text(ids) => self.text.encode(ids)?,
+                PromptSegment::AudioFrames(frames) => {
+                    ops::audio_embedding(&self.audio_embedding, frames, 2051)
+                }
+                PromptSegment::AudioEos => {
+                    ops::audio_embedding(&self.audio_embedding, &[[0u16; 16]], 2051)
+                }
+            };
+            merged = Some(ops::append(&x, merged.as_ref()));
+        }
+        let (mut hidden, mut cache) = self.backbone.forward(
+            merged.ok_or_else(|| anyhow::anyhow!("empty merged prompt"))?,
+            0,
+            &[],
+        )?;
+        self.synchronize()?;
+        let prefill_seconds = started.elapsed().as_secs_f64();
+        let decode_start = Instant::now();
+        let mut sampler = Sampler::new(options.seed);
+        let mut backbone_ids = Vec::with_capacity(options.max_frames);
+        let mut frames = 0usize;
+        let mut past = prompt_len;
+        let mut callback_seconds = 0.0f64;
+        let termination = loop {
+            let logits = ops::head(&hidden, &self.head, None);
+            let first = sampler.sample(&logits, &options, &backbone_ids, true)?;
+            backbone_ids.push(first);
+            if first == 2051 {
+                break Termination::Eos;
+            }
+            ensure!(first < 2048, "backbone emitted reserved codec ID");
+            let frame = self.depth.frame(
+                &hidden,
+                first,
+                &self.audio_embedding,
+                &options,
+                &mut sampler,
+            )?;
+            let callback_start = Instant::now();
+            on_frame(frame)?;
+            callback_seconds += callback_start.elapsed().as_secs_f64();
+            frames += 1;
+            if frames == options.max_frames {
+                break Termination::FrameLimit;
+            }
+            if past == options.max_context {
+                break Termination::ContextLimit;
+            }
+            let input = ops::audio_embedding(&self.audio_embedding, &[frame], 2051);
+            (hidden, cache) = self.backbone.forward(input, past, &cache)?;
+            past += 1;
+        };
+        self.synchronize()?;
+        let decode_seconds = decode_start.elapsed().as_secs_f64() - callback_seconds;
+        Ok(GenerationReport {
+            termination,
+            frames,
+            backbone_ids,
+            prefill_seconds,
+            decode_seconds,
+            callback_seconds,
+            total_seconds: started.elapsed().as_secs_f64(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn bounded_requests_refuse_silent_cfg_and_truncation() {
+        let p = [
+            PromptSegment::Text(vec![2, 100]),
+            PromptSegment::AudioFrames(vec![[17; 16]]),
+            PromptSegment::AudioEos,
+        ];
+        let mut o = GenerationOptions::default();
+        assert_eq!(validate_request(&p, &o).unwrap(), 4);
+        o.cfg_scale = 4.0;
+        assert!(validate_request(&p, &o).is_err());
+        o.cfg_scale = 1.0;
+        o.max_context = 3;
+        assert!(validate_request(&p, &o).is_err());
+        o.max_context = 4;
+        assert!(validate_request(&p, &o).is_ok());
+        let bad = [PromptSegment::AudioFrames(vec![[2048; 16]])];
+        assert!(validate_request(&bad, &o).is_err());
+        assert!(validate_request(&[], &o).is_err());
+    }
+}
