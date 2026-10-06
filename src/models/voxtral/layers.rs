@@ -135,7 +135,7 @@ impl<B: Backend> RopeTable<B> {
 }
 
 /// `rotate_half` on the last dim of `[B,H,L,D]`: `[-x2 ‖ x1]`.
-fn rotate_half<B: Backend>(x: Tensor<B, 4>) -> Tensor<B, 4> {
+pub(super) fn rotate_half<B: Backend>(x: Tensor<B, 4>) -> Tensor<B, 4> {
     let d = x.dims()[3];
     let half = d / 2;
     Tensor::cat(

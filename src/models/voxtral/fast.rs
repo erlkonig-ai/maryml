@@ -3,13 +3,16 @@
 //! (gated token-identical in f32 by `voxtral_probe --lane fold`), laid out for
 //! op-count and weight traffic instead of oracle-mirroring:
 //!
-//! - one **wide fused matmul** `[q‖k | R(q‖k) | v]` per attention, with
+//! - encoder: one **wide fused matmul** `[q‖k | R(q‖k) | v]`, with
 //!   rotate_half pre-applied to the qk weight ROWS — RoPE becomes
 //!   `qk·cos + qkR·sin`, no narrow/cat on activations. The encoder's biases
 //!   ride along as `[b_q‖0 | R(b_q)‖0 | b_v]` (RoPE applies after the bias,
 //!   and rope is linear, so the rotated block carries the rotated bias);
+//!   decoder: compact `[q‖k | v]` for both prefill and decode, with the same
+//!   activation-side rotate_half as the ordinary attention lane. No duplicate
+//!   rotated decoder weights are retained;
 //! - the preceding RMSNorm **weights** live folded into the consuming matmul
-//!   rows (attention norm → wide qkv; encoder MLP norm → gate‖up; encoder
+//!   rows (attention norm → fused qkv; encoder MLP norm → gate‖up; encoder
 //!   final norm → projector rows, tiled ×4 across the frame-stack; decoder
 //!   final norm → tied lm_head rows). Decoder post-attention norm weights
 //!   fold into the per-session ada scales instead (they share the same
@@ -42,7 +45,7 @@ use burn::tensor::activation::{gelu, silu, softmax};
 use super::config::*;
 use super::decoder::{AdaScales, time_embedding};
 use super::encoder::CausalConv;
-use super::layers::{Embedding, Linear, RopeTable};
+use super::layers::{Embedding, Linear, RopeTable, rotate_half};
 use super::mel::VoxtralMel;
 use super::pipeline::SttPipeline;
 use super::tokenizer::Tekken;
@@ -309,11 +312,19 @@ mod tail_block_cache_tests {
     }
 }
 
-/// Folded attention: wide fused qkv with pre-rotated rows, biases riding as
-/// `[b‖R(b)‖b_v]`, 1/√d in the q rows, GQA group-fold on single-token steps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QkvLayout {
+    RotatedWeights,
+    Compact,
+}
+
+/// One folded QKV representation per stack, 1/√d in the q rows, GQA
+/// group-fold on single-token steps. Encoder retains its pre-rotated rows;
+/// decoder rotates activations after the compact projection's F16 store.
 struct FastAttention<B: Backend> {
-    wide_t: Tensor<B, 3>,            // [1, hidden, (2(h+hkv)+hkv)·d]
-    wide_bias: Option<Tensor<B, 3>>, // [1, 1, same]
+    qkv_t: Tensor<B, 3>,            // [1, hidden, layout-dependent width]
+    qkv_bias: Option<Tensor<B, 3>>, // [1, 1, same]
+    layout: QkvLayout,
     o_proj: Linear<B>,
     heads: usize,
     kv_heads: usize,
@@ -326,11 +337,15 @@ impl<B: Backend> FastAttention<B> {
         prefix: &str,
         (h, hkv, d): (usize, usize, usize),
         qvo_bias: bool,
+        layout: QkvLayout,
         fold_in: Tensor<B, 1>,
         device: &B::Device,
     ) -> Self {
         let half = d / 2;
-        let n_out = (2 * (h + hkv) + hkv) * d;
+        let n_out = match layout {
+            QkvLayout::RotatedWeights => (2 * (h + hkv) + hkv) * d,
+            QkvLayout::Compact => (h + 2 * hkv) * d,
+        };
         let w2 = |n: &str| -> Tensor<B, 2> {
             loader.load_tensor(&format!("{prefix}.{n}.weight"), device)
         };
@@ -340,44 +355,48 @@ impl<B: Backend> FastAttention<B> {
         let q = w2("q_proj").mul_scalar(scale); // 1/√d folded into the q rows
         let qk: Tensor<B, 2> = Tensor::cat(vec![q, w2("k_proj")], 0); // [(h+hkv)d, in]
         let hidden = qk.dims()[1];
-        let qk3 = qk.clone().reshape([h + hkv, d, hidden]);
-        let qk_rot = Tensor::cat(
-            vec![
-                qk3.clone().narrow(1, half, half).neg(),
-                qk3.narrow(1, 0, half),
-            ],
-            1,
-        )
-        .reshape([(h + hkv) * d, hidden]);
-        let wide = Tensor::cat(vec![qk, qk_rot, w2("v_proj")], 0);
-        let wide_t = wide
+        let fused = match layout {
+            QkvLayout::RotatedWeights => {
+                let qk3 = qk.clone().reshape([h + hkv, d, hidden]);
+                let qk_rot = Tensor::cat(
+                    vec![qk3.clone().narrow(1, half, half).neg(), qk3.narrow(1, 0, half)],
+                    1,
+                ).reshape([(h + hkv) * d, hidden]);
+                Tensor::cat(vec![qk, qk_rot, w2("v_proj")], 0)
+            }
+            QkvLayout::Compact => Tensor::cat(vec![qk, w2("v_proj")], 0),
+        };
+        let qkv_t = fused
             .transpose()
             .mul(fold_in.reshape([hidden, 1]))
             .reshape([1, hidden, n_out]);
 
         // RoPE applies AFTER the bias (encoder), and rope is linear — the
         // rotated block carries the rotated bias. k_proj never has a bias.
-        let wide_bias = qvo_bias.then(|| {
+        let qkv_bias = qvo_bias.then(|| {
             let b1 = |n: &str| -> Tensor<B, 1> {
                 loader.load_tensor(&format!("{prefix}.{n}.bias"), device)
             };
             let bq = b1("q_proj").mul_scalar(scale);
             let bqk: Tensor<B, 1> = Tensor::cat(vec![bq, Tensor::zeros([hkv * d], device)], 0);
-            let b2 = bqk.clone().reshape([h + hkv, d]);
-            let b_rot = Tensor::cat(
-                vec![
-                    b2.clone().narrow(1, half, half).neg(),
-                    b2.narrow(1, 0, half),
-                ],
-                1,
-            )
-            .reshape([(h + hkv) * d]);
-            Tensor::cat(vec![bqk, b_rot, b1("v_proj")], 0).reshape([1, 1, n_out])
+            let fused = match layout {
+                QkvLayout::RotatedWeights => {
+                    let b2 = bqk.clone().reshape([h + hkv, d]);
+                    let b_rot = Tensor::cat(
+                        vec![b2.clone().narrow(1, half, half).neg(), b2.narrow(1, 0, half)],
+                        1,
+                    ).reshape([(h + hkv) * d]);
+                    Tensor::cat(vec![bqk, b_rot, b1("v_proj")], 0)
+                }
+                QkvLayout::Compact => Tensor::cat(vec![bqk, b1("v_proj")], 0),
+            };
+            fused.reshape([1, 1, n_out])
         });
 
         Self {
-            wide_t,
-            wide_bias,
+            qkv_t,
+            qkv_bias,
+            layout,
             o_proj: Linear::load(loader, &format!("{prefix}.o_proj"), qvo_bias, device),
             heads: h,
             kv_heads: hkv,
@@ -400,15 +419,15 @@ impl<B: Backend> FastAttention<B> {
         let (h, hkv, d) = (self.heads, self.kv_heads, self.head_dim);
         let hh = h + hkv;
 
-        // Only exact decoder M1 geometry/layout can take this local path.
-        // Encoder, prefill and unsupported metadata keep the original matmul.
+        // Exact decoder M1 and existing encoder M4 geometry/layout can take
+        // this local path. Prefill and unsupported metadata retain matmul.
         #[cfg(feature = "voxtral-cuda")]
-        let projected = super::gemv_cuda::try_project(&x, &self.wide_t)
-            .unwrap_or_else(|error| panic!("Voxtral wide QKV GEMV launch failed: {error:?}"));
+        let projected = super::gemv_cuda::try_project(&x, &self.qkv_t)
+            .unwrap_or_else(|error| panic!("Voxtral QKV GEMV launch failed: {error:?}"));
         #[cfg(not(feature = "voxtral-cuda"))]
         let projected: Option<Tensor<B, 3>> = None;
-        let mut qkv = projected.unwrap_or_else(|| x.matmul(self.wide_t.clone()));
-        if let Some(bias) = &self.wide_bias {
+        let mut qkv = projected.unwrap_or_else(|| x.matmul(self.qkv_t.clone()));
+        if let Some(bias) = &self.qkv_bias {
             qkv = qkv + bias.clone();
         }
         // [B,L,heads·D] → [B,heads,L,D]; for L=1 the reshape alone is exact.
@@ -420,8 +439,11 @@ impl<B: Backend> FastAttention<B> {
             }
         };
         let qk = heads(qkv.clone().narrow(2, 0, hh * d), hh);
-        let qkr = heads(qkv.clone().narrow(2, hh * d, hh * d), hh);
-        let v = heads(qkv.narrow(2, 2 * hh * d, hkv * d), hkv);
+        let (qkr, v_start) = match self.layout {
+            QkvLayout::RotatedWeights => (heads(qkv.clone().narrow(2, hh * d, hh * d), hh), 2 * hh * d),
+            QkvLayout::Compact => (rotate_half(qk.clone()), hh * d),
+        };
+        let v = heads(qkv.narrow(2, v_start, hkv * d), hkv);
 
         let roped = qk.mul(cos.clone()) + qkr.mul(sin.clone());
         let q = roped.clone().narrow(1, 0, h);
@@ -541,6 +563,7 @@ impl<B: Backend> FastEncoder<B> {
                         &format!("{p}.self_attn"),
                         geo,
                         true,
+                        QkvLayout::RotatedWeights,
                         w1(&format!("{p}.self_attn_layer_norm.weight")),
                         device,
                     ),
@@ -648,6 +671,7 @@ impl<B: Backend> FastDecoder<B> {
                         &format!("{p}.self_attn"),
                         geo,
                         false,
+                        QkvLayout::Compact,
                         w1("input_layernorm"),
                         device,
                     ),
@@ -818,6 +842,16 @@ mod wide_qkv_tests {
     #[test]
     #[ignore = "finite real-geometry folded attention ordering control; no model weights"]
     fn cuda_wide_qkv_fold_rope_gqa_cache_and_fallback() {
+        folded_attention_control(QkvLayout::RotatedWeights);
+    }
+
+    #[test]
+    #[ignore = "compact decoder real-geometry projection/RoPE/GQA/prefill control; no model weights"]
+    fn cuda_compact_qkv_fold_rope_gqa_prefill_and_fallback() {
+        folded_attention_control(QkvLayout::Compact);
+    }
+
+    fn folded_attention_control(layout: QkvLayout) {
         let device = Default::default();
         let (k, h, kv, d) = (3072, 32, 8, 128);
         // Ephemeral synthetic loader for this one fixture, not a model index.
@@ -828,11 +862,13 @@ mod wide_qkv_tests {
         let mut output = vec![0.0f32; k * h * d];
         for head in 0..h {
             q[head * d * k] = 8.0 + 2.0 * (head % 4) as f32;
+            q[(head * d + d / 2) * k] = 4.0 + (head % 4) as f32;
             // Observe all 32 query heads, not merely the first 3072 channels.
             output[head * h * d + head * d] = 1.0;
         }
         for group in 0..kv {
             key[group * d * k] = 1.0 + group as f32 / 8.0;
+            key[(group * d + d / 2) * k] = 0.25 + group as f32 / 16.0;
             value[group * d * k] = 1.5 + group as f32 / 4.0;
         }
         weights.insert("attn.q_proj.weight".to_owned(), (q, vec![h * d, k]));
@@ -842,18 +878,20 @@ mod wide_qkv_tests {
         let loader = WeightLoader::Pile(weights);
         let mut norm = vec![f16::ONE; k];
         norm[0] = f16::from_f32(2.0);
-        let attn = FastAttention::<RawHalf>::load(&loader, "attn", (h, kv, d), false,
+        let attn = FastAttention::<RawHalf>::load(&loader, "attn", (h, kv, d), false, layout,
             Tensor::from_data(TensorData::new(norm, [k]), &device), &device);
         drop(loader);
-        assert!(attn.wide_bias.is_none()); // This is the unbiased decoder path.
+        assert!(attn.qkv_bias.is_none()); // This is the unbiased decoder path.
+        let width = if layout == QkvLayout::Compact { 6144 } else { 11264 };
+        assert_eq!(attn.qkv_t.dims(), [1, k, width]);
         let mut input = vec![f16::ZERO; k];
         input[0] = f16::ONE;
         let x = Tensor::<RawHalf, 3>::from_data(TensorData::new(input.clone(), [1, 1, k]), &device);
-        // RED at the parent: this mandatory dispatch returns None there.
-        assert!(super::super::gemv_cuda::try_project(&x, &attn.wide_t).unwrap().is_some());
+        // Compact width must launch, not silently use the generic fallback.
+        assert!(super::super::gemv_cuda::try_project(&x, &attn.qkv_t).unwrap().is_some());
 
-        // A 90-degree synthetic RoPE makes the pre-rotated block observable.
-        // Past K uses channel64; an unrotated/new-only/swapped-block path fails.
+        // Distinct, nonzero head halves make a 90-degree RoPE observable.
+        // Negating without swapping must fail, not merely an absent rotation.
         let cos = Tensor::<RawHalf, 4>::zeros([1, 1, 1, d], &device);
         let sin = Tensor::<RawHalf, 4>::ones([1, 1, 1, d], &device);
         let mut past_k = vec![f16::ZERO; kv * d];
@@ -876,9 +914,12 @@ mod wide_qkv_tests {
             // existing scale-then-affine F16 stores; no CPU attention twin.
             let qs = f16::from_f32((8.0 + 2.0 * (head % 4) as f32) / (d as f32).sqrt());
             let qf = f16::from_f32(qs.to_f32() * 2.0).to_f32();
+            let qr = f16::from_f32((4.0 + (head % 4) as f32) / (d as f32).sqrt());
+            let qr = f16::from_f32(qr.to_f32() * 2.0).to_f32();
             let current_k = 2.0 + group as f32 / 4.0;
+            let current_k_half = 0.5 + group as f32 / 8.0;
             let a = f16::from_f32(qf * past_k[group * d + d / 2].to_f32()).to_f32();
-            let b = f16::from_f32(qf * current_k).to_f32();
+            let b = f16::from_f32(qf * current_k + qr * current_k_half).to_f32();
             let p_current = 1.0 / (1.0 + (a - b).exp());
             expected[head] = past_v[group * d].to_f32() * (1.0 - p_current)
                 + (3.0 + group as f32 / 2.0) * p_current;
@@ -901,17 +942,51 @@ mod wide_qkv_tests {
             for c in 0..d {
                 assert_eq!(cached_k[(group * 2) * d + c], past_k[group * d + c]);
                 assert_eq!(cached_v[(group * 2) * d + c], past_v[group * d + c]);
-                let key = if c == d / 2 { 2.0 + group as f32 / 4.0 } else { 0.0 };
+                let key = if c == 0 { -(0.5 + group as f32 / 8.0) }
+                    else if c == d / 2 { 2.0 + group as f32 / 4.0 } else { 0.0 };
                 let value = if c == 0 { 3.0 + group as f32 / 2.0 } else { 0.0 };
                 assert_eq!(cached_k[(group * 2 + 1) * d + c], f16::from_f32(key));
                 assert_eq!(cached_v[(group * 2 + 1) * d + c], f16::from_f32(value));
             }
         }
+        assert_eq!(cached_k[d], f16::from_f32(-0.5));
+        assert_ne!(cached_k[d], f16::from_f32(-2.0), "wrong no-swap quarter turn");
+        if layout == QkvLayout::Compact {
+            // One compact representation is also used by prefill. M2 keeps
+            // the existing generic matmul and causal mask, never this GEMV.
+            let prefill = Tensor::cat(vec![x.clone(), x.clone()], 1);
+            assert!(super::super::gemv_cuda::try_project(&prefill, &attn.qkv_t)
+                .unwrap().is_none());
+            let cos = Tensor::<RawHalf, 4>::from_data(TensorData::new(
+                [vec![f16::ONE; d], vec![f16::ZERO; d]].concat(), [1,1,2,d]), &device);
+            let sin = Tensor::<RawHalf, 4>::from_data(TensorData::new(
+                [vec![f16::ZERO; d], vec![f16::ONE; d]].concat(), [1,1,2,d]), &device);
+            let mut cache = FastKv::new(4);
+            let mask = build_mask::<RawHalf>(2, 2, 0, 4, &device);
+            let output = read(attn.forward(prefill, &cos, &sin, mask.as_ref(), &mut cache));
+            for position in 0..2 {
+                for c in 0..k {
+                    let expected = if c < h { 3.0 + (c / 4) as f32 / 2.0 } else { 0.0 };
+                    let value = output[position*k+c].to_f32();
+                    assert!(value.is_finite() && (value-expected).abs() <= 0.008);
+                }
+            }
+            assert_eq!((cache.pos, cache.stored()), (2,2));
+            let keys = read(cache.k.unwrap());
+            for group in 0..kv {
+                let a = f16::from_f32(2.0 + group as f32 / 4.0);
+                let b = f16::from_f32(0.5 + group as f32 / 8.0);
+                assert_eq!(keys[group*2*d], a);
+                assert_eq!(keys[group*2*d+d/2], b);
+                assert_eq!(keys[group*2*d+d], -b);
+                assert_eq!(keys[group*2*d+d+d/2], a);
+            }
+        }
         // Same folded weights, deliberately incompatible row-major storage:
         // generic matmul fallback must preserve the same attention expression.
-        let row = Tensor::<RawHalf, 3>::from_data(attn.wide_t.clone().into_data(), &device);
+        let row = Tensor::<RawHalf, 3>::from_data(attn.qkv_t.clone().into_data(), &device);
         assert!(super::super::gemv_cuda::try_project(&x, &row).unwrap().is_none());
-        let fallback = FastAttention { wide_t: row, ..attn };
+        let fallback = FastAttention { qkv_t: row, ..attn };
         check(read(fallback.forward(x.clone(), &cos, &sin, None, &mut initial_cache())));
         assert_eq!(read(x), input);
         assert_eq!(read(pk), past_k);
@@ -1031,7 +1106,7 @@ mod gemv_loaded_tests {
         let o_input = Tensor::<RawHalf,3>::zeros([1,1,4096], &device);
         let down_input = Tensor::<RawHalf,3>::zeros([1,1,9216], &device);
         let gate_up_input = Tensor::<RawHalf,3>::zeros([1,1,3072], &device);
-        let wide_input = Tensor::<RawHalf,3>::zeros([1,1,3072], &device);
+        let qkv_input = Tensor::<RawHalf,3>::zeros([1,1,3072], &device);
         RawHalf::sync(&device).map_err(|error| anyhow::anyhow!("owned fixture sync: {error:?}"))?;
         let mut records = Vec::new();
         for (layer, item) in decoder.layers.iter().enumerate() {
@@ -1039,7 +1114,7 @@ mod gemv_loaded_tests {
                 ("o", &o_input, &item.attn.o_proj.weight_t),
                 ("down", &down_input, &item.mlp.down.weight_t),
                 ("gate_up", &gate_up_input, &item.mlp.gate_up_t),
-                ("wide_qkv", &wide_input, &item.attn.wide_t),
+                ("compact_qkv", &qkv_input, &item.attn.qkv_t),
             ] {
                 let mut record = super::super::gemv_cuda::observe_loaded_weight(x,weight);
                 record["layer"] = serde_json::json!(layer);
@@ -1066,7 +1141,7 @@ mod gemv_loaded_tests {
         println!("DECODER_PROJECTION_ELIGIBILITY_SUMMARY accepted={accepted} rejected={}",104-accepted);
         // Drop device readers before the native pile owner. The externally
         // supplied pile must remain immutable through process/runtime teardown.
-        drop((o_input,down_input,gate_up_input,wide_input,decoder));
+        drop((o_input,down_input,gate_up_input,qkv_input,decoder));
         drop(loader);
         Ok(())
     }

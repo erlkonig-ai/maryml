@@ -1,4 +1,4 @@
-//! Isolated O/down/gate-up/wide-QKV GEMV: existing Cubek kernel, no repacking.
+//! Isolated O/down/gate-up/QKV GEMV: existing Cubek kernel, no repacking.
 //! Exact RawHalf, F16: decoder M1 or four dense encoder rows as shared-RHS GEMVs.
 //! Unsupported metadata keeps the original matmul. Launch errors propagate.
 
@@ -88,7 +88,7 @@ fn eligible<B: Backend>(
         && w.dtype == DType::F16
         && !x.quantized
         && !w.quantized
-        && ((matches!((k, n), (4096, 3072) | (9216, 3072) | (3072, 18432) | (3072, 11264))
+        && ((matches!((k, n), (4096, 3072) | (9216, 3072) | (3072, 18432) | (3072, 11264) | (3072, 6144))
             && x.shape == [1, 1, k])
             || (encoder_m4_slot(x.shape, w.shape).is_some() && x.strides[1] == k))
         && w.shape == [1, k, n]
@@ -259,7 +259,7 @@ pub(super) fn observe_loaded_weight(
         reasons.push("quantization");
     }
     let encoder = encoder_m4_slot(a.shape, b.shape).is_some();
-    if (!matches!((k, n), (4096, 3072) | (9216, 3072) | (3072, 18432) | (3072, 11264))
+    if (!matches!((k, n), (4096, 3072) | (9216, 3072) | (3072, 18432) | (3072, 11264) | (3072, 6144))
         || a.shape != [1, 1, k] || b.shape != [1, k, n]) && !encoder {
         reasons.push("shape");
     }
@@ -360,7 +360,7 @@ mod tests {
         }
         // Existing decoder M4 prefill is still excluded, even though its M1
         // counterpart remains eligible. Do not make this a generic M4 route.
-        for (k, n) in [(4096, 3072), (9216, 3072), (3072, 18432), (3072, 11264)] {
+        for (k, n) in [(4096, 3072), (9216, 3072), (3072, 18432), (3072, 11264), (3072, 6144)] {
             let (x, w) = encoder_layouts(k, n);
             assert!(!eligible::<RawHalf>(x, w, true, 32, 8));
             assert!(eligible::<RawHalf>(Layout { shape: [1, 1, k], ..x }, w, true, 32, 8));
@@ -798,12 +798,22 @@ mod tests {
 
     #[test]
     fn wide_qkv_geometry_is_exact_rawhalf_m1() {
-        let (k, n) = (3072, 11264);
+        qkv_geometry_control(11264);
+    }
+
+    #[test]
+    fn compact_qkv_geometry_is_exact_rawhalf_m1() {
+        // This positive expectation fails with the parent production gate.
+        qkv_geometry_control(6144);
+    }
+
+    fn qkv_geometry_control(n: usize) {
+        let k = 3072;
         let (x, mut w) = layouts(k);
         w.shape = [1, k, n];
         w.strides = [k * n, 1, k];
         w.bytes = (2 * k * n) as u64;
-        // The parent rejects this exact geometry; no launched fallback counts.
+        // A selected route must be eligible; no launched fallback counts.
         assert!(eligible::<RawHalf>(x, w, true, 32, 8));
         assert!(!eligible::<hear::Raw>(x, w, true, 32, 8));
         assert!(!eligible::<hear::FusedHalf>(x, w, true, 32, 8));
@@ -849,8 +859,18 @@ mod tests {
     #[test]
     #[ignore = "finite decoder-wide precision/offset/immutability control; no model weights"]
     fn cuda_wide_qkv_precision_offsets_and_inputs() {
+        qkv_precision_control(11264);
+    }
+
+    #[test]
+    #[ignore = "finite compact decoder precision/offset/immutability control; no model weights"]
+    fn cuda_compact_qkv_precision_offsets_and_inputs() {
+        qkv_precision_control(6144);
+    }
+
+    fn qkv_precision_control(n: usize) {
         let device = Default::default();
-        let (k, n) = (3072, 11264);
+        let k = 3072;
         let input = x_values(k);
         let padded: Vec<f16> = vec![f16::from_f32(-7.0); k]
             .into_iter().chain(input.iter().copied())
@@ -885,7 +905,7 @@ mod tests {
         assert_eq!(&cube(&w).meta.strides()[1..], &[1, k]);
         assert!(cube(&x).handle.offset_start.unwrap_or(0) > 0);
         assert!(cube(&w).handle.offset_start.unwrap_or(0) > 0);
-        let result = try_project(&x, &w).unwrap().expect("wide QKV must launch GEMV");
+        let result = try_project(&x, &w).unwrap().expect("QKV must launch GEMV");
         assert_eq!(result.dims(), [1, 1, n]);
         assert_eq!(result.dtype(), DType::F16);
         assert_eq!(read(result.clone()), expected);
