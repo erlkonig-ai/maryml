@@ -1,5 +1,5 @@
-//! Isolated O/down/gate-up GEMV experiment: existing Cubek kernel, no repacking.
-//! Exact RawHalf, F16, M=1; (K,N)=(4096,3072)/(9216,3072)/(3072,18432).
+//! Isolated O/down/gate-up/wide-QKV GEMV: existing Cubek kernel, no repacking.
+//! Exact RawHalf, F16, M=1; O/down, decoder gate-up and decoder wide QKV only.
 //! Unsupported metadata keeps the original matmul. Launch errors propagate.
 
 use std::any::{Any, TypeId};
@@ -78,7 +78,7 @@ fn eligible<B: Backend>(
         && w.dtype == DType::F16
         && !x.quantized
         && !w.quantized
-        && matches!((k, n), (4096, 3072) | (9216, 3072) | (3072, 18432))
+        && matches!((k, n), (4096, 3072) | (9216, 3072) | (3072, 18432) | (3072, 11264))
         && x.shape == [1, 1, k]
         && w.shape == [1, k, n]
         && x.strides[2] == 1
@@ -198,7 +198,7 @@ pub(super) fn observe_loaded_weight(
     if a.quantized || b.quantized {
         reasons.push("quantization");
     }
-    if !matches!((k, n), (4096, 3072) | (9216, 3072) | (3072, 18432))
+    if !matches!((k, n), (4096, 3072) | (9216, 3072) | (3072, 18432) | (3072, 11264))
         || a.shape != [1, 1, k] || b.shape != [1, k, n] {
         reasons.push("shape");
     }
@@ -427,7 +427,7 @@ mod tests {
                 ..w
             },
             Layout {
-                shape: [1, k, 11264],
+                shape: [1, k, 11263],
                 ..w
             },
             Layout {
@@ -522,6 +522,111 @@ mod tests {
             },
             _ => (((row * 3 + col * 7) % 31) as f32 - 15.0) / 1024.0,
         })
+    }
+
+    #[test]
+    fn wide_qkv_geometry_is_exact_rawhalf_m1() {
+        let (k, n) = (3072, 11264);
+        let (x, mut w) = layouts(k);
+        w.shape = [1, k, n];
+        w.strides = [k * n, 1, k];
+        w.bytes = (2 * k * n) as u64;
+        // The parent rejects this exact geometry; no launched fallback counts.
+        assert!(eligible::<RawHalf>(x, w, true, 32, 8));
+        assert!(!eligible::<hear::Raw>(x, w, true, 32, 8));
+        assert!(!eligible::<hear::FusedHalf>(x, w, true, 32, 8));
+        assert!(!eligible::<RawHalf>(x, w, false, 32, 8));
+        for bad_x in [
+            Layout { shape: [1, 4, k], ..x },
+            Layout { shape: [2, 1, k], ..x },
+            Layout { shape: [1, 1, 1280], ..x },
+            Layout { strides: [k, k, 2], ..x },
+            Layout { dtype: DType::F32, ..x },
+            Layout { bytes: x.bytes - 2, ..x },
+            Layout { start: 2, bytes: x.bytes + 2, ..x },
+            Layout { end: x.bytes + 1, ..x },
+            Layout { quantized: true, ..x },
+        ] {
+            assert!(!eligible::<RawHalf>(bad_x, w, true, 32, 8));
+        }
+        for bad_w in [
+            Layout { shape: [1, k, n - 1], ..w },
+            Layout { shape: [1, k, 131072], ..w },
+            Layout { shape: [1, 1280, 10240], ..w },
+            Layout { shape: [2, k, n], ..w },
+            Layout { strides: [k * n, n, 1], ..w },
+            Layout { strides: [k * n, 1, k + 16], ..w },
+            Layout { dtype: DType::BF16, ..w },
+            Layout { bytes: w.bytes - 2, ..w },
+            Layout { start: w.bytes + 1, ..w },
+            Layout { quantized: true, ..w },
+        ] {
+            assert!(!eligible::<RawHalf>(x, bad_w, true, 32, 8));
+        }
+        for (plane, vector) in [(0, 8), (32, 0), (31, 8), (32, 7), (usize::MAX, 8)] {
+            assert!(!eligible::<RawHalf>(x, w, true, plane, vector));
+        }
+        assert!(eligible::<RawHalf>(
+            Layout { strides: [9 * k, 3 * k, 1], start: 32, end: 16,
+                bytes: x.bytes + 48, ..x },
+            Layout { start: (2 * k) as u64, end: (2 * k) as u64,
+                bytes: w.bytes + (4 * k) as u64, ..w },
+            true, 32, 8));
+    }
+
+    #[test]
+    #[ignore = "finite decoder-wide precision/offset/immutability control; no model weights"]
+    fn cuda_wide_qkv_precision_offsets_and_inputs() {
+        let device = Default::default();
+        let (k, n) = (3072, 11264);
+        let input = x_values(k);
+        let padded: Vec<f16> = vec![f16::from_f32(-7.0); k]
+            .into_iter().chain(input.iter().copied())
+            .chain(vec![f16::from_f32(9.0); k]).collect();
+        let full_x = Tensor::<RawHalf, 3>::from_data(
+            TensorData::new(padded.clone(), [1, 3, k]), &device);
+        let x = full_x.clone().narrow(1, 1, 1);
+        // Real decoder dimensions, sparse analytical rows, no CPU matmul twin.
+        let mut weights = vec![f16::ZERO; (n + 2) * k];
+        let mut expected = Vec::with_capacity(n);
+        for r in 0..n + 2 {
+            let value = match r % 4 {
+                0 => f16::ZERO,
+                1 => { weights[r * k + k - 1] = f16::ONE; input[k - 1] },
+                2 => {
+                    weights[r * k] = f16::from_f32(256.0);
+                    weights[r * k + 1] = f16::from_f32(-256.0);
+                    weights[r * k + 2] = f16::ONE;
+                    f16::ONE
+                },
+                _ => {
+                    let c = (r * 17) % k;
+                    weights[r * k + c] = f16::from_f32(0.25);
+                    f16::from_f32(input[c].to_f32() * 0.25)
+                },
+            };
+            if r > 0 && r <= n { expected.push(value); }
+        }
+        let full_w = Tensor::<RawHalf, 3>::from_data(
+            TensorData::new(weights.clone(), [1, n + 2, k]), &device);
+        let w = full_w.clone().narrow(1, 1, n).swap_dims(1, 2);
+        assert_eq!(&cube(&w).meta.strides()[1..], &[1, k]);
+        assert!(cube(&x).handle.offset_start.unwrap_or(0) > 0);
+        assert!(cube(&w).handle.offset_start.unwrap_or(0) > 0);
+        let result = try_project(&x, &w).unwrap().expect("wide QKV must launch GEMV");
+        assert_eq!(result.dims(), [1, 1, n]);
+        assert_eq!(result.dtype(), DType::F16);
+        assert_eq!(read(result.clone()), expected);
+        assert!(f16::from_f32(256.0 * 256.0).is_infinite());
+        let _ = read(result.mul_scalar(0.0));
+        assert_eq!(read(full_x), padded);
+        assert_eq!(read(full_w), weights);
+        let row = Tensor::<RawHalf, 3>::from_data(w.clone().into_data(), &device);
+        assert_eq!(cube(&row).meta.strides()[2], 1);
+        assert!(try_project(&x, &row).unwrap().is_none());
+        assert!(try_project(&Tensor::<RawHalf, 3>::ones([1, 4, k], &device), &w)
+            .unwrap().is_none());
+        assert!(try_project(&x.cast(FloatDType::F32), &w).unwrap().is_none());
     }
 
     #[test]

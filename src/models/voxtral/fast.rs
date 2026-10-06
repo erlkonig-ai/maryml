@@ -268,7 +268,14 @@ impl<B: Backend> FastAttention<B> {
         let (h, hkv, d) = (self.heads, self.kv_heads, self.head_dim);
         let hh = h + hkv;
 
-        let mut qkv = x.matmul(self.wide_t.clone()); // [B,L,(2(h+hkv)+hkv)·d]
+        // Only exact decoder M1 geometry/layout can take this local path.
+        // Encoder, prefill and unsupported metadata keep the original matmul.
+        #[cfg(feature = "voxtral-cuda")]
+        let projected = super::gemv_cuda::try_project(&x, &self.wide_t)
+            .unwrap_or_else(|error| panic!("Voxtral wide QKV GEMV launch failed: {error:?}"));
+        #[cfg(not(feature = "voxtral-cuda"))]
+        let projected: Option<Tensor<B, 3>> = None;
+        let mut qkv = projected.unwrap_or_else(|| x.matmul(self.wide_t.clone()));
         if let Some(bias) = &self.wide_bias {
             qkv = qkv + bias.clone();
         }
@@ -666,6 +673,121 @@ impl<B: Backend> SttPipeline<B> for RealtimeTranscriber<B> {
 }
 
 #[cfg(all(test, feature = "voxtral-cuda"))]
+mod wide_qkv_tests {
+    use super::*;
+    use crate::nn::backend::hear::RawHalf;
+    use burn::tensor::TensorData;
+    use half::f16;
+
+    fn read<const D: usize>(t: Tensor<RawHalf, D>) -> Vec<f16> {
+        t.into_data().to_vec::<f16>().unwrap()
+    }
+
+    #[test]
+    #[ignore = "finite real-geometry folded attention ordering control; no model weights"]
+    fn cuda_wide_qkv_fold_rope_gqa_cache_and_fallback() {
+        let device = Default::default();
+        let (k, h, kv, d) = (3072, 32, 8, 128);
+        // Ephemeral synthetic loader for this one fixture, not a model index.
+        let mut weights = std::collections::HashMap::new();
+        let mut q = vec![0.0f32; h * d * k];
+        let mut key = vec![0.0f32; kv * d * k];
+        let mut value = vec![0.0f32; kv * d * k];
+        let mut output = vec![0.0f32; k * h * d];
+        for head in 0..h {
+            q[head * d * k] = 8.0 + 2.0 * (head % 4) as f32;
+            // Observe all 32 query heads, not merely the first 3072 channels.
+            output[head * h * d + head * d] = 1.0;
+        }
+        for group in 0..kv {
+            key[group * d * k] = 1.0 + group as f32 / 8.0;
+            value[group * d * k] = 1.5 + group as f32 / 4.0;
+        }
+        weights.insert("attn.q_proj.weight".to_owned(), (q, vec![h * d, k]));
+        weights.insert("attn.k_proj.weight".to_owned(), (key, vec![kv * d, k]));
+        weights.insert("attn.v_proj.weight".to_owned(), (value, vec![kv * d, k]));
+        weights.insert("attn.o_proj.weight".to_owned(), (output, vec![k, h * d]));
+        let loader = WeightLoader::Pile(weights);
+        let mut norm = vec![f16::ONE; k];
+        norm[0] = f16::from_f32(2.0);
+        let attn = FastAttention::<RawHalf>::load(&loader, "attn", (h, kv, d), false,
+            Tensor::from_data(TensorData::new(norm, [k]), &device), &device);
+        drop(loader);
+        assert!(attn.wide_bias.is_none()); // This is the unbiased decoder path.
+        let mut input = vec![f16::ZERO; k];
+        input[0] = f16::ONE;
+        let x = Tensor::<RawHalf, 3>::from_data(TensorData::new(input.clone(), [1, 1, k]), &device);
+        // RED at the parent: this mandatory dispatch returns None there.
+        assert!(super::super::gemv_cuda::try_project(&x, &attn.wide_t).unwrap().is_some());
+
+        // A 90-degree synthetic RoPE makes the pre-rotated block observable.
+        // Past K uses channel64; an unrotated/new-only/swapped-block path fails.
+        let cos = Tensor::<RawHalf, 4>::zeros([1, 1, 1, d], &device);
+        let sin = Tensor::<RawHalf, 4>::ones([1, 1, 1, d], &device);
+        let mut past_k = vec![f16::ZERO; kv * d];
+        let mut past_v = vec![f16::ZERO; kv * d];
+        for group in 0..kv {
+            past_k[group * d + d / 2] = f16::from_f32(0.5 + group as f32 / 16.0);
+            past_v[group * d] = f16::from_f32(-1.0 - group as f32 / 4.0);
+        }
+        let pk = Tensor::<RawHalf, 4>::from_data(TensorData::new(past_k.clone(), [1, kv, 1, d]), &device);
+        let pv = Tensor::<RawHalf, 4>::from_data(TensorData::new(past_v.clone(), [1, kv, 1, d]), &device);
+        let initial_cache = || {
+            let mut cache = FastKv::new(4);
+            let _ = cache.update(pk.clone(), pv.clone());
+            cache
+        };
+        let mut expected = vec![0.0f32; k];
+        for head in 0..h {
+            let group = head / 4;
+            // Reproduce only the two sparse scalar logits, including the
+            // existing scale-then-affine F16 stores; no CPU attention twin.
+            let qs = f16::from_f32((8.0 + 2.0 * (head % 4) as f32) / (d as f32).sqrt());
+            let qf = f16::from_f32(qs.to_f32() * 2.0).to_f32();
+            let current_k = 2.0 + group as f32 / 4.0;
+            let a = f16::from_f32(qf * past_k[group * d + d / 2].to_f32()).to_f32();
+            let b = f16::from_f32(qf * current_k).to_f32();
+            let p_current = 1.0 / (1.0 + (a - b).exp());
+            expected[head] = past_v[group * d].to_f32() * (1.0 - p_current)
+                + (3.0 + group as f32 / 2.0) * p_current;
+        }
+        assert!(expected[0] > 2.4 && expected[0] < 2.8);
+        let check = |actual: Vec<f16>| {
+            assert_eq!(actual.len(), k);
+            for (a, b) in actual.iter().zip(&expected) {
+                let a = a.to_f32();
+                assert!(a.is_finite() && (a - b).abs() <= 0.006 + 0.003 * b.abs(), "{a}/{b}");
+            }
+        };
+        let mut cache = initial_cache();
+        check(read(attn.forward(x.clone(), &cos, &sin, None, &mut cache)));
+        assert_eq!(cache.pos, 2);
+        assert_eq!(cache.stored(), 2);
+        let cached_k = read(cache.k.as_ref().unwrap().clone());
+        let cached_v = read(cache.v.as_ref().unwrap().clone());
+        for group in 0..kv {
+            for c in 0..d {
+                assert_eq!(cached_k[(group * 2) * d + c], past_k[group * d + c]);
+                assert_eq!(cached_v[(group * 2) * d + c], past_v[group * d + c]);
+                let key = if c == d / 2 { 2.0 + group as f32 / 4.0 } else { 0.0 };
+                let value = if c == 0 { 3.0 + group as f32 / 2.0 } else { 0.0 };
+                assert_eq!(cached_k[(group * 2 + 1) * d + c], f16::from_f32(key));
+                assert_eq!(cached_v[(group * 2 + 1) * d + c], f16::from_f32(value));
+            }
+        }
+        // Same folded weights, deliberately incompatible row-major storage:
+        // generic matmul fallback must preserve the same attention expression.
+        let row = Tensor::<RawHalf, 3>::from_data(attn.wide_t.clone().into_data(), &device);
+        assert!(super::super::gemv_cuda::try_project(&x, &row).unwrap().is_none());
+        let fallback = FastAttention { wide_t: row, ..attn };
+        check(read(fallback.forward(x.clone(), &cos, &sin, None, &mut initial_cache())));
+        assert_eq!(read(x), input);
+        assert_eq!(read(pk), past_k);
+        assert_eq!(read(pv), past_v);
+    }
+}
+
+#[cfg(all(test, feature = "voxtral-cuda"))]
 mod gate_up_tests {
     use super::*;
     use crate::nn::backend::hear::RawHalf;
@@ -777,6 +899,7 @@ mod gemv_loaded_tests {
         let o_input = Tensor::<RawHalf,3>::zeros([1,1,4096], &device);
         let down_input = Tensor::<RawHalf,3>::zeros([1,1,9216], &device);
         let gate_up_input = Tensor::<RawHalf,3>::zeros([1,1,3072], &device);
+        let wide_input = Tensor::<RawHalf,3>::zeros([1,1,3072], &device);
         RawHalf::sync(&device).map_err(|error| anyhow::anyhow!("owned fixture sync: {error:?}"))?;
         let mut records = Vec::new();
         for (layer, item) in decoder.layers.iter().enumerate() {
@@ -784,6 +907,7 @@ mod gemv_loaded_tests {
                 ("o", &o_input, &item.attn.o_proj.weight_t),
                 ("down", &down_input, &item.mlp.down.weight_t),
                 ("gate_up", &gate_up_input, &item.mlp.gate_up_t),
+                ("wide_qkv", &wide_input, &item.attn.wide_t),
             ] {
                 let mut record = super::super::gemv_cuda::observe_loaded_weight(x,weight);
                 record["layer"] = serde_json::json!(layer);
@@ -792,7 +916,7 @@ mod gemv_loaded_tests {
                 records.push(record);
             }
         }
-        assert_eq!(records.len(),78);
+        assert_eq!(records.len(),104);
         let accepted = records.iter().filter(|r| r["accepted"] == true).count();
         let mut rejected_by_reason = serde_json::Map::new();
         for record in &records {
@@ -803,14 +927,14 @@ mod gemv_loaded_tests {
             }
         }
         let report = serde_json::json!({"kind":"loaded_decoder_projection_eligibility", "pile":pile,
-            "records":records,"accepted":accepted,"rejected":78-accepted,
+            "records":records,"accepted":accepted,"rejected":104-accepted,
             "rejected_by_reason":rejected_by_reason,"load_seconds":loaded_seconds,
             "scope":"one native decoder load; real owned M1 fixture metadata; no GEMV, VAD, warmup or transcription"});
         serde_json::to_writer_pretty(file,&report)?;
-        println!("DECODER_PROJECTION_ELIGIBILITY_SUMMARY accepted={accepted} rejected={}",78-accepted);
+        println!("DECODER_PROJECTION_ELIGIBILITY_SUMMARY accepted={accepted} rejected={}",104-accepted);
         // Drop device readers before the native pile owner. The externally
         // supplied pile must remain immutable through process/runtime teardown.
-        drop((o_input,down_input,gate_up_input,decoder));
+        drop((o_input,down_input,gate_up_input,wide_input,decoder));
         drop(loader);
         Ok(())
     }
