@@ -159,6 +159,75 @@ pub(super) fn try_project<B: Backend>(
     ))
 }
 
+/// Test-only, once per loaded weight. Uses a real owned activation tensor's
+/// metadata and the production predicate; never invents a handle/lifetime or
+/// launches a GEMV. This observes eligibility, not a per-token execution count.
+#[cfg(test)]
+pub(super) fn observe_loaded_weight(
+    x: &Tensor<RawHalf, 3>,
+    w: &Tensor<RawHalf, 3>,
+) -> serde_json::Value {
+    let (TensorPrimitive::Float(lhs), TensorPrimitive::Float(rhs)) =
+        (x.clone().into_primitive(), w.clone().into_primitive())
+    else {
+        panic!("loaded observation requires actual float primitives")
+    };
+    let (a, b) = (Layout::of(&lhs), Layout::of(&rhs));
+    let plane = lhs.client.properties().hardware.plane_size_max as usize;
+    let k = a.shape[2];
+    let vector = lhs
+        .client
+        .io_optimized_vector_sizes(2)
+        .filter(|&v| {
+            plane
+                .checked_mul(v)
+                .is_some_and(|tile| tile != 0 && k % tile == 0)
+        })
+        .max();
+    let accepted =
+        vector.is_some_and(|v| eligible::<RawHalf>(a, b, lhs.device == rhs.device, plane, v));
+    let mut reasons = Vec::new();
+    if lhs.device != rhs.device {
+        reasons.push("device");
+    }
+    if a.dtype != DType::F16 || b.dtype != DType::F16 {
+        reasons.push("dtype");
+    }
+    if a.quantized || b.quantized {
+        reasons.push("quantization");
+    }
+    if !matches!(k, 4096 | 9216) || a.shape != [1, 1, k] || b.shape != [1, k, 3072] {
+        reasons.push("shape");
+    }
+    if a.strides[2] != 1 {
+        reasons.push("activation_stride");
+    }
+    if b.strides[1] != 1 || b.strides[2] != k {
+        reasons.push("weight_stride");
+    }
+    match vector {
+        None => reasons.push("vector_divisibility"),
+        Some(v) => {
+            if !a.covers(k, v) {
+                reasons.push("activation_bounds_alignment");
+            }
+            if !b.covers(k.saturating_mul(3072), v) {
+                reasons.push("weight_bounds_alignment");
+            }
+        }
+    }
+    assert_eq!(
+        accepted,
+        reasons.is_empty(),
+        "observation reasons must agree with production gate"
+    );
+    serde_json::json!({"accepted":accepted,"reasons":reasons,"plane":plane,"vector":vector,
+        "weight":{"shape":b.shape,"strides":b.strides,"dtype":format!("{:?}",b.dtype),
+            "allocation_bytes":b.bytes,"offset_start":b.start,"offset_end":b.end},
+        "activation":{"shape":a.shape,"strides":a.strides,"dtype":format!("{:?}",a.dtype),
+            "allocation_bytes":a.bytes,"offset_start":a.start,"offset_end":a.end}})
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -467,12 +536,20 @@ mod tests {
             assert!(try_project(&prefill, &w).unwrap().is_none());
             let float_x = x.clone().cast(FloatDType::F32);
             assert!(try_project(&float_x, &w).unwrap().is_none());
+            // Burn's slice copies if either removed byte extent is not
+            // allocator-aligned. Keep a genuine strided view by making the
+            // removed minor-axis tail exactly one alignment unit in bytes.
+            let alignment = cube(&x).client.properties().memory.alignment as usize;
+            assert!(alignment >= 2 && alignment <= 4096 && alignment % 2 == 0);
+            let lanes = alignment / 2 + 1;
             let strided = Tensor::<RawHalf, 3>::from_data(
-                TensorData::new(vec![f16::ONE; 2 * k], [1, k, 2]),
+                TensorData::new(vec![f16::ONE; lanes * k], [1, k, lanes]),
                 &device,
             )
             .swap_dims(1, 2)
             .narrow(1, 0, 1);
+            assert_eq!(strided.dims(), [1, 1, k]);
+            assert_eq!(cube(&strided).meta.strides()[2], lanes);
             assert!(try_project(&strided, &w).unwrap().is_none());
         }
     }

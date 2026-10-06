@@ -657,3 +657,66 @@ impl<B: Backend> SttPipeline<B> for RealtimeTranscriber<B> {
         self.decoder.logits_last(hidden)
     }
 }
+
+#[cfg(all(test, feature = "voxtral-cuda"))]
+mod gemv_loaded_tests {
+    use super::*;
+    use crate::nn::backend::hear::{Device, RawHalf};
+    use std::{fs::OpenOptions, path::PathBuf, time::Instant};
+
+    #[test]
+    #[ignore = "one real native decoder load; separately admitted model reservation and explicit pile/output required"]
+    fn loaded_odown_eligibility_once() -> anyhow::Result<()> {
+        let pile = PathBuf::from(std::env::var("MARY_HEARING_GEMV_PILE")?);
+        let output = PathBuf::from(std::env::var("MARY_HEARING_GEMV_OBSERVATION")?);
+        let file = OpenOptions::new().write(true).create_new(true).open(output)?;
+        let started = Instant::now();
+        // Existing native cohort selector/loader, kept alive through decoder
+        // and all observation tensors. No source checkpoint or host-model copy.
+        let snapshot = crate::model_collection::load_model_collection_local_latest(&pile)?;
+        let loader = super::super::VoxtralWeights::from_snapshot(snapshot)?.into_loader();
+        let device = Device::default();
+        let decoder = FastDecoder::<RawHalf>::load(&loader, crate::hear::MAX_TOKENS, &device);
+        RawHalf::sync(&device).map_err(|error| anyhow::anyhow!("decoder load sync: {error:?}"))?;
+        let loaded_seconds = started.elapsed().as_secs_f64();
+        // Genuine owned tensors, not fabricated input bindings. They establish
+        // M1 eligibility only; no claim about each live activation is inferred.
+        let o_input = Tensor::<RawHalf,3>::zeros([1,1,4096], &device);
+        let down_input = Tensor::<RawHalf,3>::zeros([1,1,9216], &device);
+        RawHalf::sync(&device).map_err(|error| anyhow::anyhow!("owned fixture sync: {error:?}"))?;
+        let mut records = Vec::new();
+        for (layer, item) in decoder.layers.iter().enumerate() {
+            for (role, x, weight) in [
+                ("o", &o_input, &item.attn.o_proj.weight_t),
+                ("down", &down_input, &item.mlp.down.weight_t),
+            ] {
+                let mut record = super::super::gemv_cuda::observe_loaded_weight(x,weight);
+                record["layer"] = serde_json::json!(layer);
+                record["role"] = serde_json::json!(role);
+                println!("ODOWN_ELIGIBILITY {record}");
+                records.push(record);
+            }
+        }
+        assert_eq!(records.len(),52);
+        let accepted = records.iter().filter(|r| r["accepted"] == true).count();
+        let mut rejected_by_reason = serde_json::Map::new();
+        for record in &records {
+            for reason in record["reasons"].as_array().expect("reason list") {
+                let key = reason.as_str().expect("reason string");
+                let count = rejected_by_reason.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
+                rejected_by_reason.insert(key.to_owned(),serde_json::json!(count+1));
+            }
+        }
+        let report = serde_json::json!({"kind":"loaded_odown_eligibility", "pile":pile,
+            "records":records,"accepted":accepted,"rejected":52-accepted,
+            "rejected_by_reason":rejected_by_reason,"load_seconds":loaded_seconds,
+            "scope":"one native decoder load; real owned M1 fixture metadata; no GEMV, VAD, warmup or transcription"});
+        serde_json::to_writer_pretty(file,&report)?;
+        println!("ODOWN_ELIGIBILITY_SUMMARY accepted={accepted} rejected={}",52-accepted);
+        // Drop device readers before the native pile owner. The externally
+        // supplied pile must remain immutable through process/runtime teardown.
+        drop((o_input,down_input,decoder));
+        drop(loader);
+        Ok(())
+    }
+}
