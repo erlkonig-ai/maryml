@@ -182,6 +182,8 @@ impl VoxtralWeights<PileSnapshot> {
 }
 
 pub mod config;
+#[cfg(feature = "voxtral-cuda")]
+mod argmax_cuda;
 pub mod decoder;
 pub mod encoder;
 pub mod fast;

@@ -249,6 +249,9 @@ pub fn transcribe<B: Backend, O: SttPipeline<B>>(
 
 /// Argmax with host readback — one sync per frame.
 fn argmax_host<B: Backend>(logits: Tensor<B, 1>) -> u32 {
+    #[cfg(feature = "voxtral-cuda")]
+    let idx = super::argmax_cuda::argmax(logits);
+    #[cfg(not(feature = "voxtral-cuda"))]
     let idx = logits.argmax(0);
     let data = idx.into_data();
     let id = data.iter::<i64>().next().expect("argmax scalar") as u32;
