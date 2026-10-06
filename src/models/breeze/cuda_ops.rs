@@ -90,24 +90,114 @@ fn norm_kernel(
         }
     }
 }
+const COOPERATIVE_NORM_THREADS: u32 = 256;
+
+fn cooperative_norm_width(width: usize) -> bool {
+    matches!(width, 1024 | 2048)
+}
+
+/// One cube per row, with a fixed F32 tree over 256 strided partials. Only
+/// hidden widths 1024/2048 use this experimental path; Q/K and text widths
+/// retain the serial kernel. Every lane reaches every cube barrier, including
+/// lanes with no output element. The affine/rounding epilogue is unchanged.
+#[cube(launch_unchecked)]
+fn cooperative_norm_kernel(
+    x: &Array<bf16>,
+    w: &Array<bf16>,
+    y: &mut Array<bf16>,
+    rows: u32,
+    width: u32,
+    units: u32,
+    eps: f32,
+    #[comptime] gemma: bool,
+) {
+    let row = CUBE_POS_X;
+    let unit = UNIT_POS_X;
+    // Uniform for the whole cube: no divergent early return around barriers.
+    if row < rows {
+        let base = (row * width) as usize;
+        let mut partials = SharedMemory::<f32>::new(comptime!(COOPERATIVE_NORM_THREADS as usize));
+        let mut sum = 0.0f32;
+        let mut j = unit;
+        while j < width {
+            let value = f32::cast_from(x[base + j as usize]);
+            sum += value * value;
+            j += units;
+        }
+        partials[unit as usize] = sum;
+        sync_cube();
+        let mut stride = units / 2;
+        while stride > 0 {
+            if unit < stride {
+                partials[unit as usize] += partials[(unit + stride) as usize];
+            }
+            sync_cube();
+            stride /= 2u32;
+        }
+        let inv = 1.0f32 / (partials[0] / f32::cast_from(width) + eps).sqrt();
+        let mut j = unit;
+        while j < width {
+            let value = f32::cast_from(x[base + j as usize]) * inv;
+            if gemma {
+                y[base + j as usize] =
+                    bf16::cast_from(value * (1.0f32 + f32::cast_from(w[j as usize])));
+            } else {
+                let normalized = bf16::cast_from(value);
+                y[base + j as usize] =
+                    bf16::cast_from(f32::cast_from(normalized) * f32::cast_from(w[j as usize]));
+            }
+            j += units;
+        }
+    }
+}
+
 pub(super) fn norm(x: &Tensor, w: &Tensor, eps: f32, gemma: bool) -> Tensor {
+    let width = *x.meta.shape().as_slice().last().unwrap();
+    norm_impl(x, w, eps, gemma, cooperative_norm_width(width))
+}
+
+// The false arm is also the unchanged GPU control in the scoped tests.
+fn norm_impl(x: &Tensor, w: &Tensor, eps: f32, gemma: bool, cooperative: bool) -> Tensor {
     let n = count(x);
     let h = *x.meta.shape().as_slice().last().unwrap();
+    assert!(h > 0 && n > 0 && n.is_multiple_of(h), "nonempty complete norm rows required");
+    assert!(n <= u32::MAX as usize, "norm extent exceeds kernel indexing");
+    assert_eq!(w.meta.shape().as_slice(), [h], "norm gain must match row width");
+    assert!(!cooperative || cooperative_norm_width(h), "unsupported cooperative norm width");
     let out = x.client.empty(n * 2);
-    // SAFETY: private model provides contiguous [1,T,H] and [H]; fresh output.
+    // SAFETY: private model provides contiguous BF16 rows and [H] gain; fresh
+    // output. Cooperative geometry is one 256-thread cube per complete row,
+    // power-of-two reduction, with u32-indexed total extent. Neither input nor
+    // immutable pile gain is ever a writable launch destination.
     unsafe {
-        norm_kernel::launch_unchecked::<CudaRuntime>(
-            &x.client,
-            grid(x, n / h),
-            CubeDim::new_1d(64),
-            ArrayArg::from_raw_parts(x.handle.clone(), n),
-            ArrayArg::from_raw_parts(w.handle.clone(), h),
-            ArrayArg::from_raw_parts(out.clone(), n),
-            n / h,
-            h,
-            eps,
-            gemma,
-        );
+        if cooperative {
+            cooperative_norm_kernel::launch_unchecked::<CudaRuntime>(
+                &x.client,
+                CubeCount::new_1d((n / h) as u32),
+                CubeDim::new_1d(COOPERATIVE_NORM_THREADS),
+                ArrayArg::from_raw_parts(x.handle.clone(), n),
+                ArrayArg::from_raw_parts(w.handle.clone(), h),
+                ArrayArg::from_raw_parts(out.clone(), n),
+                (n / h) as u32,
+                h as u32,
+                COOPERATIVE_NORM_THREADS,
+                eps,
+                gemma,
+            );
+        } else {
+            norm_kernel::launch_unchecked::<CudaRuntime>(
+                &x.client,
+                grid(x, n / h),
+                CubeDim::new_1d(64),
+                ArrayArg::from_raw_parts(x.handle.clone(), n),
+                ArrayArg::from_raw_parts(w.handle.clone(), h),
+                ArrayArg::from_raw_parts(out.clone(), n),
+                n / h,
+                h,
+                eps,
+                gemma,
+            );
+        }
     }
     tensor(x, x.meta.shape().as_slice(), out)
 }
@@ -597,6 +687,126 @@ mod tests {
     use super::*;
     use crate::models::breeze::{generator::GenerationOptions, sampling::Sampler};
     use cubecl::{Runtime, cuda::CudaDevice};
+
+    #[test]
+    fn cooperative_norm_dispatch_is_hidden_width_only() {
+        for width in [1024, 2048] {
+            assert!(cooperative_norm_width(width));
+        }
+        for width in [0, 1, 127, 128, 256, 1023, 1025, 1152, 2047, 2049, 4096] {
+            assert!(!cooperative_norm_width(width));
+        }
+    }
+
+    #[test]
+    #[ignore = "actual CUDA device 0 requires ordinary Stars lock"]
+    fn cuda_cooperative_norm_affine_rounding_and_rows() {
+        let device = CudaDevice { index: 0 };
+        let client = CudaRuntime::client(&device);
+        let make = |shape: &[usize], values: &[f32]| {
+            assert_eq!(shape.iter().product::<usize>(), values.len());
+            let values: Vec<bf16> = values.iter().copied().map(bf16::from_f32).collect();
+            Tensor::new_contiguous(
+                client.clone(), device.clone(), shape.into(),
+                client.create_from_slice(bf16::as_bytes(&values)), DType::BF16,
+            )
+        };
+        let read = |t: &Tensor| {
+            let bytes = t.client.read_one(t.handle.clone()).unwrap();
+            bytes.chunks_exact(2)
+                .map(|b| bf16::from_bits(u16::from_ne_bytes([b[0], b[1]])).to_f32())
+                .collect::<Vec<_>>()
+        };
+        for width in [1024, 2048] {
+            // Every row has exact mean-square 2.5 (or zero), independent of
+            // reduction order. These are scalar epilogue witnesses, not a
+            // host-side model/norm implementation. The ordinary first result
+            // would be 0.3203125 if its intermediate BF16 rounding vanished;
+            // the Gemma first result would be 0.9609375 if that rounding were
+            // wrongly introduced there.
+            let values: Vec<f32> = (0..3 * width).map(|i| {
+                let v = if i % 2 == 0 { 1.0 } else { 2.0 };
+                match i / width { 0 => v, 1 => -v, _ => 0.0 }
+            }).collect();
+            let x = make(&[1, 3, width], &values);
+            for (gemma, gain, pair) in [
+                (false, 0.5078125, [0.322265625, 0.64453125]),
+                (true, 0.515625, [0.95703125, 1.9140625]),
+            ] {
+                let w = make(&[width], &vec![gain; width]);
+                let output = norm(&x, &w, 1e-6, gemma);
+                assert_eq!(output.dtype, DType::BF16);
+                assert_eq!(output.meta.shape().as_slice(), [1, 3, width]);
+                let expected: Vec<f32> = (0..3 * width).map(|i| match i / width {
+                    0 => pair[i % 2], 1 => -pair[i % 2], _ => 0.0,
+                }).collect();
+                assert_eq!(read(&output), expected);
+                assert_eq!(read(&x), values, "norm must not overwrite input");
+                assert_eq!(read(&w), vec![gain; width], "norm must not overwrite gain");
+            }
+
+            // Small finite input makes the selected epsilon observable.
+            let x = make(&[1, 1, width], &vec![1.0 / 1024.0; width]);
+            let w = make(&[width], &vec![1.0; width]);
+            for (eps, expected) in [(1e-6, 0.69921875), (1e-5, 0.294921875)] {
+                assert_eq!(read(&norm(&x, &w, eps, false)), vec![expected; width]);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "actual CUDA device 0 requires ordinary Stars lock"]
+    fn cuda_cooperative_norm_matches_serial_with_bounded_error() {
+        let device = CudaDevice { index: 0 };
+        let client = CudaRuntime::client(&device);
+        let make = |shape: &[usize], values: &[f32]| {
+            let values: Vec<bf16> = values.iter().copied().map(bf16::from_f32).collect();
+            Tensor::new_contiguous(
+                client.clone(), device.clone(), shape.into(),
+                client.create_from_slice(bf16::as_bytes(&values)), DType::BF16,
+            )
+        };
+        let read = |t: &Tensor| {
+            let bytes = t.client.read_one(t.handle.clone()).unwrap();
+            bytes.chunks_exact(2)
+                .map(|b| bf16::from_bits(u16::from_ne_bytes([b[0], b[1]])).to_f32())
+                .collect::<Vec<_>>()
+        };
+        for width in [128, 256, 1024, 1152, 2048] {
+            for rows in [1, 2, 17] {
+                let values: Vec<f32> = (0..rows * width).map(|i| {
+                    // Mixed signs, zeros, low/high magnitudes, nonconstant rows.
+                    let mantissa = ((i * 37 + i / width * 13) % 127) as f32 - 63.0;
+                    mantissa * [1.0 / 65536.0, 1.0 / 32.0, 1.0, 32.0][i % 4]
+                }).collect();
+                let gains: Vec<f32> = (0..width)
+                    .map(|i| ((i * 7) % 33) as f32 / 16.0 - 1.0).collect();
+                let x = make(&[1, rows, width], &values);
+                let w = make(&[width], &gains);
+                for gemma in [false, true] {
+                    for eps in [1e-6, 1e-5] {
+                        let actual = read(&norm(&x, &w, eps, gemma));
+                        let serial = read(&norm_impl(&x, &w, eps, gemma, false));
+                        assert_eq!(actual.len(), rows * width);
+                        for (i, (&a, &s)) in actual.iter().zip(&serial).enumerate() {
+                            assert!(a.is_finite() && s.is_finite(), "nonfinite at {i}");
+                            if !cooperative_norm_width(width) {
+                                assert_eq!(a.to_bits(), s.to_bits(), "untouched width {width}");
+                            } else {
+                                // F32 reduction order may cross BF16 rounding
+                                // boundaries: two BF16-scale relative steps,
+                                // not a demand for model/serial bit parity.
+                                let tolerance = 0.015625 * s.abs().max(0.0001);
+                                assert!((a - s).abs() <= tolerance,
+                                    "width={width} rows={rows} gemma={gemma} eps={eps} i={i}: {a} vs {s}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     #[ignore = "actual CUDA device 0 requires ordinary Stars lock"]
     fn cuda_breeze_operator_boundaries() {
