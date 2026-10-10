@@ -8,57 +8,21 @@
 //! bytes per weight instead of 2. JP, 2026-10-10: "we want to use 4bit
 //! wherever we can".
 //!
-//! ## Format: the standard two-level NVFP4 layout
-//!
-//! * `codes` `[n, k/2]` bytes: E2M1, two per byte, the LOWER k in the LOW
-//!   nibble -- the order `inkling::nvfp4` settled against `compressed_tensors`.
-//! * `scales` `[n, k/16]` E4M3FN bytes, one per 16 consecutive values along K.
-//! * `scale2`, one f32 per tensor.
-//!
-//! A weight decodes to `E2M1[code] * e4m3(scale) * scale2`.
-//!
-//! ## The recipe, operation for operation
-//!
-//! ```text
-//! amax  = max |w| over the tensor                 (device partials, host fold)
-//! s2    = amax / (6 * 448)                        (f32; 1.0 if the tensor is all zero)
-//! per 16-block, bamax = max |w| over the block:
-//! sb    = e4m3_rn(min((bamax / 6) / s2, 448))     (clamped BEFORE the NOSAT cast)
-//! d     = f32(sb) * s2
-//! code  = e2m1_rn(w / d), ties to the even code, saturating at 6;
-//!         every code +0 when d == 0 (no 0/0 reaches the converter)
-//! ```
-//!
-//! Every division is a correctly rounded f32 divide (NVRTC's default
-//! `-prec-div=true`), and both conversions are the hardware's, exactly as in
-//! `inkling::fp4quant`: `e4m3::cast_from` is `__nv_cvt_float_to_fp8(..,
-//! __NV_NOSAT, E4M3)`, round to nearest even; `Vector<e2m1x2, 4>::cast_from` of
-//! eight f32 is four `cvt.rn.satfinite.e2m1x2.f32`. The host twin in
-//! `tests::recipe` performs the same operations and the CUDA gate compares
-//! every code and scale byte. Load time is not a hot path, so the recipe buys
-//! one real divide per element rather than a reciprocal multiply.
+//! The format, the quantization recipe and the GEMV are shared with Voxtral's
+//! hearing decoder and live in [`crate::nn::nvfp4_gemv`]; this module is the
+//! Breeze side: the `BREEZE_WEIGHTS` choice, the projection that carries both
+//! copies, and the gates that pin the BF16 instantiation.
 //!
 //! ## Which rows take the GEMV
 //!
-//! `[1, t, K]` with `t <= MAX_ROWS` runs [`gemv_kernel`]: every decode step,
-//! and the depth decoder's two-row prefill of each frame. Larger `t` (the
+//! `[1, t, K]` with `t <= MAX_ROWS` runs the shared NVFP4 GEMV: every decode
+//! step, and the depth decoder's two-row prefill of each frame. Larger `t` (the
 //! backbone and text-encoder prompt prefills, a few hundred rows) goes through
 //! the unchanged BF16 projection on the pile alias. That alias is the pile
 //! mapping already registered with CUDA for the weights' whole lifetime, so it
 //! costs no memory to keep; a dequantize-to-scratch per prefill call would move
 //! 0.5625 + 2 + 2 bytes per weight against the alias's 2. The consequence is a
 //! prompt state computed at full BF16 precision and decode steps at four bits.
-//!
-//! ## The GEMV
-//!
-//! One plane (32 lanes) per output row. A lane takes 32 consecutive weights at
-//! a time -- one 16-byte load of codes, the two E4M3 bytes that scale them, and
-//! four 16-byte BF16 activation loads per activation row -- and the plane walks
-//! K in 512-weight strides, so each code load is one contiguous 512-byte line
-//! across the plane. Products accumulate in f32 per 16-block, are scaled by
-//! the block's E4M3 once, carried across K in f32, summed across the plane,
-//! multiplied by `scale2` once and cast once to BF16 (round to nearest even):
-//! the same single final rounding as the BF16 projection it replaces.
 //!
 //! ## Measured on sky (GB10), 2026-10-10
 //!
@@ -80,25 +44,15 @@
 //! frames (BF16) to 2.37 s / 56 frames (NVFP4) of generation: ~111 to ~42 ms
 //! per 83 ms frame.
 use super::cuda_ops::Tensor;
-use anyhow::{Result, ensure};
-use burn::tensor::DType;
-use cubecl::{cuda::CudaRuntime, e2m1x2, e4m3, prelude::*, server::Handle};
-use half::bf16;
-
-/// Weights per E4M3 block scale.
-pub(super) const GROUP: usize = 16;
-/// Weights one lane takes per step: two blocks, sixteen code bytes.
-const CHUNK: usize = 32;
-/// Lanes per plane. CUDA's warp; checked against the device at quantize time.
-const PLANE: usize = 32;
-/// Planes (output rows) per cube.
-const PLANES: usize = 4;
-/// Activation rows the GEMV takes; beyond this the BF16 alias projects.
-pub(super) const MAX_ROWS: usize = 8;
-/// Threads in the load-time quantize and amax launches.
-const QUANT_CUBE: u32 = 256;
-/// Cubes in the amax launch: 64 x 256 partial maxima, folded on the host.
-const AMAX_CUBES: u32 = 64;
+pub(super) use crate::nn::nvfp4_gemv::Nvfp4;
+use anyhow::Result;
+#[cfg(test)]
+use {
+    crate::nn::nvfp4_gemv::{GROUP, MAX_ROWS, scale2_of},
+    burn::tensor::DType,
+    cubecl::{cuda::CudaRuntime, prelude::*, server::Handle},
+    half::bf16,
+};
 
 /// Which weights the resident decodes from. One explicit choice per load.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -135,308 +89,6 @@ impl Weights {
 pub(super) struct Linear {
     pub(super) bf16: Tensor,
     pub(super) nvfp4: Option<Nvfp4>,
-}
-
-/// A resident NVFP4 weight `[n, k]` (see the module header for the layout).
-pub(super) struct Nvfp4 {
-    codes: Handle,
-    scales: Handle,
-    scale2: f32,
-    n: usize,
-    k: usize,
-}
-
-#[cube(launch_unchecked)]
-fn amax_kernel(w: &Array<bf16>, partial: &mut Array<f32>, len: usize, threads: usize) {
-    let t = ABSOLUTE_POS;
-    let mut m = 0.0f32;
-    let mut i = t;
-    while i < len {
-        m = max(m, Abs::abs(f32::cast_from(w[i])));
-        i += threads;
-    }
-    partial[t] = m;
-}
-
-/// One thread per 16-weight block. Scalar BF16 loads on purpose: the alias
-/// sits at whatever offset its leaf has in the pile, and that seam promises
-/// four-byte alignment, not the sixteen a vector load would need.
-#[cube(launch_unchecked)]
-fn quantize_kernel(
-    w: &Array<bf16>,
-    codes: &mut Array<u32>,
-    scales: &mut Array<e4m3>,
-    blocks: usize,
-    scale2: f32,
-) {
-    let blk = ABSOLUTE_POS;
-    if blk < blocks {
-        let base = blk * 16;
-        let mut l0 = Vector::<f32, Const<8>>::empty();
-        let mut l1 = Vector::<f32, Const<8>>::empty();
-        #[unroll]
-        for i in 0..8usize {
-            l0[i] = f32::cast_from(w[base + i]);
-            l1[i] = f32::cast_from(w[base + 8 + i]);
-        }
-        let hi = max(l0.abs(), l1.abs());
-        let a01 = max(max(hi[0], hi[1]), max(hi[2], hi[3]));
-        let a23 = max(max(hi[4], hi[5]), max(hi[6], hi[7]));
-        let bamax = max(a01, a23);
-        let se = e4m3::cast_from(min((bamax / 6.0f32) / scale2, f32::new(448.0f32)));
-        scales[blk] = se;
-        let d = f32::cast_from(se) * scale2;
-        let mut q0 = Vector::<f32, Const<8>>::new(0.0f32);
-        let mut q1 = Vector::<f32, Const<8>>::new(0.0f32);
-        if d > 0.0f32 {
-            let dv = Vector::<f32, Const<8>>::new(d);
-            q0 = l0 / dv;
-            q1 = l1 / dv;
-        }
-        codes[blk * 2] = u32::reinterpret(Vector::<e2m1x2, Const<4>>::cast_from(q0));
-        codes[blk * 2 + 1] = u32::reinterpret(Vector::<e2m1x2, Const<4>>::cast_from(q1));
-    }
-}
-
-/// The E2M1 value of the low nibble of `code` (higher bits are ignored).
-///
-/// For a magnitude code `m >= 2` the value `2^((m >> 1) - 1) * (1 + (m & 1)/2)`
-/// IS an f32 whose bits are `(m << 22) + bits(0.5)`: the two exponent bits and
-/// the mantissa bit land in place and the bias comes from adding 0.5. Codes 0
-/// and 1 (`0.0`, `0.5`) are the subnormal pair the formula misses. The sign
-/// bit moves straight to bit 31, so code 8 decodes to the `-0.0` it encodes.
-#[cube]
-fn e2m1(code: u32) -> f32 {
-    let m = code & 7u32;
-    let low = (m & 1u32) * 0x3F00_0000u32;
-    let high = (m << 22u32) + 0x3F00_0000u32;
-    f32::reinterpret(select(m >= 2u32, high, low) | ((code & 8u32) << 28u32))
-}
-
-/// `sum_i x[i] * E2M1[nibble i of word]` over the eight nibbles of one word.
-#[cube]
-fn dot8(word: u32, x: Vector<f32, Const<8>>) -> f32 {
-    let mut acc = 0.0f32;
-    #[unroll]
-    for i in 0..8usize {
-        acc += x[i] * e2m1(word >> (4 * i) as u32);
-    }
-    acc
-}
-
-/// `out[r, row] = sum_k x[r, k] * w[row, k]` for `rows` activation rows, one
-/// plane per weight row. See the module header for the order of operations.
-#[cube(launch_unchecked)]
-#[allow(clippy::too_many_arguments)]
-fn gemv_kernel<O: Scalar + Cast>(
-    x: &Array<Vector<bf16, Const<8>>>,
-    codes: &Array<Vector<u32, Const<4>>>,
-    scales: &Array<e4m3>,
-    out: &mut Array<O>,
-    n: usize,
-    k: usize,
-    scale2: f32,
-    #[comptime] rows: usize,
-) {
-    let lane = UNIT_POS_X as usize;
-    let row = CUBE_POS_X as usize * comptime!(PLANES) + UNIT_POS_Y as usize;
-    // Uniform per plane: every lane of a plane shares UNIT_POS_Y, so the
-    // plane_sum below never runs with a partial plane.
-    if row < n {
-        let chunks = k / comptime!(CHUNK);
-        let mut acc = Array::<f32>::new(rows);
-        #[unroll]
-        for r in 0..rows {
-            acc[r] = 0.0f32;
-        }
-        let mut c = lane;
-        while c < chunks {
-            let at = row * chunks + c;
-            let words = codes[at];
-            let s0 = f32::cast_from(scales[at * 2]);
-            let s1 = f32::cast_from(scales[at * 2 + 1]);
-            #[unroll]
-            for r in 0..rows {
-                let base = (r * k + c * comptime!(CHUNK)) / 8;
-                let b0 = dot8(words[0], Vector::<f32, Const<8>>::cast_from(x[base]))
-                    + dot8(words[1], Vector::<f32, Const<8>>::cast_from(x[base + 1]));
-                let b1 = dot8(words[2], Vector::<f32, Const<8>>::cast_from(x[base + 2]))
-                    + dot8(words[3], Vector::<f32, Const<8>>::cast_from(x[base + 3]));
-                acc[r] += b0 * s0 + b1 * s1;
-            }
-            c += comptime!(PLANE);
-        }
-        #[unroll]
-        for r in 0..rows {
-            let total = plane_sum(acc[r]) * scale2;
-            if lane == 0 {
-                out[r * n + row] = O::cast_from(total);
-            }
-        }
-    }
-}
-
-/// Contiguous `[n, k]` BF16 storage of exactly `n * k` elements, or an error.
-fn dense_rows(w: &Tensor) -> Result<(usize, usize)> {
-    let shape = w.meta.shape().as_slice();
-    let strides = w.meta.strides();
-    ensure!(
-        shape.len() == 2 && strides.len() == 2,
-        "NVFP4 quantizes rank-2 weights"
-    );
-    let (n, k) = (shape[0], shape[1]);
-    ensure!(
-        n > 0 && k > 0 && k % CHUNK == 0 && strides[1] == 1 && (n == 1 || strides[0] == k),
-        "NVFP4 needs contiguous [n, k] with k a multiple of {CHUNK}, got {shape:?} / {strides:?}"
-    );
-    ensure!(
-        w.dtype == DType::BF16 && w.qparams.is_none(),
-        "NVFP4 quantizes unquantized BF16 weights"
-    );
-    let elements = n
-        .checked_mul(k)
-        .filter(|&e| e <= u32::MAX as usize)
-        .ok_or_else(|| anyhow::anyhow!("NVFP4 weight exceeds u32 indexing"))?;
-    ensure!(
-        w.handle.size_in_used() >= 2 * elements as u64,
-        "NVFP4 source storage is too short"
-    );
-    Ok((n, k))
-}
-
-impl Nvfp4 {
-    /// Quantize one immutable BF16 weight `[n, k]`. Reads the alias, writes two
-    /// fresh buffers; one host round trip for the tensor amax.
-    pub(super) fn quantize(w: &Tensor) -> Result<Self> {
-        let (n, k) = dense_rows(w)?;
-        ensure!(
-            w.client.properties().hardware.plane_size_max as usize == PLANE
-                && w.client.properties().hardware.plane_size_min as usize == PLANE,
-            "NVFP4 GEMV is written for {PLANE}-lane planes"
-        );
-        let len = n * k;
-        let threads = (AMAX_CUBES * QUANT_CUBE) as usize;
-        let partial = w.client.empty(threads * 4);
-        // SAFETY: the alias holds len BF16 (checked above); fresh output of
-        // `threads` f32, one per thread; the alias is only read.
-        unsafe {
-            amax_kernel::launch_unchecked::<CudaRuntime>(
-                &w.client,
-                CubeCount::new_1d(AMAX_CUBES),
-                CubeDim::new_1d(QUANT_CUBE),
-                ArrayArg::from_raw_parts(w.handle.clone(), len),
-                ArrayArg::from_raw_parts(partial.clone(), threads),
-                len,
-                threads,
-            );
-        }
-        let bytes = w
-            .client
-            .read_one(partial)
-            .map_err(|e| anyhow::anyhow!("NVFP4 amax readback: {e:?}"))?;
-        let amax = bytes
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-            .fold(0.0f32, f32::max);
-        let scale2 = scale2_of(amax)?;
-        let blocks = len / GROUP;
-        let codes = w.client.empty(len / 2);
-        let scales = w.client.empty(blocks);
-        // SAFETY: one thread per complete 16-block of the checked [n, k]
-        // alias; each writes its own two code words and one scale byte.
-        unsafe {
-            quantize_kernel::launch_unchecked::<CudaRuntime>(
-                &w.client,
-                CubeCount::new_1d(blocks.div_ceil(QUANT_CUBE as usize) as u32),
-                CubeDim::new_1d(QUANT_CUBE),
-                ArrayArg::from_raw_parts(w.handle.clone(), len),
-                ArrayArg::from_raw_parts(codes.clone(), len / 8),
-                ArrayArg::from_raw_parts(scales.clone(), blocks),
-                blocks,
-                scale2,
-            );
-        }
-        Ok(Self {
-            codes,
-            scales,
-            scale2,
-            n,
-            k,
-        })
-    }
-
-    /// Device bytes this copy holds (codes and block scales).
-    pub(super) fn bytes(&self) -> u64 {
-        (self.n * self.k / 2 + self.n * self.k / GROUP) as u64
-    }
-
-    /// Activation rows `t` if `x` is a `[1, t, k]` this GEMV takes, else None
-    /// (the caller then projects with the BF16 alias).
-    pub(super) fn takes(&self, x: &Tensor) -> Option<usize> {
-        let s = x.meta.shape().as_slice();
-        let st = x.meta.strides();
-        let ok = s.len() == 3
-            && s[0] == 1
-            && (1..=MAX_ROWS).contains(&s[1])
-            && s[2] == self.k
-            && st[2] == 1
-            && (s[1] == 1 || st[1] == self.k)
-            && x.dtype == DType::BF16
-            && x.qparams.is_none()
-            && x.handle.offset_start.unwrap_or(0) % 16 == 0
-            && x.handle.size_in_used() >= (2 * s[1] * self.k) as u64;
-        ok.then_some(s[1])
-    }
-
-    /// `[1, rows, k] x [n, k]^T -> [1, rows, n]` BF16, fresh output.
-    pub(super) fn gemv(&self, x: &Tensor, rows: usize) -> Tensor {
-        let out = self.launch::<bf16>(x, rows);
-        Tensor::new_contiguous(
-            x.client.clone(),
-            x.device.clone(),
-            [1, rows, self.n].into(),
-            out,
-            DType::BF16,
-        )
-    }
-
-    fn launch<O: Scalar + Cast>(&self, x: &Tensor, rows: usize) -> Handle {
-        assert!(
-            (1..=MAX_ROWS).contains(&rows),
-            "NVFP4 GEMV takes 1..={MAX_ROWS} rows"
-        );
-        let out = x.client.empty(rows * self.n * core::mem::size_of::<O>());
-        // SAFETY: `takes` checked x is a contiguous, 16-byte-aligned BF16
-        // [rows, k]; codes/scales are this weight's own [n, k] buffers; the
-        // output is fresh [rows, n]. k % 32 == 0 bounds every chunk.
-        unsafe {
-            gemv_kernel::launch_unchecked::<O, CudaRuntime>(
-                &x.client,
-                CubeCount::new_1d(self.n.div_ceil(PLANES) as u32),
-                CubeDim::new_2d(PLANE as u32, PLANES as u32),
-                ArrayArg::from_raw_parts(x.handle.clone(), rows * self.k / 8),
-                ArrayArg::from_raw_parts(self.codes.clone(), self.n * self.k / CHUNK),
-                ArrayArg::from_raw_parts(self.scales.clone(), self.n * self.k / GROUP),
-                ArrayArg::from_raw_parts(out.clone(), rows * self.n),
-                self.n,
-                self.k,
-                self.scale2,
-                rows,
-            );
-        }
-        out
-    }
-}
-
-/// `amax / (6 * 448)`, or 1.0 for an all-zero tensor (every block then stores
-/// a zero scale and zero codes, whatever `scale2` is).
-fn scale2_of(amax: f32) -> Result<f32> {
-    ensure!(amax.is_finite(), "NVFP4 source has a non-finite weight");
-    Ok(if amax > 0.0 {
-        amax / (6.0f32 * 448.0f32)
-    } else {
-        1.0
-    })
 }
 
 #[cfg(test)]
