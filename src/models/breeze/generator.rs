@@ -9,7 +9,7 @@ use super::{
     load::{self, Artifacts},
     nvfp4::{Linear, Nvfp4},
     prompt::GuidedPrompt,
-    sampling::Sampler,
+    sampling::{self, Sampler},
     text_encoder::TextEncoder,
 };
 use crate::nn::cuda_bf16_alias::CudaBf16Aliases;
@@ -364,26 +364,52 @@ impl Generator {
             let negative_logits = negative
                 .as_ref()
                 .map(|b| ops::head(&b.hidden, &self.head, None));
-            let first = sampler.sample_guided(
+            // The frame's sixteen sampled IDs stay on the device and reach the
+            // host in one read at its end. The backbone's code is copied out
+            // as soon as it is sampled, but waited for only once the depth
+            // decoder's first step is queued behind the copy, so the GPU stays
+            // busy across the host's EOS test; on EOS that one step is dropped.
+            let ids = self.head.client.empty(16 * 4);
+            sampler.sample_guided_into(
                 &logits,
                 negative_logits.as_ref(),
                 &options,
                 &backbone_ids,
                 true,
+                &ids,
+                0,
             )?;
+            let first = sampling::read_id_later(&self.head.client, &ids, 0)?;
+            let depth = self.depth.begin(
+                &positive.hidden,
+                negative.as_ref().map(|b| &b.hidden),
+                &ids,
+                &self.audio_embedding,
+                &options,
+                &mut sampler,
+            );
+            // Waited for even when `begin` failed: its host buffer is in flight.
+            let first = first();
+            let depth = depth?;
+            let first = first?;
+            ensure!(
+                first != u32::MAX,
+                "nonfinite/empty CUDA sampling distribution"
+            );
             backbone_ids.push(first);
             if first == 2051 {
                 break Termination::Eos;
             }
             ensure!(first < 2048, "backbone emitted reserved codec ID");
-            let frame = self.depth.frame(
-                &positive.hidden,
-                negative.as_ref().map(|b| &b.hidden),
-                first,
-                &self.audio_embedding,
-                &options,
-                &mut sampler,
-            )?;
+            self.depth
+                .finish(depth, &ids, &self.audio_embedding, &options, &mut sampler)?;
+            let codes: [u32; 16] = sampling::read_ids(&self.head.client, ids)?;
+            let mut frame = [0u16; 16];
+            for (code, &id) in frame.iter_mut().zip(&codes) {
+                ensure!(id != u32::MAX, "nonfinite/empty CUDA sampling distribution");
+                ensure!(id < 2048, "depth sampler emitted reserved code");
+                *code = id as u16;
+            }
             let callback_start = Instant::now();
             on_frame(frame)?;
             callback_seconds += callback_start.elapsed().as_secs_f64();

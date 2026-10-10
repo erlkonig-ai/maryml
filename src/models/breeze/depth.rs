@@ -1,6 +1,6 @@
 //! Fifteen additional codebooks per backbone sample; fresh depth KV per frame.
 use super::{
-    backbone::{Decoder, linear},
+    backbone::{Decoder, Kv, linear},
     config::DepthConfig,
     cuda_ops as ops,
     generator::{Binder, GenerationOptions},
@@ -8,6 +8,7 @@ use super::{
     sampling::Sampler,
 };
 use anyhow::{Result, ensure};
+use cubecl::server::Handle;
 use ops::Tensor;
 use triblespace::core::repo::BlobStoreGet;
 
@@ -42,51 +43,92 @@ impl Depth {
             }
         })
     }
-    pub(super) fn frame(
+    /// Launches the frame's first codebook step from the backbone's code in
+    /// `ids[0]` and samples it into `ids[1]`, reading nothing back. The caller
+    /// tests `ids[0]` for EOS while this step runs; on EOS it drops the frame.
+    pub(super) fn begin(
         &self,
         hidden: &Tensor,
         negative_hidden: Option<&Tensor>,
-        first: u32,
+        ids: &Handle,
         embedding: &Tensor,
         options: &GenerationOptions,
         sampler: &mut Sampler,
-    ) -> Result<[u16; 16]> {
-        ensure!(first < 2048, "invalid initial codec sample");
-        let mut frame = [0u16; 16];
-        frame[0] = first as u16;
-        let initial = ops::gather(embedding, &[first]);
+    ) -> Result<DepthFrame> {
+        let initial = ops::gather_sampled(embedding, ids, 0, 0);
         let input = ops::append(&initial, Some(hidden));
-        let (mut state, mut cache) =
-            self.decoder
-                .forward(linear(&input, &self.projection)?, 0, &[])?;
+        let (state, cache) = self
+            .decoder
+            .forward(linear(&input, &self.projection)?, 0, &[])?;
         // Fresh depth state for each branch and each frame. The only common
         // inputs are sampled codebook IDs, never a copied conditional KV cache.
-        let mut negative = negative_hidden
+        let negative = negative_hidden
             .map(|hidden| {
                 let input = ops::append(&initial, Some(hidden));
                 self.decoder
                     .forward(linear(&input, &self.projection)?, 0, &[])
             })
             .transpose()?;
-        for head in 0..15 {
-            let logits = ops::head(&state, &self.heads, Some(head));
-            let negative_logits = negative
-                .as_ref()
-                .map(|(state, _)| ops::head(state, &self.heads, Some(head)));
-            let code =
-                sampler.sample_guided(&logits, negative_logits.as_ref(), options, &[], false)?;
-            ensure!(code < 2048, "depth sampler emitted reserved code");
-            frame[head + 1] = code as u16;
-            if head < 14 {
-                let row = (head + 1) * self.vocab + code as usize;
-                let next = ops::gather(embedding, &[row as u32]);
-                let next = linear(&next, &self.projection)?;
-                (state, cache) = self.decoder.forward(next.clone(), head + 2, &cache)?;
-                if let Some((state, cache)) = &mut negative {
-                    (*state, *cache) = self.decoder.forward(next, head + 2, cache)?;
-                }
-            }
-        }
+        let frame = DepthFrame {
+            state,
+            cache,
+            negative,
+        };
+        self.sample(&frame, 0, ids, options, sampler)?;
         Ok(frame)
     }
+    /// Launches the remaining fourteen steps into `ids[2..16]`. Each step's
+    /// codebook input is gathered on the device from the previous step's
+    /// sampled ID; the caller reads the frame's sixteen IDs once afterwards
+    /// and refuses invalid codes there.
+    pub(super) fn finish(
+        &self,
+        mut frame: DepthFrame,
+        ids: &Handle,
+        embedding: &Tensor,
+        options: &GenerationOptions,
+        sampler: &mut Sampler,
+    ) -> Result<()> {
+        for head in 1..15 {
+            let next = ops::gather_sampled(embedding, ids, head, head * self.vocab);
+            let next = linear(&next, &self.projection)?;
+            (frame.state, frame.cache) =
+                self.decoder.forward(next.clone(), head + 1, &frame.cache)?;
+            if let Some((state, cache)) = &mut frame.negative {
+                (*state, *cache) = self.decoder.forward(next, head + 1, cache)?;
+            }
+            self.sample(&frame, head, ids, options, sampler)?;
+        }
+        Ok(())
+    }
+    fn sample(
+        &self,
+        frame: &DepthFrame,
+        head: usize,
+        ids: &Handle,
+        options: &GenerationOptions,
+        sampler: &mut Sampler,
+    ) -> Result<()> {
+        let logits = ops::head(&frame.state, &self.heads, Some(head));
+        let negative_logits = frame
+            .negative
+            .as_ref()
+            .map(|(state, _)| ops::head(state, &self.heads, Some(head)));
+        sampler.sample_guided_into(
+            &logits,
+            negative_logits.as_ref(),
+            options,
+            &[],
+            false,
+            ids,
+            head + 1,
+        )
+    }
+}
+
+/// One frame's depth state between its first codebook step and the rest.
+pub(super) struct DepthFrame {
+    state: Tensor,
+    cache: Vec<Kv>,
+    negative: Option<(Tensor, Vec<Kv>)>,
 }

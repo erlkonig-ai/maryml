@@ -26,38 +26,63 @@ pub(super) fn reshape(t: Tensor, shape: &[usize]) -> Tensor {
     CubeTensor::new_contiguous(t.client, t.device, shape.into(), t.handle, t.dtype)
 }
 
+/// One codebook row chosen by a sampled ID that never left the device:
+/// `base + ids[slot]`, copied unchanged. A value outside the speech codes (EOS,
+/// a reserved code or an empty-distribution `u32::MAX`, each refused by the
+/// host before the frame is used) selects `base` instead, so a step launched
+/// before the host has seen the ID never indexes outside its codebook.
 #[cube(launch_unchecked)]
-fn gather_kernel(
+fn gather_sampled_kernel(
     weight: &Array<bf16>,
     ids: &Array<u32>,
     out: &mut Array<bf16>,
-    n: usize,
+    slot: usize,
+    base: usize,
+    codes: u32,
     width: usize,
 ) {
     let i = ABSOLUTE_POS as usize;
-    if i < n {
-        out[i] = weight[(ids[i / width] as usize) * width + i % width];
+    if i < width {
+        let code = ids[slot];
+        let mut row = base;
+        if code < codes {
+            row += code as usize;
+        }
+        out[i] = weight[row * width + i];
     }
 }
-pub(super) fn gather(weight: &Tensor, ids: &[u32]) -> Tensor {
+pub(super) fn gather_sampled(
+    weight: &Tensor,
+    ids: &cubecl::server::Handle,
+    slot: usize,
+    base: usize,
+) -> Tensor {
+    const CODES: usize = 2048;
     let h = weight.meta.shape()[1];
-    let n = ids.len() * h;
-    let input = weight.client.create_from_slice(u32::as_bytes(ids));
-    let out = weight.client.empty(n * 2);
-    // SAFETY: caller checks all IDs against vocabulary and bounded [T,H].
+    let slots = ids.size_in_used() as usize / 4;
+    assert!(slot < slots, "sampled ID slot outside the buffer");
+    assert!(
+        base + CODES <= weight.meta.shape()[0],
+        "codebook outside the embedding"
+    );
+    let out = weight.client.empty(h * 2);
+    // SAFETY: in-bounds slot of a live u32 ID buffer; every selectable row is
+    // inside [base, base + 2048) of the [rows, H] weight. Fresh output.
     unsafe {
-        gather_kernel::launch_unchecked::<CudaRuntime>(
+        gather_sampled_kernel::launch_unchecked::<CudaRuntime>(
             &weight.client,
-            grid(weight, n),
+            grid(weight, h),
             CubeDim::new_1d(64),
             ArrayArg::from_raw_parts(weight.handle.clone(), count(weight)),
-            ArrayArg::from_raw_parts(input, ids.len()),
-            ArrayArg::from_raw_parts(out.clone(), n),
-            n,
+            ArrayArg::from_raw_parts(ids.clone(), slots),
+            ArrayArg::from_raw_parts(out.clone(), h),
+            slot,
+            base,
+            CODES as u32,
             h,
         );
     }
-    tensor(weight, &[1, ids.len(), h], out)
+    tensor(weight, &[1, 1, h], out)
 }
 
 #[cube(launch_unchecked)]
@@ -687,6 +712,56 @@ mod tests {
     use super::*;
     use crate::models::breeze::{generator::GenerationOptions, sampling::Sampler};
     use cubecl::{Runtime, cuda::CudaDevice};
+
+    #[test]
+    #[ignore = "actual CUDA device 0 requires ordinary Stars lock"]
+    fn cuda_gather_sampled_copies_the_row_and_stays_in_codebook() {
+        let device = CudaDevice { index: 0 };
+        let client = CudaRuntime::client(&device);
+        let (rows, width) = (2 * 2051, 64);
+        // Exact small BF16 integers; no two rows are equal.
+        let values: Vec<bf16> = (0..rows * width)
+            .map(|i| {
+                let (row, col) = (i / width, i % width);
+                bf16::from_f32(if col % 2 == 0 {
+                    row % 256
+                } else {
+                    row / 256 + col
+                } as f32)
+            })
+            .collect();
+        let weight = Tensor::new_contiguous(
+            client.clone(),
+            device.clone(),
+            [rows, width].into(),
+            client.create_from_slice(bf16::as_bytes(&values)),
+            DType::BF16,
+        );
+        let codes = [5u32, 2047, 2048, 2051, u32::MAX, 0];
+        let ids = client.create_from_slice(u32::as_bytes(&codes));
+        let read = |t: &Tensor| t.client.read_one(t.handle.clone()).unwrap().to_vec();
+        for (slot, base, row) in [
+            (0, 0, 5),
+            (1, 2051, 2051 + 2047),
+            (2, 2051, 2051), // reserved code: base row, never codebook 1's row 2048
+            (3, 0, 0),       // EOS backbone sample: base row, never row 2051
+            (4, 2051, 2051), // empty distribution
+            (5, 2051, 2051),
+        ] {
+            let sampled = gather_sampled(&weight, &ids, slot, base);
+            assert_eq!(sampled.meta.shape().as_slice(), [1, 1, width]);
+            assert_eq!(
+                read(&sampled),
+                bf16::as_bytes(&values[row * width..(row + 1) * width]),
+                "slot {slot}"
+            );
+        }
+        assert_eq!(read(&weight), bf16::as_bytes(&values), "weight unchanged");
+        assert_eq!(
+            client.read_one(ids).unwrap().to_vec(),
+            u32::as_bytes(&codes)
+        );
+    }
 
     #[test]
     fn cooperative_norm_dispatch_is_hidden_width_only() {
