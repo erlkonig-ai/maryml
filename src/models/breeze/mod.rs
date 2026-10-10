@@ -15,6 +15,8 @@ pub mod generator;
 pub mod import;
 pub mod load;
 #[cfg(feature = "breeze-cuda")]
+mod nvfp4;
+#[cfg(feature = "breeze-cuda")]
 pub mod pipeline;
 #[cfg(feature = "breeze-cuda")]
 pub mod prompt;

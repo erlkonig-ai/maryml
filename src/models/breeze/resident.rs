@@ -8,7 +8,7 @@ use cubecl::cuda::CudaDevice;
 use std::{path::PathBuf, time::Instant};
 
 use super::{
-    generator::{GenerationOptions, Generator},
+    generator::{GenerationOptions, Generator, Weights},
     load::{Artifacts, Assets},
     pipeline::{self, Synthesis},
     prompt::BreezeTokenizer,
@@ -149,6 +149,7 @@ impl BreezeResident {
         drop(samples);
 
         let device = CudaDevice { index: 0 };
+        let weights = Weights::from_env()?;
         let started = Instant::now();
         let mut aliases = CudaBf16Aliases::new(device.clone(), 2048).map_err(anyhow::Error::msg)?;
         // SAFETY: the caller establishes real pile custody through runtime
@@ -160,6 +161,7 @@ impl BreezeResident {
                 config.artifacts,
                 assets.config,
                 &mut aliases,
+                weights,
             )?
         };
         generator.synchronize()?;

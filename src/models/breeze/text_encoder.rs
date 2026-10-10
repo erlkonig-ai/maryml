@@ -5,6 +5,7 @@ use super::{
     config::TextConfig,
     cuda_ops as ops,
     generator::Binder,
+    nvfp4::Linear,
 };
 use anyhow::{Result, ensure};
 use ops::Tensor;
@@ -15,15 +16,15 @@ struct Layer {
     post_attn: Tensor,
     pre_ff: Tensor,
     post_ff: Tensor,
-    q: Tensor,
-    k: Tensor,
-    v: Tensor,
-    o: Tensor,
+    q: Linear,
+    k: Linear,
+    v: Linear,
+    o: Linear,
     q_norm: Tensor,
     k_norm: Tensor,
-    gate: Tensor,
-    up: Tensor,
-    down: Tensor,
+    gate: Linear,
+    up: Linear,
+    down: Linear,
 }
 pub(super) struct TextEncoder {
     config: TextConfig,
@@ -31,7 +32,7 @@ pub(super) struct TextEncoder {
     eoi: Tensor,
     layers: Vec<Layer>,
     norm: Tensor,
-    projection: Tensor,
+    projection: Linear,
     full_freq: Vec<f32>,
     sliding_freq: Vec<f32>,
 }
@@ -57,15 +58,15 @@ impl TextEncoder {
                     post_attn: b.weight(&format!("{p}.post_self_attn_layernorm.weight"), [h])?,
                     pre_ff: b.weight(&format!("{p}.pre_feedforward_layernorm.weight"), [h])?,
                     post_ff: b.weight(&format!("{p}.post_feedforward_layernorm.weight"), [h])?,
-                    q: b.weight(&format!("{p}.self_attn.q_proj.weight"), [q, h])?,
-                    k: b.weight(&format!("{p}.self_attn.k_proj.weight"), [kv, h])?,
-                    v: b.weight(&format!("{p}.self_attn.v_proj.weight"), [kv, h])?,
-                    o: b.weight(&format!("{p}.self_attn.o_proj.weight"), [h, q])?,
+                    q: b.linear(&format!("{p}.self_attn.q_proj.weight"), [q, h])?,
+                    k: b.linear(&format!("{p}.self_attn.k_proj.weight"), [kv, h])?,
+                    v: b.linear(&format!("{p}.self_attn.v_proj.weight"), [kv, h])?,
+                    o: b.linear(&format!("{p}.self_attn.o_proj.weight"), [h, q])?,
                     q_norm: b.weight(&format!("{p}.self_attn.q_norm.weight"), [d])?,
                     k_norm: b.weight(&format!("{p}.self_attn.k_norm.weight"), [d])?,
-                    gate: b.weight(&format!("{p}.mlp.gate_proj.weight"), [f, h])?,
-                    up: b.weight(&format!("{p}.mlp.up_proj.weight"), [f, h])?,
-                    down: b.weight(&format!("{p}.mlp.down_proj.weight"), [h, f])?,
+                    gate: b.linear(&format!("{p}.mlp.gate_proj.weight"), [f, h])?,
+                    up: b.linear(&format!("{p}.mlp.up_proj.weight"), [f, h])?,
+                    down: b.linear(&format!("{p}.mlp.down_proj.weight"), [h, f])?,
                 }
             });
         }
@@ -77,7 +78,7 @@ impl TextEncoder {
                     .weight("text_encoder.embed_tokens.weight", [c.vocab_size as u64, h])?,
                 eoi: b.weight("text_encoder.embed_tokens.eoi_embedding", [h])?,
                 norm: b.weight("text_encoder.norm.weight", [h])?,
-                projection: b.weight("text_encoder_proj.weight", [output as u64, h])?,
+                projection: b.linear("text_encoder_proj.weight", [output as u64, h])?,
                 config: c,
                 layers,
                 full_freq,

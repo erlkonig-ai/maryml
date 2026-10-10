@@ -256,6 +256,7 @@ fn main() -> Result<()> {
             ids,
             assets.config,
             &mut aliases,
+            mary::models::breeze::generator::Weights::from_env()?,
         )?
     };
     generator.synchronize()?;

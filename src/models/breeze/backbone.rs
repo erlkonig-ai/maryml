@@ -4,6 +4,7 @@ use super::{
     config::{DecoderConfig, RopeConfig, RopeKind},
     cuda_ops as ops,
     generator::Binder,
+    nvfp4::Linear,
 };
 use crate::models::qwen3_5::gdn_mixer::project;
 use anyhow::{Result, ensure};
@@ -12,7 +13,20 @@ use cubecl::{cuda::CudaRuntime, prelude::*};
 pub(super) use ops::Tensor;
 use triblespace::core::repo::BlobStoreGet;
 
-pub(super) fn linear(x: &Tensor, w: &Tensor) -> Result<Tensor> {
+/// One projection. A resident NVFP4 copy takes the activation shapes its GEMV
+/// accepts (`[1, t, K]`, `t <= nvfp4::MAX_ROWS`); everything else, and every
+/// projection under the default BF16 weights, is the unchanged BF16 path.
+pub(super) fn linear(x: &Tensor, w: &Linear) -> Result<Tensor> {
+    if let Some(q) = &w.nvfp4
+        && let Some(rows) = q.takes(x)
+        && x.device == w.bf16.device
+    {
+        return Ok(q.gemv(x, rows));
+    }
+    linear_bf16(x, &w.bf16)
+}
+
+pub(super) fn linear_bf16(x: &Tensor, w: &Tensor) -> Result<Tensor> {
     if gemv_eligible(x) {
         project_gemv(x, w)
     } else {
@@ -178,15 +192,15 @@ pub(super) fn frequencies(c: &RopeConfig, d: usize) -> Result<Vec<f32>> {
 struct Layer {
     input: Tensor,
     post: Tensor,
-    q: Tensor,
-    k: Tensor,
-    v: Tensor,
-    o: Tensor,
+    q: Linear,
+    k: Linear,
+    v: Linear,
+    o: Linear,
     q_norm: Option<Tensor>,
     k_norm: Option<Tensor>,
-    gate: Tensor,
-    up: Tensor,
-    down: Tensor,
+    gate: Linear,
+    up: Linear,
+    down: Linear,
 }
 pub(super) struct Kv {
     key: Tensor,
@@ -219,10 +233,10 @@ impl Decoder {
                 Layer {
                     input: b.weight(&format!("{p}.input_layernorm.weight"), [h])?,
                     post: b.weight(&format!("{p}.post_attention_layernorm.weight"), [h])?,
-                    q: b.weight(&format!("{p}.self_attn.q_proj.weight"), [q, h])?,
-                    k: b.weight(&format!("{p}.self_attn.k_proj.weight"), [kv, h])?,
-                    v: b.weight(&format!("{p}.self_attn.v_proj.weight"), [kv, h])?,
-                    o: b.weight(&format!("{p}.self_attn.o_proj.weight"), [h, q])?,
+                    q: b.linear(&format!("{p}.self_attn.q_proj.weight"), [q, h])?,
+                    k: b.linear(&format!("{p}.self_attn.k_proj.weight"), [kv, h])?,
+                    v: b.linear(&format!("{p}.self_attn.v_proj.weight"), [kv, h])?,
+                    o: b.linear(&format!("{p}.self_attn.o_proj.weight"), [h, q])?,
                     q_norm: if qk_norm {
                         Some(b.weight(&format!("{p}.self_attn.q_norm.weight"), [d])?)
                     } else {
@@ -233,9 +247,9 @@ impl Decoder {
                     } else {
                         None
                     },
-                    gate: b.weight(&format!("{p}.mlp.gate_proj.weight"), [f, h])?,
-                    up: b.weight(&format!("{p}.mlp.up_proj.weight"), [f, h])?,
-                    down: b.weight(&format!("{p}.mlp.down_proj.weight"), [h, f])?,
+                    gate: b.linear(&format!("{p}.mlp.gate_proj.weight"), [f, h])?,
+                    up: b.linear(&format!("{p}.mlp.up_proj.weight"), [f, h])?,
+                    down: b.linear(&format!("{p}.mlp.down_proj.weight"), [h, f])?,
                 }
             });
         }
@@ -435,7 +449,7 @@ mod tests {
             );
             let before_x = read(&x);
             let before_w = read(&w);
-            let out = linear(&x, &w).unwrap();
+            let out = linear_bf16(&x, &w).unwrap();
             assert_eq!(out.dtype, DType::BF16);
             assert_eq!(out.meta.shape().as_slice(), [1, 1, n]);
             let values = read(&out);
@@ -453,7 +467,7 @@ mod tests {
             assert_eq!(read(&w), before_w);
             let mut wrong_dtype = w.clone();
             wrong_dtype.dtype = DType::F16;
-            assert!(linear(&x, &wrong_dtype).is_err());
+            assert!(linear_bf16(&x, &wrong_dtype).is_err());
         }
         // Preserve small operator fixtures with a pre-launch old-path choice.
         let x = upload(&[bf16::from_f32(2.0), bf16::from_f32(3.0)], &[1, 1, 2]);
@@ -463,7 +477,7 @@ mod tests {
             .iter()
             .flat_map(|v| v.to_bits().to_le_bytes())
             .collect();
-        assert_eq!(read(&linear(&x, &w).unwrap()), expected);
+        assert_eq!(read(&linear_bf16(&x, &w).unwrap()), expected);
     }
 
     #[test]
@@ -514,7 +528,7 @@ mod tests {
         assert!(gemv_eligible(&x), "precision fixture must exercise GEMV");
         let before_x = read(&x);
         let before_w = read(&w);
-        let out = linear(&x, &w).unwrap();
+        let out = linear_bf16(&x, &w).unwrap();
         assert_eq!(out.dtype, DType::BF16);
         assert_eq!(out.meta.shape().as_slice(), [1, 1, n]);
         let values = read(&out);

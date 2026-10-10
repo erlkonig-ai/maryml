@@ -7,6 +7,7 @@ use super::{
     cuda_ops as ops,
     depth::Depth,
     load::{self, Artifacts},
+    nvfp4::{Linear, Nvfp4},
     prompt::GuidedPrompt,
     sampling::Sampler,
     text_encoder::TextEncoder,
@@ -19,6 +20,8 @@ use triblespace::{
     core::repo::BlobStoreGet,
     prelude::{Id, TribleSet},
 };
+
+pub use super::nvfp4::Weights;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PromptSegment {
@@ -80,6 +83,9 @@ pub(super) struct Binder<'a, R> {
     pub reader: &'a R,
     pub root: Id,
     pub aliases: &'a mut CudaBf16Aliases,
+    pub weights: Weights,
+    /// NVFP4 copies made so far and their device bytes, for the load line.
+    pub nvfp4: (usize, u64),
 }
 impl<R: BlobStoreGet> Binder<'_, R> {
     pub(super) unsafe fn weight<const N: usize>(
@@ -95,6 +101,22 @@ impl<R: BlobStoreGet> Binder<'_, R> {
             "weight alias unexpectedly writable"
         );
         Ok(value)
+    }
+    /// A linear projection `[out, in]`: always the BF16 alias, plus a resident
+    /// NVFP4 copy quantized from it under [`Weights::Nvfp4`].
+    pub(super) unsafe fn linear(&mut self, name: &str, shape: [u64; 2]) -> Result<Linear> {
+        // SAFETY: forwarded genuine mapped immutable-prefix contract from caller.
+        let bf16 = unsafe { self.weight(name, shape)? };
+        let nvfp4 = match self.weights {
+            Weights::Bf16 => None,
+            Weights::Nvfp4 => {
+                let q = Nvfp4::quantize(&bf16).map_err(|e| e.context(name.to_owned()))?;
+                self.nvfp4.0 += 1;
+                self.nvfp4.1 += q.bytes();
+                Some(q)
+            }
+        };
+        Ok(Linear { bf16, nvfp4 })
     }
 }
 
@@ -248,16 +270,20 @@ impl Generator {
         ids: Artifacts,
         config: Config,
         aliases: &mut CudaBf16Aliases,
+        weights: Weights,
     ) -> Result<Self> {
         validate_geometry(&config)?;
+        let started = Instant::now();
         let mut b = Binder {
             facts,
             reader,
             root: ids.model_root,
             aliases,
+            weights,
+            nvfp4: (0, 0),
         };
         // SAFETY: same genuine pile/root/binder and immutable lifetime premise.
-        Ok(unsafe {
+        let generator = unsafe {
             Self {
                 text: TextEncoder::bind(&mut b, config.text.clone(), config.backbone.hidden_size)?,
                 backbone: Decoder::bind(&mut b, config.backbone.clone(), "backbone_model", true)?,
@@ -267,7 +293,17 @@ impl Generator {
                 head: b.weight("lm_head.weight", [2052, 2048])?,
                 config,
             }
-        })
+        };
+        if weights == Weights::Nvfp4 {
+            generator.synchronize()?;
+            eprintln!(
+                "[breeze] NVFP4 weights: {} projections, {} bytes resident, bound and quantized in {:.3}s",
+                b.nvfp4.0,
+                b.nvfp4.1,
+                started.elapsed().as_secs_f64()
+            );
+        }
+        Ok(generator)
     }
     pub fn synchronize(&self) -> Result<()> {
         cubecl::future::block_on(self.head.client.sync())

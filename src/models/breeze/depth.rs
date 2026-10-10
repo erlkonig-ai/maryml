@@ -4,6 +4,7 @@ use super::{
     config::DepthConfig,
     cuda_ops as ops,
     generator::{Binder, GenerationOptions},
+    nvfp4::Linear,
     sampling::Sampler,
 };
 use anyhow::{Result, ensure};
@@ -12,7 +13,7 @@ use triblespace::core::repo::BlobStoreGet;
 
 pub(super) struct Depth {
     decoder: Decoder,
-    projection: Tensor,
+    projection: Linear,
     heads: Tensor,
     vocab: usize,
 }
@@ -28,7 +29,7 @@ impl Depth {
         );
         Ok(unsafe {
             Self {
-                projection: b.weight(
+                projection: b.linear(
                     "depth_decoder.model.inputs_embeds_projector.weight",
                     [c.decoder.hidden_size as u64, c.audio_embed_size as u64],
                 )?,
