@@ -1029,6 +1029,12 @@ required-features = ["import"]
 name = "voxtral_listen"
 required-features = ["voxtral"]
 
+# Offline hearing through `mary::hear::Ears` (the production seam): transcripts,
+# compute per second of audio, and the paced finish latency, per WAV.
+[[bin]]
+name = "hear_offline"
+required-features = ["voxtral"]
+
 # Kimi K3: the `situ` activation against oracle vectors captured from the
 # shipped `SituAndMul`. CPU lane only under `k3`; add `k3-cuda` for
 # the GPU lane as well.

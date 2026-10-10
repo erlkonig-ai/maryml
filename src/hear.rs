@@ -20,7 +20,7 @@ use std::path::Path;
 use crate::models::voxtral::config::{
     N_FFT, N_LEFT_PAD_TOKENS, OFFLINE_BUFFER_TOKENS, SAMPLES_PER_TOK, delay_tokens,
 };
-use crate::models::voxtral::fast::{FastCaches, RealtimeTranscriber};
+use crate::models::voxtral::fast::{FastCaches, RealtimeTranscriber, Weights};
 use crate::models::voxtral::pipeline::{EncoderPrefix, StreamingTranscriber};
 use crate::models::voxtral::tokenizer::Tekken;
 use crate::nn::backend::hear;
@@ -55,7 +55,9 @@ pub struct Ears {
 
 impl Ears {
     /// Load the Voxtral cohort and its tokenizer from the native pile at
-    /// `pile` onto the default device of [`Backend`], then stream
+    /// `pile` onto the default device of [`Backend`] with the weights
+    /// `VOXTRAL_WEIGHTS` selects ([`Weights::from_env`]: unset or `f16`, or
+    /// `nvfp4` for four-bit decoder and encoder projections on CUDA), then stream
     /// [`WARM_UP_SAMPLES`] of silence through a throwaway [`Listening`] at
     /// the default 480 ms delay, so the kernels a stream compiles on first
     /// use (the prefill above all) are compiled here rather than inside the
@@ -65,7 +67,13 @@ impl Ears {
         let tekken = Tekken::from_snapshot(&snapshot)?;
         let loader = crate::models::voxtral::VoxtralWeights::from_snapshot(snapshot)?.into_loader();
         let device = hear::Device::default();
-        let stt = RealtimeTranscriber::load(&loader, tekken, MAX_TOKENS, &device);
+        let weights = Weights::from_env()?;
+        #[cfg(not(feature = "voxtral-cuda"))]
+        anyhow::ensure!(
+            weights == Weights::F16,
+            "VOXTRAL_WEIGHTS=nvfp4 needs the voxtral-cuda build"
+        );
+        let stt = RealtimeTranscriber::load_with(&loader, tekken, MAX_TOKENS, &device, weights);
         let prefix = {
             let mut stream = StreamingTranscriber::new(&stt, 480);
             let prefix = stream.prepare_encoder_prefix();

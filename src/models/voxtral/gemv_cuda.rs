@@ -1,6 +1,8 @@
 //! Isolated O/down/gate-up/QKV GEMV: existing Cubek kernel, no repacking.
 //! Exact RawHalf, F16: decoder M1 or four dense encoder rows as shared-RHS GEMVs.
 //! Unsupported metadata keeps the original matmul. Launch errors propagate.
+//! Under `VOXTRAL_WEIGHTS=nvfp4` a projection also holds a resident NVFP4 copy
+//! ([`quantize`]), which [`try_project_nvfp4`] tries first for one to eight rows.
 
 use std::any::{Any, TypeId};
 
@@ -13,6 +15,7 @@ use cubek::std::InputBinding;
 use half::f16;
 
 use crate::nn::backend::hear::RawHalf;
+use crate::nn::nvfp4_gemv::Nvfp4;
 
 /// Ephemeral metadata for this invocation, not a retained tensor catalogue.
 #[derive(Clone, Copy)]
@@ -270,6 +273,43 @@ pub(super) fn try_project<B: Backend>(
             .expect("both inputs established the exact RawHalf type")
             .clone(),
     ))
+}
+
+/// The resident NVFP4 copy of one projection weight `[1, K, N]`, as `[N, K]`:
+/// the F16 values the projection multiplies by, folds included, widened
+/// exactly and quantized by the shared recipe. The loaded weights already keep
+/// each output column's K values contiguous (the layout `eligible` requires),
+/// so the `[N, K]` view is metadata only; any other layout is copied once into
+/// that order first.
+pub(super) fn quantize<B: Backend>(w: &Tensor<B, 3>) -> anyhow::Result<Nvfp4> {
+    let raw = (w as &dyn Any)
+        .downcast_ref::<Tensor<RawHalf, 3>>()
+        .ok_or_else(|| anyhow::anyhow!("NVFP4 hearing weights need the raw CUDA F16 backend"))?;
+    let [_, k, n] = raw.dims();
+    let TensorPrimitive::Float(rows) = raw.clone().swap_dims(1, 2).reshape([n, k]).into_primitive()
+    else {
+        anyhow::bail!("NVFP4 hearing weights must be float tensors");
+    };
+    Nvfp4::quantize(&rows)
+}
+
+/// `x [1, t, K]` against a resident NVFP4 weight when its GEMV takes `x` (F16,
+/// `t <= MAX_ROWS`, contiguous rows, 16-byte aligned, same device): a fresh F16
+/// `[1, t, N]`. `None` leaves the projection to the F16 path.
+pub(super) fn try_project_nvfp4<B: Backend>(x: &Tensor<B, 3>, q: &Nvfp4) -> Option<Tensor<B, 3>> {
+    let raw = (x as &dyn Any).downcast_ref::<Tensor<RawHalf, 3>>()?;
+    let TensorPrimitive::Float(lhs) = raw.clone().into_primitive() else {
+        return None;
+    };
+    let rows = q.takes(&lhs)?;
+    let projected =
+        Tensor::<RawHalf, 3>::from_primitive(TensorPrimitive::Float(q.gemv(&lhs, rows)));
+    Some(
+        (&projected as &dyn Any)
+            .downcast_ref::<Tensor<B, 3>>()
+            .expect("x established the exact RawHalf type")
+            .clone(),
+    )
 }
 
 // Diagnostic-only owner-thread counts. Non-test production examples have no
@@ -1250,11 +1290,15 @@ mod tests {
                 weight_t: w.clone(),
                 bias: Some(bias.clone()),
             };
-            let routed = super::super::fast::output_projection(&linear, x.clone());
+            let routed = super::super::fast::output_projection(&linear, &None, x.clone());
             // Bias remains a separate F16 operation after GEMV's F16 store.
             assert_eq!(read(routed), read(direct.clone() + bias));
             close(
-                &read(super::super::fast::output_projection(&linear, x.clone())),
+                &read(super::super::fast::output_projection(
+                    &linear,
+                    &None,
+                    x.clone(),
+                )),
                 &read(linear.forward(x.clone())),
             );
             let _ = read(direct.mul_scalar(0.0));
@@ -1303,7 +1347,11 @@ mod tests {
                 bias: None,
             };
             assert_eq!(
-                read(super::super::fast::output_projection(&linear, x.clone())),
+                read(super::super::fast::output_projection(
+                    &linear,
+                    &None,
+                    x.clone()
+                )),
                 read(linear.forward(x.clone()))
             );
             let prefill = Tensor::<RawHalf, 3>::from_data(
@@ -1334,6 +1382,209 @@ mod tests {
             assert!(try_project(&strided, &w).unwrap().is_none());
             assert_eq!(read(strided), vec![f16::ONE; k]);
             assert_eq!(read(base), vec![f16::ONE; lanes * k]);
+        }
+    }
+
+    /// `[n, k]` weight-shaped values, `[1, k, n]` in the loaded layout.
+    fn loaded(n: usize, k: usize, seed: usize) -> (Vec<f16>, Tensor<RawHalf, 3>) {
+        let values: Vec<f16> = (0..n * k)
+            .map(|i| {
+                let h = (i.wrapping_mul(2654435761) ^ seed.wrapping_mul(40503)) % 4099;
+                let outlier = if h % 509 == 0 { 8.0 } else { 1.0 };
+                f16::from_f32((h as f32 / 4099.0 - 0.5) * 0.04 * outlier)
+            })
+            .collect();
+        let w = Tensor::<RawHalf, 3>::from_data(
+            TensorData::new(values.clone(), [1, n, k]),
+            &Default::default(),
+        )
+        .swap_dims(1, 2);
+        (values, w)
+    }
+
+    fn bytes(
+        client: &cubecl::client::ComputeClient<CudaRuntime>,
+        h: &cubecl::server::Handle,
+    ) -> Vec<u8> {
+        client.read_one(h.clone()).unwrap().to_vec()
+    }
+
+    #[test]
+    #[ignore = "reserved CUDA: NVFP4 glue, loaded layout and routing; no model"]
+    fn cuda_nvfp4_projection_quantizes_the_loaded_layout_and_routes_one_to_eight_rows() {
+        let device = Default::default();
+        for (n, k) in [
+            (6144, 3072),
+            (3072, 4096),
+            (3072, 9216),
+            (10240, 1280),
+            (1280, 5120),
+        ] {
+            let (values, w) = loaded(n, k, n + k);
+            assert_eq!(&cube(&w).meta.strides()[1..], &[1, k]);
+            let q = quantize(&w).unwrap();
+            // The loaded view, the contiguous [n, k] tensor and a row-major
+            // copy (another layout, copied into order) quantize to one byte set.
+            let direct =
+                Tensor::<RawHalf, 2>::from_data(TensorData::new(values.clone(), [n, k]), &device);
+            let TensorPrimitive::Float(direct) = direct.into_primitive() else {
+                panic!("float")
+            };
+            let reference = Nvfp4::quantize(&direct).unwrap();
+            let row_major = Tensor::<RawHalf, 3>::from_data(w.clone().into_data(), &device);
+            assert_eq!(cube(&row_major).meta.strides()[2], 1);
+            let copied = quantize(&row_major).unwrap();
+            let client = cube(&w).client;
+            for other in [&reference, &copied] {
+                assert_eq!(q.scale2.to_bits(), other.scale2.to_bits());
+                assert!(
+                    bytes(&client, &q.codes) == bytes(&client, &other.codes),
+                    "[{n}, {k}] codes"
+                );
+                assert!(
+                    bytes(&client, &q.scales) == bytes(&client, &other.scales),
+                    "[{n}, {k}] scales"
+                );
+            }
+            assert_eq!(q.bytes(), (n * k / 2 + n * k / 16) as u64);
+            for rows in 1..=9 {
+                let input: Vec<f16> = (0..rows * k)
+                    .map(|i| f16::from_f32(((i * 7) % 29) as f32 / 14.0 - 1.0))
+                    .collect();
+                let x = Tensor::<RawHalf, 3>::from_data(
+                    TensorData::new(input.clone(), [1, rows, k]),
+                    &device,
+                );
+                let Some(y) = try_project_nvfp4(&x, &q) else {
+                    assert_eq!(rows, 9, "[{n}, {k}]: rows {rows} must take the NVFP4 GEMV");
+                    continue;
+                };
+                assert!(rows <= 8);
+                assert_eq!((y.dims(), y.dtype()), ([1, rows, n], DType::F16));
+                // The routed result is the GEMV itself, through the Any seam.
+                let lhs = cube(&x);
+                let direct = Tensor::<RawHalf, 3>::from_primitive(TensorPrimitive::Float(
+                    q.gemv(&lhs, rows),
+                ));
+                let got = read(y);
+                assert_eq!(got, read(direct));
+                // For the record, on this synthetic fixture (not a model
+                // statistic): four-bit against the F16 product.
+                let f16_product = read(x.clone().matmul(w.clone()));
+                let (mut err, mut norm) = (0.0f64, 0.0f64);
+                for (a, b) in got.iter().zip(&f16_product) {
+                    err += (a.to_f64() - b.to_f64()).powi(2);
+                    norm += b.to_f64().powi(2);
+                }
+                if rows == 1 || rows == 8 {
+                    eprintln!(
+                        "[{n}, {k}] rows {rows}: relative RMS difference from F16 {:.4}",
+                        (err / norm).sqrt()
+                    );
+                }
+                assert_eq!(read(x), input);
+            }
+            // An F32 activation stays on the F16 path's own fallbacks.
+            let float = Tensor::<RawHalf, 3>::ones([1, 1, k], &device).cast(FloatDType::F32);
+            assert!(try_project_nvfp4(&float, &q).is_none());
+            assert_eq!(read(w.swap_dims(1, 2)), values);
+        }
+        // output_projection: the copy goes first, the bias after it; nine rows
+        // fall through to the unchanged F16 matmul.
+        let (n, k) = (3072, 4096);
+        let (_, w) = loaded(n, k, 1);
+        let q = Some(quantize(&w).unwrap());
+        let bias = Tensor::<RawHalf, 3>::full([1, 1, n], 0.125, &device);
+        let linear = super::super::layers::Linear {
+            weight_t: w.clone(),
+            bias: Some(bias.clone()),
+        };
+        let x = Tensor::<RawHalf, 3>::from_data(
+            TensorData::new(
+                (0..k)
+                    .map(|i| f16::from_f32((i % 13) as f32 / 8.0 - 0.75))
+                    .collect::<Vec<_>>(),
+                [1, 1, k],
+            ),
+            &device,
+        );
+        let routed = super::super::fast::output_projection(&linear, &q, x.clone());
+        let four_bit = try_project_nvfp4(&x, q.as_ref().unwrap()).unwrap();
+        assert_eq!(read(routed), read(four_bit + bias));
+        let nine = Tensor::<RawHalf, 3>::ones([1, 9, k], &device);
+        assert_eq!(
+            read(super::super::fast::output_projection(
+                &linear,
+                &q,
+                nine.clone()
+            )),
+            read(linear.forward(nine))
+        );
+    }
+
+    /// The encoder question, by measurement: at the encoder's M the current
+    /// F16 route (shared-weight M4 kernel for 1280 -> 10240, Cubek GEMV for
+    /// the rest) against the W4A16 GEMV; the decoder's M1 shapes alongside.
+    #[test]
+    #[ignore = "reserved CUDA: NVFP4 against the F16 route over Voxtral's projections; timing"]
+    fn cuda_nvfp4_against_f16_route_bandwidth() {
+        use std::time::Instant;
+        let device = Default::default();
+        let iters = 400usize;
+        eprintln!(
+            "framing: back-to-back launches on one stream, {iters} per route, rotating over >= 512 MB \
+             of distinct weight copies (DRAM, not L2), sky GB10; GB/s counts weight (+ E4M3 \
+             scale) bytes only; F16 = the production try_project route"
+        );
+        eprintln!("shape                 rows | NVFP4 us   GB/s | F16 us    GB/s | speedup");
+        for (name, n, k, rows) in [
+            ("decoder qkv", 6144, 3072, 1),
+            ("decoder o", 3072, 4096, 1),
+            ("decoder gate/up", 18432, 3072, 1),
+            ("decoder down", 3072, 9216, 1),
+            ("encoder qkv, gate/up", 10240, 1280, 4),
+            ("encoder o", 1280, 2048, 4),
+            ("encoder down", 1280, 5120, 4),
+        ] {
+            let copies = (512usize << 20).div_ceil(2 * n * k).max(2);
+            let dense: Vec<Tensor<RawHalf, 3>> = (0..copies).map(|c| loaded(n, k, c).1).collect();
+            let quant: Vec<Nvfp4> = dense.iter().map(|w| quantize(w).unwrap()).collect();
+            let x = Tensor::<RawHalf, 3>::from_data(
+                TensorData::new(
+                    (0..rows * k)
+                        .map(|i| f16::from_f32((i % 11) as f32 / 8.0 - 0.6))
+                        .collect::<Vec<_>>(),
+                    [1, rows, k],
+                ),
+                &device,
+            );
+            let f16_route =
+                |w: &Tensor<RawHalf, 3>| try_project(&x, w).unwrap().expect("F16 route launches");
+            for i in 0..2 * copies {
+                let _ = try_project_nvfp4(&x, &quant[i % copies]).unwrap();
+                let _ = f16_route(&dense[i % copies]);
+            }
+            RawHalf::sync(&device).unwrap();
+            let started = Instant::now();
+            for i in 0..iters {
+                let _ = try_project_nvfp4(&x, &quant[i % copies]).unwrap();
+            }
+            RawHalf::sync(&device).unwrap();
+            let fp4 = started.elapsed().as_secs_f64() / iters as f64;
+            let started = Instant::now();
+            for i in 0..iters {
+                let _ = f16_route(&dense[i % copies]);
+            }
+            RawHalf::sync(&device).unwrap();
+            let half = started.elapsed().as_secs_f64() / iters as f64;
+            eprintln!(
+                "{name:21} {rows:4} | {:7.1} {:6.1} | {:7.1} {:6.1} | {:.2}x",
+                fp4 * 1e6,
+                quant[0].bytes() as f64 / fp4 / 1e9,
+                half * 1e6,
+                (2 * n * k) as f64 / half / 1e9,
+                half / fp4
+            );
         }
     }
 }
