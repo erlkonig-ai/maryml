@@ -240,7 +240,10 @@ impl BreezeResident {
             &prompt,
             &self.codec,
             &self.device,
-            self.options.clone(),
+            GenerationOptions {
+                max_frames: frame_budget(text, self.options.max_frames),
+                ..self.options.clone()
+            },
             on_pcm,
         )?;
         let hops = &result.hop_seconds;
@@ -267,6 +270,16 @@ impl BreezeResident {
     pub(crate) fn decode_batch(&self, frames: &[[u16; 16]]) -> Result<Vec<f32>> {
         super::audio::decode_generated(&self.codec, frames, &self.device)
     }
+}
+
+/// How many frames a line of `text` may take before it counts as a runaway:
+/// three frames per character plus two seconds, never more than the
+/// configured cap. The live voice speaks 0.75 to 0.9 frames per character
+/// (sky, 2026-10-10), so an ordinary line stays far below it. Streamed PCM
+/// cannot be taken back, so without this a generation that never reached its
+/// end would be heard for the whole configured cap.
+fn frame_budget(text: &str, configured: usize) -> usize {
+    (text.chars().count().saturating_mul(3) + 24).clamp(1, configured.max(1))
 }
 
 #[cfg(test)]
@@ -326,5 +339,14 @@ mod tests {
         assert_eq!(config.artifacts.model_root, root);
         config.options.cfg_scale = f32::INFINITY;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn a_line_may_run_about_four_times_its_spoken_length_and_no_further() {
+        // 27 characters spoke as 23 frames on the live voice.
+        assert_eq!(super::frame_budget("This is the four-bit voice.", 1500), 105);
+        assert_eq!(super::frame_budget("", 1500), 24);
+        assert_eq!(super::frame_budget(&"a".repeat(1000), 1500), 1500);
+        assert_eq!(super::frame_budget("short", 10), 10);
     }
 }
