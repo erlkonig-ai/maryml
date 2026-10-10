@@ -1,16 +1,19 @@
 //! Resident native Breeze weights and one natively encoded reference.
 //!
-//! One owning worker calls `load` once, then `synthesize` for each whole line.
-//! Output is a fresh generated-only batch, not stateful streaming. No request
+//! One owning worker calls `load` once, then `synthesize_stream` for each line.
+//! Output is generated-only PCM decoded in fixed-size hops while the line is
+//! generated; each hop decodes its left context and new frames from fresh
+//! codec state, and no decoder state is carried between hops. No request
 //! can inject precomputed reference codes, a checkpoint path or a CPU LLM.
 use anyhow::{Result, ensure};
 use cubecl::cuda::CudaDevice;
 use std::{path::PathBuf, time::Instant};
 
 use super::{
+    audio::hop_window_lengths,
     generator::{GenerationOptions, Generator, Weights},
     load::{Artifacts, Assets},
-    pipeline::{self, Synthesis},
+    pipeline::{self, Streamed},
     prompt::BreezeTokenizer,
     reference::{encode_reference, read_wav},
 };
@@ -91,6 +94,9 @@ pub struct ResidentLoadReport {
     pub reference_encode_seconds: f64,
     pub generator_load_seconds: f64,
     pub codec_load_host_seconds: f64,
+    /// Per hop window length (frames), the seconds its first decode took:
+    /// kernel compilation when the CubeCL cache is cold, so no line pays it.
+    pub codec_warm_seconds: Vec<(usize, f64)>,
     pub total_seconds: f64,
     pub reference_samples: usize,
     pub reference_frames: usize,
@@ -170,6 +176,14 @@ impl BreezeResident {
         let codec = CodecDecoder::<Fused>::load(&loader, &device);
         let codec_load_host_seconds = started.elapsed().as_secs_f64();
         drop(loader);
+        let codec_warm_seconds = hop_window_lengths()
+            .into_iter()
+            .map(|length| {
+                let started = Instant::now();
+                let _ = codec.decode(&vec![[0u32; 16]; length], &device);
+                (length, started.elapsed().as_secs_f64())
+            })
+            .collect();
         let stats = aliases.stats();
         let load_report = ResidentLoadReport {
             source_seconds,
@@ -177,6 +191,7 @@ impl BreezeResident {
             reference_encode_seconds,
             generator_load_seconds,
             codec_load_host_seconds,
+            codec_warm_seconds,
             total_seconds: total.elapsed().as_secs_f64(),
             reference_samples,
             reference_frames,
@@ -203,10 +218,15 @@ impl BreezeResident {
         &self.load_report
     }
 
-    /// One fresh generator KV/sampling state and fresh generated-only codec
-    /// state; resident model tensors and the encoded reference are reused.
-    /// The configured seed starts anew for each utterance, as in the CLI.
-    pub fn synthesize(&mut self, text: &str) -> Result<Synthesis> {
+    /// One fresh generator KV/sampling state; the line's PCM goes to `on_pcm`
+    /// hop by hop while it is generated (see [`pipeline::stream`]). Resident
+    /// model tensors and the encoded reference are reused. The configured
+    /// seed starts anew for each utterance, as in the CLI.
+    pub fn synthesize_stream(
+        &mut self,
+        text: &str,
+        on_pcm: impl FnMut(Vec<f32>) -> Result<()>,
+    ) -> Result<Streamed> {
         let started = Instant::now();
         let prompt = self.tokenizer.reference_prompts(
             &self.reference_text,
@@ -215,25 +235,37 @@ impl BreezeResident {
             self.direction.as_deref(),
             self.options.cfg_scale,
         )?;
-        let result = pipeline::run(
+        let result = pipeline::stream(
             &mut self.generator,
             &prompt,
             &self.codec,
             &self.device,
             self.options.clone(),
+            on_pcm,
         )?;
+        let hops = &result.hop_seconds;
         eprintln!(
-            "[breeze] resident utterance: {:?}, {} frames, {:.3}s generation, {:.3}s codec, {:.3}s total; CFG{}, prompt {} / {:?} tokens; batch PCM",
+            "[breeze] resident utterance: {:?}, {} frames, {:.3}s generation, {} hops of {:.1} ms codec ({:.1} ms max), first PCM {:.3}s, {:.3}s total; CFG{}, prompt {} / {:?} tokens; hop PCM",
             result.generation.termination,
             result.frames.len(),
-            result.generation.total_seconds,
-            result.codec_decode_seconds,
+            result.generation.total_seconds - result.generation.callback_seconds,
+            hops.len(),
+            hops.iter().sum::<f64>() / hops.len().max(1) as f64 * 1e3,
+            hops.iter().copied().fold(0.0, f64::max) * 1e3,
+            result.first_pcm_seconds.unwrap_or(f64::NAN),
             started.elapsed().as_secs_f64(),
             result.generation.cfg_scale,
             result.generation.conditional_prompt_tokens,
             result.generation.negative_prompt_tokens,
         );
         Ok(result)
+    }
+
+    /// The same frames decoded as one batch, the way [`pipeline::run`] does:
+    /// the reference a hop decode is listened against.
+    #[cfg(test)]
+    pub(crate) fn decode_batch(&self, frames: &[[u16; 16]]) -> Result<Vec<f32>> {
+        super::audio::decode_generated(&self.codec, frames, &self.device)
     }
 }
 

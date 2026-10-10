@@ -1,11 +1,12 @@
-//! Single-request native Breeze composition. The initial acoustic endpoint is
-//! batch decoding, not a stateful/realtime stream and not Qwen clone synthesis.
+//! Single-request native Breeze composition: [`run`] decodes the whole
+//! utterance as one batch once generation ends, [`stream`] decodes it in
+//! fixed-size hops while it is generated. Not Qwen clone synthesis.
 use anyhow::{Result, ensure};
 use burn::prelude::Backend;
 use std::{path::Path, time::Instant};
 
 use super::{
-    audio::decode_generated,
+    audio::{HopWindow, Hops, decode_generated, decode_hop},
     generator::{GenerationOptions, GenerationReport, Generator},
     prompt::{BreezeTokenizer, GuidedPrompt},
     reference::{encode_reference, read_wav},
@@ -93,5 +94,72 @@ pub fn run<B: Backend>(
         frames,
         generation,
         codec_decode_seconds: started.elapsed().as_secs_f64(),
+    })
+}
+
+/// One utterance decoded in hops, and when its audio left.
+pub struct Streamed {
+    pub frames: Vec<[u16; 16]>,
+    pub generation: GenerationReport,
+    /// Wall seconds of each hop's decode in the order the hops left; a tail
+    /// shorter than a hop is the last.
+    pub hop_seconds: Vec<f64>,
+    /// From the call to the first PCM handed on; `None` if none was.
+    pub first_pcm_seconds: Option<f64>,
+}
+
+/// Generate and decode in hops ([`Hops`]): each time `HOP_FRAMES` new frames
+/// are generated they are decoded on this thread, between two frames, and
+/// handed to `on_pcm` at once; the frames left at the end go as a shorter
+/// tail. The chunks in order are the utterance. An error from `on_pcm` stops
+/// generation at that hop. Termination is the caller's to judge: the hops
+/// already handed on are not taken back when generation ends at a cap.
+pub fn stream<B: Backend>(
+    generator: &mut Generator,
+    prompt: &GuidedPrompt,
+    decoder: &CodecDecoder<B>,
+    device: &B::Device,
+    options: GenerationOptions,
+    mut on_pcm: impl FnMut(Vec<f32>) -> Result<()>,
+) -> Result<Streamed> {
+    let started = Instant::now();
+    let limit = options.max_frames;
+    ensure!(limit > 0, "positive frame limit required");
+    let mut frames = Vec::new();
+    let mut hops = Hops::default();
+    let mut hop_seconds = Vec::new();
+    let mut first_pcm_seconds = None;
+    let mut emit = |window: HopWindow| -> Result<()> {
+        let decoding = Instant::now();
+        let pcm = decode_hop(decoder, &window, device)?;
+        hop_seconds.push(decoding.elapsed().as_secs_f64());
+        first_pcm_seconds.get_or_insert_with(|| started.elapsed().as_secs_f64());
+        on_pcm(pcm)
+    };
+    let generation = generator.generate(prompt, options, |frame| {
+        ensure!(
+            frames.len() < limit,
+            "generator exceeded requested frame limit"
+        );
+        frames.push(frame);
+        match hops.push(frame)? {
+            Some(window) => emit(window),
+            None => Ok(()),
+        }
+    })?;
+    generator.synchronize()?;
+    ensure!(
+        generation.frames == frames.len(),
+        "generator frame receipt mismatch"
+    );
+    ensure!(!frames.is_empty(), "generation produced no speech frames");
+    if let Some(window) = hops.flush() {
+        emit(window)?;
+    }
+    Ok(Streamed {
+        frames,
+        generation,
+        hop_seconds,
+        first_pcm_seconds,
     })
 }
