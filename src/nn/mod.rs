@@ -22,6 +22,10 @@ pub mod npz;
 /// collections arrange its rows into blobs; accelerator backends consume its
 /// read-only plane views.
 pub mod nvfp4_cosine;
+/// Resident NVFP4 weights quantized on the device and the W4A16 GEMV that
+/// reads them, shared by Breeze (BF16) and Voxtral's hearing model (F16).
+#[cfg(any(feature = "breeze-cuda", feature = "voxtral-cuda"))]
+pub(crate) mod nvfp4_gemv;
 // Share the existing raw CUDA launcher without enabling the Inkling model.
 #[cfg(feature = "nvfp4-encode-cuda")]
 #[path = "../models/inkling/rawcuda.rs"]

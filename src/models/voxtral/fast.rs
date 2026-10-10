@@ -51,6 +51,115 @@ use super::pipeline::SttPipeline;
 use super::tokenizer::Tekken;
 use crate::nn::weight_loader::WeightLoader;
 
+/// Which weights the folded lane's linear projections read. One explicit choice
+/// per load; `mary::hear` takes it from `VOXTRAL_WEIGHTS`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Weights {
+    /// The F16 weights only: byte-identical to the path before NVFP4.
+    #[default]
+    F16,
+    /// Also a resident NVFP4 copy of every linear projection of the decoder
+    /// (the folded q/k/v, o, the fused gate/up, down) and of the audio
+    /// encoder's transformer (its wide q/k/rotated/v, o, gate/up, down),
+    /// quantized once at load from the F16 values those projections multiply
+    /// by. One- to eight-row activations take the W4A16 GEMV
+    /// ([`crate::nn::nvfp4_gemv`]): every decode step and every four-row
+    /// encoder step of a stream. The decoder's prompt prefill and the
+    /// encoder's 72-row finishing block keep the F16 weights, which stay
+    /// resident for them. The encoder follows by measurement: at its M of four
+    /// the GEMV took 45/11/21 us against the F16 route's 110/30/74 us for the
+    /// QKV and gate/up, O and down shapes (sky, 2026-10-10,
+    /// `cuda_nvfp4_against_f16_route_bandwidth`). Embeddings, the LM head,
+    /// norms, the ada scales, the projector and the audio frontend keep their
+    /// precision. Needs the `voxtral-cuda` build.
+    ///
+    /// Measured end to end with `hear_offline` on sky (GB10), 2026-10-10: six
+    /// 16 kHz clips of 7.3 to 11.5 s in 80 ms chunks, two runs per choice
+    /// alternating, the live bot resident. Compute per second of audio
+    /// (unpaced) went from 0.75-0.80 (median 0.77) to 0.41-0.43 (median
+    /// 0.42), and the finish, from the last sample to the finished transcript
+    /// with the audio paced at real time, from 0.76-0.85 s (median 0.78) to
+    /// 0.40-0.44 s (median 0.42). Every transcript was identical to the F16
+    /// one. With only the decoder quantized the compute was 0.50-0.52 and the
+    /// finish the same 0.40-0.45 s: the encoder's share is streaming compute,
+    /// since the finishing block it runs is 72 rows and stays F16. 2.34 GB of
+    /// codes and scales are resident on top of the F16 weights.
+    Nvfp4,
+}
+
+impl Weights {
+    /// `VOXTRAL_WEIGHTS`: unset or `f16` keeps F16, `nvfp4` selects four-bit
+    /// projections. Anything else is refused rather than silently
+    /// read as the default.
+    pub fn from_env() -> anyhow::Result<Self> {
+        match std::env::var("VOXTRAL_WEIGHTS") {
+            Err(std::env::VarError::NotPresent) => Ok(Self::F16),
+            Ok(value) => Self::parse(&value),
+            Err(e) => anyhow::bail!("VOXTRAL_WEIGHTS: {e}"),
+        }
+    }
+
+    fn parse(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "f16" => Ok(Self::F16),
+            "nvfp4" => Ok(Self::Nvfp4),
+            other => anyhow::bail!("VOXTRAL_WEIGHTS must be f16 or nvfp4, not {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod weights_tests {
+    use super::Weights;
+
+    #[test]
+    fn weights_option_is_explicit() {
+        assert_eq!(Weights::default(), Weights::F16);
+        assert_eq!(Weights::parse("f16").unwrap(), Weights::F16);
+        assert_eq!(Weights::parse("nvfp4").unwrap(), Weights::Nvfp4);
+        for bad in ["", "NVFP4", "fp4", "bf16", "f16 "] {
+            assert!(Weights::parse(bad).is_err(), "{bad:?}");
+        }
+    }
+}
+
+/// A projection's resident NVFP4 copy. Without CUDA there is none to hold.
+#[cfg(feature = "voxtral-cuda")]
+pub(super) type Fp4 = crate::nn::nvfp4_gemv::Nvfp4;
+#[cfg(not(feature = "voxtral-cuda"))]
+pub(super) type Fp4 = std::convert::Infallible;
+
+/// The NVFP4 copy of a projection weight `[1, K, N]` under [`Weights::Nvfp4`].
+fn fp4<B: Backend>(w: &Tensor<B, 3>, weights: Weights, name: &str) -> Option<Fp4> {
+    match weights {
+        Weights::F16 => None,
+        #[cfg(feature = "voxtral-cuda")]
+        Weights::Nvfp4 => Some(
+            super::gemv_cuda::quantize(w)
+                .unwrap_or_else(|error| panic!("{name}: NVFP4 quantization failed: {error:#}")),
+        ),
+        #[cfg(not(feature = "voxtral-cuda"))]
+        Weights::Nvfp4 => {
+            let _ = w;
+            panic!("{name}: VOXTRAL_WEIGHTS=nvfp4 needs the voxtral-cuda build")
+        }
+    }
+}
+
+/// `x` through the W4A16 GEMV when the projection has an NVFP4 copy and the
+/// GEMV takes `x`; `None` leaves it to the F16 path.
+fn fp4_project<B: Backend>(x: &Tensor<B, 3>, q: &Option<Fp4>) -> Option<Tensor<B, 3>> {
+    #[cfg(feature = "voxtral-cuda")]
+    return q
+        .as_ref()
+        .and_then(|q| super::gemv_cuda::try_project_nvfp4(x, q));
+    #[cfg(not(feature = "voxtral-cuda"))]
+    {
+        let _ = x;
+        q.as_ref().map(|never| match *never {})
+    }
+}
+
 /// Weightless RMS normalization: `x · rsqrt(mean(x²)+eps)`; the variance
 /// chain runs in f32 and casts back.
 pub(super) fn rms<B: Backend>(x: Tensor<B, 3>, eps: f64) -> Tensor<B, 3> {
@@ -84,11 +193,19 @@ fn linear_t<B: Backend>(
 
 /// Only the folded lane's O/down projections are candidates. Eligibility is
 /// checked against actual RawHalf storage; other cases keep Linear::forward.
-pub(super) fn output_projection<B: Backend>(linear: &Linear<B>, x: Tensor<B, 3>) -> Tensor<B, 3> {
+/// An NVFP4 copy, when there is one and its GEMV takes `x`, goes first.
+pub(super) fn output_projection<B: Backend>(
+    linear: &Linear<B>,
+    fp4: &Option<Fp4>,
+    x: Tensor<B, 3>,
+) -> Tensor<B, 3> {
+    let projected = fp4_project(&x, fp4);
     #[cfg(feature = "voxtral-cuda")]
-    if let Some(y) = super::gemv_cuda::try_project(&x, &linear.weight_t)
-        .unwrap_or_else(|error| panic!("Voxtral O/down GEMV launch failed: {error:?}"))
-    {
+    let projected = projected.or_else(|| {
+        super::gemv_cuda::try_project(&x, &linear.weight_t)
+            .unwrap_or_else(|error| panic!("Voxtral O/down GEMV launch failed: {error:?}"))
+    });
+    if let Some(y) = projected {
         return match &linear.bias {
             Some(bias) => y + bias.clone(),
             None => y,
@@ -326,6 +443,8 @@ struct FastAttention<B: Backend> {
     qkv_bias: Option<Tensor<B, 3>>, // [1, 1, same]
     layout: QkvLayout,
     o_proj: Linear<B>,
+    qkv_fp4: Option<Fp4>,
+    o_fp4: Option<Fp4>,
     heads: usize,
     kv_heads: usize,
     head_dim: usize,
@@ -339,6 +458,7 @@ impl<B: Backend> FastAttention<B> {
         qvo_bias: bool,
         layout: QkvLayout,
         fold_in: Tensor<B, 1>,
+        weights: Weights,
         device: &B::Device,
     ) -> Self {
         let half = d / 2;
@@ -393,11 +513,14 @@ impl<B: Backend> FastAttention<B> {
             fused.reshape([1, 1, n_out])
         });
 
+        let o_proj = Linear::load(loader, &format!("{prefix}.o_proj"), qvo_bias, device);
         Self {
+            qkv_fp4: fp4(&qkv_t, weights, &format!("{prefix} qkv")),
+            o_fp4: fp4(&o_proj.weight_t, weights, &format!("{prefix}.o_proj")),
             qkv_t,
             qkv_bias,
             layout,
-            o_proj: Linear::load(loader, &format!("{prefix}.o_proj"), qvo_bias, device),
+            o_proj,
             heads: h,
             kv_heads: hkv,
             head_dim: d,
@@ -419,13 +542,15 @@ impl<B: Backend> FastAttention<B> {
         let (h, hkv, d) = (self.heads, self.kv_heads, self.head_dim);
         let hh = h + hkv;
 
-        // Exact decoder M1 and existing encoder M4 geometry/layout can take
-        // this local path. Prefill and unsupported metadata retain matmul.
+        // An NVFP4 copy takes one to eight rows. Otherwise exact decoder M1
+        // and existing encoder M4 geometry/layout can take the F16 GEMV.
+        // Prefill and unsupported metadata retain matmul.
+        let projected = fp4_project(&x, &self.qkv_fp4);
         #[cfg(feature = "voxtral-cuda")]
-        let projected = super::gemv_cuda::try_project(&x, &self.qkv_t)
-            .unwrap_or_else(|error| panic!("Voxtral QKV GEMV launch failed: {error:?}"));
-        #[cfg(not(feature = "voxtral-cuda"))]
-        let projected: Option<Tensor<B, 3>> = None;
+        let projected = projected.or_else(|| {
+            super::gemv_cuda::try_project(&x, &self.qkv_t)
+                .unwrap_or_else(|error| panic!("Voxtral QKV GEMV launch failed: {error:?}"))
+        });
         let mut qkv = projected.unwrap_or_else(|| x.matmul(self.qkv_t.clone()));
         if let Some(bias) = &self.qkv_bias {
             qkv = qkv + bias.clone();
@@ -461,7 +586,7 @@ impl<B: Backend> FastAttention<B> {
             let scores = q.matmul(k.swap_dims(2, 3)); // 1/√d pre-folded
             let probs = softmax(scores, 3);
             let out = probs.matmul(v).reshape([b, 1, h * d]);
-            return output_projection(&self.o_proj, out);
+            return output_projection(&self.o_proj, &self.o_fp4, out);
         }
 
         let expand = |t: Tensor<B, 4>| {
@@ -486,7 +611,7 @@ impl<B: Backend> FastAttention<B> {
         };
         let probs = softmax(scores, 3);
         let out = probs.matmul(v).swap_dims(1, 2).reshape([b, l, h * d]);
-        output_projection(&self.o_proj, out)
+        output_projection(&self.o_proj, &self.o_fp4, out)
     }
 }
 
@@ -495,6 +620,8 @@ struct FastMlp<B: Backend> {
     gate_up_t: Tensor<B, 3>, // [1, hidden, 2·inter]
     down: Linear<B>,
     inter: usize,
+    gate_up_fp4: Option<Fp4>,
+    down_fp4: Option<Fp4>,
 }
 
 impl<B: Backend> FastMlp<B> {
@@ -503,6 +630,7 @@ impl<B: Backend> FastMlp<B> {
         prefix: &str,
         down_bias: bool,
         fold_in: Option<Tensor<B, 1>>,
+        weights: Weights,
         device: &B::Device,
     ) -> Self {
         let gate: Tensor<B, 2> = loader.load_tensor(&format!("{prefix}.gate_proj.weight"), device);
@@ -514,28 +642,34 @@ impl<B: Backend> FastMlp<B> {
             Some(s) => gut.mul(s.reshape([hidden, 1])),
             None => gut,
         };
+        let gate_up_t = gut.reshape([1, hidden, o2]);
+        let down = Linear::load(loader, &format!("{prefix}.down_proj"), down_bias, device);
         Self {
-            gate_up_t: gut.reshape([1, hidden, o2]),
-            down: Linear::load(loader, &format!("{prefix}.down_proj"), down_bias, device),
+            gate_up_fp4: fp4(&gate_up_t, weights, &format!("{prefix} gate/up")),
+            down_fp4: fp4(&down.weight_t, weights, &format!("{prefix}.down_proj")),
+            gate_up_t,
+            down,
             inter: o2 / 2,
         }
     }
 
     fn forward(&self, h: Tensor<B, 3>) -> Tensor<B, 3> {
-        // Only exact decoder M1 geometry/layout can take this local path.
-        // Encoder, prefill and unsupported backends keep the original matmul.
+        // An NVFP4 copy takes one to eight rows. Otherwise only exact decoder
+        // M1 geometry/layout can take the F16 GEMV. Encoder, prefill and
+        // unsupported backends keep the original matmul.
+        let projected = fp4_project(&h, &self.gate_up_fp4);
         #[cfg(feature = "voxtral-cuda")]
-        let projected = super::gemv_cuda::try_project(&h, &self.gate_up_t)
-            .unwrap_or_else(|error| panic!("Voxtral gate/up GEMV launch failed: {error:?}"));
-        #[cfg(not(feature = "voxtral-cuda"))]
-        let projected: Option<Tensor<B, 3>> = None;
+        let projected = projected.or_else(|| {
+            super::gemv_cuda::try_project(&h, &self.gate_up_t)
+                .unwrap_or_else(|error| panic!("Voxtral gate/up GEMV launch failed: {error:?}"))
+        });
         let gu = projected.unwrap_or_else(|| h.matmul(self.gate_up_t.clone()));
         #[cfg(feature = "voxtral-cuda")]
         let activated = super::swiglu_cuda::swiglu(gu, self.inter);
         #[cfg(not(feature = "voxtral-cuda"))]
         let activated = silu(gu.clone().narrow(2, 0, self.inter))
             .mul(gu.narrow(2, self.inter, self.inter));
-        output_projection(&self.down, activated)
+        output_projection(&self.down, &self.down_fp4, activated)
     }
 }
 
@@ -553,7 +687,12 @@ pub struct FastEncoder<B: Backend> {
 }
 
 impl<B: Backend> FastEncoder<B> {
-    pub fn load(loader: &WeightLoader, max_positions: usize, device: &B::Device) -> Self {
+    pub fn load(
+        loader: &WeightLoader,
+        max_positions: usize,
+        weights: Weights,
+        device: &B::Device,
+    ) -> Self {
         let geo = (ENC_HEADS, ENC_HEADS, ENC_HEAD_DIM);
         let w1 = |n: &str| -> Tensor<B, 1> { loader.load_tensor(n, device) };
         let layers = (0..ENC_LAYERS)
@@ -567,6 +706,7 @@ impl<B: Backend> FastEncoder<B> {
                         true,
                         QkvLayout::RotatedWeights,
                         w1(&format!("{p}.self_attn_layer_norm.weight")),
+                        weights,
                         device,
                     ),
                     FastMlp::load(
@@ -574,6 +714,7 @@ impl<B: Backend> FastEncoder<B> {
                         &format!("{p}.mlp"),
                         true,
                         Some(w1(&format!("{p}.final_layer_norm.weight"))),
+                        weights,
                         device,
                     ),
                 )
@@ -659,7 +800,12 @@ pub struct FastDecoder<B: Backend> {
 }
 
 impl<B: Backend> FastDecoder<B> {
-    pub fn load(loader: &WeightLoader, max_positions: usize, device: &B::Device) -> Self {
+    pub fn load(
+        loader: &WeightLoader,
+        max_positions: usize,
+        weights: Weights,
+        device: &B::Device,
+    ) -> Self {
         let geo = (DEC_HEADS, DEC_KV_HEADS, DEC_HEAD_DIM);
         let layers = (0..DEC_LAYERS)
             .map(|i| {
@@ -675,9 +821,10 @@ impl<B: Backend> FastDecoder<B> {
                         false,
                         QkvLayout::Compact,
                         w1("input_layernorm"),
+                        weights,
                         device,
                     ),
-                    mlp: FastMlp::load(loader, &format!("{p}.mlp"), false, None, device),
+                    mlp: FastMlp::load(loader, &format!("{p}.mlp"), false, None, weights, device),
                     ada1_t: linear_t(loader, &format!("{p}.ada_rms_norm.linear1"), None, device),
                     ada2_t: linear_t(loader, &format!("{p}.ada_rms_norm.linear2"), None, device),
                     post_w: w1("post_attention_layernorm"),
@@ -768,19 +915,54 @@ pub struct RealtimeTranscriber<B: Backend> {
 }
 
 impl<B: Backend> RealtimeTranscriber<B> {
+    /// The F16 weights only ([`Weights::F16`]).
     pub fn load(
         loader: &WeightLoader,
         tekken: Tekken,
         max_tokens: usize,
         device: &B::Device,
     ) -> Self {
-        Self {
+        Self::load_with(loader, tekken, max_tokens, device, Weights::F16)
+    }
+
+    /// Load with an explicit weight choice. [`Weights::Nvfp4`] needs the raw
+    /// CUDA F16 backend and panics on any other, like a missing leaf does.
+    pub fn load_with(
+        loader: &WeightLoader,
+        tekken: Tekken,
+        max_tokens: usize,
+        device: &B::Device,
+        weights: Weights,
+    ) -> Self {
+        #[cfg(feature = "voxtral-cuda")]
+        let started = std::time::Instant::now();
+        let stt = Self {
             mel: VoxtralMel::new(device),
-            encoder: FastEncoder::load(loader, max_tokens * DOWNSAMPLE, device),
-            decoder: FastDecoder::load(loader, max_tokens, device),
+            encoder: FastEncoder::load(loader, max_tokens * DOWNSAMPLE, weights, device),
+            decoder: FastDecoder::load(loader, max_tokens, weights, device),
             tekken,
             device: device.clone(),
+        };
+        #[cfg(feature = "voxtral-cuda")]
+        if weights == Weights::Nvfp4 {
+            B::sync(device).unwrap_or_else(|error| panic!("Voxtral load sync: {error:?}"));
+            let copies: Vec<&Fp4> = stt
+                .decoder
+                .layers
+                .iter()
+                .map(|l| (&l.attn, &l.mlp))
+                .chain(stt.encoder.layers.iter().map(|(a, m)| (a, m)))
+                .flat_map(|(a, m)| [&a.qkv_fp4, &a.o_fp4, &m.gate_up_fp4, &m.down_fp4])
+                .flatten()
+                .collect();
+            eprintln!(
+                "[voxtral] NVFP4 weights: {} projections, {} bytes resident, loaded and quantized in {:.3}s",
+                copies.len(),
+                copies.iter().map(|q| q.bytes()).sum::<u64>(),
+                started.elapsed().as_secs_f64()
+            );
         }
+        stt
     }
 }
 
@@ -880,8 +1062,16 @@ mod wide_qkv_tests {
         let loader = WeightLoader::Pile(weights);
         let mut norm = vec![f16::ONE; k];
         norm[0] = f16::from_f32(2.0);
-        let attn = FastAttention::<RawHalf>::load(&loader, "attn", (h, kv, d), false, layout,
-            Tensor::from_data(TensorData::new(norm, [k]), &device), &device);
+        let attn = FastAttention::<RawHalf>::load(
+            &loader,
+            "attn",
+            (h, kv, d),
+            false,
+            layout,
+            Tensor::from_data(TensorData::new(norm, [k]), &device),
+            Weights::F16,
+            &device,
+        );
         drop(loader);
         assert!(attn.qkv_bias.is_none()); // This is the unbiased decoder path.
         let width = if layout == QkvLayout::Compact { 6144 } else { 11264 };
@@ -1047,6 +1237,8 @@ mod gate_up_tests {
                 bias: Some(Tensor::<RawHalf, 3>::full([1, 1, k], 0.0625, &device)),
             },
             inter,
+            gate_up_fp4: None,
+            down_fp4: None,
         };
         let old_gu = h.clone().matmul(gu_tensor.clone());
         let expected =
@@ -1100,7 +1292,8 @@ mod gemv_loaded_tests {
         let snapshot = crate::model_collection::load_model_collection_local_latest(&pile)?;
         let loader = super::super::VoxtralWeights::from_snapshot(snapshot)?.into_loader();
         let device = Device::default();
-        let decoder = FastDecoder::<RawHalf>::load(&loader, crate::hear::MAX_TOKENS, &device);
+        let decoder =
+            FastDecoder::<RawHalf>::load(&loader, crate::hear::MAX_TOKENS, Weights::F16, &device);
         RawHalf::sync(&device).map_err(|error| anyhow::anyhow!("decoder load sync: {error:?}"))?;
         let loaded_seconds = started.elapsed().as_secs_f64();
         // Genuine owned tensors, not fabricated input bindings. They establish
