@@ -1,5 +1,7 @@
 //! CUDA logits policy follows the pinned suppress/temperature/top-k/top-p path.
-//! Only a seeded uniform scalar and the final sampled ID cross the host seam.
+//! Only a seeded uniform scalar crosses the host seam per sample. Sampled IDs
+//! land in device slots: a frame's sixteen reach the host in one read at its
+//! end, and its backbone code in a copy the host waits for behind more work.
 //! SplitMix64 categorical draws are NOT Torch RNG-coordinate parity.
 use super::{
     cuda_ops::{Tensor, count, grid},
@@ -7,7 +9,7 @@ use super::{
 };
 use anyhow::{Result, ensure};
 use burn::tensor::DType;
-use cubecl::{cuda::CudaRuntime, prelude::*};
+use cubecl::{cuda::CudaRuntime, prelude::*, server::Handle};
 
 #[cube(launch_unchecked)]
 fn cfg_kernel(
@@ -76,39 +78,52 @@ impl Sampler {
         // Midpoints avoid exact zero and one in the F32 transport.
         ((z >> 41) as f32 + 0.5) / 8388608.0
     }
-    pub(super) fn sample_guided(
+    /// Writes the sampled ID into `ids[slot]` on the device and reads nothing
+    /// back. Same kernels and the same single uniform draw per sample as
+    /// before; only the destination of `choose_kernel`'s one word moved.
+    pub(super) fn sample_guided_into(
         &mut self,
         positive: &Tensor,
         negative: Option<&Tensor>,
         options: &GenerationOptions,
         history: &[u32],
         backbone: bool,
-    ) -> Result<u32> {
+        ids: &Handle,
+        slot: usize,
+    ) -> Result<()> {
         ensure!(
             negative.is_some() == (options.cfg_scale != 1.0),
             "CFG branch/scale mismatch"
         );
         match negative {
-            Some(negative) => self.sample(
+            Some(negative) => self.sample_into(
                 &cfg_logits(positive, negative, options.cfg_scale)?,
                 options,
                 history,
                 backbone,
+                ids,
+                slot,
             ),
-            None => self.sample(positive, options, history, backbone),
+            None => self.sample_into(positive, options, history, backbone, ids, slot),
         }
     }
-    pub(super) fn sample(
+    pub(super) fn sample_into(
         &mut self,
         logits: &Tensor,
         o: &GenerationOptions,
         history: &[u32],
         backbone: bool,
-    ) -> Result<u32> {
+        ids: &Handle,
+        slot: usize,
+    ) -> Result<()> {
         let n = count(logits);
         ensure!(
             n == if backbone { 2052 } else { 2051 },
             "unexpected audio head width"
+        );
+        ensure!(
+            (slot as u64 + 1) * 4 <= ids.size_in_used(),
+            "sample slot outside the ID buffer"
         );
         let mut seen = vec![0u32; n];
         for &id in history {
@@ -118,9 +133,10 @@ impl Sampler {
         let seen = logits.client.create_from_slice(u32::as_bytes(&seen));
         let values = logits.client.empty(n * 4);
         let masses = logits.client.empty(n * 4);
-        let output = logits.client.empty(4);
+        let output = ids.clone().offset_start(slot as u64 * 4);
         let uniform = self.uniform();
-        // All arrays are fresh bounded vocabulary scratch, not weight aliases.
+        // All arrays are fresh bounded vocabulary scratch, not weight aliases;
+        // the output is one in-bounds u32 slot of the caller's ID buffer.
         unsafe {
             adjust_kernel::launch_unchecked::<CudaRuntime>(
                 &logits.client,
@@ -149,24 +165,89 @@ impl Sampler {
                 CubeDim::new_1d(1),
                 ArrayArg::from_raw_parts(values, n),
                 ArrayArg::from_raw_parts(masses, n),
-                ArrayArg::from_raw_parts(output.clone(), 1),
+                ArrayArg::from_raw_parts(output, 1),
                 n,
                 o.top_p,
                 uniform,
                 o.do_sample,
             );
         }
-        let bytes = logits
-            .client
-            .read_one(output)
-            .map_err(|e| anyhow::anyhow!("CUDA sample read: {e:?}"))?;
-        let word = bytes
-            .get(..4)
-            .ok_or_else(|| anyhow::anyhow!("short CUDA sample read"))?;
-        let id = u32::from_ne_bytes(word.try_into()?);
+        Ok(())
+    }
+    #[cfg(test)]
+    pub(super) fn sample_guided(
+        &mut self,
+        positive: &Tensor,
+        negative: Option<&Tensor>,
+        options: &GenerationOptions,
+        history: &[u32],
+        backbone: bool,
+    ) -> Result<u32> {
+        let ids = positive.client.empty(4);
+        self.sample_guided_into(positive, negative, options, history, backbone, &ids, 0)?;
+        let [id] = read_ids::<1>(&positive.client, ids)?;
         ensure!(id != u32::MAX, "nonfinite/empty CUDA sampling distribution");
         Ok(id)
     }
+    #[cfg(test)]
+    pub(super) fn sample(
+        &mut self,
+        logits: &Tensor,
+        o: &GenerationOptions,
+        history: &[u32],
+        backbone: bool,
+    ) -> Result<u32> {
+        let ids = logits.client.empty(4);
+        self.sample_into(logits, o, history, backbone, &ids, 0)?;
+        let [id] = read_ids::<1>(&logits.client, ids)?;
+        ensure!(id != u32::MAX, "nonfinite/empty CUDA sampling distribution");
+        Ok(id)
+    }
+}
+
+/// Queues the copy of `ids[slot]` to the host now and returns the wait for it,
+/// so the caller can queue more device work before blocking. The returned
+/// value is raw, like [`read_ids`]. Always call the wait: the copy is in flight.
+pub(super) fn read_id_later<'c>(
+    client: &'c ComputeClient<CudaRuntime>,
+    ids: &Handle,
+    slot: usize,
+) -> Result<impl FnOnce() -> Result<u32> + use<'c>> {
+    let size = ids.size_in_used();
+    let end = (slot as u64 + 1) * 4;
+    ensure!(end <= size, "sample slot outside the ID buffer");
+    let view = ids
+        .clone()
+        .offset_start(slot as u64 * 4)
+        .offset_end(size - end);
+    let pending = client.read_async(vec![view]);
+    Ok(move || {
+        let bytes = cubecl::future::block_on(pending)
+            .map_err(|e| anyhow::anyhow!("CUDA sample read: {e:?}"))?;
+        let word = bytes
+            .first()
+            .and_then(|bytes| bytes.get(..4))
+            .ok_or_else(|| anyhow::anyhow!("short CUDA sample read"))?;
+        Ok(u32::from_ne_bytes(word.try_into()?))
+    })
+}
+
+/// The one host read of a buffer of sampled IDs. Values are returned raw:
+/// `u32::MAX` (an empty or nonfinite distribution) and reserved codes are the
+/// caller's to refuse, in the order its own termination rules give them.
+pub(super) fn read_ids<const N: usize>(
+    client: &ComputeClient<CudaRuntime>,
+    ids: Handle,
+) -> Result<[u32; N]> {
+    let bytes = client
+        .read_one(ids)
+        .map_err(|e| anyhow::anyhow!("CUDA sample read: {e:?}"))?;
+    ensure!(bytes.len() >= N * 4, "short CUDA sample read");
+    let mut out = [0u32; N];
+    for (id, word) in out.iter_mut().zip(bytes.chunks_exact(4)) {
+        *id = u32::from_ne_bytes(word.try_into()?);
+    }
+    Ok(out)
 }
 
 #[cube(launch_unchecked)]
@@ -308,6 +389,89 @@ mod tests {
             assert!(u > 0.0 && u < 1.0);
             assert_eq!(u, b.uniform());
         }
+    }
+
+    #[test]
+    #[ignore = "actual CUDA device 0 requires ordinary Stars lock"]
+    fn cuda_device_slots_keep_samples_and_random_stream() {
+        use cubecl::{Runtime, cuda::CudaDevice};
+        let device = CudaDevice { index: 0 };
+        let client = CudaRuntime::client(&device);
+        // A backbone head and fifteen depth heads, each a spread distribution
+        // with one planted maximum, so greedy and seeded draws both matter.
+        let heads: Vec<(Tensor, bool, u32)> = (0..16usize)
+            .map(|slot| {
+                let n = if slot == 0 { 2052 } else { 2051 };
+                let planted = (slot * 131 + 7) % 2048;
+                let values: Vec<f32> = (0..n)
+                    .map(|i| match i {
+                        i if i == planted => 6.0,
+                        _ => ((i * 7919 + slot * 104729) % 1000) as f32 / 250.0,
+                    })
+                    .collect();
+                let logits = Tensor::new_contiguous(
+                    client.clone(),
+                    device.clone(),
+                    [1, 1, n].into(),
+                    client.create_from_slice(f32::as_bytes(&values)),
+                    DType::F32,
+                );
+                (logits, slot == 0, planted as u32)
+            })
+            .collect();
+        let history = [3u32, 17, 2051];
+        let history_for = |backbone: bool| if backbone { &history[..] } else { &[][..] };
+        let mut greedy = GenerationOptions::default();
+        greedy.do_sample = false;
+        for options in [GenerationOptions::default(), greedy.clone()] {
+            let mut returned = Sampler::new(7);
+            let expected: Vec<u32> = heads
+                .iter()
+                .map(|(logits, backbone, _)| {
+                    returned
+                        .sample(logits, &options, history_for(*backbone), *backbone)
+                        .unwrap()
+                })
+                .collect();
+            // Slots 1..=16 of eighteen; the outer two must stay untouched.
+            let ids = client.create_from_slice(u32::as_bytes(&[0xdead_beef_u32; 18]));
+            let mut sampler = Sampler::new(7);
+            for (slot, (logits, backbone, _)) in heads.iter().enumerate() {
+                sampler
+                    .sample_into(
+                        logits,
+                        &options,
+                        history_for(*backbone),
+                        *backbone,
+                        &ids,
+                        slot + 1,
+                    )
+                    .unwrap();
+            }
+            // Single-slot copies queued before, waited for after, the full read.
+            let ninth = read_id_later(&client, &ids, 9).unwrap();
+            let last = read_id_later(&client, &ids, 17).unwrap();
+            assert!(read_id_later(&client, &ids, 18).is_err());
+            let got: [u32; 18] = read_ids(&client, ids).unwrap();
+            assert_eq!((ninth().unwrap(), last().unwrap()), (got[9], 0xdead_beef));
+            assert_eq!((got[0], got[17]), (0xdead_beef, 0xdead_beef));
+            assert_eq!(&got[1..17], &expected[..]);
+            if !options.do_sample {
+                let planted: Vec<u32> = heads.iter().map(|h| h.2).collect();
+                assert_eq!(&got[1..17], &planted[..]);
+            } else {
+                assert!(got[1..17].windows(2).any(|w| w[0] != w[1]));
+            }
+            // One uniform per sample on both paths: the streams stay aligned.
+            assert_eq!(returned.uniform(), sampler.uniform());
+        }
+        let short = client.empty(16 * 4);
+        let (logits, _, _) = &heads[1];
+        assert!(
+            Sampler::new(7)
+                .sample_into(logits, &greedy, &[], false, &short, 16)
+                .is_err()
+        );
     }
 
     #[test]
