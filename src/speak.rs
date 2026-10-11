@@ -601,7 +601,7 @@ mod breeze_transport_tests {
             std::fs::create_dir(&output)?; // exclusive new run; preserve old evidence
             let config = BreezeVoiceConfig {
                 quantization: crate::persist::QUANTIZATION_NVFP4.to_owned(),
-                lane: Default::default(),
+                lane: crate::models::breeze::PROMPT_LANE,
                 reference_wav: reference_wav.clone(),
                 reference_text: std::fs::read_to_string(&transcript)?,
                 direction: None,

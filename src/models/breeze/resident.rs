@@ -33,7 +33,8 @@ use crate::{
 pub struct BreezeVoiceConfig {
     /// The stored weight-format label to select (`persist::QUANTIZATION_NVFP4`).
     pub quantization: String,
-    /// How projections stored as NVFP4 multiply prompt-height activations.
+    /// How projections stored as NVFP4 multiply prompt-height activations
+    /// (`breeze::PROMPT_LANE` unless a comparison asks otherwise).
     pub lane: PromptLane,
     pub reference_wav: PathBuf,
     /// Known transcript, not an ASR request. Outer whitespace is stripped once.
@@ -282,7 +283,7 @@ fn frame_budget(text: &str, configured: usize) -> usize {
 pub(crate) fn test_config() -> BreezeVoiceConfig {
     BreezeVoiceConfig {
         quantization: crate::persist::QUANTIZATION_NVFP4.to_owned(),
-        lane: PromptLane::default(),
+        lane: super::PROMPT_LANE,
         reference_wav: PathBuf::from("request-reference.wav"),
         reference_text: "Known reference words.".to_owned(),
         direction: None,

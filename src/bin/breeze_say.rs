@@ -47,9 +47,9 @@ struct Args {
     /// the device at load. NVFP4-stored projections are bound as stored.
     #[arg(long, default_value = "bf16")]
     weights: String,
-    /// How NVFP4 projections multiply prompt-height activations: `w4a16` or
-    /// `w4a4`.
-    #[arg(long, default_value = "w4a16")]
+    /// How NVFP4 projections multiply prompt-height activations: `w4a4`
+    /// (Breeze's default, `breeze::PROMPT_LANE`) or `w4a16`.
+    #[arg(long, default_value = "w4a4")]
     lane: String,
     #[arg(long)]
     model_root: Option<String>,

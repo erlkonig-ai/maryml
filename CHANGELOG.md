@@ -10,7 +10,7 @@
   leaf (`models_import`, packed on the host and gated byte for byte against
   the device quantizer) and copied to device memory once at load; nothing
   else changes precision. The prompt pass (more than eight activation rows) runs on the
-  same four-bit planes (`nn::nvfp4_gemm`, W4A16 by default, W4A4 selectable),
+  same four-bit planes (`nn::nvfp4_gemm`: W4A4 for Breeze, W4A16 for Voxtral),
   so no 16-bit copy of a projection is resident. Importers publish into an
   explicit collection handle after a WRITE admission check
   (`model_collection::publish_model_fragment_into`). `nvfp4::pack_nearest`

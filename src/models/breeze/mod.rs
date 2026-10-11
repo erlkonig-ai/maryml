@@ -32,5 +32,12 @@ mod text_encoder;
 pub const SOURCE: &str = "BreezeBlue/Breeze-TTS-2";
 pub const REVISION: &str = "3e28c5151381a722f1d8661b4118c298caa77aa4";
 
+/// How Breeze's stored NVFP4 projections multiply prompt-height activations:
+/// four-bit activations into the block-scaled four-bit MMA. JP chose it by ear
+/// over W4A16 on 2026-10-11 ("everything sounded great"). Voxtral keeps
+/// W4A16, the shared default (`nvfp4::PromptLane::default`).
+#[cfg(feature = "breeze-cuda")]
+pub const PROMPT_LANE: crate::nvfp4::PromptLane = crate::nvfp4::PromptLane::W4a4;
+
 #[cfg(all(test, feature = "import"))]
 mod tests;
