@@ -1357,6 +1357,53 @@ mod tests {
     }
 
     #[test]
+    fn publication_into_a_named_handle_requires_write_admission() {
+        let path = TestPile::new();
+        let mut pile = Pile::open(&path.0).unwrap();
+        let root = SigningKey::from_bytes(&[0x81; 32]);
+        let outsider = SigningKey::from_bytes(&[0x82; 32]);
+        let collection = pile
+            .collection("models", direct_model_policy(root.verifying_key()))
+            .unwrap();
+        let hex: String = collection
+            .handle()
+            .raw
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let handle = parse_collection_handle(&format!("blake3:{hex}")).unwrap();
+        assert_eq!(parse_collection_handle(&hex).unwrap(), handle);
+        for bad in ["", "blake3:", "xyz", &hex[..63]] {
+            assert!(parse_collection_handle(bad).is_err(), "{bad:?}");
+        }
+        let snapshot = pile.snapshot().unwrap();
+        assert_eq!(open_model_collection(&snapshot, handle).unwrap(), collection);
+        drop(snapshot);
+
+        let refused = publish_model_fragment_into(
+            &mut pile,
+            &outsider,
+            collection,
+            entity! { metadata::name: "an outsider's model" },
+        )
+        .unwrap_err();
+        assert!(refused.to_string().contains("not admitted"), "{refused:#}");
+        publish_model_fragment_into(
+            &mut pile,
+            &root,
+            collection,
+            entity! { metadata::name: "an admitted model" },
+        )
+        .unwrap();
+        let snapshot = pile.snapshot().unwrap();
+        let models = snapshot_model_collection_for(&snapshot, collection).unwrap();
+        assert_eq!(models.support().len(), 1);
+        drop(models);
+        drop(snapshot);
+        pile.close().unwrap();
+    }
+
+    #[test]
     fn named_collection_discovery_keeps_current_collection_without_admitted_commits() {
         let path = TestPile::new();
         let mut pile = Pile::open(&path.0).unwrap();
