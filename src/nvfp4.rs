@@ -227,6 +227,41 @@ impl Packed {
     }
 }
 
+/// A projection packed for storage as a `Tensor<NVFP4, 2>` leaf.
+#[derive(Clone, Debug)]
+pub struct StoredProjection {
+    /// The tensor name the leaf is stored under.
+    pub name: String,
+    /// `[out, in]`.
+    pub shape: [u64; 2],
+    /// Codes, block scales and global scale (see [`Packed::payload`]).
+    pub payload: Vec<u8>,
+}
+
+/// How a projection stored as NVFP4 multiplies an activation taller than the
+/// GEMV's eight rows (the prompt pass). Both read the stored four-bit planes;
+/// neither keeps a 16-bit copy of the weight (`nn::nvfp4_gemm`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PromptLane {
+    /// Activations quantized per 16 to E2M1 with E4M3 scales, both operands
+    /// into the block-scaled four-bit tensor-core MMA.
+    W4a4,
+    /// Activations stay 16-bit; weights are decoded to 16 bits in registers
+    /// for the 16-bit MMA.
+    #[default]
+    W4a16,
+}
+
+impl PromptLane {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "w4a4" => Ok(Self::W4a4),
+            "w4a16" => Ok(Self::W4a16),
+            other => anyhow::bail!("NVFP4 prompt lane must be w4a4 or w4a16, not {other:?}"),
+        }
+    }
+}
+
 /// Round-to-nearest NVFP4 of a row-major `[rows, cols]` matrix under one
 /// global scale, block scales from each block's maximum.
 pub fn pack_nearest(w: &[f32], cols: usize) -> Result<Packed> {

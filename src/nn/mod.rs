@@ -26,6 +26,10 @@ pub mod nvfp4_cosine;
 /// reads them, shared by Breeze (BF16) and Voxtral's hearing model (F16).
 #[cfg(any(feature = "breeze-cuda", feature = "voxtral-cuda"))]
 pub(crate) mod nvfp4_gemv;
+/// The prompt pass (more than eight activation rows) on the same stored
+/// NVFP4 planes: W4A4 block-scaled MMA or W4A16 with in-register decode.
+#[cfg(any(feature = "breeze-cuda", feature = "voxtral-cuda"))]
+pub mod nvfp4_gemm;
 // Share the existing raw CUDA launcher without enabling the Inkling model.
 #[cfg(feature = "nvfp4-encode-cuda")]
 #[path = "../models/inkling/rawcuda.rs"]

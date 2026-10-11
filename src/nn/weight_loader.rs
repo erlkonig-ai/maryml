@@ -510,6 +510,18 @@ impl WeightLoader {
         )?))
     }
 
+    /// The typed leaf behind `name`, for a consumer that binds its stored
+    /// bytes itself (a stored NVFP4 projection). Only the leaf-indexed
+    /// loaders have one; the others answer `None`.
+    pub fn leaf(&self, name: &str) -> Option<&crate::leaf::Leaf> {
+        match self {
+            WeightLoader::Typed(map) => map.get(name),
+            #[cfg(all(any(feature = "qwen3tts", feature = "voxtral"), target_os = "macos"))]
+            WeightLoader::Aliased(pile) => pile.leaf(name),
+            _ => None,
+        }
+    }
+
     pub fn load_tensor<B: Backend, const D: usize>(
         &self,
         name: &str,

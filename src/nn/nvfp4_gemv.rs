@@ -110,7 +110,7 @@ fn amax_kernel<E: Scalar + Cast>(
 /// at whatever offset its leaf has in the pile, and that seam promises
 /// four-byte alignment, not the sixteen a vector load would need.
 #[cube(launch_unchecked)]
-fn quantize_kernel<E: Scalar + Cast>(
+pub(crate) fn quantize_kernel<E: Scalar + Cast>(
     w: &Array<E>,
     codes: &mut Array<u32>,
     scales: &mut Array<e4m3>,
@@ -322,6 +322,120 @@ impl Nvfp4 {
             k,
             dtype: w.dtype,
             device: w.device.clone(),
+        })
+    }
+
+    /// A weight whose planes already sit on the device: the code and scale
+    /// aliases of a stored NVFP4 leaf (`cuda_bf16_alias::bind_nvfp4_leaf`).
+    /// `dtype` is the 16-bit type of the activations it multiplies.
+    pub(crate) fn from_parts(
+        codes: Handle,
+        scales: Handle,
+        scale2: f32,
+        n: usize,
+        k: usize,
+        dtype: DType,
+        device: CudaDevice,
+    ) -> Result<Self> {
+        ensure!(
+            n > 0 && k > 0 && k % CHUNK == 0,
+            "NVFP4 weight [{n}, {k}] needs k a multiple of {CHUNK}"
+        );
+        ensure!(
+            matches!(dtype, DType::BF16 | DType::F16),
+            "NVFP4 weights multiply BF16 or F16 activations, not {dtype:?}"
+        );
+        ensure!(
+            scale2.is_finite() && scale2 > 0.0,
+            "NVFP4 global scale {scale2} is not a positive finite number"
+        );
+        ensure!(
+            codes.size_in_used() >= (n * k / 2) as u64 && scales.size_in_used() >= (n * k / GROUP) as u64,
+            "NVFP4 planes are shorter than [{n}, {k}]"
+        );
+        Ok(Self {
+            codes,
+            scales,
+            scale2,
+            n,
+            k,
+            dtype,
+            device,
+        })
+    }
+
+    /// Output rows.
+    pub(crate) fn n(&self) -> usize {
+        self.n
+    }
+
+    /// Input columns.
+    pub(crate) fn k(&self) -> usize {
+        self.k
+    }
+
+    /// The 16-bit type of the activations and outputs.
+    pub(crate) fn dtype(&self) -> DType {
+        self.dtype
+    }
+
+    pub(crate) fn device(&self) -> &CudaDevice {
+        &self.device
+    }
+
+    /// The code and scale planes as host bytes: what an exporter gates a host
+    /// packing against.
+    pub(crate) fn read_planes(&self, client: &ComputeClient<CudaRuntime>) -> Result<(Vec<u8>, Vec<u8>)> {
+        let codes = client
+            .read_one(self.codes.clone())
+            .map_err(|e| anyhow::anyhow!("NVFP4 code readback: {e:?}"))?;
+        let scales = client
+            .read_one(self.scales.clone())
+            .map_err(|e| anyhow::anyhow!("NVFP4 scale readback: {e:?}"))?;
+        Ok((
+            codes[..self.n * self.k / 2].to_vec(),
+            scales[..self.n * self.k / GROUP].to_vec(),
+        ))
+    }
+
+    /// Pack `values` (this weight's `[n, k]` row-major 16-bit values, widened
+    /// exactly to f32) on the host for storage, and require the host planes
+    /// to equal this device copy's byte for byte and its global scale bit for
+    /// bit. The host packing is what gets stored; the device quantizer, which
+    /// is what the runtime used before projections were stored packed, is the
+    /// reference it must reproduce.
+    pub(crate) fn pack_matching(
+        &self,
+        name: &str,
+        values: &[f32],
+    ) -> Result<crate::nvfp4::StoredProjection> {
+        ensure!(
+            values.len() == self.n * self.k,
+            "{name}: {} values for an [{}, {}] weight",
+            values.len(),
+            self.n,
+            self.k
+        );
+        let packed = crate::nvfp4::pack_nearest(values, self.k)?;
+        let client = CudaRuntime::client(&self.device);
+        let (codes, scales) = self.read_planes(&client)?;
+        let bad_codes = codes.iter().zip(&packed.codes).filter(|(a, b)| a != b).count();
+        let bad_scales = scales.iter().zip(&packed.scales).filter(|(a, b)| a != b).count();
+        ensure!(
+            self.scale2.to_bits() == packed.scale2.to_bits()
+                && codes.len() == packed.codes.len()
+                && scales.len() == packed.scales.len()
+                && bad_codes == 0
+                && bad_scales == 0,
+            "{name}: host packing differs from the device quantizer \
+             ({bad_codes} code bytes, {bad_scales} scale bytes, scale2 {} vs {})",
+            packed.scale2,
+            self.scale2
+        );
+        Ok(crate::nvfp4::StoredProjection {
+            name: name.to_owned(),
+            shape: [self.n as u64, self.k as u64],
+            payload: packed.payload(),
         })
     }
 

@@ -1,7 +1,8 @@
-//! Strict native BF16 pile -> raw CUDA tensor binding.
+//! Strict native BF16 and NVFP4 pile -> raw CUDA tensor binding.
 //!
 //! Query the required typed leaf at the consuming model slot, fetch its
-//! `Blob<Tensor<BF16, R>>` from the frozen store, then bind it here. This module
+//! `Blob<Tensor<BF16, R>>` (or `Blob<Tensor<NVFP4, 2>>`, whose code and scale
+//! planes become two aliases) from the frozen store, then bind it here. This module
 //! owns CUDA registrations, not a catalogue of model facts. There is no upload,
 //! dtype conversion, source-file reopen, or CPU model path.
 //!
@@ -32,7 +33,7 @@ use memmap2::MmapRaw;
 use std::sync::Arc;
 use triblespace::core::blob::{
     Blob,
-    encodings::tensor::{MAX_RANK, TENSOR_HEADER_LEN, Tensor, elements::BF16},
+    encodings::tensor::{MAX_RANK, TENSOR_HEADER_LEN, Tensor, elements::{BF16, NVFP4}},
 };
 
 /// Successful binds, including repeated binds, are counted explicitly.
@@ -144,28 +145,114 @@ impl CudaBf16Aliases {
         let shape = checked_shape(&blob)?;
         let view = crate::leaf::read_leaf(blob).map_err(|e| e.to_string())?;
         let payload = view.payload();
-        let address = payload.as_ptr() as usize;
-        let owner = payload.clone().downcast_to_owner::<MmapRaw>()
-            .map_err(|_| "BF16 tensor is not backed by a pile MmapRaw owner".to_string())?;
-        if !address.is_multiple_of(256) {
+        if !(payload.as_ptr() as usize).is_multiple_of(256) {
             return Err("BF16 tensor payload is not 256-byte aligned".into());
+        }
+        // SAFETY: forwarded genuine immutable pile-prefix contract.
+        let handle = unsafe { self.register(payload, 0, payload.len())? };
+        Ok(CubeTensor::new_contiguous(
+            self.client.clone(), self.device.clone(), shape.as_slice().into(), handle, DType::BF16,
+        ))
+    }
+
+    /// Bind a stored NVFP4 matrix `[n, k]` as the resident four-bit weight the
+    /// GEMV and the prompt GEMM read: its code plane and its E4M3 scale plane
+    /// become two aliases of the pile mapping, and the trailing f32 global
+    /// scale is read on the host. Nothing is uploaded or converted. `dtype` is
+    /// the 16-bit type of the activations it will multiply (BF16 or F16).
+    ///
+    /// # Safety
+    /// The same pile custody contract as [`Self::bind_pile_leaf`].
+    #[cfg(any(feature = "breeze-cuda", feature = "voxtral-cuda"))]
+    pub(crate) unsafe fn bind_nvfp4_leaf(
+        &mut self,
+        blob: Blob<Tensor<NVFP4, 2>>,
+        dtype: DType,
+    ) -> Result<crate::nn::nvfp4_gemv::Nvfp4, String> {
+        let view = crate::leaf::read_leaf(blob).map_err(|e| e.to_string())?;
+        let dims = [view.dims()[0], view.dims()[1]];
+        // SAFETY: forwarded genuine immutable pile-prefix contract.
+        unsafe { self.bind_nvfp4_payload(view.payload(), dims, dtype) }
+    }
+
+    /// [`Self::bind_nvfp4_leaf`] for a payload already resolved to its leaf
+    /// (`crate::leaf::Leaf`): the `Tensor<NVFP4, 2>` payload of `dims`.
+    ///
+    /// # Safety
+    /// The same pile custody contract as [`Self::bind_pile_leaf`].
+    #[cfg(any(feature = "breeze-cuda", feature = "voxtral-cuda"))]
+    pub(crate) unsafe fn bind_nvfp4_payload(
+        &mut self,
+        payload: &anybytes::Bytes,
+        dims: [u64; 2],
+        dtype: DType,
+    ) -> Result<crate::nn::nvfp4_gemv::Nvfp4, String> {
+        let (n, k) = (
+            usize::try_from(dims[0]).map_err(|_| "NVFP4 rows exceed usize")?,
+            usize::try_from(dims[1]).map_err(|_| "NVFP4 columns exceed usize")?,
+        );
+        let elements = n.checked_mul(k).filter(|&e| e > 0 && e <= u32::MAX as usize)
+            .ok_or("NVFP4 alias requires a nonempty shape in the u32 kernel index domain")?;
+        if !k.is_multiple_of(32) {
+            return Err(format!("NVFP4 alias needs k a multiple of 32, got {k}"));
+        }
+        if !(payload.as_ptr() as usize).is_multiple_of(256) {
+            return Err("NVFP4 tensor payload is not 256-byte aligned".into());
+        }
+        let (codes_len, scales_len) = (elements / 2, elements / 16);
+        if payload.len() != codes_len + scales_len + 4 {
+            return Err(format!(
+                "NVFP4 payload has {} bytes; [{n}, {k}] requires {}",
+                payload.len(), codes_len + scales_len + 4
+            ));
+        }
+        let tail = &payload[codes_len + scales_len..];
+        let scale2 = f32::from_le_bytes(tail.try_into().expect("four trailing bytes"));
+        // SAFETY: forwarded genuine immutable pile-prefix contract.
+        let codes = unsafe { self.register(payload, 0, codes_len)? };
+        let scales = unsafe { self.register(payload, codes_len, scales_len)? };
+        crate::nn::nvfp4_gemv::Nvfp4::from_parts(
+            codes, scales, scale2, n, k, dtype, self.device.clone(),
+        ).map_err(|e| e.to_string())
+    }
+
+    /// Register `payload[start..start + size]` once and return its handle.
+    ///
+    /// # Safety
+    /// `payload` must be a slice of a genuine validated pile mapping whose
+    /// bytes, from the containing page on, stay immutable through CUDA
+    /// runtime/storage teardown (see [`Self::bind_pile_leaf`]).
+    unsafe fn register(
+        &mut self,
+        payload: &anybytes::Bytes,
+        start: usize,
+        size: usize,
+    ) -> Result<Handle, String> {
+        if size == 0 || start.checked_add(size).is_none_or(|end| end > payload.len()) {
+            return Err("alias span is empty or outside its payload".into());
+        }
+        let address = payload.as_ptr() as usize + start;
+        let owner = payload.clone().downcast_to_owner::<MmapRaw>()
+            .map_err(|_| "tensor is not backed by a pile MmapRaw owner".to_string())?;
+        if !address.is_multiple_of(4) {
+            return Err("alias span is not 4-byte aligned".into());
         }
         let base = owner.as_ptr() as usize;
         let length = owner.len();
         let page_start = address - address % self.page_size;
-        let end = address.checked_add(payload.len()).ok_or("BF16 payload address overflow")?;
+        let end = address.checked_add(size).ok_or("alias address overflow")?;
         let map_end = base.checked_add(length).ok_or("pile mapping address overflow")?;
         if page_start < base || end > map_end {
-            return Err("BF16 payload/page prefix lies outside its actual mmap owner".into());
+            return Err("alias span/page prefix lies outside its actual mmap owner".into());
         }
         let payload_offset = address - base;
-        let offset = u64::try_from(address - page_start).map_err(|_| "BF16 offset exceeds u64")?;
-        let size = u64::try_from(payload.len()).map_err(|_| "BF16 payload exceeds u64")?;
+        let offset = u64::try_from(address - page_start).map_err(|_| "alias offset exceeds u64")?;
+        let size = u64::try_from(size).map_err(|_| "alias span exceeds u64")?;
         let map_size = u64::try_from(length).map_err(|_| "pile mapping exceeds u64")?;
-        let span_size = offset.checked_add(size).ok_or("BF16 registered span overflow")?;
-        let bindings = self.stats.bindings.checked_add(1).ok_or("BF16 bind counter overflow")?;
+        let span_size = offset.checked_add(size).ok_or("registered span overflow")?;
+        let bindings = self.stats.bindings.checked_add(1).ok_or("bind counter overflow")?;
         let aliased_bytes = self.stats.aliased_bytes.checked_add(size)
-            .ok_or("BF16 alias-byte counter overflow")?;
+            .ok_or("alias-byte counter overflow")?;
 
         let index = if let Some(index) = self.registrations.iter().position(|entry| {
             Arc::ptr_eq(&entry.owner, &owner)
@@ -175,20 +262,20 @@ impl CudaBf16Aliases {
             index
         } else {
             if self.registrations.len() == self.max_registrations {
-                return Err(format!("BF16 alias registration budget {} exhausted", self.max_registrations));
+                return Err(format!("alias registration budget {} exhausted", self.max_registrations));
             }
             let new_owner = !self.registrations.iter().any(|entry| Arc::ptr_eq(&entry.owner, &owner));
             let owners = self.stats.owners.checked_add(usize::from(new_owner))
-                .ok_or("BF16 owner counter overflow")?;
+                .ok_or("owner counter overflow")?;
             let owner_capacity_bytes = self.stats.owner_capacity_bytes
                 .checked_add(if new_owner { map_size } else { 0 })
-                .ok_or("BF16 owner-capacity counter overflow")?;
+                .ok_or("owner-capacity counter overflow")?;
             let registered_span_bytes = self.stats.registered_span_bytes.checked_add(span_size)
-                .ok_or("BF16 registered-span counter overflow")?;
+                .ok_or("registered-span counter overflow")?;
             let keepalive: Arc<dyn std::any::Any + Send + Sync> = owner.clone();
             // SAFETY: the caller establishes a genuine immutable pile prefix.
             // page_start is page-aligned and in this actual owner; the span
-            // ends exactly at the checked payload end, never beyond EOF.
+            // ends exactly at the checked span end, never beyond EOF.
             // Earlier bytes in its first page are earlier bytes of that same
             // immutable file prefix. No page-multiple LENGTH is required by
             // the CUDA implementation or the generic client's safety clause.
@@ -212,12 +299,9 @@ impl CudaBf16Aliases {
         };
         // CUDA storage has ALREADY applied offset and returned a size-byte
         // handle. Adding owner-relative handle offsets would apply them twice.
-        let handle = self.registrations[index].handle.clone();
         self.stats.bindings = bindings;
         self.stats.aliased_bytes = aliased_bytes;
-        Ok(CubeTensor::new_contiguous(
-            self.client.clone(), self.device.clone(), shape.as_slice().into(), handle, DType::BF16,
-        ))
+        Ok(self.registrations[index].handle.clone())
     }
 }
 
