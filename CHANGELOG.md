@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Breeze and Voxtral load from a model collection the caller names, as one
+  `nvfp4` root each: `BreezeResident::load` / `Synthesizer::spawn_breeze` and
+  `hear::Ears::load` take a frozen `ModelSnapshot` instead of a pile path and
+  opaque ids, and `BREEZE_WEIGHTS` / `VOXTRAL_WEIGHTS` are gone. Every linear
+  projection the runtime quantized at load is stored as a `Tensor<NVFP4, 2>`
+  leaf (`models_import`, packed on the host and gated byte for byte against
+  the device quantizer) and bound from the pile; nothing else changes
+  precision. The prompt pass (more than eight activation rows) runs on the
+  same four-bit planes (`nn::nvfp4_gemm`, W4A16 by default, W4A4 selectable),
+  so no 16-bit copy of a projection is resident. Importers publish into an
+  explicit collection handle after a WRITE admission check
+  (`model_collection::publish_model_fragment_into`). `nvfp4::pack_nearest`
+  is now the device quantizer's exact recipe.
 - Text attributes no longer use the 32-byte inline `ShortString`: module
   `kind` and root `quantization`, the Gemma LoRA projection, the Inkling code
   revision, the tokenizer's unknown token, continuing-subword prefix,
