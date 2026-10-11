@@ -17,7 +17,7 @@ use mary::{
         },
         qwen3tts::{codec::CodecDecoder, encoder::CodecEncoder},
     },
-    nn::{backend::speak::Fused, cuda_bf16_alias::CudaBf16Aliases, weight_loader::WeightLoader},
+    nn::{backend::speak::Fused, weight_loader::WeightLoader},
 };
 use std::{
     fs::OpenOptions,
@@ -61,10 +61,6 @@ struct Args {
     external_codec_root: Option<String>,
     #[arg(long)]
     external_codec_config_root: Option<String>,
-    /// Genuine pile prefix, including mapped page prefixes, must stay immutable
-    /// until CUDA process/runtime teardown. Read-only FD alone is insufficient.
-    #[arg(long)]
-    immutable_pile: bool,
     #[arg(long)]
     text: String,
     /// Official ref_edit_tata target instruction; no singing guarantee.
@@ -139,10 +135,6 @@ fn write_report(path: &Path, report: &serde_json::Value) -> Result<()> {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    ensure!(
-        args.immutable_pile,
-        "--immutable-pile custody confirmation required through CUDA teardown"
-    );
     ensure!(
         !args.report.exists()
             && args
@@ -284,23 +276,16 @@ fn main() -> Result<()> {
     );
 
     let started = Instant::now();
-    // Bounded registration resource, not a retained model-fact catalogue.
-    let mut aliases =
-        CudaBf16Aliases::new(CudaDevice { index: 0 }, 2048).map_err(anyhow::Error::msg)?;
-    // SAFETY: caller confirms genuine immutable pile custody through runtime
-    // teardown. One read-only validated source observation owns all mappings;
-    // CUDA's external storage retains actual owners, including partial pages.
-    let mut generator = unsafe {
-        Generator::from_pile(
-            &facts,
-            &store,
-            ids.model_root,
-            assets.config,
-            &mut aliases,
-            weights,
-            lane,
-        )?
-    };
+    // Every weight is copied to the device; nothing stays aliased.
+    let mut generator = Generator::from_pile(
+        &facts,
+        &store,
+        ids.model_root,
+        assets.config,
+        &CudaDevice { index: 0 },
+        weights,
+        lane,
+    )?;
     generator.synchronize()?;
     let generator_load_seconds = started.elapsed().as_secs_f64();
     let device = CudaDevice { index: 0 };
@@ -317,7 +302,6 @@ fn main() -> Result<()> {
         &result.samples,
     )?;
     let wav_write_seconds = started.elapsed().as_secs_f64();
-    let stats = aliases.stats();
     let report = serde_json::json!({
         "scope":"native Rust reference + CUDA generation + generated-only CUDA batch codec; not stateful streaming",
         "pile":args.pile,"collection":args.collection,"model_root":format!("{:X}", ids.model_root),
@@ -350,7 +334,7 @@ fn main() -> Result<()> {
         "generation_and_codec_rtf":(result.generation.total_seconds+result.codec_decode_seconds)/duration,
         "timing_scope":"cold one request; includes native CPU reference and CUDA JIT/page faults; codec load host time may defer GPU work into decode",
         "output_format":"24k mono IEEE FLOAT32 WAV; no normalization or fades",
-        "out":args.out,"alias_registrations":stats.registrations,"aliased_bytes":stats.aliased_bytes,
+        "out":args.out,"device_weight_bytes":generator.device_bytes(),
         "runtime_assets":"explicit pile identities only; request WAV/transcript are external inputs",
     });
     write_report(&args.report, &report)?;
@@ -363,7 +347,6 @@ fn main() -> Result<()> {
     generator.synchronize()?;
     drop(codec);
     drop(generator);
-    drop(aliases);
     drop(codec_loader);
     drop((facts, store));
     Ok(())

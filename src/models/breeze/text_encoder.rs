@@ -37,7 +37,7 @@ pub(super) struct TextEncoder {
     sliding_freq: Vec<f32>,
 }
 impl TextEncoder {
-    pub(super) unsafe fn bind<R: BlobStoreGet>(
+    pub(super) fn bind<R: BlobStoreGet>(
         b: &mut Binder<'_, R>,
         c: TextConfig,
         output: usize,
@@ -51,39 +51,34 @@ impl TextEncoder {
         let mut layers = Vec::with_capacity(g.num_hidden_layers);
         for i in 0..g.num_hidden_layers {
             let p = format!("text_encoder.layers.{i}");
-            // SAFETY: fixed typed consuming slots under Generator's contract.
-            layers.push(unsafe {
-                Layer {
-                    pre_attn: b.weight(&format!("{p}.pre_self_attn_layernorm.weight"), [h])?,
-                    post_attn: b.weight(&format!("{p}.post_self_attn_layernorm.weight"), [h])?,
-                    pre_ff: b.weight(&format!("{p}.pre_feedforward_layernorm.weight"), [h])?,
-                    post_ff: b.weight(&format!("{p}.post_feedforward_layernorm.weight"), [h])?,
-                    q: b.linear(&format!("{p}.self_attn.q_proj.weight"), [q, h])?,
-                    k: b.linear(&format!("{p}.self_attn.k_proj.weight"), [kv, h])?,
-                    v: b.linear(&format!("{p}.self_attn.v_proj.weight"), [kv, h])?,
-                    o: b.linear(&format!("{p}.self_attn.o_proj.weight"), [h, q])?,
-                    q_norm: b.weight(&format!("{p}.self_attn.q_norm.weight"), [d])?,
-                    k_norm: b.weight(&format!("{p}.self_attn.k_norm.weight"), [d])?,
-                    gate: b.linear(&format!("{p}.mlp.gate_proj.weight"), [f, h])?,
-                    up: b.linear(&format!("{p}.mlp.up_proj.weight"), [f, h])?,
-                    down: b.linear(&format!("{p}.mlp.down_proj.weight"), [h, f])?,
-                }
+            layers.push(Layer {
+                pre_attn: b.weight(&format!("{p}.pre_self_attn_layernorm.weight"), [h])?,
+                post_attn: b.weight(&format!("{p}.post_self_attn_layernorm.weight"), [h])?,
+                pre_ff: b.weight(&format!("{p}.pre_feedforward_layernorm.weight"), [h])?,
+                post_ff: b.weight(&format!("{p}.post_feedforward_layernorm.weight"), [h])?,
+                q: b.linear(&format!("{p}.self_attn.q_proj.weight"), [q, h])?,
+                k: b.linear(&format!("{p}.self_attn.k_proj.weight"), [kv, h])?,
+                v: b.linear(&format!("{p}.self_attn.v_proj.weight"), [kv, h])?,
+                o: b.linear(&format!("{p}.self_attn.o_proj.weight"), [h, q])?,
+                q_norm: b.weight(&format!("{p}.self_attn.q_norm.weight"), [d])?,
+                k_norm: b.weight(&format!("{p}.self_attn.k_norm.weight"), [d])?,
+                gate: b.linear(&format!("{p}.mlp.gate_proj.weight"), [f, h])?,
+                up: b.linear(&format!("{p}.mlp.up_proj.weight"), [f, h])?,
+                down: b.linear(&format!("{p}.mlp.down_proj.weight"), [h, f])?,
             });
         }
         let full_freq = frequencies(&c.full_rope, g.head_dim)?;
         let sliding_freq = frequencies(&c.sliding_rope, g.head_dim)?;
-        Ok(unsafe {
-            Self {
-                embedding: b
-                    .weight("text_encoder.embed_tokens.weight", [c.vocab_size as u64, h])?,
-                eoi: b.weight("text_encoder.embed_tokens.eoi_embedding", [h])?,
-                norm: b.weight("text_encoder.norm.weight", [h])?,
-                projection: b.linear("text_encoder_proj.weight", [output as u64, h])?,
-                config: c,
-                layers,
-                full_freq,
-                sliding_freq,
-            }
+        Ok(Self {
+            embedding: b
+                .weight("text_encoder.embed_tokens.weight", [c.vocab_size as u64, h])?,
+            eoi: b.weight("text_encoder.embed_tokens.eoi_embedding", [h])?,
+            norm: b.weight("text_encoder.norm.weight", [h])?,
+            projection: b.linear("text_encoder_proj.weight", [output as u64, h])?,
+            config: c,
+            layers,
+            full_freq,
+            sliding_freq,
         })
     }
     pub(super) fn encode(&self, ids: &[u32]) -> Result<Tensor> {

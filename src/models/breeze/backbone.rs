@@ -220,8 +220,7 @@ pub(super) struct Decoder {
     freq: Vec<f32>,
 }
 impl Decoder {
-    /// Binder forwards Generator's immutable mapped-prefix lifetime contract.
-    pub(super) unsafe fn bind<R: BlobStoreGet>(
+    pub(super) fn bind<R: BlobStoreGet>(
         b: &mut Binder<'_, R>,
         c: DecoderConfig,
         prefix: &str,
@@ -235,32 +234,29 @@ impl Decoder {
         let mut layers = Vec::with_capacity(c.num_hidden_layers);
         for i in 0..c.num_hidden_layers {
             let p = format!("{prefix}.layers.{i}");
-            // SAFETY: every fixed slot belongs to the same validated immutable pile.
-            layers.push(unsafe {
-                Layer {
-                    input: b.weight(&format!("{p}.input_layernorm.weight"), [h])?,
-                    post: b.weight(&format!("{p}.post_attention_layernorm.weight"), [h])?,
-                    q: b.linear(&format!("{p}.self_attn.q_proj.weight"), [q, h])?,
-                    k: b.linear(&format!("{p}.self_attn.k_proj.weight"), [kv, h])?,
-                    v: b.linear(&format!("{p}.self_attn.v_proj.weight"), [kv, h])?,
-                    o: b.linear(&format!("{p}.self_attn.o_proj.weight"), [h, q])?,
-                    q_norm: if qk_norm {
-                        Some(b.weight(&format!("{p}.self_attn.q_norm.weight"), [d])?)
-                    } else {
-                        None
-                    },
-                    k_norm: if qk_norm {
-                        Some(b.weight(&format!("{p}.self_attn.k_norm.weight"), [d])?)
-                    } else {
-                        None
-                    },
-                    gate: b.linear(&format!("{p}.mlp.gate_proj.weight"), [f, h])?,
-                    up: b.linear(&format!("{p}.mlp.up_proj.weight"), [f, h])?,
-                    down: b.linear(&format!("{p}.mlp.down_proj.weight"), [h, f])?,
-                }
+            layers.push(Layer {
+                input: b.weight(&format!("{p}.input_layernorm.weight"), [h])?,
+                post: b.weight(&format!("{p}.post_attention_layernorm.weight"), [h])?,
+                q: b.linear(&format!("{p}.self_attn.q_proj.weight"), [q, h])?,
+                k: b.linear(&format!("{p}.self_attn.k_proj.weight"), [kv, h])?,
+                v: b.linear(&format!("{p}.self_attn.v_proj.weight"), [kv, h])?,
+                o: b.linear(&format!("{p}.self_attn.o_proj.weight"), [h, q])?,
+                q_norm: if qk_norm {
+                    Some(b.weight(&format!("{p}.self_attn.q_norm.weight"), [d])?)
+                } else {
+                    None
+                },
+                k_norm: if qk_norm {
+                    Some(b.weight(&format!("{p}.self_attn.k_norm.weight"), [d])?)
+                } else {
+                    None
+                },
+                gate: b.linear(&format!("{p}.mlp.gate_proj.weight"), [f, h])?,
+                up: b.linear(&format!("{p}.mlp.up_proj.weight"), [f, h])?,
+                down: b.linear(&format!("{p}.mlp.down_proj.weight"), [h, f])?,
             });
         }
-        let norm = unsafe { b.weight(&format!("{prefix}.norm.weight"), [h])? };
+        let norm = b.weight(&format!("{prefix}.norm.weight"), [h])?;
         let freq = frequencies(&c.rope, c.head_dim)?;
         Ok(Self {
             config: c,

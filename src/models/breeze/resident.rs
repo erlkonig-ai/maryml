@@ -22,7 +22,7 @@ use super::{
 use crate::{
     model_collection::ModelSnapshot,
     models::qwen3tts::{codec::CodecDecoder, encoder::CodecEncoder},
-    nn::{backend::speak::Fused, cuda_bf16_alias::CudaBf16Aliases, weight_loader::WeightLoader},
+    nn::{backend::speak::Fused, weight_loader::WeightLoader},
 };
 
 /// Explicit per-resident inputs. The model is not named here: it is the
@@ -106,18 +106,15 @@ pub struct ResidentLoadReport {
     pub total_seconds: f64,
     pub reference_samples: usize,
     pub reference_frames: usize,
-    pub alias_registrations: usize,
-    pub aliased_bytes: u64,
+    /// Generator weight bytes copied to the device (BF16 and NVFP4).
+    pub device_weight_bytes: u64,
 }
 
 /// Models/reference belong to the calling worker, never a global voice owner.
-/// Fields drop GPU consumers before the local alias keeper. Independently,
-/// CubeCL retains real mmap owners through storage teardown, also on partial
-/// construction errors; neither field drop nor sync releases file custody.
+/// Every weight is a device copy; nothing aliases the store it came from.
 pub struct BreezeResident {
     generator: Generator,
     codec: CodecDecoder<Fused>,
-    _aliases: CudaBf16Aliases,
     device: CudaDevice,
     tokenizer: BreezeTokenizer,
     reference_codes: Vec<[u16; 16]>,
@@ -131,18 +128,9 @@ impl BreezeResident {
     /// Load on the same worker that will synthesize. Reference waveform input
     /// and the CPU encoder are discarded after one real native encoding.
     ///
-    /// # Safety
-    /// The selected file must be a genuine validated pile. Its aliased bytes,
-    /// including preceding partial file-backed page prefixes, must remain
-    /// immutable or append-only/untruncated until CUDA runtime/storage teardown,
-    /// including after this resident/worker drops or construction fails. A
-    /// read-only file descriptor, owned snapshot or mode0444 is not that proof.
-    ///
-    /// Every selected tensor must be resident in `models`' store: the binder
-    /// aliases only pile-mapped bytes and refuses anything else (a blob fetched
-    /// from a peer, for one), so a collection that is not fully replicated
-    /// fails here, by name, rather than loading partly.
-    pub unsafe fn load<R: BlobStoreGet>(
+    /// Every weight is copied to the device, so the store's bytes are not
+    /// needed once this returns.
+    pub fn load<R: BlobStoreGet>(
         models: &ModelSnapshot<R>,
         config: BreezeVoiceConfig,
     ) -> Result<Self> {
@@ -173,20 +161,15 @@ impl BreezeResident {
 
         let device = CudaDevice { index: 0 };
         let started = Instant::now();
-        let mut aliases = CudaBf16Aliases::new(device.clone(), 2048).map_err(anyhow::Error::msg)?;
-        // SAFETY: the caller establishes real pile custody through runtime
-        // teardown; this exact validated observation owns every selected blob.
-        let generator = unsafe {
-            Generator::from_pile(
-                facts,
-                store,
-                artifacts.model_root,
-                assets.config,
-                &mut aliases,
-                Weights::Bf16,
-                config.lane,
-            )?
-        };
+        let generator = Generator::from_pile(
+            facts,
+            store,
+            artifacts.model_root,
+            assets.config,
+            &device,
+            Weights::Bf16,
+            config.lane,
+        )?;
         generator.synchronize()?;
         let generator_load_seconds = started.elapsed().as_secs_f64();
         let started = Instant::now();
@@ -201,7 +184,6 @@ impl BreezeResident {
                 (length, started.elapsed().as_secs_f64())
             })
             .collect();
-        let stats = aliases.stats();
         let load_report = ResidentLoadReport {
             source_seconds,
             encoder_load_seconds,
@@ -212,14 +194,12 @@ impl BreezeResident {
             total_seconds: total.elapsed().as_secs_f64(),
             reference_samples,
             reference_frames,
-            alias_registrations: stats.registrations,
-            aliased_bytes: stats.aliased_bytes,
+            device_weight_bytes: generator.device_bytes(),
         };
         eprintln!("[breeze] resident loaded once: {load_report:?}");
         Ok(Self {
             generator,
             codec,
-            _aliases: aliases,
             device,
             tokenizer,
             reference_codes,
