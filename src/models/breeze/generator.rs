@@ -6,8 +6,8 @@ use super::{
     config::{Config, DecoderConfig},
     cuda_ops as ops,
     depth::Depth,
-    load::{self, Artifacts},
-    nvfp4::{Linear, Nvfp4},
+    load,
+    nvfp4::{Linear, Nvfp4, PromptLane, StoredProjection},
     prompt::GuidedPrompt,
     sampling::{self, Sampler},
     text_encoder::TextEncoder,
@@ -84,8 +84,13 @@ pub(super) struct Binder<'a, R> {
     pub root: Id,
     pub aliases: &'a mut CudaBf16Aliases,
     pub weights: Weights,
-    /// NVFP4 copies made so far and their device bytes, for the load line.
+    pub lane: PromptLane,
+    /// NVFP4 projections bound so far and their device bytes, for the load
+    /// line: stored ones are pile aliases, quantized ones were made here.
     pub nvfp4: (usize, u64),
+    /// Under export, every BF16 projection packed on the host for storage
+    /// after its codes matched the device quantizer's bit for bit.
+    pub export: Option<Vec<StoredProjection>>,
 }
 impl<R: BlobStoreGet> Binder<'_, R> {
     pub(super) unsafe fn weight<const N: usize>(
@@ -102,21 +107,47 @@ impl<R: BlobStoreGet> Binder<'_, R> {
         );
         Ok(value)
     }
-    /// A linear projection `[out, in]`: always the BF16 alias, plus a resident
-    /// NVFP4 copy quantized from it under [`Weights::Nvfp4`].
+    /// A linear projection `[out, in]`. A stored NVFP4 leaf is bound as the
+    /// only copy. Otherwise the BF16 alias, plus a resident NVFP4 copy
+    /// quantized from it under [`Weights::Nvfp4`] or under export.
     pub(super) unsafe fn linear(&mut self, name: &str, shape: [u64; 2]) -> Result<Linear> {
+        if let Some(blob) = load::find_tensor_nvfp4(self.facts, self.reader, self.root, name, shape)? {
+            // SAFETY: forwarded genuine mapped immutable-prefix contract from caller.
+            let q = unsafe { self.aliases.bind_nvfp4_leaf(blob, burn::tensor::DType::BF16) }
+                .map_err(|e| anyhow::anyhow!("{name}: {e}"))?;
+            self.nvfp4.0 += 1;
+            self.nvfp4.1 += q.bytes();
+            return Ok(Linear { bf16: None, nvfp4: Some(q), lane: self.lane });
+        }
         // SAFETY: forwarded genuine mapped immutable-prefix contract from caller.
         let bf16 = unsafe { self.weight(name, shape)? };
-        let nvfp4 = match self.weights {
-            Weights::Bf16 => None,
-            Weights::Nvfp4 => {
-                let q = Nvfp4::quantize(&bf16).map_err(|e| e.context(name.to_owned()))?;
-                self.nvfp4.0 += 1;
-                self.nvfp4.1 += q.bytes();
-                Some(q)
+        let nvfp4 = if self.weights == Weights::Nvfp4 || self.export.is_some() {
+            let q = Nvfp4::quantize(&bf16).map_err(|e| e.context(name.to_owned()))?;
+            if self.export.is_some() {
+                let stored = self.pack_for_storage(name, shape, &q)?;
+                self.export.as_mut().expect("checked above").push(stored);
             }
+            self.nvfp4.0 += 1;
+            self.nvfp4.1 += q.bytes();
+            Some(q)
+        } else {
+            None
         };
-        Ok(Linear { bf16, nvfp4 })
+        Ok(Linear { bf16: Some(bf16), nvfp4, lane: self.lane })
+    }
+
+    /// Pack the stored BF16 projection on the host for storage, gated against
+    /// the device quantizer's planes (`Nvfp4::pack_matching`).
+    fn pack_for_storage(&self, name: &str, shape: [u64; 2], q: &Nvfp4) -> Result<StoredProjection> {
+        let (_, blob) = load::tensor_bf16(self.facts, self.reader, self.root, name, shape)?;
+        let view = crate::leaf::read_leaf(blob)?;
+        let values = view
+            .payload()
+            .clone()
+            .view::<[half::bf16]>()
+            .map_err(|e| anyhow::anyhow!("{name}: BF16 view: {e}"))?;
+        let wide: Vec<f32> = values.iter().map(|v| v.to_f32()).collect();
+        q.pack_matching(name, &wide)
     }
 }
 
@@ -267,20 +298,59 @@ impl Generator {
     pub unsafe fn from_pile<R: BlobStoreGet>(
         facts: &TribleSet,
         reader: &R,
-        ids: Artifacts,
+        model_root: Id,
         config: Config,
         aliases: &mut CudaBf16Aliases,
         weights: Weights,
+        lane: PromptLane,
     ) -> Result<Self> {
+        let (generator, _) = unsafe {
+            Self::bind(facts, reader, model_root, config, aliases, weights, lane, false)?
+        };
+        Ok(generator)
+    }
+
+    /// Bind a BF16-stored root and pack every linear projection the generator
+    /// would quantize for NVFP4 storage, each gated bit for bit against the
+    /// device quantizer on the same values (see `Binder::pack_for_storage`).
+    ///
+    /// # Safety
+    /// As [`Self::from_pile`].
+    pub unsafe fn export_projections<R: BlobStoreGet>(
+        facts: &TribleSet,
+        reader: &R,
+        model_root: Id,
+        config: Config,
+        aliases: &mut CudaBf16Aliases,
+    ) -> Result<Vec<StoredProjection>> {
+        let (_, exported) = unsafe {
+            Self::bind(facts, reader, model_root, config, aliases, Weights::Bf16, PromptLane::default(), true)?
+        };
+        Ok(exported)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn bind<R: BlobStoreGet>(
+        facts: &TribleSet,
+        reader: &R,
+        model_root: Id,
+        config: Config,
+        aliases: &mut CudaBf16Aliases,
+        weights: Weights,
+        lane: PromptLane,
+        export: bool,
+    ) -> Result<(Self, Vec<StoredProjection>)> {
         validate_geometry(&config)?;
         let started = Instant::now();
         let mut b = Binder {
             facts,
             reader,
-            root: ids.model_root,
+            root: model_root,
             aliases,
             weights,
+            lane,
             nvfp4: (0, 0),
+            export: export.then(Vec::new),
         };
         // SAFETY: same genuine pile/root/binder and immutable lifetime premise.
         let generator = unsafe {
@@ -294,16 +364,17 @@ impl Generator {
                 config,
             }
         };
-        if weights == Weights::Nvfp4 {
+        if b.nvfp4.0 > 0 {
             generator.synchronize()?;
             eprintln!(
-                "[breeze] NVFP4 weights: {} projections, {} bytes resident, bound and quantized in {:.3}s",
+                "[breeze] NVFP4 weights: {} projections, {} bytes, bound in {:.3}s; prompt lane {:?}",
                 b.nvfp4.0,
                 b.nvfp4.1,
-                started.elapsed().as_secs_f64()
+                started.elapsed().as_secs_f64(),
+                lane
             );
         }
-        Ok(generator)
+        Ok((generator, b.export.unwrap_or_default()))
     }
     pub fn synchronize(&self) -> Result<()> {
         cubecl::future::block_on(self.head.client.sync())

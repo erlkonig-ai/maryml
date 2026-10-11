@@ -10,19 +10,19 @@
 //!
 //! The format, the quantization recipe and the GEMV are shared with Voxtral's
 //! hearing decoder and live in [`crate::nn::nvfp4_gemv`]; this module is the
-//! Breeze side: the `BREEZE_WEIGHTS` choice, the projection that carries both
-//! copies, and the gates that pin the BF16 instantiation.
+//! Breeze side: what a BF16-stored root's projections run on, the projection
+//! type, and the gates that pin the BF16 instantiation.
 //!
 //! ## Which rows take the GEMV
 //!
 //! `[1, t, K]` with `t <= MAX_ROWS` runs the shared NVFP4 GEMV: every decode
 //! step, and the depth decoder's two-row prefill of each frame. Larger `t` (the
-//! backbone and text-encoder prompt prefills, a few hundred rows) goes through
-//! the unchanged BF16 projection on the pile alias. That alias is the pile
-//! mapping already registered with CUDA for the weights' whole lifetime, so it
-//! costs no memory to keep; a dequantize-to-scratch per prefill call would move
-//! 0.5625 + 2 + 2 bytes per weight against the alias's 2. The consequence is a
-//! prompt state computed at full BF16 precision and decode steps at four bits.
+//! backbone and text-encoder prompt prefills, a few hundred rows) runs on the
+//! same stored four-bit planes in the prompt GEMM ([`PromptLane`],
+//! `nn::nvfp4_gemm`) when the root stores its projections as NVFP4 (the
+//! `nvfp4` root): no 16-bit copy of a projection exists. A BF16-stored root
+//! keeps its BF16 pile alias for those heights instead, which is the path the
+//! measurements below were taken on.
 //!
 //! ## Measured on sky (GB10), 2026-10-10
 //!
@@ -54,42 +54,43 @@ use {
     half::bf16,
 };
 
-/// Which weights the resident decodes from. One explicit choice per load.
+/// What a BF16 root's projections run on. A root that stores its projections
+/// as NVFP4 leaves needs no choice: those are bound as they are, and this
+/// applies only to projections stored at 16 bits.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Weights {
     /// The BF16 pile aliases only: byte-identical to the pre-NVFP4 path.
     #[default]
     Bf16,
-    /// A resident NVFP4 copy of every linear projection of the text encoder,
-    /// backbone and depth decoder; embeddings, LM heads and norms stay BF16.
+    /// A resident NVFP4 copy of every BF16 linear projection of the text
+    /// encoder, backbone and depth decoder, quantized on the device at load;
+    /// embeddings, LM heads and norms stay BF16.
     Nvfp4,
 }
 
 impl Weights {
-    /// `BREEZE_WEIGHTS`: unset or `bf16` keeps BF16, `nvfp4` selects four bits.
-    /// Anything else is refused rather than silently read as the default.
-    pub fn from_env() -> Result<Self> {
-        match std::env::var("BREEZE_WEIGHTS") {
-            Err(std::env::VarError::NotPresent) => Ok(Self::Bf16),
-            Ok(value) => Self::parse(&value),
-            Err(e) => anyhow::bail!("BREEZE_WEIGHTS: {e}"),
-        }
-    }
-    fn parse(value: &str) -> Result<Self> {
+    pub fn parse(value: &str) -> Result<Self> {
         match value {
             "bf16" => Ok(Self::Bf16),
             "nvfp4" => Ok(Self::Nvfp4),
-            other => anyhow::bail!("BREEZE_WEIGHTS must be bf16 or nvfp4, not {other:?}"),
+            other => anyhow::bail!("Breeze weights must be bf16 or nvfp4, not {other:?}"),
         }
     }
 }
 
-/// One linear projection: the immutable BF16 pile alias, and under
-/// [`Weights::Nvfp4`] its resident four-bit copy.
+/// One linear projection `[out, in]`.
+///
+/// A stored NVFP4 projection is `nvfp4` alone, bound from the pile: the GEMV
+/// takes one to eight rows and the prompt GEMM ([`PromptLane`]) every other
+/// height, so no 16-bit copy exists. A BF16-stored projection keeps its pile
+/// alias and, under [`Weights::Nvfp4`], a device-quantized copy for decode.
 pub(super) struct Linear {
-    pub(super) bf16: Tensor,
+    pub(super) bf16: Option<Tensor>,
     pub(super) nvfp4: Option<Nvfp4>,
+    pub(super) lane: PromptLane,
 }
+
+pub use crate::nvfp4::{PromptLane, StoredProjection};
 
 #[cfg(test)]
 mod tests {
@@ -201,6 +202,8 @@ mod tests {
     #[test]
     fn weights_option_is_explicit() {
         assert_eq!(Weights::default(), Weights::Bf16);
+        assert_eq!(PromptLane::parse("w4a4").unwrap(), PromptLane::W4a4);
+        assert!(PromptLane::parse("bf16").is_err());
         assert_eq!(Weights::parse("bf16").unwrap(), Weights::Bf16);
         assert_eq!(Weights::parse("nvfp4").unwrap(), Weights::Nvfp4);
         for bad in ["", "NVFP4", "fp4", "bf16 "] {
@@ -310,6 +313,70 @@ mod tests {
             };
         }
         w
+    }
+
+    /// The storage packer (`crate::nvfp4::pack_nearest`) is this recipe, so a
+    /// projection packed on the host is the projection the device quantizer
+    /// made, and the CUDA gate below ties the recipe to the device.
+    #[test]
+    fn host_packer_is_the_recipe_bit_for_bit() {
+        let mut rng = Rng(0x5EED_0F_F5);
+        let cases = [
+            (64usize, 1024usize, adversarial(&mut rng, 64, 1024)),
+            (96, 1152, weights(&mut rng, 96 * 1152, 0.02)),
+            (32, 2048, weights(&mut rng, 32 * 2048, 3e-5)),
+        ];
+        for (n, k, w) in cases {
+            let wide: Vec<f32> = w.iter().map(|v| v.to_f32()).collect();
+            let packed = crate::nvfp4::pack_nearest(&wide, k).unwrap();
+            let (codes, scales, s2) = recipe(&w);
+            assert_eq!(packed.scale2.to_bits(), s2.to_bits(), "[{n}, {k}] scale2");
+            assert_eq!(packed.scales, scales, "[{n}, {k}] scales");
+            assert_eq!(packed.codes, codes, "[{n}, {k}] codes");
+        }
+    }
+
+    #[test]
+    #[ignore = "reserved CUDA: both NVFP4 prompt GEMM lanes against host f64 products"]
+    fn cuda_prompt_gemm_lanes_against_f64_reference() {
+        let client = CudaRuntime::client(&cubecl::cuda::CudaDevice { index: 0 });
+        let mut rng = Rng(0x9E77_0F_F4);
+        for (name, n, k) in [SHAPES[0], SHAPES[4], SHAPES[6], SHAPES[13], SHAPES[14]] {
+            let w = weights(&mut rng, n * k, 0.02);
+            let q = Nvfp4::quantize(&upload(&client, &w, &[n, k])).unwrap();
+            let dense = decode(&read(&client, &q.codes), &read(&client, &q.scales), q.scale2);
+            for rows in [9usize, 33, 200] {
+                let xv: Vec<bf16> = (0..rows * k).map(|_| bf16::from_f64(rng.normal())).collect();
+                let x = upload(&client, &xv, &[1, rows, k]);
+                let (y, mag) = reference(&xv, rows, k, &dense, n);
+                for lane in [PromptLane::W4a16, PromptLane::W4a4] {
+                    let out = q.project(&x, lane).unwrap();
+                    assert_eq!(out.meta.shape().as_slice(), [1, rows, n]);
+                    let got: Vec<f64> = read(&client, &out.handle)
+                        .chunks_exact(2)
+                        .map(|b| bf16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f64())
+                        .collect();
+                    let (mut worst, mut err, mut norm) = (0.0f64, 0.0f64, 0.0f64);
+                    for i in 0..rows * n {
+                        worst = worst.max((got[i] - y[i]).abs() / mag[i].max(f64::MIN_POSITIVE));
+                        err += (got[i] - y[i]).powi(2);
+                        norm += y[i].powi(2);
+                    }
+                    let rel = (err / norm).sqrt();
+                    eprintln!(
+                        "{name} [{n}, {k}] rows={rows} {lane:?}: worst |err|/sum|xw| {worst:.2e}, relative RMS {rel:.4}"
+                    );
+                    match lane {
+                        // Exact weights, BF16 activations, f32 accumulation,
+                        // one BF16 rounding of the output.
+                        PromptLane::W4a16 => assert!(rel < 4e-3, "{name} rows={rows}: {rel}"),
+                        // Four-bit activations: an error of the activation
+                        // quantization's own size, nothing structural.
+                        PromptLane::W4a4 => assert!(rel < 0.2, "{name} rows={rows}: {rel}"),
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -497,13 +564,14 @@ mod tests {
             let copies = (512usize << 20).div_ceil(2 * n * k).max(2);
             let dense: Vec<Linear> = (0..copies)
                 .map(|_| Linear {
-                    bf16: upload(&client, &w, &[n, k]),
+                    bf16: Some(upload(&client, &w, &[n, k])),
                     nvfp4: None,
+                    lane: PromptLane::default(),
                 })
                 .collect();
             let quant: Vec<Nvfp4> = dense
                 .iter()
-                .map(|l| Nvfp4::quantize(&l.bf16).unwrap())
+                .map(|l| Nvfp4::quantize(l.bf16.as_ref().unwrap()).unwrap())
                 .collect();
             let x = upload(
                 &client,

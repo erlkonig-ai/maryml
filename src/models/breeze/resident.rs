@@ -8,27 +8,33 @@
 use anyhow::{Result, ensure};
 use cubecl::cuda::CudaDevice;
 use std::{path::PathBuf, time::Instant};
+use triblespace::core::repo::BlobStoreGet;
 
 use super::{
     audio::hop_window_lengths,
     generator::{GenerationOptions, Generator, Weights},
     load::{Artifacts, Assets},
+    nvfp4::PromptLane,
     pipeline::{self, Streamed},
     prompt::BreezeTokenizer,
     reference::{encode_reference, read_wav},
 };
 use crate::{
+    model_collection::ModelSnapshot,
     models::qwen3tts::{codec::CodecDecoder, encoder::CodecEncoder},
     nn::{backend::speak::Fused, cuda_bf16_alias::CudaBf16Aliases, weight_loader::WeightLoader},
-    persist::ModelPileSource,
 };
 
-/// Explicit per-resident inputs. The five artifact IDs are opaque, selected
-/// stored identities; none is derived from another field or from a path.
+/// Explicit per-resident inputs. The model is not named here: it is the
+/// Breeze root of the model collection the caller hands to
+/// [`BreezeResident::load`], selected by its source revision and `quantization`
+/// label, with its assets found by name under that root.
 #[derive(Clone, Debug)]
 pub struct BreezeVoiceConfig {
-    pub pile: PathBuf,
-    pub artifacts: Artifacts,
+    /// The stored weight-format label to select (`persist::QUANTIZATION_NVFP4`).
+    pub quantization: String,
+    /// How projections stored as NVFP4 multiply prompt-height activations.
+    pub lane: PromptLane,
     pub reference_wav: PathBuf,
     /// Known transcript, not an ASR request. Outer whitespace is stripped once.
     pub reference_text: String,
@@ -43,8 +49,8 @@ impl BreezeVoiceConfig {
     /// shared prompt/generator APIs for each target, never silently truncated.
     pub fn validate(&self) -> Result<()> {
         ensure!(
-            !self.pile.as_os_str().is_empty() && !self.reference_wav.as_os_str().is_empty(),
-            "Breeze requires explicit pile and reference WAV paths"
+            !self.quantization.is_empty() && !self.reference_wav.as_os_str().is_empty(),
+            "Breeze requires an explicit weight-format label and reference WAV path"
         );
         ensure!(
             !self.reference_text.trim().is_empty() && self.reference_text.len() <= 65536,
@@ -105,14 +111,13 @@ pub struct ResidentLoadReport {
 }
 
 /// Models/reference belong to the calling worker, never a global voice owner.
-/// Fields drop GPU consumers before local alias/source keepers. Independently,
+/// Fields drop GPU consumers before the local alias keeper. Independently,
 /// CubeCL retains real mmap owners through storage teardown, also on partial
 /// construction errors; neither field drop nor sync releases file custody.
 pub struct BreezeResident {
     generator: Generator,
     codec: CodecDecoder<Fused>,
     _aliases: CudaBf16Aliases,
-    _source: ModelPileSource,
     device: CudaDevice,
     tokenizer: BreezeTokenizer,
     reference_codes: Vec<[u16; 16]>,
@@ -132,14 +137,26 @@ impl BreezeResident {
     /// immutable or append-only/untruncated until CUDA runtime/storage teardown,
     /// including after this resident/worker drops or construction fails. A
     /// read-only file descriptor, owned snapshot or mode0444 is not that proof.
-    pub unsafe fn load(config: BreezeVoiceConfig) -> Result<Self> {
+    ///
+    /// Every selected tensor must be resident in `models`' store: the binder
+    /// aliases only pile-mapped bytes and refuses anything else (a blob fetched
+    /// from a peer, for one), so a collection that is not fully replicated
+    /// fails here, by name, rather than loading partly.
+    pub unsafe fn load<R: BlobStoreGet>(
+        models: &ModelSnapshot<R>,
+        config: BreezeVoiceConfig,
+    ) -> Result<Self> {
         config.validate()?;
         let total = Instant::now();
-        let source = crate::persist::read_model_pile_read_only(&config.pile)?;
-        let assets = Assets::from_frozen(&source.facts, &source.store, config.artifacts)?;
+        let (facts, store) = (models.facts(), models.store());
+        let artifacts = Artifacts::select(facts, store, &config.quantization)?;
+        let assets = Assets::from_frozen(facts, store, artifacts)?;
         let tokenizer = BreezeTokenizer::from_bytes(assets.tokenizer_json.as_bytes())?;
-        let snapshot = crate::model_collection::snapshot_model_collection_in(&source.store)?;
-        let loader = WeightLoader::selected(snapshot, config.artifacts.external_codec_root);
+        let loader = WeightLoader::Typed(crate::selection::index_keymap_for_root(
+            facts,
+            store,
+            artifacts.external_codec_root,
+        )?);
         let source_seconds = total.elapsed().as_secs_f64();
 
         let samples = read_wav(&config.reference_wav)?;
@@ -155,19 +172,19 @@ impl BreezeResident {
         drop(samples);
 
         let device = CudaDevice { index: 0 };
-        let weights = Weights::from_env()?;
         let started = Instant::now();
         let mut aliases = CudaBf16Aliases::new(device.clone(), 2048).map_err(anyhow::Error::msg)?;
         // SAFETY: the caller establishes real pile custody through runtime
         // teardown; this exact validated observation owns every selected blob.
         let generator = unsafe {
             Generator::from_pile(
-                &source.facts,
-                &source.store,
-                config.artifacts,
+                facts,
+                store,
+                artifacts.model_root,
                 assets.config,
                 &mut aliases,
-                weights,
+                Weights::Bf16,
+                config.lane,
             )?
         };
         generator.synchronize()?;
@@ -203,7 +220,6 @@ impl BreezeResident {
             generator,
             codec,
             _aliases: aliases,
-            _source: source,
             device,
             tokenizer,
             reference_codes,
@@ -284,16 +300,9 @@ fn frame_budget(text: &str, configured: usize) -> usize {
 
 #[cfg(test)]
 pub(crate) fn test_config() -> BreezeVoiceConfig {
-    use triblespace::prelude::fucid;
     BreezeVoiceConfig {
-        pile: std::env::temp_dir().join(format!("absent-breeze-{}.pile", fucid().id)),
-        artifacts: Artifacts {
-            model_root: fucid().id,
-            config_root: fucid().id,
-            tokenizer_asset: fucid().id,
-            external_codec_root: fucid().id,
-            external_codec_config_root: fucid().id,
-        },
+        quantization: crate::persist::QUANTIZATION_NVFP4.to_owned(),
+        lane: PromptLane::default(),
         reference_wav: PathBuf::from("request-reference.wav"),
         reference_text: "Known reference words.".to_owned(),
         direction: None,
@@ -322,21 +331,19 @@ mod tests {
         bad.options.temperature = f32::NAN;
         assert!(bad.validate().is_err());
         bad = original;
-        bad.pile.clear();
+        bad.quantization.clear();
         assert!(bad.validate().is_err());
     }
 
     #[test]
-    fn nonunit_resident_cfg_needs_direction_without_changing_opaque_ids() {
+    fn nonunit_resident_cfg_needs_direction() {
         let mut config = test_config();
-        let root = config.artifacts.model_root;
         config.options.cfg_scale = 4.0;
         assert!(config.validate().is_err());
         config.direction = Some(" \n".to_owned());
         assert!(config.validate().is_err());
         config.direction = Some("Speak softly.".to_owned());
         config.validate().unwrap();
-        assert_eq!(config.artifacts.model_root, root);
         config.options.cfg_scale = f32::INFINITY;
         assert!(config.validate().is_err());
     }

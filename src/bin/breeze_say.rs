@@ -34,16 +34,33 @@ use triblespace::prelude::Id;
 struct Args {
     #[arg(long)]
     pile: PathBuf,
+    /// Exact model collection descriptor handle (`blake3:HEX`). The Breeze
+    /// root is selected in it by source revision and `--quantization`, and
+    /// its assets by name. Without it, the five explicit ids below name a
+    /// legacy native model pile.
+    #[arg(long, conflicts_with_all = ["model_root", "config_root", "tokenizer_asset", "external_codec_root", "external_codec_config_root"])]
+    collection: Option<String>,
+    /// The stored weight-format label to select under `--collection`.
+    #[arg(long, default_value = "nvfp4")]
+    quantization: String,
+    /// BF16-stored projections only: `bf16`, or `nvfp4` to quantize them on
+    /// the device at load. NVFP4-stored projections are bound as stored.
+    #[arg(long, default_value = "bf16")]
+    weights: String,
+    /// How NVFP4 projections multiply prompt-height activations: `w4a16` or
+    /// `w4a4`.
+    #[arg(long, default_value = "w4a16")]
+    lane: String,
     #[arg(long)]
-    model_root: String,
+    model_root: Option<String>,
     #[arg(long)]
-    config_root: String,
+    config_root: Option<String>,
     #[arg(long)]
-    tokenizer_asset: String,
+    tokenizer_asset: Option<String>,
     #[arg(long)]
-    external_codec_root: String,
+    external_codec_root: Option<String>,
     #[arg(long)]
-    external_codec_config_root: String,
+    external_codec_config_root: Option<String>,
     /// Genuine pile prefix, including mapped page prefixes, must stay immutable
     /// until CUDA process/runtime teardown. Read-only FD alone is insufficient.
     #[arg(long)]
@@ -91,7 +108,10 @@ struct Args {
     report: PathBuf,
 }
 
-fn id(value: &str) -> Result<Id> {
+fn id(value: &Option<String>, name: &str) -> Result<Id> {
+    let value = value
+        .as_deref()
+        .with_context(|| format!("--{name} is required without --collection"))?;
     Id::from_hex(value).context("expected explicit stored 32-hex entity ID")
 }
 
@@ -161,13 +181,6 @@ fn main() -> Result<()> {
             && args.repetition_penalty > 0.0,
         "invalid sampling options"
     );
-    let ids = Artifacts {
-        model_root: id(&args.model_root)?,
-        config_root: id(&args.config_root)?,
-        tokenizer_asset: id(&args.tokenizer_asset)?,
-        external_codec_root: id(&args.external_codec_root)?,
-        external_codec_config_root: id(&args.external_codec_config_root)?,
-    };
     let options = GenerationOptions {
         max_frames: args.max_frames,
         max_context: args.max_context,
@@ -179,12 +192,37 @@ fn main() -> Result<()> {
         do_sample: !args.greedy,
         cfg_scale: args.cfg_scale,
     };
+    let weights = mary::models::breeze::generator::Weights::parse(&args.weights)?;
+    let lane = mary::nn::nvfp4_gemm::PromptLane::parse(&args.lane)?;
     let total_started = Instant::now();
-    let source = mary::persist::read_model_pile_read_only(&args.pile)?;
-    let assets = Assets::from_frozen(&source.facts, &source.store, ids)?;
+    let (facts, store, ids) = if let Some(collection) = &args.collection {
+        let store = mary::persist::read_model_pile_snapshot_read_only(&args.pile)?;
+        let collection = mary::model_collection::open_model_collection(
+            &store,
+            mary::model_collection::parse_collection_handle(collection)?,
+        )?;
+        let models = mary::model_collection::snapshot_model_collection_for(&store, collection)?;
+        let ids = Artifacts::select(models.facts(), models.store(), &args.quantization)?;
+        let (facts, _, store) = models.into_parts();
+        (facts, store, ids)
+    } else {
+        let source = mary::persist::read_model_pile_read_only(&args.pile)?;
+        let ids = Artifacts {
+            model_root: id(&args.model_root, "model-root")?,
+            config_root: id(&args.config_root, "config-root")?,
+            tokenizer_asset: id(&args.tokenizer_asset, "tokenizer-asset")?,
+            external_codec_root: id(&args.external_codec_root, "external-codec-root")?,
+            external_codec_config_root: id(&args.external_codec_config_root, "external-codec-config-root")?,
+        };
+        (source.facts, source.store, ids)
+    };
+    let assets = Assets::from_frozen(&facts, &store, ids)?;
     let tokenizer = BreezeTokenizer::from_bytes(assets.tokenizer_json.as_bytes())?;
-    let snapshot = mary::model_collection::snapshot_model_collection_in(&source.store)?;
-    let codec_loader = WeightLoader::selected(snapshot, ids.external_codec_root);
+    let codec_loader = WeightLoader::Typed(mary::selection::index_keymap_for_root(
+        &facts,
+        &store,
+        ids.external_codec_root,
+    )?);
     let reference_text = read_text(&args.reference_text)?;
     let source_seconds = total_started.elapsed().as_secs_f64();
 
@@ -216,9 +254,12 @@ fn main() -> Result<()> {
             .context("prepared reference has no audio frames")?;
         let report = serde_json::json!({
             "scope":"native Rust CPU reference encoding only; no CUDA initialization, generation or WAV output",
-            "pile":args.pile,"model_root":args.model_root,"config_root":args.config_root,
-            "tokenizer_asset":args.tokenizer_asset,"external_codec_root":args.external_codec_root,
-            "external_codec_config_root":args.external_codec_config_root,
+            "pile":args.pile,"collection":args.collection,"model_root":format!("{:X}", ids.model_root),
+            "config_root":format!("{:X}", ids.config_root),
+            "tokenizer_asset":format!("{:X}", ids.tokenizer_asset),
+            "external_codec_root":format!("{:X}", ids.external_codec_root),
+            "external_codec_config_root":format!("{:X}", ids.external_codec_config_root),
+            "weights":args.weights,"lane":args.lane,
             "reference":args.reference,"reference_text":reference_text,"reference_transcript_path":args.reference_text,
             "reference_samples":prepared.reference_samples,"reference_frames":prepared.reference_frames,
             "codebooks":16,"code_min":codes.iter().flatten().min(),"code_max":codes.iter().flatten().max(),
@@ -251,12 +292,13 @@ fn main() -> Result<()> {
     // CUDA's external storage retains actual owners, including partial pages.
     let mut generator = unsafe {
         Generator::from_pile(
-            &source.facts,
-            &source.store,
-            ids,
+            &facts,
+            &store,
+            ids.model_root,
             assets.config,
             &mut aliases,
-            mary::models::breeze::generator::Weights::from_env()?,
+            weights,
+            lane,
         )?
     };
     generator.synchronize()?;
@@ -278,9 +320,12 @@ fn main() -> Result<()> {
     let stats = aliases.stats();
     let report = serde_json::json!({
         "scope":"native Rust reference + CUDA generation + generated-only CUDA batch codec; not stateful streaming",
-        "pile":args.pile,"model_root":args.model_root,"config_root":args.config_root,
-        "tokenizer_asset":args.tokenizer_asset,"external_codec_root":args.external_codec_root,
-        "external_codec_config_root":args.external_codec_config_root,
+        "pile":args.pile,"collection":args.collection,"model_root":format!("{:X}", ids.model_root),
+        "config_root":format!("{:X}", ids.config_root),
+        "tokenizer_asset":format!("{:X}", ids.tokenizer_asset),
+        "external_codec_root":format!("{:X}", ids.external_codec_root),
+        "external_codec_config_root":format!("{:X}", ids.external_codec_config_root),
+        "weights":args.weights,"lane":args.lane,
         "text":args.text,"direction":args.direction,"reference":args.reference,
         "reference_text":reference_text,"reference_transcript_path":args.reference_text,
         "reference_samples":prepared.reference_samples,"reference_frames":prepared.reference_frames,
@@ -320,6 +365,6 @@ fn main() -> Result<()> {
     drop(generator);
     drop(aliases);
     drop(codec_loader);
-    drop(source);
+    drop((facts, store));
     Ok(())
 }

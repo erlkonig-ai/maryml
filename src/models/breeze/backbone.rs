@@ -13,17 +13,24 @@ use cubecl::{cuda::CudaRuntime, prelude::*};
 pub(super) use ops::Tensor;
 use triblespace::core::repo::BlobStoreGet;
 
-/// One projection. A resident NVFP4 copy takes the activation shapes its GEMV
-/// accepts (`[1, t, K]`, `t <= nvfp4::MAX_ROWS`); everything else, and every
-/// projection under the default BF16 weights, is the unchanged BF16 path.
+/// One projection. An NVFP4 weight takes the activation shapes its GEMV
+/// accepts (`[1, t, K]`, `t <= nvfp4::MAX_ROWS`). Every other height goes to
+/// the BF16 alias when the projection has one, and otherwise to the prompt
+/// GEMM on the same four-bit planes (`w.lane`).
 pub(super) fn linear(x: &Tensor, w: &Linear) -> Result<Tensor> {
-    if let Some(q) = &w.nvfp4
-        && let Some(rows) = q.takes(x)
-        && x.device == w.bf16.device
-    {
-        return Ok(q.gemv(x, rows));
+    if let Some(q) = &w.nvfp4 {
+        if let Some(rows) = q.takes(x) {
+            return Ok(q.gemv(x, rows));
+        }
+        if w.bf16.is_none() {
+            return q.project(x, w.lane);
+        }
     }
-    linear_bf16(x, &w.bf16)
+    let bf16 = w
+        .bf16
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("a projection with neither BF16 nor NVFP4 weights"))?;
+    linear_bf16(x, bf16)
 }
 
 pub(super) fn linear_bf16(x: &Tensor, w: &Tensor) -> Result<Tensor> {

@@ -5,7 +5,7 @@ use triblespace::core::blob::{
     Blob,
     encodings::tensor::{
         Tensor, TensorElement,
-        elements::{BF16, F32},
+        elements::{BF16, F32, NVFP4},
     },
 };
 use triblespace::prelude::*;
@@ -17,6 +17,99 @@ pub struct Artifacts {
     pub tokenizer_asset: Id,
     pub external_codec_root: Id,
     pub external_codec_config_root: Id,
+}
+
+impl Artifacts {
+    /// Select the Breeze model root stored under `quantization` for this
+    /// source revision, and its four assets by the names the importer gave
+    /// them under that root. Every coordinate is a stored label or a
+    /// relation; no id is computed, and two candidates are an error.
+    pub fn select(
+        facts: &TribleSet,
+        reader: &impl BlobStoreGet,
+        quantization: &str,
+    ) -> Result<Self> {
+        let source = format!("{}@{}", super::SOURCE, super::REVISION);
+        let model_root = crate::selection::select_model_root(
+            facts,
+            reader,
+            crate::selection::ModelSelector::Source {
+                source: &source,
+                quantization,
+            },
+        )?;
+        Self::from_root(facts, model_root)
+    }
+
+    /// The four assets the importer named under one explicit model root.
+    ///
+    /// A name alone does not pick one: the importer stores `config.json` both
+    /// as its text and as its parsed JSON, so each asset is asked for with
+    /// what it is: the configs as JSON objects, the tokenizer as text, the
+    /// codec as a model root.
+    pub fn from_root(facts: &TribleSet, model_root: Id) -> Result<Self> {
+        use crate::jsonfacts::ty::JSON_OBJECT;
+        use triblespace::core::metadata;
+        let one = |name: &str, found: Vec<Id>| -> Result<Id> {
+            let mut found = found.into_iter();
+            let first = found
+                .next()
+                .with_context(|| format!("Breeze root {model_root:?} has no {name} asset"))?;
+            ensure!(
+                found.all(|other| other == first),
+                "Breeze root {model_root:?} has several {name} assets"
+            );
+            Ok(first)
+        };
+        let handle = |name: &str| {
+            let blob: Blob<blobencodings::UTF8String> = name.to_owned().to_blob();
+            blob.get_handle() // content-addressed value, not an entity-ID lookup
+        };
+        let json = |name: &str| -> Result<Id> {
+            let wanted = handle(name);
+            one(
+                name,
+                find!((asset: Id), pattern!(facts, [{ ?asset @
+                    crate::format::attrs::model_root: model_root,
+                    metadata::name: wanted,
+                    metadata::tag: JSON_OBJECT,
+                }]))
+                .map(|(asset,)| asset)
+                .collect(),
+            )
+        };
+        let wanted = handle("tokenizer.json");
+        let tokenizer_asset = one(
+            "tokenizer.json",
+            find!((asset: Id), pattern!(facts, [{ ?asset @
+                crate::format::attrs::model_root: model_root,
+                metadata::name: wanted,
+                crate::dataset::text: _?text,
+            }]))
+            .map(|(asset,)| asset)
+            .collect(),
+        )?;
+        let wanted = handle("audio_tokenizer");
+        let external_codec_root = one(
+            "audio_tokenizer",
+            find!((asset: Id), pattern!(facts, [{ ?asset @
+                crate::format::attrs::model_root: model_root,
+                metadata::name: wanted,
+                crate::format::attrs::member: _?member,
+            }]))
+            .map(|(asset,)| asset)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect(),
+        )?;
+        Ok(Self {
+            model_root,
+            config_root: json("config.json")?,
+            tokenizer_asset,
+            external_codec_root,
+            external_codec_config_root: json("audio_tokenizer/config.json")?,
+        })
+    }
 }
 
 pub struct Assets {
@@ -73,16 +166,22 @@ impl Assets {
     }
 }
 
-fn tensor<T: TensorElement, const R: usize>(
+/// The leaf named `name` under `root` in element format `T` and this exact
+/// shape, or `None` when the root holds no such leaf. The type is the query: a
+/// root may hold the same name as BF16 or as NVFP4, and asking for one never
+/// returns the other.
+fn find_tensor<T: TensorElement, const R: usize>(
     facts: &TribleSet,
     reader: &impl BlobStoreGet,
     root: Id,
     name: &str,
     shape: [u64; R],
-) -> Result<(
-    Inline<inlineencodings::Handle<Tensor<T, R>>>,
-    Blob<Tensor<T, R>>,
-)> {
+) -> Result<
+    Option<(
+        Inline<inlineencodings::Handle<Tensor<T, R>>>,
+        Blob<Tensor<T, R>>,
+    )>,
+> {
     let path: Blob<blobencodings::UTF8String> = name.to_owned().to_blob();
     let path = path.get_handle(); // content-addressed value, not an entity-ID lookup
     for (handle,) in find!((handle: Inline<inlineencodings::Handle<Tensor<T, R>>>),
@@ -99,8 +198,35 @@ fn tensor<T: TensorElement, const R: usize>(
             .dims()
             == shape
         {
-            return Ok((handle, blob));
+            return Ok(Some((handle, blob)));
         }
+    }
+    Ok(None)
+}
+
+/// A stored NVFP4 projection `[out, in]` under `root`, if the root holds one.
+pub fn find_tensor_nvfp4(
+    facts: &TribleSet,
+    reader: &impl BlobStoreGet,
+    root: Id,
+    name: &str,
+    shape: [u64; 2],
+) -> Result<Option<Blob<Tensor<NVFP4, 2>>>> {
+    Ok(find_tensor(facts, reader, root, name, shape)?.map(|(_, blob)| blob))
+}
+
+fn tensor<T: TensorElement, const R: usize>(
+    facts: &TribleSet,
+    reader: &impl BlobStoreGet,
+    root: Id,
+    name: &str,
+    shape: [u64; R],
+) -> Result<(
+    Inline<inlineencodings::Handle<Tensor<T, R>>>,
+    Blob<Tensor<T, R>>,
+)> {
+    if let Some(found) = find_tensor(facts, reader, root, name, shape)? {
+        return Ok(found);
     }
     bail!("{name}: no supported rank-{R} leaf with shape {shape:?} under {root:?}")
 }

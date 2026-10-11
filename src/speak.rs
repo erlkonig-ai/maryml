@@ -509,27 +509,45 @@ mod breeze_transport_tests {
     use super::*;
     use crate::models::breeze::resident::test_config;
 
+    /// An empty, current model collection: what a host sees before the
+    /// models collection has replicated to it.
+    fn empty_models() -> crate::model_collection::ModelSnapshot<
+        <triblespace::core::repo::memoryrepo::MemoryRepo as triblespace::core::repo::SnapshotSource>::Snapshot,
+    > {
+        use triblespace::core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};
+        use triblespace::core::repo::SnapshotSource;
+        let mut repo = triblespace::core::repo::memoryrepo::MemoryRepo::default();
+        let root = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]).verifying_key();
+        let collection = repo
+            .collection(
+                "models",
+                CollectionPolicy::new(AdmissionPolicy::direct(root), AdmissionPolicy::direct(root)),
+            )
+            .unwrap();
+        crate::model_collection::snapshot_model_collection_for(&repo.snapshot().unwrap(), collection)
+            .unwrap()
+    }
+
     #[test]
     fn breeze_rejects_invalid_config_before_spawning_or_opening_assets() {
         let mut config = test_config();
         config.options.max_frames = 0;
         // SAFETY: invalid inputs are refused before any file or CUDA access.
-        assert!(unsafe { Synthesizer::spawn_breeze(config) }.is_err());
+        assert!(unsafe { Synthesizer::spawn_breeze(empty_models(), config) }.is_err());
     }
 
     #[test]
     fn breeze_load_failure_reaches_each_existing_stream_finish() {
         let config = test_config();
-        assert!(!config.pile.exists());
-        // SAFETY: this unique missing path fails before any tensor is bound;
-        // no aliased file/CUDA storage exists in this non-GPU routing control.
-        let synth = unsafe { Synthesizer::spawn_breeze(config) }.unwrap();
+        // SAFETY: an empty collection fails selection before any tensor is
+        // bound; no aliased file/CUDA storage exists in this routing control.
+        let synth = unsafe { Synthesizer::spawn_breeze(empty_models(), config) }.unwrap();
         for text in ["First request.", "Second request."] {
             let mut stream = synth.speak(text).unwrap();
             assert!(stream.next().is_none());
             let error = stream.finish().unwrap_err().to_string();
             assert!(error.contains("Breeze resident failed to load"), "{error}");
-            assert!(error.contains("open read-only"), "{error}");
+            assert!(error.contains("no model root"), "{error}");
         }
         drop(synth);
     }
@@ -558,8 +576,8 @@ mod breeze_transport_tests {
     /// output directory `<BREEZE_RESIDENT_OUTPUT>/<name>` for one of them.
     struct RealInputs {
         config: crate::models::breeze::resident::BreezeVoiceConfig,
-        imported: serde_json::Value,
-        receipt_path: String,
+        models: crate::model_collection::ModelPileSnapshot,
+        pile: String,
         reference_wav: PathBuf,
         transcript: PathBuf,
         output: PathBuf,
@@ -567,28 +585,20 @@ mod breeze_transport_tests {
 
     impl RealInputs {
         fn from_env(name: &str) -> anyhow::Result<Self> {
-            use crate::models::breeze::{
-                generator::GenerationOptions, load::Artifacts, resident::BreezeVoiceConfig,
-            };
-            use triblespace::prelude::Id;
+            use crate::models::breeze::{generator::GenerationOptions, resident::BreezeVoiceConfig};
 
             anyhow::ensure!(
                 std::env::var("BREEZE_RESIDENT_CUSTODY")?.as_str()
                     == "immutable-pile-through-cuda-runtime-teardown",
                 "explicit immutable alias custody is required"
             );
-            let receipt_path = std::env::var("BREEZE_RESIDENT_IMPORT_RECEIPT")?;
-            let imported: serde_json::Value =
-                serde_json::from_slice(&std::fs::read(&receipt_path)?)?;
-            let field = |name: &str| -> anyhow::Result<String> {
-                imported[name]
-                    .as_str()
-                    .map(str::to_owned)
-                    .ok_or_else(|| anyhow::anyhow!("missing {name}"))
-            };
-            let id = |name: &str| -> anyhow::Result<Id> {
-                Id::from_hex(&field(name)?).ok_or_else(|| anyhow::anyhow!("invalid {name}"))
-            };
+            let pile = std::env::var("BREEZE_RESIDENT_PILE")?;
+            let collection = crate::model_collection::parse_collection_handle(
+                &std::env::var("BREEZE_RESIDENT_COLLECTION")?,
+            )?;
+            let source = crate::persist::read_model_pile_snapshot_read_only(Path::new(&pile))?;
+            let collection = crate::model_collection::open_model_collection(&source, collection)?;
+            let models = crate::model_collection::snapshot_model_collection_for(&source, collection)?;
             let reference_wav = PathBuf::from(std::env::var("BREEZE_RESIDENT_REFERENCE_WAV")?);
             let transcript = PathBuf::from(std::env::var("BREEZE_RESIDENT_REFERENCE_TEXT")?);
             let root = PathBuf::from(std::env::var("BREEZE_RESIDENT_OUTPUT")?);
@@ -596,14 +606,8 @@ mod breeze_transport_tests {
             let output = root.join(name);
             std::fs::create_dir(&output)?; // exclusive new run; preserve old evidence
             let config = BreezeVoiceConfig {
-                pile: PathBuf::from(field("pile")?),
-                artifacts: Artifacts {
-                    model_root: id("model_root")?,
-                    config_root: id("config_root")?,
-                    tokenizer_asset: id("tokenizer_asset")?,
-                    external_codec_root: id("external_codec_root")?,
-                    external_codec_config_root: id("external_codec_config_root")?,
-                },
+                quantization: crate::persist::QUANTIZATION_NVFP4.to_owned(),
+                lane: Default::default(),
                 reference_wav: reference_wav.clone(),
                 reference_text: std::fs::read_to_string(&transcript)?,
                 direction: None,
@@ -614,16 +618,12 @@ mod breeze_transport_tests {
             };
             Ok(Self {
                 config,
-                imported,
-                receipt_path,
+                models,
+                pile,
                 reference_wav,
                 transcript,
                 output,
             })
-        }
-
-        fn field(&self, name: &str) -> &str {
-            self.imported[name].as_str().unwrap_or_default()
         }
 
         fn write_report(&self, report: &serde_json::Value) -> anyhow::Result<()> {
@@ -649,7 +649,7 @@ mod breeze_transport_tests {
         let inputs = RealInputs::from_env("transport")?;
         // SAFETY: explicit test-runner custody covers real immutable bytes
         // through CUDA process/runtime teardown, including any failure path.
-        let synth = unsafe { Synthesizer::spawn_breeze(inputs.config.clone()) }?;
+        let synth = unsafe { Synthesizer::spawn_breeze(inputs.models.clone(), inputs.config.clone()) }?;
         let texts = [
             "The rain has stopped, and the room is quiet. Shall we open the window?",
             "There is a little sunlight on the table. I think this is a good place to begin.",
@@ -701,8 +701,7 @@ mod breeze_transport_tests {
         drop(synth);
         inputs.write_report(&serde_json::json!({
             "scope":"two sequential real Synthesizer/SpeakStream requests; one resident/native reference load; hop PCM",
-            "import_receipt":inputs.receipt_path,"model_pile":inputs.field("pile"),
-            "model_pile_import_sha256":inputs.field("pile_sha256"),
+            "model_pile":inputs.pile,
             "reference_wav":inputs.reference_wav,"known_transcript":inputs.transcript,
             "cfg_scale":1,"seed":42,"max_frames":256,"max_context":2048,
             "hop_frames":HOP_FRAMES,"hop_context":crate::models::breeze::audio::HOP_CONTEXT,
@@ -724,7 +723,7 @@ mod breeze_transport_tests {
 
         let inputs = RealInputs::from_env("hops-against-batch")?;
         // SAFETY: as in the transport control; custody is the runner's.
-        let mut resident = unsafe { BreezeResident::load(inputs.config.clone()) }?;
+        let mut resident = unsafe { BreezeResident::load(&inputs.models, inputs.config.clone()) }?;
         let warm = resident.load_report().codec_warm_seconds.clone();
         let texts = [
             "The rain has stopped, and the room is quiet. Shall we open the window?",
@@ -816,7 +815,7 @@ mod breeze_transport_tests {
         drop(resident);
         inputs.write_report(&serde_json::json!({
             "scope":"one resident on the test thread; two lines of different length and the first again, hop decode while generating, then a batch decode of the same frames",
-            "model_pile":inputs.field("pile"),"reference_wav":inputs.reference_wav,
+            "model_pile":inputs.pile,"reference_wav":inputs.reference_wav,
             "hop_frames":HOP_FRAMES,"hop_context":HOP_CONTEXT,
             "hop_window_lengths":crate::models::breeze::audio::hop_window_lengths(),
             "codec_warm_seconds_by_window_frames":warm,
@@ -841,9 +840,13 @@ impl Synthesizer {
     /// teardown, including after the worker ends or load fails. Keeping a
     /// snapshot/read-only FD alive alone cannot enforce that external custody.
     #[cfg(feature = "breeze-cuda")]
-    pub unsafe fn spawn_breeze(
+    pub unsafe fn spawn_breeze<R>(
+        models: crate::model_collection::ModelSnapshot<R>,
         config: crate::models::breeze::resident::BreezeVoiceConfig,
-    ) -> anyhow::Result<Self> {
+    ) -> anyhow::Result<Self>
+    where
+        R: triblespace::core::repo::BlobStoreGet + Send + 'static,
+    {
         use crate::models::breeze::resident::BreezeResident;
         config.validate()?;
         let (tx, rx) = mpsc::channel::<Request>();
@@ -852,7 +855,7 @@ impl Synthesizer {
             .spawn(move || {
                 // SAFETY: explicit caller contract extends through runtime storage
                 // teardown, not merely through this worker or successful loading.
-                let mut resident = unsafe { BreezeResident::load(config) }
+                let mut resident = unsafe { BreezeResident::load(&models, config) }
                     .map_err(|error| format!("Breeze resident failed to load: {error:#}"));
                 while let Ok(req) = rx.recv() {
                     let result = match &mut resident {
