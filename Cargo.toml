@@ -59,6 +59,7 @@ hf-hub = { version = "0.3", optional = true }
 # no C deps. Behind `k3tok`; the default build stays light.
 fancy-regex = { version = "0.14", optional = true }
 half = { version = "2", features = ["zerocopy"] }
+matrixmultiply = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 # Pile loading (mary::persist) is THE runtime weight path, so its deps are
@@ -1041,6 +1042,10 @@ required-features = ["breeze-cuda", "voxtral-cuda", "import"]
 [[bin]]
 name = "hear_offline"
 required-features = ["voxtral"]
+
+[[bin]]
+name = "voxtral_capture"
+required-features = ["voxtral-cuda"]
 
 # Kimi K3: the `situ` activation against oracle vectors captured from the
 # shipped `SituAndMul`. CPU lane only under `k3`; add `k3-cuda` for

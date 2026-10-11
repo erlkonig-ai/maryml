@@ -199,6 +199,8 @@ pub(super) struct Projection<B: Backend> {
     lane: PromptLane,
     /// Output width N.
     n: usize,
+    /// The stored leaf name (capture key).
+    name: String,
 }
 
 impl<B: Backend> Projection<B> {
@@ -210,6 +212,7 @@ impl<B: Backend> Projection<B> {
             dense: Some(dense),
             lane: opts.lane,
             n,
+            name: String::new(),
         }
     }
 
@@ -246,6 +249,7 @@ impl<B: Backend> Projection<B> {
                 fp4: Some(q),
                 lane: opts.lane,
                 n,
+                name: name.to_string(),
             });
         }
         // No CUDA lane: decode the stored codes on the host (`Leaf::to_f32`).
@@ -255,11 +259,108 @@ impl<B: Backend> Projection<B> {
             fp4: None,
             lane: opts.lane,
             n,
+            name: name.to_string(),
         })
     }
 
     fn forward(&self, x: Tensor<B, 3>, what: &str) -> Tensor<B, 3> {
+        capture::push(&self.name, &x);
         project(x, self.dense.as_ref(), self.fp4.as_ref(), self.lane, what)
+    }
+}
+
+/// Calibration capture (voxtral-gptq lane, not for main): while active, every
+/// projection's input rows accumulate `H = X^T X` in f32 on the device, keyed
+/// by the projection's stored leaf name.
+pub mod capture {
+    use burn::prelude::*;
+    use burn::tensor::FloatDType;
+    use std::any::Any;
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
+
+    #[derive(Default)]
+    struct Entry {
+        pending: Vec<Box<dyn Any>>,
+        rows: usize,
+        total: usize,
+        k: usize,
+        h: Option<Box<dyn Any>>,
+    }
+
+    thread_local! {
+        static CAP: RefCell<Option<BTreeMap<String, Entry>>> = const { RefCell::new(None) };
+    }
+
+    const FLUSH_ROWS: usize = 512;
+
+    pub fn begin() {
+        CAP.with(|c| *c.borrow_mut() = Some(BTreeMap::new()));
+    }
+
+    fn flush<B: Backend>(e: &mut Entry) {
+        if e.pending.is_empty() {
+            return;
+        }
+        let xs: Vec<Tensor<B, 2>> = e
+            .pending
+            .drain(..)
+            .map(|b| *b.downcast::<Tensor<B, 2>>().expect("capture backend"))
+            .collect();
+        let x = Tensor::cat(xs, 0).cast(FloatDType::F32);
+        let g = x.clone().transpose().matmul(x);
+        let h = match e.h.take() {
+            Some(h) => *h.downcast::<Tensor<B, 2>>().expect("capture backend") + g,
+            None => g,
+        };
+        e.h = Some(Box::new(h));
+        e.total += e.rows;
+        e.rows = 0;
+    }
+
+    pub(super) fn push<B: Backend>(name: &str, x: &Tensor<B, 3>) {
+        CAP.with(|c| {
+            let mut c = c.borrow_mut();
+            let Some(map) = c.as_mut() else { return };
+            assert!(!name.is_empty(), "capture: unnamed projection");
+            let [b, t, k] = x.dims();
+            let e = map.entry(name.to_string()).or_default();
+            e.k = k;
+            e.pending.push(Box::new(x.clone().reshape([b * t, k])));
+            e.rows += b * t;
+            if e.rows >= FLUSH_ROWS {
+                flush::<B>(e);
+            }
+        })
+    }
+
+    /// File stem for a leaf name.
+    pub fn stem(name: &str) -> String {
+        name.replace('/', "_")
+    }
+
+    /// Flush and write every `H` as raw little-endian f32 `{dir}/{stem}.h`,
+    /// plus `manifest.tsv` (name, k, rows). Ends the capture.
+    pub fn dump<B: Backend>(dir: &std::path::Path) -> anyhow::Result<()> {
+        use std::io::Write;
+        let map = CAP.with(|c| c.borrow_mut().take()).unwrap_or_default();
+        std::fs::create_dir_all(dir)?;
+        let mut manifest = std::fs::File::create(dir.join("manifest.tsv"))?;
+        for (name, mut e) in map {
+            flush::<B>(&mut e);
+            let h = *e.h.take().expect("flushed").downcast::<Tensor<B, 2>>().expect("backend");
+            let v: Vec<f32> = h
+                .into_data()
+                .to_vec::<f32>()
+                .map_err(|error| anyhow::anyhow!("{name}: read H: {error:?}"))?;
+            let mut bytes = Vec::with_capacity(v.len() * 4);
+            for x in &v {
+                bytes.extend_from_slice(&x.to_le_bytes());
+            }
+            std::fs::write(dir.join(format!("{}.h", stem(&name))), bytes)?;
+            writeln!(manifest, "{name}\t{}\t{}", e.k, e.total)?;
+        }
+        Ok(())
     }
 }
 
@@ -633,6 +734,8 @@ impl<B: Backend> FastAttention<B> {
                 .reshape([1, hidden, n_out]);
             Projection::folded(qkv_t, opts, &format!("{prefix} qkv"))
         });
+        let mut qkv = qkv;
+        qkv.name = fused_qkv_name(prefix);
         assert_eq!(qkv.n, n_out, "{prefix}: QKV width");
 
         // RoPE applies AFTER the bias (encoder), and rope is linear — the
@@ -664,6 +767,8 @@ impl<B: Backend> FastAttention<B> {
                 let [o, i] = w.dims();
                 Projection::folded(w.transpose().reshape([1, i, o]), opts, &o_name)
             });
+        let mut o = o;
+        o.name = format!("{o_name}.weight");
         let o_bias = qvo_bias.then(|| {
             let b: Tensor<B, 1> = loader.load_tensor(&format!("{o_name}.bias"), device);
             b.reshape([1, 1, o.n])
@@ -810,6 +915,9 @@ impl<B: Backend> FastMlp<B> {
                 let [o, i] = w.dims();
                 Projection::folded(w.transpose().reshape([1, i, o]), opts, &down_name)
             });
+        let (mut gate_up, mut down) = (gate_up, down);
+        gate_up.name = fused_gate_up_name(prefix);
+        down.name = format!("{down_name}.weight");
         let down_bias = down_bias.then(|| {
             let b: Tensor<B, 1> = loader.load_tensor(&format!("{down_name}.bias"), device);
             b.reshape([1, 1, down.n])
@@ -1114,7 +1222,36 @@ pub fn export_nvfp4_projections(
             .iter()
             .map(|v| v.to_f32())
             .collect();
-        sink(q.pack_matching(&name, &values)?, replaces)
+        let mut stored = q.pack_matching(&name, &values)?;
+        // voxtral-gptq lane: error-feedback packing from a captured H.
+        if let Ok(dir) = std::env::var("VOXTRAL_GPTQ_DIR") {
+            let path = std::path::Path::new(&dir).join(format!("{}.h", capture::stem(&name)));
+            if path.exists() {
+                let bytes = std::fs::read(&path)?;
+                anyhow::ensure!(bytes.len() == k * k * 4, "{name}: H is {} bytes for k {k}", bytes.len());
+                let h: Vec<f64> = bytes
+                    .chunks_exact(4)
+                    .map(|b| f32::from_le_bytes(b.try_into().unwrap()) as f64)
+                    .collect();
+                let damp: f64 = std::env::var("VOXTRAL_GPTQ_DAMP")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0.01);
+                let t = std::time::Instant::now();
+                let (packed, ratio) =
+                    crate::calibrate::pack_gptq_h(&values, k, h, damp)?;
+                eprintln!(
+                    "[gptq] {name}: k {k} n {n} H-weighted error vs nearest {ratio:.4} in {:.1}s",
+                    t.elapsed().as_secs_f64()
+                );
+                if ratio < 1.0 {
+                    stored.payload = packed.payload();
+                }
+            } else {
+                eprintln!("[gptq] {name}: no H, nearest");
+            }
+        }
+        sink(stored, replaces)
     };
     let names = |prefix: &str, leaves: &[&str]| -> Vec<String> {
         leaves.iter().map(|leaf| format!("{prefix}.{leaf}.weight")).collect()
@@ -1507,12 +1644,14 @@ mod gate_up_tests {
                 fp4: None,
                 lane: PromptLane::default(),
                 n: 2 * inter,
+                name: String::new(),
             },
             down: Projection {
                 dense: Some(down_tensor.clone()),
                 fp4: None,
                 lane: PromptLane::default(),
                 n: k,
+                name: String::new(),
             },
             down_bias: Some(bias.clone()),
             inter,

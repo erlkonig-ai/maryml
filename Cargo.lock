@@ -3284,6 +3284,7 @@ dependencies = [
  "maryml-cubecl",
  "maryml-cubecl-cpp",
  "maryml-cubek",
+ "matrixmultiply",
  "memmap2",
  "pollster",
  "rand 0.8.7",

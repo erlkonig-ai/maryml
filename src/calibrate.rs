@@ -328,6 +328,290 @@ pub fn pack_gptq(w: &[f32], cols: usize, x: &[Vec<f32>]) -> Result<Packed> {
     })
 }
 
+// ── voxtral-gptq lane: GPTQ from a precomputed H, blocked f64 algebra ──
+
+fn par_rows<F: Fn(usize, usize) + Sync>(n: usize, f: F) {
+    let threads = std::thread::available_parallelism()
+        .map_or(8, |v| v.get())
+        .min(32)
+        .max(1);
+    let chunk = n.div_ceil(threads).max(1);
+    std::thread::scope(|scope| {
+        for start in (0..n).step_by(chunk) {
+            let f = &f;
+            scope.spawn(move || f(start, (start + chunk).min(n)));
+        }
+    });
+}
+
+#[derive(Clone, Copy)]
+struct SyncPtr(*mut f64);
+unsafe impl Send for SyncPtr {}
+unsafe impl Sync for SyncPtr {}
+
+/// In-place lower Cholesky of row-major SPD `a` (n x n); the strict upper
+/// triangle is left as garbage-free zeros on return.
+fn cholesky_blocked(a: &mut [f64], n: usize) -> Result<()> {
+    const NB: usize = 128;
+    let p = SyncPtr(a.as_mut_ptr());
+    let mut k0 = 0;
+    while k0 < n {
+        let kb = NB.min(n - k0);
+        let k1 = k0 + kb;
+        // diagonal block, unblocked
+        for i in k0..k1 {
+            for j in k0..=i {
+                let mut sum = a[i * n + j];
+                for k in k0..j {
+                    sum -= a[i * n + k] * a[j * n + k];
+                }
+                if i == j {
+                    ensure!(sum > 0.0, "cholesky: non-positive pivot at {i}: {sum}");
+                    a[i * n + i] = sum.sqrt();
+                } else {
+                    a[i * n + j] = sum / a[j * n + j];
+                }
+            }
+        }
+        if k1 < n {
+            // panel: rows k1..n, L21 = A21 L11^-T, row by row
+            par_rows(n - k1, |s, e| {
+                let p = p;
+                for r in k1 + s..k1 + e {
+                    for j in k0..k1 {
+                        // SAFETY: row r of the panel is owned by this thread;
+                        // the diagonal block is read-only here.
+                        unsafe {
+                            let mut sum = *p.0.add(r * n + j);
+                            for k in k0..j {
+                                sum -= *p.0.add(r * n + k) * *p.0.add(j * n + k);
+                            }
+                            *p.0.add(r * n + j) = sum / *p.0.add(j * n + j);
+                        }
+                    }
+                }
+            });
+            // trailing: A22 -= L21 L21^T, split over row blocks of A22
+            let m = n - k1;
+            par_rows(m, |s, e| {
+                let p = p;
+                // SAFETY: each thread writes rows k1+s..k1+e of A22 (cols
+                // k1..n), and reads the panel columns k0..k1, disjoint.
+                unsafe {
+                    matrixmultiply::dgemm(
+                        e - s,
+                        kb,
+                        m,
+                        -1.0,
+                        p.0.add((k1 + s) * n + k0),
+                        n as isize,
+                        1,
+                        p.0.add(k1 * n + k0),
+                        1,
+                        n as isize,
+                        1.0,
+                        p.0.add((k1 + s) * n + k1),
+                        n as isize,
+                        1,
+                    );
+                }
+            });
+        }
+        k0 = k1;
+    }
+    for i in 0..n {
+        for j in i + 1..n {
+            a[i * n + j] = 0.0;
+        }
+    }
+    Ok(())
+}
+
+/// Inverse of a lower-triangular row-major `l`, by column blocks solved with
+/// forward substitution in parallel.
+fn lower_inverse(l: &[f64], n: usize) -> Vec<f64> {
+    const CB: usize = 64;
+    let mut inv = vec![0f64; n * n];
+    let p = SyncPtr(inv.as_mut_ptr());
+    let blocks = n.div_ceil(CB);
+    par_rows(blocks, |s, e| {
+        let p = p;
+        let mut y = vec![0f64; n * CB];
+        for blk in s..e {
+            let c0 = blk * CB;
+            let cw = CB.min(n - c0);
+            y.iter_mut().for_each(|v| *v = 0.0);
+            // rows below c0 are zero in these columns
+            for i in c0..n {
+                let mut acc = [0f64; CB];
+                if i - c0 < cw {
+                    acc[i - c0] = 1.0;
+                }
+                let row = &l[i * n..i * n + i];
+                for k in c0..i {
+                    let lik = row[k];
+                    if lik != 0.0 {
+                        let yk = &y[k * CB..k * CB + cw];
+                        for (a, &v) in acc[..cw].iter_mut().zip(yk) {
+                            *a -= lik * v;
+                        }
+                    }
+                }
+                let d = l[i * n + i];
+                for c in 0..cw {
+                    y[i * CB + c] = acc[c] / d;
+                }
+            }
+            for i in c0..n {
+                for c in 0..cw {
+                    // SAFETY: columns c0..c0+cw are owned by this block.
+                    unsafe { *p.0.add(i * n + c0 + c) = y[i * CB + c] };
+                }
+            }
+        }
+    });
+    inv
+}
+
+/// GPTQ NVFP4 of `w` (`[rows, cols]`) from an accumulated `H = X^T X`
+/// (row-major cols x cols, any positive scale), damped by `damp` times its
+/// mean diagonal. Returns the packing and its H-weighted output error
+/// relative to nearest rounding, `tr((W-Wq) H (W-Wq)^T)`.
+pub fn pack_gptq_h(w: &[f32], cols: usize, mut h: Vec<f64>, damp: f64) -> Result<(Packed, f64)> {
+    let n = cols;
+    ensure!(n > 0 && n % BLOCK == 0 && w.len() % n == 0, "bad shape");
+    ensure!(h.len() == n * n, "H is not {n} x {n}");
+    let rows = w.len() / n;
+    let mean_diag = (0..n).map(|i| h[i * n + i]).sum::<f64>() / n as f64;
+    let d = damp * mean_diag.max(1e-12);
+    for i in 0..n {
+        if h[i * n + i] <= 0.0 {
+            h[i * n + i] = mean_diag.max(1e-12);
+        }
+        h[i * n + i] += d;
+    }
+    let h_orig = h.clone();
+    // Hinv = U^T U, U upper: with J the reversal, chol(J H J) = M lower,
+    // H = R R^T where R = J M J is upper, and U = R^-1 = J M^-1 J.
+    let mut jhj = vec![0f64; n * n];
+    for i in 0..n {
+        for j in 0..n {
+            jhj[i * n + j] = h[(n - 1 - i) * n + (n - 1 - j)];
+        }
+    }
+    drop(h);
+    cholesky_blocked(&mut jhj, n)?;
+    let minv = lower_inverse(&jhj, n);
+    drop(jhj);
+    let mut u = vec![0f64; n * n];
+    for i in 0..n {
+        for j in i..n {
+            u[i * n + j] = minv[(n - 1 - i) * n + (n - 1 - j)];
+        }
+    }
+    drop(minv);
+
+    let scale2 = global_scale(w);
+    let mut codes = vec![0u8; w.len() / 2];
+    let mut scales = vec![0u8; w.len() / BLOCK];
+    let threads = std::thread::available_parallelism()
+        .map_or(8, |v| v.get())
+        .min(32)
+        .max(1);
+    let chunk = rows.div_ceil(threads).max(1);
+    let u32: Vec<f32> = u.iter().map(|&v| v as f32).collect();
+    drop(u);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = w
+            .chunks(chunk * n)
+            .enumerate()
+            .map(|(ci, part)| {
+                let u = &u32;
+                scope.spawn(move || {
+                    let mut work: Vec<f32> = part.to_vec();
+                    let nrows = part.len() / n;
+                    let mut codes = vec![0u8; part.len() / 2];
+                    let mut scales = vec![0u8; part.len() / BLOCK];
+                    let mut units = vec![0f32; nrows];
+                    for j in 0..n {
+                        if j % BLOCK == 0 {
+                            for r in 0..nrows {
+                                let block = &work[r * n + j..r * n + j + BLOCK];
+                                let (byte, unit) = block_unit(block, scale2);
+                                scales[(r * n + j) / BLOCK] = byte;
+                                units[r] = unit;
+                            }
+                        }
+                        let ujj = u[j * n + j];
+                        let urow = &u[j * n + j + 1..(j + 1) * n];
+                        for r in 0..nrows {
+                            let e = r * n + j;
+                            let v = work[e];
+                            let code = code_of(v, units[r]);
+                            codes[e / 2] |= code << (4 * (e % 2));
+                            let qv = decode_code(code) * units[r];
+                            let err = (v - qv) / ujj;
+                            if err != 0.0 {
+                                let wrow = &mut work[e + 1..(r + 1) * n];
+                                for (wk, &ujk) in wrow.iter_mut().zip(urow) {
+                                    *wk -= err * ujk;
+                                }
+                            }
+                        }
+                    }
+                    (ci, codes, scales)
+                })
+            })
+            .collect();
+        for hd in handles {
+            let (ci, c, s) = hd.join().expect("gptq worker");
+            let c0 = ci * chunk * n / 2;
+            codes[c0..c0 + c.len()].copy_from_slice(&c);
+            let s0 = ci * chunk * n / BLOCK;
+            scales[s0..s0 + s.len()].copy_from_slice(&s);
+        }
+    });
+    let packed = Packed { rows, cols: n, codes, scales, scale2 };
+    let plain = pack_nearest(w, n)?;
+    let err = |wq: &[f32]| -> f64 { h_weighted_error(w, wq, n, &h_orig) };
+    let e_g = err(&packed.decode());
+    let e_p = err(&plain.decode());
+    Ok((packed, if e_p > 0.0 { e_g / e_p } else { 1.0 }))
+}
+
+/// `tr(D H D^T)` for `D = W - Wq`, row blocks in parallel through dgemm.
+fn h_weighted_error(w: &[f32], wq: &[f32], n: usize, h: &[f64]) -> f64 {
+    const RB: usize = 64;
+    let rows = w.len() / n;
+    let total = std::sync::Mutex::new(0f64);
+    let blocks = rows.div_ceil(RB);
+    par_rows(blocks, |s, e| {
+        let mut acc = 0f64;
+        let mut d = vec![0f64; RB * n];
+        let mut dh = vec![0f64; RB * n];
+        for blk in s..e {
+            let r0 = blk * RB;
+            let rb = RB.min(rows - r0);
+            for i in 0..rb * n {
+                d[i] = (w[r0 * n + i] - wq[r0 * n + i]) as f64;
+            }
+            // SAFETY: plain row-major buffers of the sizes passed.
+            unsafe {
+                matrixmultiply::dgemm(
+                    rb, n, n, 1.0,
+                    d.as_ptr(), n as isize, 1,
+                    h.as_ptr(), n as isize, 1,
+                    0.0,
+                    dh.as_mut_ptr(), n as isize, 1,
+                );
+            }
+            acc += d[..rb * n].iter().zip(&dh[..rb * n]).map(|(a, b)| a * b).sum::<f64>();
+        }
+        *total.lock().unwrap() += acc;
+    });
+    total.into_inner().unwrap()
+}
+
 /// `mean|x|^alpha`, geometric mean one, or all ones at alpha zero.
 fn channel_scales(mean_abs: &[f32], alpha: f32) -> Vec<f32> {
     if alpha == 0.0 {
@@ -473,6 +757,40 @@ mod tests {
             *v /= rows.len() as f32;
         }
         m
+    }
+
+    #[test]
+    fn gptq_h_algebra_and_gain() {
+        // n spans several Cholesky (128) and inverse (64) blocks.
+        let n = 320;
+        let x = inputs(2000, n);
+        let mut h = vec![0f64; n * n];
+        for r in &x {
+            for i in 0..n {
+                for j in 0..n {
+                    h[i * n + j] += r[i] as f64 * r[j] as f64;
+                }
+            }
+        }
+        let mut a = h.clone();
+        for i in 0..n { a[i * n + i] += 1.0; }
+        let a0 = a.clone();
+        cholesky_blocked(&mut a, n).unwrap();
+        let mut worst = 0f64;
+        for i in 0..n { for j in 0..n {
+            let v: f64 = (0..n).map(|k| a[i * n + k] * a[j * n + k]).sum();
+            worst = worst.max((v - a0[i * n + j]).abs());
+        }}
+        assert!(worst < 1e-6 * a0[0], "LL^T residual {worst}");
+        let inv = lower_inverse(&a, n);
+        for i in 0..n { for j in 0..n {
+            let v: f64 = (0..n).map(|k| a[i * n + k] * inv[k * n + j]).sum();
+            let want = if i == j { 1.0 } else { 0.0 };
+            assert!((v - want).abs() < 1e-9, "L Linv at {i},{j}: {v}");
+        }}
+        let w = matrix(48, n);
+        let (_, ratio) = pack_gptq_h(&w, n, h, 0.01).unwrap();
+        assert!(ratio < 1.0, "gptq ratio {ratio}");
     }
 
     #[test]
