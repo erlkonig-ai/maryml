@@ -60,20 +60,18 @@ fn main() -> anyhow::Result<()> {
     let lane = mary::nvfp4::PromptLane::parse(&lane)?;
     let started = Instant::now();
     let store = mary::persist::read_model_pile_snapshot_read_only(Path::new(&args[0]))?;
-    // SAFETY: the operator runs this against a pile nobody truncates or
-    // rewrites while the process lives.
     let ears = match (&collection, &root) {
         (Some(collection), _) => {
             let handle = mary::model_collection::parse_collection_handle(collection)?;
             let collection = mary::model_collection::open_model_collection(&store, handle)?;
             let models = mary::model_collection::snapshot_model_collection_for(&store, collection)?;
-            unsafe { Ears::load(&models, lane)? }
+            Ears::load(&models, lane)?
         }
         (None, Some(root)) => {
             let root = triblespace::prelude::Id::from_hex(root)
                 .ok_or_else(|| anyhow::anyhow!("--root is not a 32-hex id"))?;
             let models = mary::model_collection::snapshot_model_collection_in(&store)?;
-            unsafe { Ears::load_root(&models, root, weights, lane)? }
+            Ears::load_root(&models, root, weights, lane)?
         }
         (None, None) => unreachable!("checked above"),
     };

@@ -86,7 +86,7 @@ pub(super) struct Binder<'a, R> {
     pub weights: Weights,
     pub lane: PromptLane,
     /// NVFP4 projections bound so far and their device bytes, for the load
-    /// line: stored ones are pile aliases, quantized ones were made here.
+    /// line: stored ones are uploaded, quantized ones were made here.
     pub nvfp4: (usize, u64),
     /// Under export, every BF16 projection packed on the host for storage
     /// after its codes matched the device quantizer's bit for bit.
@@ -107,14 +107,14 @@ impl<R: BlobStoreGet> Binder<'_, R> {
         );
         Ok(value)
     }
-    /// A linear projection `[out, in]`. A stored NVFP4 leaf is bound as the
-    /// only copy. Otherwise the BF16 alias, plus a resident NVFP4 copy
+    /// A linear projection `[out, in]`. A stored NVFP4 leaf is copied into
+    /// device memory as the only copy. Otherwise the BF16 alias, plus a resident NVFP4 copy
     /// quantized from it under [`Weights::Nvfp4`] or under export.
     pub(super) unsafe fn linear(&mut self, name: &str, shape: [u64; 2]) -> Result<Linear> {
         if let Some(blob) = load::find_tensor_nvfp4(self.facts, self.reader, self.root, name, shape)? {
-            // SAFETY: forwarded genuine mapped immutable-prefix contract from caller.
-            let q = unsafe { self.aliases.bind_nvfp4_leaf(blob, burn::tensor::DType::BF16) }
-                .map_err(|e| anyhow::anyhow!("{name}: {e}"))?;
+            let view = crate::leaf::read_leaf(blob)?;
+            let q = Nvfp4::upload(view.payload(), shape, burn::tensor::DType::BF16, self.aliases.device())
+                .map_err(|e| e.context(name.to_owned()))?;
             self.nvfp4.0 += 1;
             self.nvfp4.1 += q.bytes();
             return Ok(Linear { bf16: None, nvfp4: Some(q), lane: self.lane });

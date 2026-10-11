@@ -208,8 +208,9 @@ impl VoxtralNvfp4 {
     }
 
     /// The leaf index as the lazy runtime loader. Leaves view the pile's
-    /// mapping; F16 tensors upload at native width, stored NVFP4 projections
-    /// are bound by the folded lane itself (`fast::Projection`).
+    /// mapping until loading copies them: F16 tensors upload at native width,
+    /// stored NVFP4 projections are uploaded by the folded lane itself
+    /// (`fast::Projection`).
     pub fn into_loader(self) -> WeightLoader {
         WeightLoader::Typed(self.index)
     }

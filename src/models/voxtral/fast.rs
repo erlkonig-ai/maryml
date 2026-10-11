@@ -108,13 +108,11 @@ pub struct LoadOptions {
     pub weights: Weights,
     /// How stored NVFP4 projections multiply prompt-height activations.
     pub lane: PromptLane,
-    /// The binder that aliases stored NVFP4 leaves onto the device. Without
-    /// one there is no CUDA lane, and a stored projection is decoded on the
-    /// host to the backend's 16-bit type.
+    /// The device stored NVFP4 leaves are copied to. Without one there is no
+    /// CUDA lane, and a stored projection is decoded on the host to the
+    /// backend's 16-bit type.
     #[cfg(feature = "voxtral-cuda")]
-    pub aliases: Option<
-        std::rc::Rc<std::cell::RefCell<crate::nn::cuda_bf16_alias::CudaBf16Aliases>>,
-    >,
+    pub fp4_device: Option<cubecl::cuda::CudaDevice>,
 }
 
 impl LoadOptions {
@@ -188,7 +186,7 @@ fn fp4_prompt<B: Backend>(x: Tensor<B, 3>, q: &Fp4, lane: PromptLane, what: &str
 ///
 /// A 16-bit-stored root's projection is its folded 16-bit weight, plus an
 /// NVFP4 copy quantized at load under [`Weights::Nvfp4`]. A stored NVFP4
-/// projection is the pile alias alone on CUDA: the GEMV takes one to eight
+/// projection is its device copy alone on CUDA: the GEMV takes one to eight
 /// rows and the prompt GEMM ([`PromptLane`]) every other height, so no 16-bit
 /// copy of it exists. Without CUDA it is decoded on the host to `dense`.
 pub(super) struct Projection<B: Backend> {
@@ -229,18 +227,14 @@ impl<B: Backend> Projection<B> {
         };
         let (n, k) = (n as usize, k as usize);
         #[cfg(feature = "voxtral-cuda")]
-        if let Some(aliases) = &opts.aliases {
-            // SAFETY: the pile custody contract `Ears::load`'s caller owes:
-            // the leaf is a slice of a genuine pile mapping that stays
-            // immutable through CUDA runtime teardown.
-            let q = unsafe {
-                aliases.borrow_mut().bind_nvfp4_payload(
-                    leaf.payload(),
-                    [n as u64, k as u64],
-                    burn::tensor::DType::F16,
-                )
-            }
-            .unwrap_or_else(|error| panic!("{name}: bind stored NVFP4 projection: {error}"));
+        if let Some(device) = &opts.fp4_device {
+            let q = Fp4::upload(
+                leaf.payload(),
+                [n as u64, k as u64],
+                burn::tensor::DType::F16,
+                device,
+            )
+            .unwrap_or_else(|error| panic!("{name}: upload stored NVFP4 projection: {error:#}"));
             return Some(Self {
                 dense: None,
                 fp4: Some(q),
