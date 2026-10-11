@@ -80,7 +80,7 @@ impl Weights {
 
 /// One linear projection `[out, in]`.
 ///
-/// A stored NVFP4 projection is `nvfp4` alone, bound from the pile: the GEMV
+/// A stored NVFP4 projection is `nvfp4` alone, copied into device memory: the GEMV
 /// takes one to eight rows and the prompt GEMM ([`PromptLane`]) every other
 /// height, so no 16-bit copy exists. A BF16-stored projection keeps its pile
 /// alias and, under [`Weights::Nvfp4`], a device-quantized copy for decode.

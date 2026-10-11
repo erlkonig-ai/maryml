@@ -51,11 +51,6 @@ pub const WARM_UP_SAMPLES: usize = 32_000;
 pub struct Ears {
     stt: RealtimeTranscriber<Backend>,
     prefix: EncoderPrefix<Backend, FastCaches<Backend>>,
-    /// The registration session of the stored NVFP4 aliases. CubeCL keeps
-    /// the mappings until runtime teardown regardless; this keeps the
-    /// registration bound per load.
-    #[cfg(feature = "voxtral-cuda")]
-    _aliases: Option<std::rc::Rc<std::cell::RefCell<crate::nn::cuda_bf16_alias::CudaBf16Aliases>>>,
 }
 
 impl Ears {
@@ -67,41 +62,30 @@ impl Ears {
     /// caller's first utterance. `lane` is how the stored four-bit
     /// projections multiply prompt-height activations.
     ///
-    /// On CUDA the stored projections are aliased from the pile mapping, not
-    /// copied, so every selected tensor must be resident in `models`' store:
-    /// bytes from anywhere else are refused, by tensor name.
-    ///
-    /// # Safety
-    /// The snapshot's pile bytes, including the preceding partial pages of
-    /// every aliased leaf, must stay immutable or append-only/untruncated
-    /// through CUDA runtime teardown (see `cuda_bf16_alias`).
-    pub unsafe fn load<R: triblespace::core::repo::BlobStoreGet>(
+    /// Every tensor, the stored four-bit projections included, is copied to
+    /// the device; nothing stays aliased to the pile after loading.
+    pub fn load<R: triblespace::core::repo::BlobStoreGet>(
         models: &ModelSnapshot<R>,
         lane: PromptLane,
     ) -> anyhow::Result<Self> {
         let weights = VoxtralNvfp4::from_snapshot(models)?;
-        // SAFETY: forwarded.
-        unsafe { Self::load_weights(models, weights, Weights::F16, lane) }
+        Self::load_weights(models, weights, Weights::F16, lane)
     }
 
     /// [`Self::load`] for one explicit root of F16 and NVFP4 leaves, with
     /// `weights` choosing what its 16-bit-stored projections run on: the form
     /// a legacy f16 root, whose labels this build cannot read, loads in.
-    ///
-    /// # Safety
-    /// As [`Self::load`].
-    pub unsafe fn load_root<R: triblespace::core::repo::BlobStoreGet>(
+    pub fn load_root<R: triblespace::core::repo::BlobStoreGet>(
         models: &ModelSnapshot<R>,
         root: triblespace::prelude::Id,
         weights: Weights,
         lane: PromptLane,
     ) -> anyhow::Result<Self> {
         let model = VoxtralNvfp4::from_root(models, root)?;
-        // SAFETY: forwarded.
-        unsafe { Self::load_weights(models, model, weights, lane) }
+        Self::load_weights(models, model, weights, lane)
     }
 
-    unsafe fn load_weights<R: triblespace::core::repo::BlobStoreGet>(
+    fn load_weights<R: triblespace::core::repo::BlobStoreGet>(
         models: &ModelSnapshot<R>,
         model: VoxtralNvfp4,
         weights: Weights,
@@ -116,36 +100,14 @@ impl Ears {
             weights == Weights::F16,
             "NVFP4 quantization at load needs the voxtral-cuda build"
         );
-        #[cfg(feature = "voxtral-cuda")]
-        let aliases = if stored > 0 {
-            Some(std::rc::Rc::new(std::cell::RefCell::new(
-                crate::nn::cuda_bf16_alias::CudaBf16Aliases::new(
-                    cubecl::cuda::CudaDevice { index: 0 },
-                    4096,
-                )
-                .map_err(anyhow::Error::msg)?,
-            )))
-        } else {
-            None
-        };
-        #[cfg(not(feature = "voxtral-cuda"))]
-        let _ = stored;
         let opts = LoadOptions {
             weights,
             lane,
             #[cfg(feature = "voxtral-cuda")]
-            aliases: aliases.clone(),
+            fp4_device: (stored > 0).then(|| cubecl::cuda::CudaDevice { index: 0 }),
         };
         let stt = RealtimeTranscriber::load_with(&loader, tekken, MAX_TOKENS, &device, &opts);
         drop(loader);
-        #[cfg(feature = "voxtral-cuda")]
-        if let Some(aliases) = &aliases {
-            let stats = aliases.borrow().stats();
-            eprintln!(
-                "[voxtral] stored NVFP4 aliases: {} registrations, {} bytes",
-                stats.registrations, stats.aliased_bytes
-            );
-        }
         let prefix = {
             let mut stream = StreamingTranscriber::new(&stt, 480);
             let prefix = stream.prepare_encoder_prefix();
@@ -155,12 +117,7 @@ impl Ears {
             warm.finish();
             prefix
         };
-        Ok(Self {
-            stt,
-            prefix,
-            #[cfg(feature = "voxtral-cuda")]
-            _aliases: aliases,
-        })
+        Ok(Self { stt, prefix })
     }
 
     /// Start a stream with text delayed `delay_ms` behind the audio (a
@@ -296,9 +253,7 @@ pub(crate) fn test_ears(pile: &std::path::Path) -> anyhow::Result<Ears> {
     )?)?;
     let collection = crate::model_collection::open_model_collection(&store, handle)?;
     let models = crate::model_collection::snapshot_model_collection_for(&store, collection)?;
-    // SAFETY: the test runner owns custody of the configured pile through
-    // process teardown.
-    unsafe { Ears::load(&models, PromptLane::default()) }
+    Ears::load(&models, PromptLane::default())
 }
 
 #[cfg(test)]

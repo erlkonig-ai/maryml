@@ -12,7 +12,7 @@ use super::{
     sampling::{self, Sampler},
     text_encoder::TextEncoder,
 };
-use crate::nn::cuda_bf16_alias::CudaBf16Aliases;
+use cubecl::{Runtime, client::ComputeClient, cuda::{CudaDevice, CudaRuntime}};
 use anyhow::{Result, ensure};
 use ops::Tensor;
 use std::time::Instant;
@@ -82,45 +82,48 @@ pub(super) struct Binder<'a, R> {
     pub facts: &'a TribleSet,
     pub reader: &'a R,
     pub root: Id,
-    pub aliases: &'a mut CudaBf16Aliases,
+    pub client: ComputeClient<CudaRuntime>,
+    pub device: CudaDevice,
     pub weights: Weights,
     pub lane: PromptLane,
     /// NVFP4 projections bound so far and their device bytes, for the load
-    /// line: stored ones are pile aliases, quantized ones were made here.
+    /// line: stored ones are uploaded, quantized ones were made here.
     pub nvfp4: (usize, u64),
+    /// BF16 bytes copied to the device so far.
+    pub bf16_bytes: u64,
     /// Under export, every BF16 projection packed on the host for storage
     /// after its codes matched the device quantizer's bit for bit.
     pub export: Option<Vec<StoredProjection>>,
 }
 impl<R: BlobStoreGet> Binder<'_, R> {
-    pub(super) unsafe fn weight<const N: usize>(
-        &mut self,
-        name: &str,
-        shape: [u64; N],
-    ) -> Result<Tensor> {
+    /// A BF16 leaf `name` of exactly `shape`, copied into device memory.
+    pub(super) fn weight<const N: usize>(&mut self, name: &str, shape: [u64; N]) -> Result<Tensor> {
         let (_, blob) = load::tensor_bf16(self.facts, self.reader, self.root, name, shape)?;
-        // SAFETY: forwarded genuine mapped immutable-prefix contract from caller.
-        let value = unsafe { self.aliases.bind_pile_leaf(blob) }.map_err(anyhow::Error::msg)?;
-        ensure!(
-            !value.handle.can_mut(),
-            "weight alias unexpectedly writable"
-        );
-        Ok(value)
+        let view = crate::leaf::read_leaf(blob)?;
+        let handle = self.client.create_from_slice(view.payload());
+        self.bf16_bytes += view.payload().len() as u64;
+        let dims: Vec<usize> = shape.iter().map(|&d| d as usize).collect();
+        Ok(Tensor::new_contiguous(
+            self.client.clone(),
+            self.device.clone(),
+            dims.as_slice().into(),
+            handle,
+            burn::tensor::DType::BF16,
+        ))
     }
-    /// A linear projection `[out, in]`. A stored NVFP4 leaf is bound as the
-    /// only copy. Otherwise the BF16 alias, plus a resident NVFP4 copy
-    /// quantized from it under [`Weights::Nvfp4`] or under export.
-    pub(super) unsafe fn linear(&mut self, name: &str, shape: [u64; 2]) -> Result<Linear> {
+    /// A linear projection `[out, in]`. A stored NVFP4 leaf is copied into
+    /// device memory as the only copy. Otherwise the BF16 weight, plus an
+    /// NVFP4 copy quantized from it under [`Weights::Nvfp4`] or under export.
+    pub(super) fn linear(&mut self, name: &str, shape: [u64; 2]) -> Result<Linear> {
         if let Some(blob) = load::find_tensor_nvfp4(self.facts, self.reader, self.root, name, shape)? {
-            // SAFETY: forwarded genuine mapped immutable-prefix contract from caller.
-            let q = unsafe { self.aliases.bind_nvfp4_leaf(blob, burn::tensor::DType::BF16) }
-                .map_err(|e| anyhow::anyhow!("{name}: {e}"))?;
+            let view = crate::leaf::read_leaf(blob)?;
+            let q = Nvfp4::upload(view.payload(), shape, burn::tensor::DType::BF16, &self.device)
+                .map_err(|e| e.context(name.to_owned()))?;
             self.nvfp4.0 += 1;
             self.nvfp4.1 += q.bytes();
             return Ok(Linear { bf16: None, nvfp4: Some(q), lane: self.lane });
         }
-        // SAFETY: forwarded genuine mapped immutable-prefix contract from caller.
-        let bf16 = unsafe { self.weight(name, shape)? };
+        let bf16 = self.weight(name, shape)?;
         let nvfp4 = if self.weights == Weights::Nvfp4 || self.export.is_some() {
             let q = Nvfp4::quantize(&bf16).map_err(|e| e.context(name.to_owned()))?;
             if self.export.is_some() {
@@ -286,56 +289,62 @@ pub struct Generator {
     depth: Depth,
     audio_embedding: Tensor,
     head: Tensor,
+    /// Weight bytes this generator copied to the device (BF16 and NVFP4).
+    device_bytes: u64,
 }
 impl Generator {
-    /// # Safety
-    /// All selected leaves must be genuine validated mapped pile blobs. Their
-    /// backing files INCLUDING preceding partial pages must stay immutable or
-    /// append-only and untruncated through CUDA client/runtime STORAGE TEARDOWN,
-    /// not merely until Generator/reader/binder drop or synchronization. Runtime
-    /// external registrations retain mmap owners. Partial construction failure
-    /// also retains registrations; a read-only FD is not external immutability.
-    pub unsafe fn from_pile<R: BlobStoreGet>(
+    /// Weight bytes this generator holds on the device.
+    pub fn device_bytes(&self) -> u64 {
+        self.device_bytes
+    }
+
+    /// Copy one model root's weights into device memory on `device`: every
+    /// BF16 tensor, and every stored NVFP4 projection. Nothing stays aliased
+    /// to the store the leaves came from.
+    pub fn from_pile<R: BlobStoreGet>(
         facts: &TribleSet,
         reader: &R,
         model_root: Id,
         config: Config,
-        aliases: &mut CudaBf16Aliases,
+        device: &CudaDevice,
         weights: Weights,
         lane: PromptLane,
     ) -> Result<Self> {
-        let (generator, _) = unsafe {
-            Self::bind(facts, reader, model_root, config, aliases, weights, lane, false)?
-        };
+        let (generator, _) =
+            Self::bind(facts, reader, model_root, config, device, weights, lane, false)?;
         Ok(generator)
     }
 
     /// Bind a BF16-stored root and pack every linear projection the generator
     /// would quantize for NVFP4 storage, each gated bit for bit against the
     /// device quantizer on the same values (see `Binder::pack_for_storage`).
-    ///
-    /// # Safety
-    /// As [`Self::from_pile`].
-    pub unsafe fn export_projections<R: BlobStoreGet>(
+    pub fn export_projections<R: BlobStoreGet>(
         facts: &TribleSet,
         reader: &R,
         model_root: Id,
         config: Config,
-        aliases: &mut CudaBf16Aliases,
+        device: &CudaDevice,
     ) -> Result<Vec<StoredProjection>> {
-        let (_, exported) = unsafe {
-            Self::bind(facts, reader, model_root, config, aliases, Weights::Bf16, PromptLane::default(), true)?
-        };
+        let (_, exported) = Self::bind(
+            facts,
+            reader,
+            model_root,
+            config,
+            device,
+            Weights::Bf16,
+            PromptLane::default(),
+            true,
+        )?;
         Ok(exported)
     }
 
     #[allow(clippy::too_many_arguments)]
-    unsafe fn bind<R: BlobStoreGet>(
+    fn bind<R: BlobStoreGet>(
         facts: &TribleSet,
         reader: &R,
         model_root: Id,
         config: Config,
-        aliases: &mut CudaBf16Aliases,
+        device: &CudaDevice,
         weights: Weights,
         lane: PromptLane,
         export: bool,
@@ -346,30 +355,32 @@ impl Generator {
             facts,
             reader,
             root: model_root,
-            aliases,
+            client: CudaRuntime::client(device),
+            device: device.clone(),
             weights,
             lane,
             nvfp4: (0, 0),
+            bf16_bytes: 0,
             export: export.then(Vec::new),
         };
-        // SAFETY: same genuine pile/root/binder and immutable lifetime premise.
-        let generator = unsafe {
-            Self {
-                text: TextEncoder::bind(&mut b, config.text.clone(), config.backbone.hidden_size)?,
-                backbone: Decoder::bind(&mut b, config.backbone.clone(), "backbone_model", true)?,
-                depth: Depth::bind(&mut b, config.depth.clone(), config.audio_vocab_size)?,
-                audio_embedding: b
-                    .weight("depth_decoder.model.embed_tokens.weight", [32816, 2048])?,
-                head: b.weight("lm_head.weight", [2052, 2048])?,
-                config,
-            }
+        let mut generator = Self {
+            text: TextEncoder::bind(&mut b, config.text.clone(), config.backbone.hidden_size)?,
+            backbone: Decoder::bind(&mut b, config.backbone.clone(), "backbone_model", true)?,
+            depth: Depth::bind(&mut b, config.depth.clone(), config.audio_vocab_size)?,
+            audio_embedding: b
+                .weight("depth_decoder.model.embed_tokens.weight", [32816, 2048])?,
+            head: b.weight("lm_head.weight", [2052, 2048])?,
+            device_bytes: 0,
+            config,
         };
-        if b.nvfp4.0 > 0 {
+        generator.device_bytes = b.bf16_bytes + b.nvfp4.1;
+        {
             generator.synchronize()?;
             eprintln!(
-                "[breeze] NVFP4 weights: {} projections, {} bytes, bound in {:.3}s; prompt lane {:?}",
+                "[breeze] weights on the device: {} NVFP4 projections, {} bytes, and {} BF16 bytes, in {:.3}s; prompt lane {:?}",
                 b.nvfp4.0,
                 b.nvfp4.1,
+                b.bf16_bytes,
                 started.elapsed().as_secs_f64(),
                 lane
             );

@@ -19,7 +19,7 @@ pub(super) struct Depth {
     vocab: usize,
 }
 impl Depth {
-    pub(super) unsafe fn bind<R: BlobStoreGet>(
+    pub(super) fn bind<R: BlobStoreGet>(
         b: &mut Binder<'_, R>,
         c: DepthConfig,
         vocab: usize,
@@ -28,19 +28,17 @@ impl Depth {
             c.audio_embed_size == c.backbone_hidden_size,
             "separate depth backbone projector unsupported"
         );
-        Ok(unsafe {
-            Self {
-                projection: b.linear(
-                    "depth_decoder.model.inputs_embeds_projector.weight",
-                    [c.decoder.hidden_size as u64, c.audio_embed_size as u64],
-                )?,
-                heads: b.weight(
-                    "depth_decoder.codebooks_head.weight",
-                    [15, c.decoder.hidden_size as u64, vocab as u64],
-                )?,
-                decoder: Decoder::bind(b, c.decoder, "depth_decoder.model", false)?,
-                vocab,
-            }
+        Ok(Self {
+            projection: b.linear(
+                "depth_decoder.model.inputs_embeds_projector.weight",
+                [c.decoder.hidden_size as u64, c.audio_embed_size as u64],
+            )?,
+            heads: b.weight(
+                "depth_decoder.codebooks_head.weight",
+                [15, c.decoder.hidden_size as u64, vocab as u64],
+            )?,
+            decoder: Decoder::bind(b, c.decoder, "depth_decoder.model", false)?,
+            vocab,
         })
     }
     /// Launches the frame's first codebook step from the backbone's code in

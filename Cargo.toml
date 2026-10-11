@@ -347,7 +347,7 @@ voxtral = ["dep:burn-fusion", "dep:burn-cubecl", "dep:memmap2"]
 # aliases. Opt-in rather than target-implied: the wgpu lane stays buildable and
 # measurable on the same Linux box. `dep:cubek` only names a crate burn-cubecl
 # already brings, for voxtral_gemv_probe's direct kernel launches.
-voxtral-cuda = ["voxtral", "dep:cubecl", "cubecl?/cuda", "burn/cuda", "dep:cubek", "cuda-bf16-alias"]
+voxtral-cuda = ["voxtral", "dep:cubecl", "cubecl?/cuda", "burn/cuda", "dep:cubek"]
 # Construct a `tokenizers::Tokenizer` DIRECTLY from a tokenizer graph
 # (mary::tokenizer::build_tokenizer + persist::load_tokenizer_from_pile) —
 # the load half of tokenizers-as-tribles: no tokenizer.json anywhere in the

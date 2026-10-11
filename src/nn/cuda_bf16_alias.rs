@@ -1,8 +1,7 @@
-//! Strict native BF16 and NVFP4 pile -> raw CUDA tensor binding.
+//! Strict native BF16 pile -> raw CUDA tensor binding.
 //!
 //! Query the required typed leaf at the consuming model slot, fetch its
-//! `Blob<Tensor<BF16, R>>` (or `Blob<Tensor<NVFP4, 2>>`, whose code and scale
-//! planes become two aliases) from the frozen store, then bind it here. This module
+//! `Blob<Tensor<BF16, R>>` from the frozen store, then bind it here. This module
 //! owns CUDA registrations, not a catalogue of model facts. There is no upload,
 //! dtype conversion, source-file reopen, or CPU model path.
 //!
@@ -33,7 +32,7 @@ use memmap2::MmapRaw;
 use std::sync::Arc;
 use triblespace::core::blob::{
     Blob,
-    encodings::tensor::{MAX_RANK, TENSOR_HEADER_LEN, Tensor, elements::{BF16, NVFP4}},
+    encodings::tensor::{MAX_RANK, TENSOR_HEADER_LEN, Tensor, elements::BF16},
 };
 
 /// Successful binds, including repeated binds, are counted explicitly.
@@ -153,67 +152,6 @@ impl CudaBf16Aliases {
         Ok(CubeTensor::new_contiguous(
             self.client.clone(), self.device.clone(), shape.as_slice().into(), handle, DType::BF16,
         ))
-    }
-
-    /// Bind a stored NVFP4 matrix `[n, k]` as the resident four-bit weight the
-    /// GEMV and the prompt GEMM read: its code plane and its E4M3 scale plane
-    /// become two aliases of the pile mapping, and the trailing f32 global
-    /// scale is read on the host. Nothing is uploaded or converted. `dtype` is
-    /// the 16-bit type of the activations it will multiply (BF16 or F16).
-    ///
-    /// # Safety
-    /// The same pile custody contract as [`Self::bind_pile_leaf`].
-    #[cfg(any(feature = "breeze-cuda", feature = "voxtral-cuda"))]
-    pub(crate) unsafe fn bind_nvfp4_leaf(
-        &mut self,
-        blob: Blob<Tensor<NVFP4, 2>>,
-        dtype: DType,
-    ) -> Result<crate::nn::nvfp4_gemv::Nvfp4, String> {
-        let view = crate::leaf::read_leaf(blob).map_err(|e| e.to_string())?;
-        let dims = [view.dims()[0], view.dims()[1]];
-        // SAFETY: forwarded genuine immutable pile-prefix contract.
-        unsafe { self.bind_nvfp4_payload(view.payload(), dims, dtype) }
-    }
-
-    /// [`Self::bind_nvfp4_leaf`] for a payload already resolved to its leaf
-    /// (`crate::leaf::Leaf`): the `Tensor<NVFP4, 2>` payload of `dims`.
-    ///
-    /// # Safety
-    /// The same pile custody contract as [`Self::bind_pile_leaf`].
-    #[cfg(any(feature = "breeze-cuda", feature = "voxtral-cuda"))]
-    pub(crate) unsafe fn bind_nvfp4_payload(
-        &mut self,
-        payload: &anybytes::Bytes,
-        dims: [u64; 2],
-        dtype: DType,
-    ) -> Result<crate::nn::nvfp4_gemv::Nvfp4, String> {
-        let (n, k) = (
-            usize::try_from(dims[0]).map_err(|_| "NVFP4 rows exceed usize")?,
-            usize::try_from(dims[1]).map_err(|_| "NVFP4 columns exceed usize")?,
-        );
-        let elements = n.checked_mul(k).filter(|&e| e > 0 && e <= u32::MAX as usize)
-            .ok_or("NVFP4 alias requires a nonempty shape in the u32 kernel index domain")?;
-        if !k.is_multiple_of(32) {
-            return Err(format!("NVFP4 alias needs k a multiple of 32, got {k}"));
-        }
-        if !(payload.as_ptr() as usize).is_multiple_of(256) {
-            return Err("NVFP4 tensor payload is not 256-byte aligned".into());
-        }
-        let (codes_len, scales_len) = (elements / 2, elements / 16);
-        if payload.len() != codes_len + scales_len + 4 {
-            return Err(format!(
-                "NVFP4 payload has {} bytes; [{n}, {k}] requires {}",
-                payload.len(), codes_len + scales_len + 4
-            ));
-        }
-        let tail = &payload[codes_len + scales_len..];
-        let scale2 = f32::from_le_bytes(tail.try_into().expect("four trailing bytes"));
-        // SAFETY: forwarded genuine immutable pile-prefix contract.
-        let codes = unsafe { self.register(payload, 0, codes_len)? };
-        let scales = unsafe { self.register(payload, codes_len, scales_len)? };
-        crate::nn::nvfp4_gemv::Nvfp4::from_parts(
-            codes, scales, scale2, n, k, dtype, self.device.clone(),
-        ).map_err(|e| e.to_string())
     }
 
     /// Register `payload[start..start + size]` once and return its handle.

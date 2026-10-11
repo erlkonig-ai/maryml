@@ -243,22 +243,13 @@ fn breeze(
     let ids = Artifacts::from_root(&source.facts, source.root)?;
     let assets = Assets::from_frozen(&source.facts, &source.store, ids)?;
     let started = Instant::now();
-    let mut aliases = mary::nn::cuda_bf16_alias::CudaBf16Aliases::new(
-        cubecl::cuda::CudaDevice { index: 0 },
-        2048,
-    )
-    .map_err(anyhow::Error::msg)?;
-    // SAFETY: the source pile is read-only, immutable for this process's
-    // lifetime (the operator's custody), and the aliases die with it.
-    let exported = unsafe {
-        Generator::export_projections(
-            &source.facts,
-            &source.store,
-            source.root,
-            assets.config,
-            &mut aliases,
-        )?
-    };
+    let exported = Generator::export_projections(
+        &source.facts,
+        &source.store,
+        source.root,
+        assets.config,
+        &cubecl::cuda::CudaDevice { index: 0 },
+    )?;
     let export_seconds = started.elapsed().as_secs_f64();
     eprintln!(
         "[breeze] {} projections packed and gated in {export_seconds:.1}s",

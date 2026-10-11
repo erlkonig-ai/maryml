@@ -325,9 +325,45 @@ impl Nvfp4 {
         })
     }
 
-    /// A weight whose planes already sit on the device: the code and scale
-    /// aliases of a stored NVFP4 leaf (`cuda_bf16_alias::bind_nvfp4_leaf`).
-    /// `dtype` is the 16-bit type of the activations it multiplies.
+    /// A stored `Tensor<NVFP4, 2>` leaf payload of `dims` `[n, k]`, copied into
+    /// device memory: the code plane and the E4M3 scale plane each become one
+    /// fresh device buffer, and the trailing global scale is read on the
+    /// host. Nothing is converted or quantized. `dtype` is the 16-bit type of
+    /// the activations it will multiply (BF16 or F16).
+    ///
+    /// A copy rather than an alias of the pile mapping on purpose: on GB10 the
+    /// GEMV and the prompt GEMM ran 13 to 17 percent slower reading pageable
+    /// mapped memory than reading device buffers (Breeze 47.7 against 40.9 ms
+    /// per frame, Voxtral 0.483 against 0.427 s of compute per audio second,
+    /// sky, 2026-10-11), for 1.38 and 2.34 GB of four-bit planes.
+    pub(crate) fn upload(
+        payload: &[u8],
+        dims: [u64; 2],
+        dtype: DType,
+        device: &CudaDevice,
+    ) -> Result<Self> {
+        let (n, k) = (dims[0] as usize, dims[1] as usize);
+        let elements = n
+            .checked_mul(k)
+            .filter(|&e| e > 0 && e <= u32::MAX as usize)
+            .ok_or_else(|| anyhow::anyhow!("NVFP4 [{n}, {k}] is empty or exceeds u32 indexing"))?;
+        let (codes_len, scales_len) = (elements / 2, elements / GROUP);
+        ensure!(
+            payload.len() == codes_len + scales_len + 4,
+            "NVFP4 payload has {} bytes; [{n}, {k}] requires {}",
+            payload.len(),
+            codes_len + scales_len + 4
+        );
+        let tail = &payload[codes_len + scales_len..];
+        let scale2 = f32::from_le_bytes(tail.try_into().expect("four trailing bytes"));
+        let client = CudaRuntime::client(device);
+        let codes = client.create_from_slice(&payload[..codes_len]);
+        let scales = client.create_from_slice(&payload[codes_len..codes_len + scales_len]);
+        Self::from_parts(codes, scales, scale2, n, k, dtype, device.clone())
+    }
+
+    /// A weight whose planes already sit on the device. `dtype` is the
+    /// 16-bit type of the activations it multiplies.
     pub(crate) fn from_parts(
         codes: Handle,
         scales: Handle,

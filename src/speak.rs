@@ -532,16 +532,15 @@ mod breeze_transport_tests {
     fn breeze_rejects_invalid_config_before_spawning_or_opening_assets() {
         let mut config = test_config();
         config.options.max_frames = 0;
-        // SAFETY: invalid inputs are refused before any file or CUDA access.
-        assert!(unsafe { Synthesizer::spawn_breeze(empty_models(), config) }.is_err());
+        // Invalid inputs are refused before any file or CUDA access.
+        assert!(Synthesizer::spawn_breeze(empty_models(), config).is_err());
     }
 
     #[test]
     fn breeze_load_failure_reaches_each_existing_stream_finish() {
         let config = test_config();
-        // SAFETY: an empty collection fails selection before any tensor is
-        // bound; no aliased file/CUDA storage exists in this routing control.
-        let synth = unsafe { Synthesizer::spawn_breeze(empty_models(), config) }.unwrap();
+        // An empty collection fails selection before any tensor is bound.
+        let synth = Synthesizer::spawn_breeze(empty_models(), config).unwrap();
         for text in ["First request.", "Second request."] {
             let mut stream = synth.speak(text).unwrap();
             assert!(stream.next().is_none());
@@ -587,11 +586,6 @@ mod breeze_transport_tests {
         fn from_env(name: &str) -> anyhow::Result<Self> {
             use crate::models::breeze::{generator::GenerationOptions, resident::BreezeVoiceConfig};
 
-            anyhow::ensure!(
-                std::env::var("BREEZE_RESIDENT_CUSTODY")?.as_str()
-                    == "immutable-pile-through-cuda-runtime-teardown",
-                "explicit immutable alias custody is required"
-            );
             let pile = std::env::var("BREEZE_RESIDENT_PILE")?;
             let collection = crate::model_collection::parse_collection_handle(
                 &std::env::var("BREEZE_RESIDENT_COLLECTION")?,
@@ -642,14 +636,12 @@ mod breeze_transport_tests {
     /// Explicit real-model control, never part of the default test run: two
     /// lines through the production transport, each streamed in hops.
     #[test]
-    #[ignore = "real native Breeze CUDA; requires immutable-pile custody and fresh Stars reservation"]
+    #[ignore = "real native Breeze CUDA; requires a model collection and a GPU reservation"]
     fn breeze_resident_two_real_requests() -> anyhow::Result<()> {
         use crate::models::breeze::audio::{HOP_FRAMES, hop_chunks, write_float_wav_new};
 
         let inputs = RealInputs::from_env("transport")?;
-        // SAFETY: explicit test-runner custody covers real immutable bytes
-        // through CUDA process/runtime teardown, including any failure path.
-        let synth = unsafe { Synthesizer::spawn_breeze(inputs.models.clone(), inputs.config.clone()) }?;
+        let synth = Synthesizer::spawn_breeze(inputs.models.clone(), inputs.config.clone())?;
         let texts = [
             "The rain has stopped, and the room is quiet. Shall we open the window?",
             "There is a little sunlight on the table. I think this is a good place to begin.",
@@ -714,7 +706,7 @@ mod breeze_transport_tests {
     /// in hops, each also decoded as one batch from the same frames, both
     /// written for listening, with their timings.
     #[test]
-    #[ignore = "real native Breeze CUDA; requires immutable-pile custody and a GPU reservation"]
+    #[ignore = "real native Breeze CUDA; requires a model collection and a GPU reservation"]
     fn breeze_resident_hops_against_batch() -> anyhow::Result<()> {
         use crate::models::breeze::{
             audio::{HOP_CONTEXT, HOP_FRAMES, hop_chunks, write_float_wav_new},
@@ -722,8 +714,7 @@ mod breeze_transport_tests {
         };
 
         let inputs = RealInputs::from_env("hops-against-batch")?;
-        // SAFETY: as in the transport control; custody is the runner's.
-        let mut resident = unsafe { BreezeResident::load(&inputs.models, inputs.config.clone()) }?;
+        let mut resident = BreezeResident::load(&inputs.models, inputs.config.clone())?;
         let warm = resident.load_report().codec_warm_seconds.clone();
         let texts = [
             "The rain has stopped, and the room is quiet. Shall we open the window?",
@@ -834,13 +825,8 @@ impl Synthesizer {
     /// queued request. Frame/context caps are completion errors, reported by
     /// `finish` after the PCM already sent.
     ///
-    /// # Safety
-    /// The actual validated pile bytes and preceding aliased page prefixes must
-    /// remain immutable or append-only/untruncated through CUDA runtime/storage
-    /// teardown, including after the worker ends or load fails. Keeping a
-    /// snapshot/read-only FD alive alone cannot enforce that external custody.
     #[cfg(feature = "breeze-cuda")]
-    pub unsafe fn spawn_breeze<R>(
+    pub fn spawn_breeze<R>(
         models: crate::model_collection::ModelSnapshot<R>,
         config: crate::models::breeze::resident::BreezeVoiceConfig,
     ) -> anyhow::Result<Self>
@@ -853,9 +839,7 @@ impl Synthesizer {
         std::thread::Builder::new()
             .name("speak-breeze".into())
             .spawn(move || {
-                // SAFETY: explicit caller contract extends through runtime storage
-                // teardown, not merely through this worker or successful loading.
-                let mut resident = unsafe { BreezeResident::load(&models, config) }
+                let mut resident = BreezeResident::load(&models, config)
                     .map_err(|error| format!("Breeze resident failed to load: {error:#}"));
                 while let Ok(req) = rx.recv() {
                     let result = match &mut resident {

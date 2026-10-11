@@ -1,5 +1,5 @@
 //! B1 Breeze CUDA operators: BF16 weights/activations, F32 reductions.
-//! Every output is fresh; immutable pile aliases are never writable destinations.
+//! Every output is fresh; weight buffers are never writable destinations.
 use burn::tensor::DType;
 use burn_cubecl::tensor::CubeTensor;
 use cubecl::{cuda::CudaRuntime, prelude::*};
