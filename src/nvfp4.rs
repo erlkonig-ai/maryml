@@ -23,6 +23,14 @@
 //! `scale2 = absmax / (6 * 448)` the largest block lands on E4M3's top code and
 //! a block has to be smaller than `absmax / 229376` before its scale flushes
 //! to zero.
+//!
+//! [`pack_nearest`] is the device quantizer's recipe operation for operation
+//! (`nn::nvfp4_gemv`, the load-time quantizer Breeze and Voxtral ran before
+//! their projections were stored packed): the block scale is
+//! `e4m3_rn(min((bamax / 6) / scale2, 448))`, two correctly rounded divides in
+//! that order, and a block whose scale flushes to zero codes every element as
+//! `+0`. It must stay that way: a stored projection is gated against the
+//! device's own codes, bit for bit, before it is published.
 
 use anyhow::{Result, ensure};
 use triblespace::core::blob::encodings::tensor::TensorElement;
@@ -57,6 +65,11 @@ pub fn e4m3_to_f32(b: u8) -> f32 {
 
 /// The E4M3 pattern nearest a non-negative scale, ties to the even
 /// significand, saturating at 448. A non-positive or NaN input is zero.
+///
+/// Arithmetic rather than a search over the 127 patterns: scaling by a power
+/// of two is exact, so `v / 2^e * 8` is the significand in eighths exactly and
+/// one `round_ties_even` is the conversion. The subnormal binade (exponent
+/// field zero) is the same step, `2^-9`, as the first normal one.
 pub fn e4m3_from_f32(v: f32) -> u8 {
     if !(v > 0.0) {
         return 0;
@@ -64,39 +77,49 @@ pub fn e4m3_from_f32(v: f32) -> u8 {
     if v >= E4M3_MAX {
         return E4M3_MAX_BYTE;
     }
-    let mut best = 0u8;
-    let mut best_err = f32::INFINITY;
-    for b in 0..=E4M3_MAX_BYTE {
-        let err = (e4m3_to_f32(b) - v).abs();
-        if err < best_err || (err == best_err && b & 1 == 0) {
-            best = b;
-            best_err = err;
-        }
-    }
-    best
+    // Exponent of the binade, floored at the smallest normal (2^-6): below it
+    // the step stays 2^-9 and the exponent field is zero.
+    let e = (((v.to_bits() >> 23) & 0xFF) as i32 - 127).max(-6);
+    let steps = (v * 2f32.powi(3 - e)).round_ties_even() as u32;
+    let byte = if e == -6 && steps < 8 {
+        steps
+    } else {
+        // steps is 8..=16 in a normal binade; 16 carries into the next one.
+        let (e, m) = if steps == 16 { (e + 1, 0) } else { (e, steps - 8) };
+        (((e + 7) as u32) << 3) | m
+    };
+    (byte as u8).min(E4M3_MAX_BYTE)
 }
 
 /// The E2M1 code nearest a magnitude given in E2M1 units, ties to the even
 /// code (the GB10's `cvt.rn.satfinite.e2m1x2` rule), saturating at 6.
 pub fn e2m1_code(m: f32) -> u8 {
-    let m = if m.is_nan() { E2M1_MAX } else { m.min(E2M1_MAX) };
-    let mut best = 0u8;
-    let mut best_err = f32::INFINITY;
-    for (code, value) in E2M1.iter().enumerate() {
-        let err = (m - value).abs();
-        if err < best_err || (err == best_err && code % 2 == 0) {
-            best = code as u8;
-            best_err = err;
+    // The seven midpoints between neighbouring magnitudes; an exact midpoint
+    // goes to the even code, which is the upper neighbour exactly when that
+    // neighbour's code is even.
+    const MIDPOINTS: [f32; 7] = [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0];
+    if m.is_nan() {
+        return 7;
+    }
+    let mut code = 0u8;
+    for (i, &mid) in MIDPOINTS.iter().enumerate() {
+        if m > mid || (m == mid && (i + 1) % 2 == 0) {
+            code = i as u8 + 1;
         }
     }
-    best
+    code
 }
 
-/// The signed code of `v` at `unit` per E2M1 step. A zero unit codes every
-/// value as a signed zero.
+/// The signed code of `v` at `unit` per E2M1 step: `cvt.rn.satfinite` of
+/// `v / unit`, which keeps the sign of a value that rounds to zero. A zero
+/// unit codes every value as `+0`, as the device does when a block's scale
+/// flushes (no `0 / 0` reaches its converter).
 pub fn code_of(v: f32, unit: f32) -> u8 {
+    if !(unit > 0.0) {
+        return 0;
+    }
     let sign = if v.is_sign_negative() { 8 } else { 0 };
-    if !(unit > 0.0) || v == 0.0 || v.is_nan() {
+    if v == 0.0 || v.is_nan() {
         return sign;
     }
     e2m1_code(v.abs() / unit) | sign
@@ -122,7 +145,7 @@ pub fn global_scale(w: &[f32]) -> f32 {
 /// One block's E4M3 scale byte and the value of one E2M1 step under it.
 pub fn block_unit(block: &[f32], scale2: f32) -> (u8, f32) {
     let bmax = block.iter().fold(0f32, |m, v| m.max(v.abs()));
-    let byte = e4m3_from_f32(bmax / (E2M1_MAX * scale2));
+    let byte = e4m3_from_f32(((bmax / E2M1_MAX) / scale2).min(E4M3_MAX));
     (byte, e4m3_to_f32(byte) * scale2)
 }
 
@@ -213,14 +236,29 @@ pub fn pack_nearest(w: &[f32], cols: usize) -> Result<Packed> {
     let scale2 = global_scale(w);
     let mut codes = vec![0u8; w.len() / 2];
     let mut scales = vec![0u8; w.len() / BLOCK];
-    for (blk, block) in w.chunks(BLOCK).enumerate() {
-        let (byte, unit) = block_unit(block, scale2);
-        scales[blk] = byte;
-        for (i, &v) in block.iter().enumerate() {
-            let e = blk * BLOCK + i;
-            codes[e / 2] |= code_of(v, unit) << (4 * (e % 2));
+    // Blocks are independent once the global scale is known, so the planes
+    // are filled in parallel row bands. A projection is hundreds of millions
+    // of elements; one thread took minutes per model.
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(16);
+    let band = rows.div_ceil(threads).max(1) * cols;
+    std::thread::scope(|scope| {
+        for ((w, codes), scales) in w
+            .chunks(band)
+            .zip(codes.chunks_mut(band / 2))
+            .zip(scales.chunks_mut(band / BLOCK))
+        {
+            scope.spawn(move || {
+                for (blk, block) in w.chunks(BLOCK).enumerate() {
+                    let (byte, unit) = block_unit(block, scale2);
+                    scales[blk] = byte;
+                    for (i, pair) in block.chunks(2).enumerate() {
+                        codes[blk * BLOCK / 2 + i] =
+                            code_of(pair[0], unit) | code_of(pair[1], unit) << 4;
+                    }
+                }
+            });
         }
-    }
+    });
     Ok(Packed {
         rows,
         cols,
@@ -233,6 +271,50 @@ pub fn pack_nearest(w: &[f32], cols: usize) -> Result<Packed> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The search this module used before the arithmetic form: nearest
+    /// pattern, ties to the even one.
+    fn e4m3_search(v: f32) -> u8 {
+        if !(v > 0.0) {
+            return 0;
+        }
+        if v >= E4M3_MAX {
+            return E4M3_MAX_BYTE;
+        }
+        let mut best = 0u8;
+        let mut best_err = f64::INFINITY;
+        for b in 0..=E4M3_MAX_BYTE {
+            let err = (e4m3_to_f32(b) as f64 - v as f64).abs();
+            if err < best_err || (err == best_err && b & 1 == 0) {
+                best = b;
+                best_err = err;
+            }
+        }
+        best
+    }
+
+    #[test]
+    fn arithmetic_e4m3_is_the_nearest_pattern_everywhere() {
+        // Every pattern, every midpoint and its two f32 neighbours, and a
+        // dense sweep across the whole range including the subnormals.
+        let mut probes = vec![0.0f32, 1e-30, 2f32.powi(-10), 2f32.powi(-9), 447.9, 448.0, 1e9];
+        for b in 0..=E4M3_MAX_BYTE {
+            let lo = e4m3_to_f32(b);
+            probes.push(lo);
+            if b < E4M3_MAX_BYTE {
+                let mid = ((lo as f64 + e4m3_to_f32(b + 1) as f64) / 2.0) as f32;
+                probes.extend([mid, f32::from_bits(mid.to_bits() - 1), f32::from_bits(mid.to_bits() + 1)]);
+            }
+        }
+        let mut v = 2f32.powi(-12);
+        while v < 460.0 {
+            probes.push(v);
+            v *= 1.0007;
+        }
+        for v in probes {
+            assert_eq!(e4m3_from_f32(v), e4m3_search(v), "{v:e}");
+        }
+    }
 
     #[test]
     fn every_finite_e4m3_pattern_round_trips() {
