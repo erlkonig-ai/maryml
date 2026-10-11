@@ -738,6 +738,49 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "reserved CUDA: both F16 prompt GEMM lanes against host f64 products over Voxtral's shapes"]
+    fn cuda_f16_prompt_gemm_lanes_against_f64_reference() {
+        use crate::nn::nvfp4_gemm::PromptLane;
+        let client = client();
+        let mut rng = Rng(0x0F16_9E77);
+        for (name, n, k) in SHAPES {
+            let w = weights(&mut rng, n * k, 0.02);
+            let q = Nvfp4::quantize(&upload(&client, &w, &[n, k])).unwrap();
+            let dense = decode(&read(&client, &q.codes), &read(&client, &q.scales), q.scale2);
+            // The encoder's finishing block is 72 rows; 9 and 41 leave a
+            // partial last tile.
+            for rows in [9usize, 41, 72] {
+                let xv: Vec<f16> = (0..rows * k).map(|_| f16::from_f64(rng.normal())).collect();
+                let x = upload(&client, &xv, &[1, rows, k]);
+                // Only a sample of output columns is worth the host product.
+                let cols: Vec<usize> = (0..n).step_by(n / 64).collect();
+                for lane in [PromptLane::W4a16, PromptLane::W4a4] {
+                    let out = q.project(&x, lane).unwrap();
+                    assert_eq!(out.meta.shape().as_slice(), [1, rows, n]);
+                    assert_eq!(out.dtype, DType::F16);
+                    let got = read(&client, &out.handle);
+                    let (mut err, mut norm) = (0.0f64, 0.0f64);
+                    for r in 0..rows {
+                        for &j in &cols {
+                            let y: f64 = (0..k).map(|i| xv[r * k + i].to_f64() * dense[j * k + i]).sum();
+                            let at = 2 * (r * n + j);
+                            let g = f16::from_bits(u16::from_le_bytes([got[at], got[at + 1]])).to_f64();
+                            err += (g - y).powi(2);
+                            norm += y.powi(2);
+                        }
+                    }
+                    let rel = (err / norm).sqrt();
+                    eprintln!("{name} [{n}, {k}] rows={rows} {lane:?}: relative RMS {rel:.4}");
+                    match lane {
+                        PromptLane::W4a16 => assert!(rel < 2e-3, "{name} rows={rows}: {rel}"),
+                        PromptLane::W4a4 => assert!(rel < 0.2, "{name} rows={rows}: {rel}"),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     #[ignore = "reserved CUDA: F16 W4A16 GEMV against a host f64 product over Voxtral's shapes"]
     fn cuda_f16_gemv_matches_f64_reference_over_voxtral_shapes() {
         let client = client();
