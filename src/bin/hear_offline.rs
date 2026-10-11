@@ -10,13 +10,18 @@
 //!   speaking. A stream that falls behind real time carries its backlog into
 //!   that number, as it would live.
 //!
-//! The weights are whatever `Ears::load` selects (`VOXTRAL_WEIGHTS`). One
+//! The model is the `nvfp4` Voxtral root of the model collection
+//! `--collection blake3:HEX` names in `<pile>`, or with `--root HEX` one
+//! explicit root of a legacy native pile (found in its `mary-model-graph`),
+//! whose 16-bit projections `--weights f16|nvfp4` decides. `--lane w4a4|w4a16`
+//! is how stored NVFP4 projections multiply prompt-height activations;
+//! `--unpaced` skips the real-time pass (its columns read 0). One
 //! `RESULT` line per clip, tab separated: clip, audio s, unpaced compute s,
 //! paced compute s, finish s, transcript (paced; the unpaced one is checked
 //! equal and reported if not).
 //!
 //!   cargo run --release --features voxtral-cuda --bin hear_offline -- \
-//!     <voxtral.pile> <clip.wav>...
+//!     <pile> (--collection HEX | --root HEX) [--weights W] [--lane L] [--unpaced] <clip.wav>...
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -29,17 +34,53 @@ const RATE: usize = 16_000;
 const CHUNK: usize = 1280;
 
 fn main() -> anyhow::Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let mut flag = |name: &str| -> Option<String> {
+        let at = args.iter().position(|a| a == name)?;
+        let value = args.get(at + 1).cloned();
+        args.drain(at..(at + 2).min(args.len()));
+        value
+    };
+    let collection = flag("--collection");
+    let root = flag("--root");
+    let weights = flag("--weights").unwrap_or_else(|| "f16".into());
+    let lane = flag("--lane").unwrap_or_else(|| "w4a16".into());
+    let unpaced_only = match args.iter().position(|a| a == "--unpaced") {
+        Some(at) => {
+            args.remove(at);
+            true
+        }
+        None => false,
+    };
     anyhow::ensure!(
-        args.len() >= 2,
-        "usage: hear_offline <voxtral.pile> <clip.wav>..."
+        args.len() >= 2 && collection.is_some() != root.is_some(),
+        "usage: hear_offline <pile> (--collection HEX | --root HEX) [--weights f16|nvfp4] [--lane w4a4|w4a16] [--unpaced] <clip.wav>..."
     );
+    let weights = mary::models::voxtral::fast::Weights::parse(&weights)?;
+    let lane = mary::nvfp4::PromptLane::parse(&lane)?;
     let started = Instant::now();
-    let ears = Ears::load(Path::new(&args[0]))?;
+    let store = mary::persist::read_model_pile_snapshot_read_only(Path::new(&args[0]))?;
+    // SAFETY: the operator runs this against a pile nobody truncates or
+    // rewrites while the process lives.
+    let ears = match (&collection, &root) {
+        (Some(collection), _) => {
+            let handle = mary::model_collection::parse_collection_handle(collection)?;
+            let collection = mary::model_collection::open_model_collection(&store, handle)?;
+            let models = mary::model_collection::snapshot_model_collection_for(&store, collection)?;
+            unsafe { Ears::load(&models, lane)? }
+        }
+        (None, Some(root)) => {
+            let root = triblespace::prelude::Id::from_hex(root)
+                .ok_or_else(|| anyhow::anyhow!("--root is not a 32-hex id"))?;
+            let models = mary::model_collection::snapshot_model_collection_in(&store)?;
+            unsafe { Ears::load_root(&models, root, weights, lane)? }
+        }
+        (None, None) => unreachable!("checked above"),
+    };
     eprintln!(
-        "[hear_offline] loaded in {:.1} s, VOXTRAL_WEIGHTS={}",
+        "[hear_offline] loaded in {:.1} s ({}; weights {weights:?}, lane {lane:?})",
         started.elapsed().as_secs_f64(),
-        std::env::var("VOXTRAL_WEIGHTS").unwrap_or_else(|_| "(unset)".into())
+        collection.as_deref().map_or("legacy root", |_| "nvfp4 root"),
     );
     report_memory();
     for clip in &args[1..] {
@@ -47,7 +88,12 @@ fn main() -> anyhow::Result<()> {
         anyhow::ensure!(rate as usize == RATE, "{clip}: expected 16 kHz, got {rate}");
         let audio = samples.len() as f64 / RATE as f64;
         let (unpaced, _, unpaced_text) = stream(&ears, &samples, false);
-        let (paced, finish, text) = stream(&ears, &samples, true);
+        // `--unpaced`: transcripts at scale, no real-time pass and no finish.
+        let (paced, finish, text) = if unpaced_only {
+            (Duration::ZERO, Duration::ZERO, unpaced_text.clone())
+        } else {
+            stream(&ears, &samples, true)
+        };
         if unpaced_text != text {
             eprintln!("[hear_offline] {clip}: unpaced transcript differs: {unpaced_text:?}");
         }

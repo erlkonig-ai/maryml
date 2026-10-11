@@ -1,8 +1,10 @@
 //! Isolated O/down/gate-up/QKV GEMV: existing Cubek kernel, no repacking.
 //! Exact RawHalf, F16: decoder M1 or four dense encoder rows as shared-RHS GEMVs.
 //! Unsupported metadata keeps the original matmul. Launch errors propagate.
-//! Under `VOXTRAL_WEIGHTS=nvfp4` a projection also holds a resident NVFP4 copy
-//! ([`quantize`]), which [`try_project_nvfp4`] tries first for one to eight rows.
+//! A projection's NVFP4 weight (stored and aliased, or quantized at load by
+//! [`quantize`]) goes first through [`try_project_nvfp4`] for one to eight
+//! rows, and through [`project_nvfp4_prompt`] for every other height when no
+//! 16-bit copy exists.
 
 use std::any::{Any, TypeId};
 
@@ -310,6 +312,27 @@ pub(super) fn try_project_nvfp4<B: Backend>(x: &Tensor<B, 3>, q: &Nvfp4) -> Opti
             .expect("x established the exact RawHalf type")
             .clone(),
     )
+}
+
+/// `x [1, t, K]` of any height against an NVFP4 weight that has no 16-bit
+/// copy, through the prompt GEMM `lane`: a fresh F16 `[1, t, N]`.
+pub(super) fn project_nvfp4_prompt<B: Backend>(
+    x: &Tensor<B, 3>,
+    q: &Nvfp4,
+    lane: crate::nvfp4::PromptLane,
+) -> anyhow::Result<Tensor<B, 3>> {
+    let raw = (x as &dyn Any)
+        .downcast_ref::<Tensor<RawHalf, 3>>()
+        .ok_or_else(|| anyhow::anyhow!("NVFP4 hearing weights need the raw CUDA F16 backend"))?;
+    let TensorPrimitive::Float(lhs) = raw.clone().into_primitive() else {
+        anyhow::bail!("NVFP4 projections take float activations");
+    };
+    let projected =
+        Tensor::<RawHalf, 3>::from_primitive(TensorPrimitive::Float(q.project(&lhs, lane)?));
+    Ok((&projected as &dyn Any)
+        .downcast_ref::<Tensor<B, 3>>()
+        .expect("x established the exact RawHalf type")
+        .clone())
 }
 
 // Diagnostic-only owner-thread counts. Non-test production examples have no
@@ -764,7 +787,7 @@ mod tests {
             .map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
         let file = OpenOptions::new().write(true).create_new(true).open(report)?;
         let started = Instant::now();
-        let ears = crate::hear::Ears::load(&pile)?; // Includes unchanged stock warmup.
+        let ears = crate::hear::test_ears(&pile)?; // Includes unchanged stock warmup.
         let load_seconds = started.elapsed().as_secs_f64();
         ENCODER_ROUTES.with(|counts| *counts.borrow_mut() = [[0; 3]; 2]);
         let started = Instant::now();

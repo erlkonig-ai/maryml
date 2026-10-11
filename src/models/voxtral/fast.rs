@@ -51,8 +51,9 @@ use super::pipeline::SttPipeline;
 use super::tokenizer::Tekken;
 use crate::nn::weight_loader::WeightLoader;
 
-/// Which weights the folded lane's linear projections read. One explicit choice
-/// per load; `mary::hear` takes it from `VOXTRAL_WEIGHTS`.
+/// Which weights a 16-bit-stored root's linear projections read. One explicit
+/// choice per load. A root that stores its projections as NVFP4 leaves (the
+/// `nvfp4` root `mary::hear` loads) needs none.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Weights {
     /// The F16 weights only: byte-identical to the path before NVFP4.
@@ -88,25 +89,50 @@ pub enum Weights {
 }
 
 impl Weights {
-    /// `VOXTRAL_WEIGHTS`: unset or `f16` keeps F16, `nvfp4` selects four-bit
-    /// projections. Anything else is refused rather than silently
-    /// read as the default.
-    pub fn from_env() -> anyhow::Result<Self> {
-        match std::env::var("VOXTRAL_WEIGHTS") {
-            Err(std::env::VarError::NotPresent) => Ok(Self::F16),
-            Ok(value) => Self::parse(&value),
-            Err(e) => anyhow::bail!("VOXTRAL_WEIGHTS: {e}"),
-        }
-    }
-
-    fn parse(value: &str) -> anyhow::Result<Self> {
+    /// `f16` or `nvfp4`; anything else is refused rather than silently read
+    /// as the default.
+    pub fn parse(value: &str) -> anyhow::Result<Self> {
         match value {
             "f16" => Ok(Self::F16),
             "nvfp4" => Ok(Self::Nvfp4),
-            other => anyhow::bail!("VOXTRAL_WEIGHTS must be f16 or nvfp4, not {other:?}"),
+            other => anyhow::bail!("Voxtral weights must be f16 or nvfp4, not {other:?}"),
         }
     }
 }
+
+/// Load-time choices of the folded lane.
+#[derive(Clone, Default)]
+pub struct LoadOptions {
+    /// What a root's 16-bit-stored projections run on. A projection the root
+    /// stores as an NVFP4 leaf is bound as stored, whatever this says.
+    pub weights: Weights,
+    /// How stored NVFP4 projections multiply prompt-height activations.
+    pub lane: PromptLane,
+    /// The binder that aliases stored NVFP4 leaves onto the device. Without
+    /// one there is no CUDA lane, and a stored projection is decoded on the
+    /// host to the backend's 16-bit type.
+    #[cfg(feature = "voxtral-cuda")]
+    pub aliases: Option<
+        std::rc::Rc<std::cell::RefCell<crate::nn::cuda_bf16_alias::CudaBf16Aliases>>,
+    >,
+}
+
+impl LoadOptions {
+    /// 16-bit-stored projections at 16 bits, no binder.
+    pub fn f16() -> Self {
+        Self::default()
+    }
+
+    /// `weights` for 16-bit-stored projections, no binder.
+    pub fn with_weights(weights: Weights) -> Self {
+        Self {
+            weights,
+            ..Self::default()
+        }
+    }
+}
+
+pub use crate::nvfp4::PromptLane;
 
 #[cfg(test)]
 mod weights_tests {
@@ -141,22 +167,145 @@ fn fp4<B: Backend>(w: &Tensor<B, 3>, weights: Weights, name: &str) -> Option<Fp4
         #[cfg(not(feature = "voxtral-cuda"))]
         Weights::Nvfp4 => {
             let _ = w;
-            panic!("{name}: VOXTRAL_WEIGHTS=nvfp4 needs the voxtral-cuda build")
+            panic!("{name}: NVFP4 weights need the voxtral-cuda build")
         }
     }
 }
 
-/// `x` through the W4A16 GEMV when the projection has an NVFP4 copy and the
-/// GEMV takes `x`; `None` leaves it to the F16 path.
-fn fp4_project<B: Backend>(x: &Tensor<B, 3>, q: &Option<Fp4>) -> Option<Tensor<B, 3>> {
+/// `x` of any height against an NVFP4 weight with no 16-bit copy.
+fn fp4_prompt<B: Backend>(x: Tensor<B, 3>, q: &Fp4, lane: PromptLane, what: &str) -> Tensor<B, 3> {
     #[cfg(feature = "voxtral-cuda")]
-    return q
-        .as_ref()
-        .and_then(|q| super::gemv_cuda::try_project_nvfp4(x, q));
+    return super::gemv_cuda::project_nvfp4_prompt(&x, q, lane)
+        .unwrap_or_else(|error| panic!("Voxtral {what} NVFP4 prompt projection failed: {error:#}"));
     #[cfg(not(feature = "voxtral-cuda"))]
     {
-        let _ = x;
-        q.as_ref().map(|never| match *never {})
+        let _ = (x, lane, what);
+        match *q {}
+    }
+}
+
+/// One linear projection of the folded lane, `x [1, t, K] -> [1, t, N]`.
+///
+/// A 16-bit-stored root's projection is its folded 16-bit weight, plus an
+/// NVFP4 copy quantized at load under [`Weights::Nvfp4`]. A stored NVFP4
+/// projection is the pile alias alone on CUDA: the GEMV takes one to eight
+/// rows and the prompt GEMM ([`PromptLane`]) every other height, so no 16-bit
+/// copy of it exists. Without CUDA it is decoded on the host to `dense`.
+pub(super) struct Projection<B: Backend> {
+    /// `[1, K, N]` at 16 bits.
+    dense: Option<Tensor<B, 3>>,
+    /// `[N, K]` NVFP4.
+    fp4: Option<Fp4>,
+    lane: PromptLane,
+    /// Output width N.
+    n: usize,
+}
+
+impl<B: Backend> Projection<B> {
+    /// A folded 16-bit weight `[1, K, N]`, quantized at load if asked.
+    fn folded(dense: Tensor<B, 3>, opts: &LoadOptions, name: &str) -> Self {
+        let n = dense.dims()[2];
+        Self {
+            fp4: fp4(&dense, opts.weights, name),
+            dense: Some(dense),
+            lane: opts.lane,
+            n,
+        }
+    }
+
+    /// The projection the loader's root stores under `name` as an NVFP4 leaf
+    /// `[N, K]`, or `None` when it stores none: the type is the query.
+    fn stored(
+        loader: &WeightLoader,
+        name: &str,
+        opts: &LoadOptions,
+        device: &B::Device,
+    ) -> Option<Self> {
+        let leaf = loader
+            .leaf(name)
+            .filter(|leaf| leaf.elem() == crate::leaf::Elem::Nvfp4)?;
+        let &[n, k] = leaf.dims() else {
+            panic!("{name}: a stored NVFP4 projection is rank 2, not {:?}", leaf.dims())
+        };
+        let (n, k) = (n as usize, k as usize);
+        #[cfg(feature = "voxtral-cuda")]
+        if let Some(aliases) = &opts.aliases {
+            // SAFETY: the pile custody contract `Ears::load`'s caller owes:
+            // the leaf is a slice of a genuine pile mapping that stays
+            // immutable through CUDA runtime teardown.
+            let q = unsafe {
+                aliases.borrow_mut().bind_nvfp4_payload(
+                    leaf.payload(),
+                    [n as u64, k as u64],
+                    burn::tensor::DType::F16,
+                )
+            }
+            .unwrap_or_else(|error| panic!("{name}: bind stored NVFP4 projection: {error}"));
+            return Some(Self {
+                dense: None,
+                fp4: Some(q),
+                lane: opts.lane,
+                n,
+            });
+        }
+        // No CUDA lane: decode the stored codes on the host (`Leaf::to_f32`).
+        let w: Tensor<B, 2> = loader.load_tensor(name, device);
+        Some(Self {
+            dense: Some(w.transpose().reshape([1, k, n])),
+            fp4: None,
+            lane: opts.lane,
+            n,
+        })
+    }
+
+    fn forward(&self, x: Tensor<B, 3>, what: &str) -> Tensor<B, 3> {
+        project(x, self.dense.as_ref(), self.fp4.as_ref(), self.lane, what)
+    }
+}
+
+/// `x [1, t, K]` through the NVFP4 GEMV if there is a four-bit weight and it
+/// takes `x`, else the 16-bit weight (its GEMV, then matmul), else the NVFP4
+/// prompt GEMM.
+fn project<B: Backend>(
+    x: Tensor<B, 3>,
+    dense: Option<&Tensor<B, 3>>,
+    fp4: Option<&Fp4>,
+    lane: PromptLane,
+    what: &str,
+) -> Tensor<B, 3> {
+    #[cfg(feature = "voxtral-cuda")]
+    if let Some(y) = fp4.and_then(|q| super::gemv_cuda::try_project_nvfp4(&x, q)) {
+        return y;
+    }
+    if let Some(w) = dense {
+        #[cfg(feature = "voxtral-cuda")]
+        if let Some(y) = super::gemv_cuda::try_project(&x, w)
+            .unwrap_or_else(|error| panic!("Voxtral {what} GEMV launch failed: {error:?}"))
+        {
+            return y;
+        }
+        return x.matmul(w.clone());
+    }
+    fp4_prompt(
+        x,
+        fp4.expect("a projection holds a 16-bit or an NVFP4 weight"),
+        lane,
+        what,
+    )
+}
+
+/// The O/down routing over a [`Linear`]'s 16-bit weight and an optional NVFP4
+/// copy: [`project`], then the bias. Kept for the routing controls.
+#[cfg(test)]
+pub(super) fn output_projection<B: Backend>(
+    linear: &Linear<B>,
+    fp4: &Option<Fp4>,
+    x: Tensor<B, 3>,
+) -> Tensor<B, 3> {
+    let y = project(x, Some(&linear.weight_t), fp4.as_ref(), PromptLane::default(), "O/down");
+    match &linear.bias {
+        Some(bias) => y + bias.clone(),
+        None => y,
     }
 }
 
@@ -189,29 +338,6 @@ fn linear_t<B: Backend>(
         None => wt,
     };
     wt.reshape([1, i, o])
-}
-
-/// Only the folded lane's O/down projections are candidates. Eligibility is
-/// checked against actual RawHalf storage; other cases keep Linear::forward.
-/// An NVFP4 copy, when there is one and its GEMV takes `x`, goes first.
-pub(super) fn output_projection<B: Backend>(
-    linear: &Linear<B>,
-    fp4: &Option<Fp4>,
-    x: Tensor<B, 3>,
-) -> Tensor<B, 3> {
-    let projected = fp4_project(&x, fp4);
-    #[cfg(feature = "voxtral-cuda")]
-    let projected = projected.or_else(|| {
-        super::gemv_cuda::try_project(&x, &linear.weight_t)
-            .unwrap_or_else(|error| panic!("Voxtral O/down GEMV launch failed: {error:?}"))
-    });
-    if let Some(y) = projected {
-        return match &linear.bias {
-            Some(bias) => y + bias.clone(),
-            None => y,
-        };
-    }
-    linear.forward(x)
 }
 
 /// Sliding-window KV cache with absolute-position bookkeeping. Stores at most
@@ -439,18 +565,32 @@ enum QkvLayout {
 /// group-fold on single-token steps. Encoder retains its pre-rotated rows;
 /// decoder rotates activations after the compact projection's F16 store.
 struct FastAttention<B: Backend> {
-    qkv_t: Tensor<B, 3>,            // [1, hidden, layout-dependent width]
+    qkv: Projection<B>,             // [1, hidden, layout-dependent width]
     qkv_bias: Option<Tensor<B, 3>>, // [1, 1, same]
     layout: QkvLayout,
-    o_proj: Linear<B>,
-    qkv_fp4: Option<Fp4>,
-    o_fp4: Option<Fp4>,
+    o: Projection<B>,
+    o_bias: Option<Tensor<B, 3>>, // [1, 1, hidden]
     heads: usize,
     kv_heads: usize,
     head_dim: usize,
 }
 
+/// Name under which an `nvfp4` root stores a stack's fused, folded QKV
+/// projection `[N, K]`: the q/k/v weights with the attention norm folded into
+/// their columns, 1/√d into the q rows and, for the encoder, the
+/// rotate_half rows, exactly as [`FastAttention::load`] folds a 16-bit root.
+pub(crate) fn fused_qkv_name(prefix: &str) -> String {
+    format!("{prefix}.fused_qkv.weight")
+}
+
+/// Name of a stack's fused gate‖up projection `[2I, K]` in an `nvfp4` root,
+/// with the MLP norm folded into its columns where the stack has one.
+pub(crate) fn fused_gate_up_name(prefix: &str) -> String {
+    format!("{prefix}.fused_gate_up.weight")
+}
+
 impl<B: Backend> FastAttention<B> {
+    #[allow(clippy::too_many_arguments)]
     fn load(
         loader: &WeightLoader,
         prefix: &str,
@@ -458,7 +598,7 @@ impl<B: Backend> FastAttention<B> {
         qvo_bias: bool,
         layout: QkvLayout,
         fold_in: Tensor<B, 1>,
-        weights: Weights,
+        opts: &LoadOptions,
         device: &B::Device,
     ) -> Self {
         let half = d / 2;
@@ -471,25 +611,29 @@ impl<B: Backend> FastAttention<B> {
         };
         let scale = (d as f64).powf(-0.5);
 
-        // rotate_half on OUTPUT rows: per head, rows [d] → [-rows[half..] ‖ rows[..half]]
-        let q = w2("q_proj").mul_scalar(scale); // 1/√d folded into the q rows
-        let qk: Tensor<B, 2> = Tensor::cat(vec![q, w2("k_proj")], 0); // [(h+hkv)d, in]
-        let hidden = qk.dims()[1];
-        let fused = match layout {
-            QkvLayout::RotatedWeights => {
-                let qk3 = qk.clone().reshape([h + hkv, d, hidden]);
-                let qk_rot = Tensor::cat(
-                    vec![qk3.clone().narrow(1, half, half).neg(), qk3.narrow(1, 0, half)],
-                    1,
-                ).reshape([(h + hkv) * d, hidden]);
-                Tensor::cat(vec![qk, qk_rot, w2("v_proj")], 0)
-            }
-            QkvLayout::Compact => Tensor::cat(vec![qk, w2("v_proj")], 0),
-        };
-        let qkv_t = fused
-            .transpose()
-            .mul(fold_in.reshape([hidden, 1]))
-            .reshape([1, hidden, n_out]);
+        let qkv = Projection::stored(loader, &fused_qkv_name(prefix), opts, device).unwrap_or_else(|| {
+            // rotate_half on OUTPUT rows: per head, rows [d] → [-rows[half..] ‖ rows[..half]]
+            let q = w2("q_proj").mul_scalar(scale); // 1/√d folded into the q rows
+            let qk: Tensor<B, 2> = Tensor::cat(vec![q, w2("k_proj")], 0); // [(h+hkv)d, in]
+            let hidden = qk.dims()[1];
+            let fused = match layout {
+                QkvLayout::RotatedWeights => {
+                    let qk3 = qk.clone().reshape([h + hkv, d, hidden]);
+                    let qk_rot = Tensor::cat(
+                        vec![qk3.clone().narrow(1, half, half).neg(), qk3.narrow(1, 0, half)],
+                        1,
+                    ).reshape([(h + hkv) * d, hidden]);
+                    Tensor::cat(vec![qk, qk_rot, w2("v_proj")], 0)
+                }
+                QkvLayout::Compact => Tensor::cat(vec![qk, w2("v_proj")], 0),
+            };
+            let qkv_t = fused
+                .transpose()
+                .mul(fold_in.reshape([hidden, 1]))
+                .reshape([1, hidden, n_out]);
+            Projection::folded(qkv_t, opts, &format!("{prefix} qkv"))
+        });
+        assert_eq!(qkv.n, n_out, "{prefix}: QKV width");
 
         // RoPE applies AFTER the bias (encoder), and rope is linear — the
         // rotated block carries the rotated bias. k_proj never has a bias.
@@ -513,17 +657,34 @@ impl<B: Backend> FastAttention<B> {
             fused.reshape([1, 1, n_out])
         });
 
-        let o_proj = Linear::load(loader, &format!("{prefix}.o_proj"), qvo_bias, device);
+        let o_name = format!("{prefix}.o_proj");
+        let o = Projection::stored(loader, &format!("{o_name}.weight"), opts, device)
+            .unwrap_or_else(|| {
+                let w: Tensor<B, 2> = loader.load_tensor(&format!("{o_name}.weight"), device);
+                let [o, i] = w.dims();
+                Projection::folded(w.transpose().reshape([1, i, o]), opts, &o_name)
+            });
+        let o_bias = qvo_bias.then(|| {
+            let b: Tensor<B, 1> = loader.load_tensor(&format!("{o_name}.bias"), device);
+            b.reshape([1, 1, o.n])
+        });
         Self {
-            qkv_fp4: fp4(&qkv_t, weights, &format!("{prefix} qkv")),
-            o_fp4: fp4(&o_proj.weight_t, weights, &format!("{prefix}.o_proj")),
-            qkv_t,
+            qkv,
             qkv_bias,
             layout,
-            o_proj,
+            o,
+            o_bias,
             heads: h,
             kv_heads: hkv,
             head_dim: d,
+        }
+    }
+
+    fn output(&self, out: Tensor<B, 3>) -> Tensor<B, 3> {
+        let y = self.o.forward(out, "O");
+        match &self.o_bias {
+            Some(bias) => y + bias.clone(),
+            None => y,
         }
     }
 
@@ -542,16 +703,11 @@ impl<B: Backend> FastAttention<B> {
         let (h, hkv, d) = (self.heads, self.kv_heads, self.head_dim);
         let hh = h + hkv;
 
-        // An NVFP4 copy takes one to eight rows. Otherwise exact decoder M1
-        // and existing encoder M4 geometry/layout can take the F16 GEMV.
-        // Prefill and unsupported metadata retain matmul.
-        let projected = fp4_project(&x, &self.qkv_fp4);
-        #[cfg(feature = "voxtral-cuda")]
-        let projected = projected.or_else(|| {
-            super::gemv_cuda::try_project(&x, &self.qkv_t)
-                .unwrap_or_else(|error| panic!("Voxtral QKV GEMV launch failed: {error:?}"))
-        });
-        let mut qkv = projected.unwrap_or_else(|| x.matmul(self.qkv_t.clone()));
+        // An NVFP4 weight takes one to eight rows in its GEMV. Otherwise
+        // exact decoder M1 and existing encoder M4 geometry/layout can take
+        // the F16 GEMV of a 16-bit weight; prefill takes its matmul, or the
+        // NVFP4 prompt GEMM when the projection is stored four-bit.
+        let mut qkv = self.qkv.forward(x, "QKV");
         if let Some(bias) = &self.qkv_bias {
             qkv = qkv + bias.clone();
         }
@@ -586,7 +742,7 @@ impl<B: Backend> FastAttention<B> {
             let scores = q.matmul(k.swap_dims(2, 3)); // 1/√d pre-folded
             let probs = softmax(scores, 3);
             let out = probs.matmul(v).reshape([b, 1, h * d]);
-            return output_projection(&self.o_proj, &self.o_fp4, out);
+            return self.output(out);
         }
 
         let expand = |t: Tensor<B, 4>| {
@@ -611,17 +767,16 @@ impl<B: Backend> FastAttention<B> {
         };
         let probs = softmax(scores, 3);
         let out = probs.matmul(v).swap_dims(1, 2).reshape([b, l, h * d]);
-        output_projection(&self.o_proj, &self.o_fp4, out)
+        self.output(out)
     }
 }
 
 /// SwiGLU MLP with fused gate‖up; `down` optionally biased (encoder).
 struct FastMlp<B: Backend> {
-    gate_up_t: Tensor<B, 3>, // [1, hidden, 2·inter]
-    down: Linear<B>,
+    gate_up: Projection<B>, // [1, hidden, 2·inter]
+    down: Projection<B>,
+    down_bias: Option<Tensor<B, 3>>,
     inter: usize,
-    gate_up_fp4: Option<Fp4>,
-    down_fp4: Option<Fp4>,
 }
 
 impl<B: Backend> FastMlp<B> {
@@ -630,46 +785,55 @@ impl<B: Backend> FastMlp<B> {
         prefix: &str,
         down_bias: bool,
         fold_in: Option<Tensor<B, 1>>,
-        weights: Weights,
+        opts: &LoadOptions,
         device: &B::Device,
     ) -> Self {
-        let gate: Tensor<B, 2> = loader.load_tensor(&format!("{prefix}.gate_proj.weight"), device);
-        let up: Tensor<B, 2> = loader.load_tensor(&format!("{prefix}.up_proj.weight"), device);
-        let gu = Tensor::cat(vec![gate, up], 0); // [2I, hidden]
-        let [o2, hidden] = gu.dims();
-        let gut = gu.transpose();
-        let gut = match fold_in {
-            Some(s) => gut.mul(s.reshape([hidden, 1])),
-            None => gut,
-        };
-        let gate_up_t = gut.reshape([1, hidden, o2]);
-        let down = Linear::load(loader, &format!("{prefix}.down_proj"), down_bias, device);
+        let gate_up = Projection::stored(loader, &fused_gate_up_name(prefix), opts, device)
+            .unwrap_or_else(|| {
+                let gate: Tensor<B, 2> =
+                    loader.load_tensor(&format!("{prefix}.gate_proj.weight"), device);
+                let up: Tensor<B, 2> =
+                    loader.load_tensor(&format!("{prefix}.up_proj.weight"), device);
+                let gu = Tensor::cat(vec![gate, up], 0); // [2I, hidden]
+                let [o2, hidden] = gu.dims();
+                let gut = gu.transpose();
+                let gut = match fold_in {
+                    Some(s) => gut.mul(s.reshape([hidden, 1])),
+                    None => gut,
+                };
+                Projection::folded(gut.reshape([1, hidden, o2]), opts, &format!("{prefix} gate/up"))
+            });
+        let down_name = format!("{prefix}.down_proj");
+        let down = Projection::stored(loader, &format!("{down_name}.weight"), opts, device)
+            .unwrap_or_else(|| {
+                let w: Tensor<B, 2> = loader.load_tensor(&format!("{down_name}.weight"), device);
+                let [o, i] = w.dims();
+                Projection::folded(w.transpose().reshape([1, i, o]), opts, &down_name)
+            });
+        let down_bias = down_bias.then(|| {
+            let b: Tensor<B, 1> = loader.load_tensor(&format!("{down_name}.bias"), device);
+            b.reshape([1, 1, down.n])
+        });
         Self {
-            gate_up_fp4: fp4(&gate_up_t, weights, &format!("{prefix} gate/up")),
-            down_fp4: fp4(&down.weight_t, weights, &format!("{prefix}.down_proj")),
-            gate_up_t,
+            inter: gate_up.n / 2,
+            gate_up,
             down,
-            inter: o2 / 2,
+            down_bias,
         }
     }
 
     fn forward(&self, h: Tensor<B, 3>) -> Tensor<B, 3> {
-        // An NVFP4 copy takes one to eight rows. Otherwise only exact decoder
-        // M1 geometry/layout can take the F16 GEMV. Encoder, prefill and
-        // unsupported backends keep the original matmul.
-        let projected = fp4_project(&h, &self.gate_up_fp4);
-        #[cfg(feature = "voxtral-cuda")]
-        let projected = projected.or_else(|| {
-            super::gemv_cuda::try_project(&h, &self.gate_up_t)
-                .unwrap_or_else(|error| panic!("Voxtral gate/up GEMV launch failed: {error:?}"))
-        });
-        let gu = projected.unwrap_or_else(|| h.matmul(self.gate_up_t.clone()));
+        let gu = self.gate_up.forward(h, "gate/up");
         #[cfg(feature = "voxtral-cuda")]
         let activated = super::swiglu_cuda::swiglu(gu, self.inter);
         #[cfg(not(feature = "voxtral-cuda"))]
         let activated = silu(gu.clone().narrow(2, 0, self.inter))
             .mul(gu.narrow(2, self.inter, self.inter));
-        output_projection(&self.down, &self.down_fp4, activated)
+        let y = self.down.forward(activated, "down");
+        match &self.down_bias {
+            Some(bias) => y + bias.clone(),
+            None => y,
+        }
     }
 }
 
@@ -690,7 +854,7 @@ impl<B: Backend> FastEncoder<B> {
     pub fn load(
         loader: &WeightLoader,
         max_positions: usize,
-        weights: Weights,
+        opts: &LoadOptions,
         device: &B::Device,
     ) -> Self {
         let geo = (ENC_HEADS, ENC_HEADS, ENC_HEAD_DIM);
@@ -706,7 +870,7 @@ impl<B: Backend> FastEncoder<B> {
                         true,
                         QkvLayout::RotatedWeights,
                         w1(&format!("{p}.self_attn_layer_norm.weight")),
-                        weights,
+                        opts,
                         device,
                     ),
                     FastMlp::load(
@@ -714,7 +878,7 @@ impl<B: Backend> FastEncoder<B> {
                         &format!("{p}.mlp"),
                         true,
                         Some(w1(&format!("{p}.final_layer_norm.weight"))),
-                        weights,
+                        opts,
                         device,
                     ),
                 )
@@ -803,7 +967,7 @@ impl<B: Backend> FastDecoder<B> {
     pub fn load(
         loader: &WeightLoader,
         max_positions: usize,
-        weights: Weights,
+        opts: &LoadOptions,
         device: &B::Device,
     ) -> Self {
         let geo = (DEC_HEADS, DEC_KV_HEADS, DEC_HEAD_DIM);
@@ -821,10 +985,10 @@ impl<B: Backend> FastDecoder<B> {
                         false,
                         QkvLayout::Compact,
                         w1("input_layernorm"),
-                        weights,
+                        opts,
                         device,
                     ),
-                    mlp: FastMlp::load(loader, &format!("{p}.mlp"), false, None, weights, device),
+                    mlp: FastMlp::load(loader, &format!("{p}.mlp"), false, None, opts, device),
                     ada1_t: linear_t(loader, &format!("{p}.ada_rms_norm.linear1"), None, device),
                     ada2_t: linear_t(loader, &format!("{p}.ada_rms_norm.linear2"), None, device),
                     post_w: w1("post_attention_layernorm"),
@@ -904,6 +1068,106 @@ impl<B: Backend> FastDecoder<B> {
     }
 }
 
+// ── NVFP4 export ───────────────────────────────────────────────────────────
+
+/// Pack every projection the folded lane quantizes, for an `nvfp4` root.
+///
+/// `loader` indexes a 16-bit root. Each stack is loaded exactly as
+/// [`Weights::Nvfp4`] loads it, one layer at a time: the 16-bit fold of the
+/// projection, then the device quantizer's NVFP4 copy of it. The host packs
+/// the same 16-bit values (`nvfp4::pack_nearest`) and must reproduce the
+/// device's planes byte for byte (`Nvfp4::pack_matching`); the host packing
+/// is what `sink` receives, with the names of the 16-bit tensors an `nvfp4`
+/// root no longer needs because this projection replaces them.
+///
+/// Stored names: `{stack}.self_attn.fused_qkv.weight` ([`fused_qkv_name`])
+/// and `{stack}.mlp.fused_gate_up.weight` ([`fused_gate_up_name`]) for the two
+/// fused, folded projections, and the checkpoint's own `o_proj.weight` and
+/// `down_proj.weight` names for the other two, which are not folded.
+#[cfg(feature = "voxtral-cuda")]
+pub fn export_nvfp4_projections(
+    loader: &WeightLoader,
+    device: &crate::nn::backend::hear::Device,
+    mut sink: impl FnMut(crate::nvfp4::StoredProjection, Vec<String>) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    use crate::nn::backend::hear::RawHalf;
+    let opts = LoadOptions::with_weights(Weights::Nvfp4);
+    let mut export = |projection: &Projection<RawHalf>,
+                      name: String,
+                      replaces: Vec<String>|
+     -> anyhow::Result<()> {
+        let dense = projection
+            .dense
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("{name}: exporting needs a 16-bit root"))?;
+        let q = projection
+            .fp4
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("{name}: no device NVFP4 copy"))?;
+        let [_, k, n] = dense.dims();
+        let values: Vec<f32> = dense
+            .swap_dims(1, 2)
+            .reshape([n, k])
+            .into_data()
+            .to_vec::<half::f16>()
+            .map_err(|error| anyhow::anyhow!("{name}: read the 16-bit fold: {error:?}"))?
+            .iter()
+            .map(|v| v.to_f32())
+            .collect();
+        sink(q.pack_matching(&name, &values)?, replaces)
+    };
+    let names = |prefix: &str, leaves: &[&str]| -> Vec<String> {
+        leaves.iter().map(|leaf| format!("{prefix}.{leaf}.weight")).collect()
+    };
+    let w1 = |n: &str| -> Tensor<RawHalf, 1> { loader.load_tensor(n, device) };
+    let stacks = (0..ENC_LAYERS)
+        .map(|i| (format!("audio_tower.layers.{i}"), true))
+        .chain((0..DEC_LAYERS).map(|i| (format!("language_model.model.layers.{i}"), false)));
+    for (p, encoder) in stacks {
+        let (attn_norm, mlp_norm) = if encoder {
+            (
+                w1(&format!("{p}.self_attn_layer_norm.weight")),
+                Some(w1(&format!("{p}.final_layer_norm.weight"))),
+            )
+        } else {
+            (w1(&format!("{p}.input_layernorm.weight")), None)
+        };
+        let (geo, layout) = if encoder {
+            ((ENC_HEADS, ENC_HEADS, ENC_HEAD_DIM), QkvLayout::RotatedWeights)
+        } else {
+            ((DEC_HEADS, DEC_KV_HEADS, DEC_HEAD_DIM), QkvLayout::Compact)
+        };
+        let attn_prefix = format!("{p}.self_attn");
+        let attn = FastAttention::<RawHalf>::load(
+            loader, &attn_prefix, geo, encoder, layout, attn_norm, &opts, device,
+        );
+        export(
+            &attn.qkv,
+            fused_qkv_name(&attn_prefix),
+            names(&attn_prefix, &["q_proj", "k_proj", "v_proj"]),
+        )?;
+        export(
+            &attn.o,
+            format!("{attn_prefix}.o_proj.weight"),
+            names(&attn_prefix, &["o_proj"]),
+        )?;
+        drop(attn);
+        let mlp_prefix = format!("{p}.mlp");
+        let mlp = FastMlp::<RawHalf>::load(loader, &mlp_prefix, encoder, mlp_norm, &opts, device);
+        export(
+            &mlp.gate_up,
+            fused_gate_up_name(&mlp_prefix),
+            names(&mlp_prefix, &["gate_proj", "up_proj"]),
+        )?;
+        export(
+            &mlp.down,
+            format!("{mlp_prefix}.down_proj.weight"),
+            names(&mlp_prefix, &["down_proj"]),
+        )?;
+    }
+    Ok(())
+}
+
 // ── the stage bundle ───────────────────────────────────────────────────────
 
 pub struct RealtimeTranscriber<B: Backend> {
@@ -915,52 +1179,58 @@ pub struct RealtimeTranscriber<B: Backend> {
 }
 
 impl<B: Backend> RealtimeTranscriber<B> {
-    /// The F16 weights only ([`Weights::F16`]).
+    /// A 16-bit root's weights at 16 bits ([`LoadOptions::f16`]).
     pub fn load(
         loader: &WeightLoader,
         tekken: Tekken,
         max_tokens: usize,
         device: &B::Device,
     ) -> Self {
-        Self::load_with(loader, tekken, max_tokens, device, Weights::F16)
+        Self::load_with(loader, tekken, max_tokens, device, &LoadOptions::f16())
     }
 
-    /// Load with an explicit weight choice. [`Weights::Nvfp4`] needs the raw
-    /// CUDA F16 backend and panics on any other, like a missing leaf does.
+    /// Load with explicit choices. Stored NVFP4 projections and
+    /// [`Weights::Nvfp4`] need the raw CUDA F16 backend and panic on any
+    /// other, like a missing leaf does.
     pub fn load_with(
         loader: &WeightLoader,
         tekken: Tekken,
         max_tokens: usize,
         device: &B::Device,
-        weights: Weights,
+        opts: &LoadOptions,
     ) -> Self {
         #[cfg(feature = "voxtral-cuda")]
         let started = std::time::Instant::now();
         let stt = Self {
             mel: VoxtralMel::new(device),
-            encoder: FastEncoder::load(loader, max_tokens * DOWNSAMPLE, weights, device),
-            decoder: FastDecoder::load(loader, max_tokens, weights, device),
+            encoder: FastEncoder::load(loader, max_tokens * DOWNSAMPLE, opts, device),
+            decoder: FastDecoder::load(loader, max_tokens, opts, device),
             tekken,
             device: device.clone(),
         };
         #[cfg(feature = "voxtral-cuda")]
-        if weights == Weights::Nvfp4 {
-            B::sync(device).unwrap_or_else(|error| panic!("Voxtral load sync: {error:?}"));
-            let copies: Vec<&Fp4> = stt
+        {
+            let projections: Vec<&Projection<B>> = stt
                 .decoder
                 .layers
                 .iter()
                 .map(|l| (&l.attn, &l.mlp))
                 .chain(stt.encoder.layers.iter().map(|(a, m)| (a, m)))
-                .flat_map(|(a, m)| [&a.qkv_fp4, &a.o_fp4, &m.gate_up_fp4, &m.down_fp4])
-                .flatten()
+                .flat_map(|(a, m)| [&a.qkv, &a.o, &m.gate_up, &m.down])
                 .collect();
-            eprintln!(
-                "[voxtral] NVFP4 weights: {} projections, {} bytes resident, loaded and quantized in {:.3}s",
-                copies.len(),
-                copies.iter().map(|q| q.bytes()).sum::<u64>(),
-                started.elapsed().as_secs_f64()
-            );
+            let copies: Vec<&Fp4> = projections.iter().filter_map(|p| p.fp4.as_ref()).collect();
+            if !copies.is_empty() {
+                B::sync(device).unwrap_or_else(|error| panic!("Voxtral load sync: {error:?}"));
+                let dense = projections.iter().filter(|p| p.dense.is_some()).count();
+                eprintln!(
+                    "[voxtral] NVFP4 weights: {} projections, {} bytes, {} with a 16-bit copy, loaded in {:.3}s; prompt lane {:?}",
+                    copies.len(),
+                    copies.iter().map(|q| q.bytes()).sum::<u64>(),
+                    dense,
+                    started.elapsed().as_secs_f64(),
+                    opts.lane
+                );
+            }
         }
         stt
     }
@@ -1069,18 +1339,18 @@ mod wide_qkv_tests {
             false,
             layout,
             Tensor::from_data(TensorData::new(norm, [k]), &device),
-            Weights::F16,
+            &LoadOptions::f16(),
             &device,
         );
         drop(loader);
         assert!(attn.qkv_bias.is_none()); // This is the unbiased decoder path.
         let width = if layout == QkvLayout::Compact { 6144 } else { 11264 };
-        assert_eq!(attn.qkv_t.dims(), [1, k, width]);
+        assert_eq!(attn.qkv.dense.as_ref().unwrap().dims(), [1, k, width]);
         let mut input = vec![f16::ZERO; k];
         input[0] = f16::ONE;
         let x = Tensor::<RawHalf, 3>::from_data(TensorData::new(input.clone(), [1, 1, k]), &device);
         // Compact width must launch, not silently use the generic fallback.
-        assert!(super::super::gemv_cuda::try_project(&x, &attn.qkv_t).unwrap().is_some());
+        assert!(super::super::gemv_cuda::try_project(&x, attn.qkv.dense.as_ref().unwrap()).unwrap().is_some());
 
         // Distinct, nonzero head halves make a 90-degree RoPE observable.
         // Negating without swapping must fail, not merely an absent rotation.
@@ -1147,7 +1417,7 @@ mod wide_qkv_tests {
             // One compact representation is also used by prefill. M2 keeps
             // the existing generic matmul and causal mask, never this GEMV.
             let prefill = Tensor::cat(vec![x.clone(), x.clone()], 1);
-            assert!(super::super::gemv_cuda::try_project(&prefill, &attn.qkv_t)
+            assert!(super::super::gemv_cuda::try_project(&prefill, attn.qkv.dense.as_ref().unwrap())
                 .unwrap().is_none());
             let cos = Tensor::<RawHalf, 4>::from_data(TensorData::new(
                 [vec![f16::ONE; d], vec![f16::ZERO; d]].concat(), [1,1,2,d]), &device);
@@ -1176,9 +1446,9 @@ mod wide_qkv_tests {
         }
         // Same folded weights, deliberately incompatible row-major storage:
         // generic matmul fallback must preserve the same attention expression.
-        let row = Tensor::<RawHalf, 3>::from_data(attn.qkv_t.clone().into_data(), &device);
+        let row = Tensor::<RawHalf, 3>::from_data(attn.qkv.dense.clone().unwrap().into_data(), &device);
         assert!(super::super::gemv_cuda::try_project(&x, &row).unwrap().is_none());
-        let fallback = FastAttention { qkv_t: row, ..attn };
+        let fallback = FastAttention { qkv: Projection { dense: Some(row), ..attn.qkv }, ..attn };
         check(read(fallback.forward(x.clone(), &cos, &sin, None, &mut initial_cache())));
         assert_eq!(read(x), input);
         assert_eq!(read(pk), past_k);
@@ -1230,21 +1500,33 @@ mod gate_up_tests {
         let down_tensor =
             Tensor::<RawHalf, 3>::from_data(TensorData::new(down.clone(), [1, k, inter]), &device)
                 .swap_dims(1, 2);
+        let bias = Tensor::<RawHalf, 3>::full([1, 1, k], 0.0625, &device);
         let mlp = FastMlp {
-            gate_up_t: gu_tensor.clone(),
-            down: Linear {
-                weight_t: down_tensor.clone(),
-                bias: Some(Tensor::<RawHalf, 3>::full([1, 1, k], 0.0625, &device)),
+            gate_up: Projection {
+                dense: Some(gu_tensor.clone()),
+                fp4: None,
+                lane: PromptLane::default(),
+                n: 2 * inter,
             },
+            down: Projection {
+                dense: Some(down_tensor.clone()),
+                fp4: None,
+                lane: PromptLane::default(),
+                n: k,
+            },
+            down_bias: Some(bias.clone()),
             inter,
-            gate_up_fp4: None,
-            down_fp4: None,
         };
         let old_gu = h.clone().matmul(gu_tensor.clone());
-        let expected =
-            read(mlp.down.forward(
-                silu(old_gu.clone().narrow(2, 0, inter)).mul(old_gu.narrow(2, inter, inter)),
-            ));
+        let expected = read(
+            old_gu
+                .clone()
+                .narrow(2, 0, inter)
+                
+                .mul(old_gu.narrow(2, inter, inter))
+                .matmul(down_tensor.clone())
+                + bias,
+        );
         // Row0 is SiLU(-1.5)*1.25 + bias, unlike swapping gate/up or
         // applying SiLU after their product; the difference exceeds tolerance.
         assert!(expected[0].to_f32() < -0.25);
@@ -1264,7 +1546,10 @@ mod gate_up_tests {
                 .is_none()
         );
         let fallback = FastMlp {
-            gate_up_t: row_major,
+            gate_up: Projection {
+                dense: Some(row_major),
+                ..mlp.gate_up
+            },
             ..mlp
         };
         check(read(fallback.forward(h.clone())));
@@ -1293,7 +1578,7 @@ mod gemv_loaded_tests {
         let loader = super::super::VoxtralWeights::from_snapshot(snapshot)?.into_loader();
         let device = Device::default();
         let decoder =
-            FastDecoder::<RawHalf>::load(&loader, crate::hear::MAX_TOKENS, Weights::F16, &device);
+            FastDecoder::<RawHalf>::load(&loader, crate::hear::MAX_TOKENS, &LoadOptions::f16(), &device);
         RawHalf::sync(&device).map_err(|error| anyhow::anyhow!("decoder load sync: {error:?}"))?;
         let loaded_seconds = started.elapsed().as_secs_f64();
         // Genuine owned tensors, not fabricated input bindings. They establish
@@ -1306,10 +1591,10 @@ mod gemv_loaded_tests {
         let mut records = Vec::new();
         for (layer, item) in decoder.layers.iter().enumerate() {
             for (role, x, weight) in [
-                ("o", &o_input, &item.attn.o_proj.weight_t),
-                ("down", &down_input, &item.mlp.down.weight_t),
-                ("gate_up", &gate_up_input, &item.mlp.gate_up_t),
-                ("compact_qkv", &qkv_input, &item.attn.qkv_t),
+                ("o", &o_input, item.attn.o.dense.as_ref().unwrap()),
+                ("down", &down_input, item.mlp.down.dense.as_ref().unwrap()),
+                ("gate_up", &gate_up_input, item.mlp.gate_up.dense.as_ref().unwrap()),
+                ("compact_qkv", &qkv_input, item.attn.qkv.dense.as_ref().unwrap()),
             ] {
                 let mut record = super::super::gemv_cuda::observe_loaded_weight(x,weight);
                 record["layer"] = serde_json::json!(layer);

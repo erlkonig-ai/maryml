@@ -1,9 +1,9 @@
 //! Voxtral-Mini-4B-Realtime-2602 — delay-conditioned streaming
 //! speech-to-text (one AR step per 80 ms frame, text delayed 80 ms–2.4 s
 //! behind the audio via ada-RMS-norm conditioning). Architecture + port log:
-//! `docs/VOXTRAL_ARCH.md`. Runtime weights are two explicit roots in one
-//! frozen native model-collection snapshot: the exact f32 checkpoint and its
-//! full f16 derivation.
+//! `docs/VOXTRAL_ARCH.md`. Runtime weights are one `nvfp4` root in a frozen
+//! model-collection snapshot ([`VoxtralNvfp4`]); it is derived from the exact
+//! f32 checkpoint and its full f16 derivation ([`VoxtralWeights`]).
 
 use crate::leaf::{Elem, Leaf};
 use crate::model_collection::ModelSnapshot;
@@ -154,6 +154,64 @@ impl<R: BlobStoreGet> VoxtralWeights<R> {
             elements += exact_values.len();
         }
         Ok((names.len(), elements))
+    }
+}
+
+/// Voxtral as one `nvfp4` root: every projection the folded lane multiplies
+/// stored as an NVFP4 leaf (`fast::export_nvfp4_projections` names them),
+/// every other tensor at 16 bits. The runtime form; [`VoxtralWeights`] is the
+/// exact/f16 cohort it is derived from.
+pub struct VoxtralNvfp4 {
+    root: Id,
+    index: HashMap<String, Leaf>,
+}
+
+impl VoxtralNvfp4 {
+    /// Select the root labelled with this source and `nvfp4` in one frozen
+    /// model snapshot.
+    pub fn from_snapshot<R: BlobStoreGet>(snapshot: &ModelSnapshot<R>) -> anyhow::Result<Self> {
+        let root = select_model_root(
+            snapshot.facts(),
+            snapshot.store(),
+            ModelSelector::Source {
+                source: SOURCE,
+                quantization: crate::persist::QUANTIZATION_NVFP4,
+            },
+        )?;
+        Self::from_root(snapshot, root)
+    }
+
+    /// One explicit root of F16 and NVFP4 leaves: an `nvfp4` root, or a
+    /// legacy f16 root whose labels this build cannot read.
+    pub fn from_root<R: BlobStoreGet>(
+        snapshot: &ModelSnapshot<R>,
+        root: Id,
+    ) -> anyhow::Result<Self> {
+        let index = index_keymap_for_root(snapshot.facts(), snapshot.store(), root)?;
+        for (name, leaf) in &index {
+            anyhow::ensure!(
+                matches!(leaf.elem(), Elem::F16 | Elem::Nvfp4),
+                "Voxtral tensor {name:?} under {root} is {:?}, not F16 or NVFP4",
+                leaf.elem()
+            );
+        }
+        Ok(Self { root, index })
+    }
+
+    pub const fn root(&self) -> Id {
+        self.root
+    }
+
+    /// Tensors stored as NVFP4 leaves.
+    pub fn nvfp4_count(&self) -> usize {
+        self.index.values().filter(|leaf| leaf.elem() == Elem::Nvfp4).count()
+    }
+
+    /// The leaf index as the lazy runtime loader. Leaves view the pile's
+    /// mapping; F16 tensors upload at native width, stored NVFP4 projections
+    /// are bound by the folded lane itself (`fast::Projection`).
+    pub fn into_loader(self) -> WeightLoader {
+        WeightLoader::Typed(self.index)
     }
 }
 

@@ -1,7 +1,7 @@
 //! `mary::hear` — the production ears seam: Voxtral-Mini-4B-Realtime
-//! streaming speech-to-text, loaded whole from one native model pile (the
-//! exact/f16 weight cohort AND the Tekken tokenizer, see the `voxtral_persist`
-//! bin), running the folded f16 realtime layout on the hearing backend
+//! streaming speech-to-text, loaded whole from one model collection snapshot
+//! (its `nvfp4` root AND the Tekken tokenizer, see the `models_import` bin),
+//! running the folded realtime layout on the hearing backend
 //! ([`crate::nn::backend::hear`]: raw CUDA under `voxtral-cuda`, the fused
 //! wgpu lane otherwise; see [`Backend`]).
 //!
@@ -15,12 +15,12 @@
 //! The model and its GPU state are not shared across threads here: keep
 //! `Ears` and its `Listening`s on one thread and send samples to it.
 
-use std::path::Path;
-
+use crate::model_collection::ModelSnapshot;
+use crate::models::voxtral::VoxtralNvfp4;
 use crate::models::voxtral::config::{
     N_FFT, N_LEFT_PAD_TOKENS, OFFLINE_BUFFER_TOKENS, SAMPLES_PER_TOK, delay_tokens,
 };
-use crate::models::voxtral::fast::{FastCaches, RealtimeTranscriber, Weights};
+use crate::models::voxtral::fast::{FastCaches, LoadOptions, PromptLane, RealtimeTranscriber, Weights};
 use crate::models::voxtral::pipeline::{EncoderPrefix, StreamingTranscriber};
 use crate::models::voxtral::tokenizer::Tekken;
 use crate::nn::backend::hear;
@@ -51,29 +51,101 @@ pub const WARM_UP_SAMPLES: usize = 32_000;
 pub struct Ears {
     stt: RealtimeTranscriber<Backend>,
     prefix: EncoderPrefix<Backend, FastCaches<Backend>>,
+    /// The registration session of the stored NVFP4 aliases. CubeCL keeps
+    /// the mappings until runtime teardown regardless; this keeps the
+    /// registration bound per load.
+    #[cfg(feature = "voxtral-cuda")]
+    _aliases: Option<std::rc::Rc<std::cell::RefCell<crate::nn::cuda_bf16_alias::CudaBf16Aliases>>>,
 }
 
 impl Ears {
-    /// Load the Voxtral cohort and its tokenizer from the native pile at
-    /// `pile` onto the default device of [`Backend`] with the weights
-    /// `VOXTRAL_WEIGHTS` selects ([`Weights::from_env`]: unset or `f16`, or
-    /// `nvfp4` for four-bit decoder and encoder projections on CUDA), then stream
-    /// [`WARM_UP_SAMPLES`] of silence through a throwaway [`Listening`] at
-    /// the default 480 ms delay, so the kernels a stream compiles on first
-    /// use (the prefill above all) are compiled here rather than inside the
-    /// caller's first utterance.
-    pub fn load(pile: &Path) -> anyhow::Result<Self> {
-        let snapshot = crate::model_collection::load_model_collection_local_latest(pile)?;
-        let tekken = Tekken::from_snapshot(&snapshot)?;
-        let loader = crate::models::voxtral::VoxtralWeights::from_snapshot(snapshot)?.into_loader();
+    /// Load Voxtral's `nvfp4` root and its tokenizer out of one frozen model
+    /// collection snapshot onto the default device of [`Backend`], then stream
+    /// [`WARM_UP_SAMPLES`] of silence through a throwaway [`Listening`] at the
+    /// default 480 ms delay, so the kernels a stream compiles on first use
+    /// (the prefill above all) are compiled here rather than inside the
+    /// caller's first utterance. `lane` is how the stored four-bit
+    /// projections multiply prompt-height activations.
+    ///
+    /// On CUDA the stored projections are aliased from the pile mapping, not
+    /// copied, so every selected tensor must be resident in `models`' store:
+    /// bytes from anywhere else are refused, by tensor name.
+    ///
+    /// # Safety
+    /// The snapshot's pile bytes, including the preceding partial pages of
+    /// every aliased leaf, must stay immutable or append-only/untruncated
+    /// through CUDA runtime teardown (see `cuda_bf16_alias`).
+    pub unsafe fn load<R: triblespace::core::repo::BlobStoreGet>(
+        models: &ModelSnapshot<R>,
+        lane: PromptLane,
+    ) -> anyhow::Result<Self> {
+        let weights = VoxtralNvfp4::from_snapshot(models)?;
+        // SAFETY: forwarded.
+        unsafe { Self::load_weights(models, weights, Weights::F16, lane) }
+    }
+
+    /// [`Self::load`] for one explicit root of F16 and NVFP4 leaves, with
+    /// `weights` choosing what its 16-bit-stored projections run on: the form
+    /// a legacy f16 root, whose labels this build cannot read, loads in.
+    ///
+    /// # Safety
+    /// As [`Self::load`].
+    pub unsafe fn load_root<R: triblespace::core::repo::BlobStoreGet>(
+        models: &ModelSnapshot<R>,
+        root: triblespace::prelude::Id,
+        weights: Weights,
+        lane: PromptLane,
+    ) -> anyhow::Result<Self> {
+        let model = VoxtralNvfp4::from_root(models, root)?;
+        // SAFETY: forwarded.
+        unsafe { Self::load_weights(models, model, weights, lane) }
+    }
+
+    unsafe fn load_weights<R: triblespace::core::repo::BlobStoreGet>(
+        models: &ModelSnapshot<R>,
+        model: VoxtralNvfp4,
+        weights: Weights,
+        lane: PromptLane,
+    ) -> anyhow::Result<Self> {
+        let tekken = Tekken::from_snapshot(models)?;
+        let stored = model.nvfp4_count();
+        let loader = model.into_loader();
         let device = hear::Device::default();
-        let weights = Weights::from_env()?;
         #[cfg(not(feature = "voxtral-cuda"))]
         anyhow::ensure!(
             weights == Weights::F16,
-            "VOXTRAL_WEIGHTS=nvfp4 needs the voxtral-cuda build"
+            "NVFP4 quantization at load needs the voxtral-cuda build"
         );
-        let stt = RealtimeTranscriber::load_with(&loader, tekken, MAX_TOKENS, &device, weights);
+        #[cfg(feature = "voxtral-cuda")]
+        let aliases = if stored > 0 {
+            Some(std::rc::Rc::new(std::cell::RefCell::new(
+                crate::nn::cuda_bf16_alias::CudaBf16Aliases::new(
+                    cubecl::cuda::CudaDevice { index: 0 },
+                    4096,
+                )
+                .map_err(anyhow::Error::msg)?,
+            )))
+        } else {
+            None
+        };
+        #[cfg(not(feature = "voxtral-cuda"))]
+        let _ = stored;
+        let opts = LoadOptions {
+            weights,
+            lane,
+            #[cfg(feature = "voxtral-cuda")]
+            aliases: aliases.clone(),
+        };
+        let stt = RealtimeTranscriber::load_with(&loader, tekken, MAX_TOKENS, &device, &opts);
+        drop(loader);
+        #[cfg(feature = "voxtral-cuda")]
+        if let Some(aliases) = &aliases {
+            let stats = aliases.borrow().stats();
+            eprintln!(
+                "[voxtral] stored NVFP4 aliases: {} registrations, {} bytes",
+                stats.registrations, stats.aliased_bytes
+            );
+        }
         let prefix = {
             let mut stream = StreamingTranscriber::new(&stt, 480);
             let prefix = stream.prepare_encoder_prefix();
@@ -83,7 +155,12 @@ impl Ears {
             warm.finish();
             prefix
         };
-        Ok(Self { stt, prefix })
+        Ok(Self {
+            stt,
+            prefix,
+            #[cfg(feature = "voxtral-cuda")]
+            _aliases: aliases,
+        })
     }
 
     /// Start a stream with text delayed `delay_ms` behind the audio (a
@@ -209,9 +286,29 @@ fn take_complete_utf8(pending: &mut Vec<u8>) -> String {
     }
 }
 
+/// The ears out of `pile`'s model collection named by
+/// `MARY_MODELS_COLLECTION` (`blake3:HEX`), for the real-model controls.
+#[cfg(test)]
+pub(crate) fn test_ears(pile: &std::path::Path) -> anyhow::Result<Ears> {
+    let store = crate::persist::read_model_pile_snapshot_read_only(pile)?;
+    let handle = crate::model_collection::parse_collection_handle(&std::env::var(
+        "MARY_MODELS_COLLECTION",
+    )?)?;
+    let collection = crate::model_collection::open_model_collection(&store, handle)?;
+    let models = crate::model_collection::snapshot_model_collection_for(&store, collection)?;
+    // SAFETY: the test runner owns custody of the configured pile through
+    // process teardown.
+    unsafe { Ears::load(&models, PromptLane::default()) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
+    fn load_ears(pile: &str) -> anyhow::Result<Ears> {
+        test_ears(Path::new(pile))
+    }
 
     #[test]
     fn a_character_split_across_tokens_waits_for_its_last_byte() {
@@ -250,7 +347,7 @@ mod tests {
         let (pcm,sr) = crate::models::f5::wav::read_pcm16_mono(Path::new(&wav));
         anyhow::ensure!(sr==16000,"expected16k PCM");
         let started = Instant::now();
-        let ears = Ears::load(Path::new(&pile))?;
+        let ears = load_ears(&pile)?;
         let load_seconds = started.elapsed().as_secs_f64();
         writeln!(file,"{}",serde_json::json!({"kind":"load","pile":pile,
             "wav_sha256":wav_hash,"load_stock_warmup_seconds":load_seconds,
@@ -337,7 +434,7 @@ mod tests {
         let output = std::env::var("MARY_HEARING_PREFIX_REPORT")?;
         let file = OpenOptions::new().write(true).create_new(true).open(output)?;
         let started = Instant::now();
-        let ears = Ears::load(Path::new(&pile))?;
+        let ears = load_ears(&pile)?;
         let loaded_seconds = started.elapsed().as_secs_f64();
         let seed_before = ears.prefix.test_snapshot();
         let state_ok = |state: &PrefixTestState, encoded, positions| {
@@ -430,7 +527,7 @@ mod tests {
         let expect = std::fs::read_to_string(expect).unwrap();
 
         let started = std::time::Instant::now();
-        let ears = Ears::load(Path::new(&pile)).unwrap();
+        let ears = load_ears(&pile).unwrap();
         let loaded = started.elapsed();
         let mut listening = ears.listen(480);
         let mut text = String::new();
