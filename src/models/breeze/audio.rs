@@ -10,14 +10,48 @@ use std::{fs::OpenOptions, io::Write, ops::Range, path::Path};
 use super::reference::SAMPLE_RATE;
 use crate::models::qwen3tts::{codec::CodecDecoder, config::SAMPLES_PER_FRAME};
 
-/// Generated frames per streaming hop: 8 frames are 667 ms of audio, so the
-/// first PCM waits for the prefill and eight frames, not the utterance.
+/// Generated frames per streaming hop once the stream is going: 8 frames are
+/// 667 ms of audio, enough that the cost of a hop's left context is spread
+/// over many new frames.
 pub const HOP_FRAMES: usize = 8;
+/// The hops before the steady [`HOP_FRAMES`]: the first PCM waits for the
+/// prefill and two frames, not eight. The ramp grows more slowly than the
+/// generator runs ahead of real time (~40 ms of GPU per 83 ms frame), so a
+/// player that starts on the first hop is not caught up by any later one,
+/// with ~70 ms to spare: the first 2 frames play 167 ms while the next 2 are
+/// generated and decoded in ~100 ms, those 4 play 333 ms while the next 3
+/// take ~140 ms, and so on up to 8. A steeper 2, 3, 5 measured only 20 to
+/// 30 ms to spare before its second hop (sky, nvfp4, 2026-10-11), too little
+/// on a GPU shared with hearing.
+pub const FIRST_HOPS: [usize; 4] = [2, 2, 3, 5];
 /// Frames of left context decoded again before each hop, the value upstream's
 /// `chunked_decode` and Mary's Qwen stream use. The decoder is causal, so a
 /// window only looks back; 25 frames of its 72-frame attention window is the
 /// upstream trade between fidelity at the seams and the cost of a hop.
 pub const HOP_CONTEXT: usize = 25;
+
+/// The early hops in effect: [`FIRST_HOPS`], or in the test binary the
+/// comma-separated frame counts in `BREEZE_FIRST_HOPS` (empty for none), so
+/// that one build can time and be listened to under another ramp.
+fn first_hops() -> Vec<usize> {
+    #[cfg(test)]
+    if let Ok(ramp) = std::env::var("BREEZE_FIRST_HOPS") {
+        return ramp
+            .split(',')
+            .filter(|hop| !hop.trim().is_empty())
+            .map(|hop| hop.trim().parse().expect("BREEZE_FIRST_HOPS: frame counts"))
+            .filter(|&hop| (1..=HOP_FRAMES).contains(&hop))
+            .collect();
+    }
+    FIRST_HOPS.to_vec()
+}
+
+/// The new frames of each hop in order: the early hops, then [`HOP_FRAMES`].
+fn hop_sizes() -> impl Iterator<Item = usize> {
+    first_hops()
+        .into_iter()
+        .chain(std::iter::repeat(HOP_FRAMES))
+}
 
 fn decoder_frame(frame: &[u16; 16]) -> Result<[u32; 16]> {
     ensure!(
@@ -36,31 +70,47 @@ fn decoder_frames(frames: &[[u16; 16]]) -> Result<Vec<[u32; 16]>> {
 #[derive(Debug)]
 pub struct HopWindow {
     /// Left context, the hop's new frames, then the last frame repeated up to
-    /// a whole hop, so that every window has one of [`hop_window_lengths`].
-    /// The decoder is causal: the repeats change none of the real samples.
+    /// the hop's whole size, so that every window has one of
+    /// [`hop_window_lengths`]. The decoder is causal: the repeats change none
+    /// of the real samples.
     pub codes: Vec<[u32; 16]>,
     /// The new frames' samples in the decoded window.
     pub keep: Range<usize>,
 }
 
-/// Generated frames, cut into hops as they arrive: every [`HOP_FRAMES`] new
-/// frames make a window with up to [`HOP_CONTEXT`] frames of left context,
-/// and [`flush`](Self::flush) makes the last, shorter one. Decoding the
-/// windows in order and concatenating their kept samples gives one sample run
-/// of exactly `frames × SAMPLES_PER_FRAME`, starting from fresh decoder state
-/// at the first generated frame, as [`decode_generated`] does.
-#[derive(Debug, Default)]
+/// Generated frames, cut into hops as they arrive: the early hops
+/// ([`FIRST_HOPS`]), then every [`HOP_FRAMES`] new frames, each make a window
+/// with up to [`HOP_CONTEXT`] frames of left context, and
+/// [`flush`](Self::flush) makes the last, shorter one. Decoding the windows in
+/// order and concatenating their kept samples gives one sample run of exactly
+/// `frames × SAMPLES_PER_FRAME`, starting from fresh decoder state at the
+/// first generated frame, as [`decode_generated`] does.
+#[derive(Debug)]
 pub struct Hops {
     frames: Vec<[u32; 16]>,
     emitted: usize,
+    first_hops: Vec<usize>,
+    /// Hops emitted so far.
+    hops: usize,
+}
+
+impl Default for Hops {
+    fn default() -> Self {
+        Self {
+            frames: Vec::new(),
+            emitted: 0,
+            first_hops: first_hops(),
+            hops: 0,
+        }
+    }
 }
 
 impl Hops {
-    /// Take one generated frame; once a whole hop of new frames waits, the
+    /// Take one generated frame; once the hop now filling is whole, the
     /// window that decodes it.
     pub fn push(&mut self, frame: [u16; 16]) -> Result<Option<HopWindow>> {
         self.frames.push(decoder_frame(&frame)?);
-        Ok(self.window(HOP_FRAMES))
+        Ok(self.window(self.size()))
     }
 
     /// The window for the frames not yet in a hop, at the end of generation.
@@ -68,18 +118,28 @@ impl Hops {
         self.window(1)
     }
 
+    /// The new frames of the hop now filling.
+    fn size(&self) -> usize {
+        self.first_hops
+            .get(self.hops)
+            .copied()
+            .unwrap_or(HOP_FRAMES)
+    }
+
     fn window(&mut self, at_least: usize) -> Option<HopWindow> {
         let new = self.frames.len() - self.emitted;
         if new < at_least {
             return None;
         }
-        let new = new.min(HOP_FRAMES);
+        let size = self.size();
+        let new = new.min(size);
         let context = HOP_CONTEXT.min(self.emitted);
         let start = self.emitted - context;
         let mut codes = self.frames[start..self.emitted + new].to_vec();
         let last = *codes.last().expect("a window holds at least one new frame");
-        codes.resize(context + HOP_FRAMES, last);
+        codes.resize(context + size, last);
         self.emitted += new;
+        self.hops += 1;
         Some(HopWindow {
             codes,
             keep: context * SAMPLES_PER_FRAME..(context + new) * SAMPLES_PER_FRAME,
@@ -87,19 +147,40 @@ impl Hops {
     }
 }
 
-/// Every length a hop window has: shorter while the left context fills at
-/// the start of an utterance, then `HOP_CONTEXT + HOP_FRAMES` for good. The
-/// codec compiles one set of kernels per length, so these few are all.
+/// Every length a hop window has: shorter while the early hops run and the
+/// left context fills at the start of an utterance, then
+/// `HOP_CONTEXT + HOP_FRAMES` for good. A tail pads to its hop's whole size,
+/// so it has its hop's length too. The codec compiles one set of kernels per
+/// length, so these few are all.
 pub fn hop_window_lengths() -> Vec<usize> {
     let mut lengths: Vec<usize> = Vec::new();
-    for emitted in (0..).step_by(HOP_FRAMES) {
-        let length = HOP_CONTEXT.min(emitted) + HOP_FRAMES;
-        if lengths.last() == Some(&length) {
+    let (mut emitted, mut previous, early) = (0, 0, first_hops().len());
+    for (index, size) in hop_sizes().enumerate() {
+        let length = HOP_CONTEXT.min(emitted) + size;
+        if index > early && length == previous {
             break;
         }
-        lengths.push(length);
+        if !lengths.contains(&length) {
+            lengths.push(length);
+        }
+        (emitted, previous) = (emitted + size, length);
     }
     lengths
+}
+
+/// The new frames in each chunk a stream of `frames` frames is handed on as.
+#[cfg(test)]
+pub(crate) fn hop_chunks(frames: usize) -> Vec<usize> {
+    let mut chunks = Vec::new();
+    let mut left = frames;
+    for size in hop_sizes() {
+        if left == 0 {
+            break;
+        }
+        chunks.push(size.min(left));
+        left -= size.min(left);
+    }
+    chunks
 }
 
 /// Decode one hop and keep its new samples.
@@ -257,16 +338,48 @@ mod tests {
 
     #[test]
     fn hop_windows_have_a_few_fixed_lengths() {
-        assert_eq!(hop_window_lengths(), [8, 16, 24, 32, 33]);
+        assert_eq!(FIRST_HOPS, [2, 2, 3, 5]);
+        assert_eq!(hop_window_lengths(), [2, 4, 7, 12, 20, 28, 33]);
+    }
+
+    #[test]
+    fn early_hops_ramp_up_to_the_steady_hop() {
+        assert_eq!(hop_chunks(1), [1]);
+        assert_eq!(hop_chunks(2), [2]);
+        assert_eq!(hop_chunks(4), [2, 2]);
+        assert_eq!(hop_chunks(12), [2, 2, 3, 5]);
+        assert_eq!(hop_chunks(29), [2, 2, 3, 5, 8, 8, 1]);
+        assert_eq!(hop_chunks(0), Vec::<usize>::new());
+        // Played from the first hop's arrival, every later hop arrives
+        // before the audio ahead of it runs out: generation at 40 ms per
+        // 83 ms frame plus a decode of 10 ms and 1.6 ms per window frame
+        // (measured on sky: 13 ms at 2, 22 ms at 10, 61 ms at 33), with 50 ms
+        // to spare.
+        let (mut played_ms, mut ready_ms, mut emitted) = (0.0, 0.0, 0);
+        for (hop, frames) in hop_chunks(200).into_iter().enumerate() {
+            let window = HOP_CONTEXT.min(emitted) + frames;
+            ready_ms += 40.0 * frames as f64 + 10.0 + 1.6 * window as f64;
+            if hop == 0 {
+                played_ms = ready_ms;
+            }
+            assert!(
+                hop == 0 || ready_ms + 50.0 <= played_ms,
+                "hop {hop} of {frames}: ready at {ready_ms} ms, playback there at {played_ms} ms"
+            );
+            played_ms += 1000.0 * (frames * SAMPLES_PER_FRAME) as f64 / f64::from(SAMPLE_RATE);
+            emitted += frames;
+        }
     }
 
     #[test]
     fn hops_cover_every_frame_once_with_fixed_window_lengths() {
-        for count in [1, 5, 7, 8, 9, 15, 16, 17, 32, 33, 40, 41, 54, 100] {
+        for count in [
+            1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 15, 16, 17, 18, 19, 26, 27, 32, 33, 34, 40, 41, 54, 100,
+        ] {
             let frames = generated(count);
             let (samples, lengths) = stream(&frames);
             assert_eq!(samples.len(), count * SAMPLES_PER_FRAME, "{count} frames");
-            assert_eq!(lengths.len(), count.div_ceil(HOP_FRAMES), "{count} frames");
+            assert_eq!(lengths.len(), hop_chunks(count).len(), "{count} frames");
             assert!(
                 lengths
                     .iter()
@@ -282,22 +395,42 @@ mod tests {
     }
 
     #[test]
-    fn an_utterance_shorter_than_a_hop_is_one_padded_tail() {
+    fn the_first_hop_is_two_frames_without_context() {
         let mut hops = Hops::default();
-        for frame in generated(5) {
-            assert!(hops.push(frame).unwrap().is_none());
-        }
-        let tail = hops.flush().unwrap();
-        assert_eq!(tail.codes.len(), HOP_FRAMES);
-        assert_eq!(tail.keep, 0..5 * SAMPLES_PER_FRAME);
-        assert_eq!(tail.codes[4..], [tail.codes[4]; 4]);
+        assert!(hops.push(generated(1)[0]).unwrap().is_none());
+        let first = hops.push(generated(2)[1]).unwrap().unwrap();
+        assert_eq!(first.codes.len(), 2);
+        assert_eq!(first.keep, 0..2 * SAMPLES_PER_FRAME);
         assert!(Hops::default().flush().is_none(), "no frames, no tail");
+    }
+
+    #[test]
+    fn a_tail_shorter_than_its_hop_pads_to_that_hops_window() {
+        // One frame: the first hop's two-frame window.
+        let mut hops = Hops::default();
+        hops.push(generated(1)[0]).unwrap();
+        let tail = hops.flush().unwrap();
+        assert_eq!(tail.codes.len(), 2);
+        assert_eq!(tail.keep, 0..SAMPLES_PER_FRAME);
+        assert_eq!(tail.codes[1], tail.codes[0]);
+        // Nine frames: hops of 2, 2 and 3, then 2 of the fourth hop's 5
+        // after 7 frames of context.
+        let mut hops = Hops::default();
+        let windows: Vec<HopWindow> = generated(9)
+            .into_iter()
+            .filter_map(|frame| hops.push(frame).unwrap())
+            .collect();
+        assert_eq!(windows.len(), 3);
+        let tail = hops.flush().unwrap();
+        assert_eq!(tail.codes.len(), 12);
+        assert_eq!(tail.keep, 7 * SAMPLES_PER_FRAME..9 * SAMPLES_PER_FRAME);
+        assert_eq!(tail.codes[8..], [tail.codes[8]; 4]);
     }
 
     #[test]
     fn a_hop_keeps_only_its_new_frames_after_full_context() {
         let mut hops = Hops::default();
-        let windows: Vec<HopWindow> = generated(48)
+        let windows: Vec<HopWindow> = generated(52)
             .into_iter()
             .filter_map(|frame| hops.push(frame).unwrap())
             .collect();
@@ -307,7 +440,10 @@ mod tests {
             last.keep,
             HOP_CONTEXT * SAMPLES_PER_FRAME..(HOP_CONTEXT + HOP_FRAMES) * SAMPLES_PER_FRAME
         );
-        assert!(hops.flush().is_none(), "48 frames are six whole hops");
+        assert!(
+            hops.flush().is_none(),
+            "52 frames are 2 + 2 + 3 + 5 and five whole hops"
+        );
         assert!(Hops::default().push([2048; 16]).is_err());
     }
 

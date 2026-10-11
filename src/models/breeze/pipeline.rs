@@ -108,12 +108,13 @@ pub struct Streamed {
     pub first_pcm_seconds: Option<f64>,
 }
 
-/// Generate and decode in hops ([`Hops`]): each time `HOP_FRAMES` new frames
-/// are generated they are decoded on this thread, between two frames, and
-/// handed to `on_pcm` at once; the frames left at the end go as a shorter
-/// tail. The chunks in order are the utterance. An error from `on_pcm` stops
-/// generation at that hop. Termination is the caller's to judge: the hops
-/// already handed on are not taken back when generation ends at a cap.
+/// Generate and decode in hops ([`Hops`]): each time a hop's new frames (2,
+/// 2, 3 and 5 for the first four, then 8) are generated they are decoded on
+/// this thread, between two frames, and handed to `on_pcm` at once; the
+/// frames left at the end go as a shorter tail. The chunks in order are the
+/// utterance. An error from `on_pcm` stops generation at that hop.
+/// Termination is the caller's to judge: the hops already handed on are not
+/// taken back when generation ends at a cap.
 pub fn stream<B: Backend>(
     generator: &mut Generator,
     prompt: &GuidedPrompt,

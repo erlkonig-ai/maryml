@@ -51,9 +51,10 @@
 //!
 //! With `breeze-cuda`, `Synthesizer::spawn_breeze` adds an explicitly selected
 //! native Breeze resident using the same request/completion transport. It
-//! streams too: every 8 generated frames are decoded with 25 frames of left
-//! context while generation goes on (`models::breeze::audio::Hops`). Its
-//! tokenizer/weights are pile-only and its reference is encoded natively once.
+//! streams too: hops of 2, 2, 3 and 5 generated frames, then every 8, are
+//! decoded with 25 frames of left context while generation goes on
+//! (`models::breeze::audio::Hops`). Its tokenizer/weights are pile-only and
+//! its reference is encoded natively once.
 
 use std::collections::{HashMap, hash_map::Entry};
 use std::path::{Path, PathBuf};
@@ -643,7 +644,7 @@ mod breeze_transport_tests {
     #[test]
     #[ignore = "real native Breeze CUDA; requires immutable-pile custody and fresh Stars reservation"]
     fn breeze_resident_two_real_requests() -> anyhow::Result<()> {
-        use crate::models::breeze::audio::{HOP_FRAMES, write_float_wav_new};
+        use crate::models::breeze::audio::{HOP_FRAMES, hop_chunks, write_float_wav_new};
 
         let inputs = RealInputs::from_env("transport")?;
         // SAFETY: explicit test-runner custody covers real immutable bytes
@@ -659,7 +660,7 @@ mod breeze_transport_tests {
             let started = Instant::now();
             let mut stream = synth.speak(text)?;
             let mut pcm = Vec::new();
-            let mut chunks = 0usize;
+            let mut chunk_frames = Vec::new();
             let mut first_pcm_seconds = None;
             for chunk in stream.by_ref() {
                 first_pcm_seconds.get_or_insert_with(|| started.elapsed().as_secs_f64());
@@ -669,9 +670,10 @@ mod breeze_transport_tests {
                         && chunk.len() <= HOP_FRAMES * SAMPLES_PER_FRAME,
                     "a chunk is one hop or a shorter tail of whole frames"
                 );
-                chunks += 1;
+                chunk_frames.push(chunk.len() / SAMPLES_PER_FRAME);
                 pcm.extend_from_slice(&chunk);
             }
+            let chunks = chunk_frames.len();
             stream.finish()?;
             let seconds = started.elapsed().as_secs_f64();
             let frames = pcm.len() / SAMPLES_PER_FRAME;
@@ -679,7 +681,7 @@ mod breeze_transport_tests {
                 frames > 0 && frames <= 256 && pcm.iter().all(|x| x.is_finite()),
                 "invalid bounded native stream"
             );
-            anyhow::ensure!(chunks == frames.div_ceil(HOP_FRAMES), "one chunk per hop");
+            anyhow::ensure!(chunk_frames == hop_chunks(frames), "one chunk per hop");
             let wav = inputs
                 .output
                 .join(format!("resident-{:02}-hops-float.wav", index + 1));
@@ -709,13 +711,14 @@ mod breeze_transport_tests {
     }
 
     /// Explicit real-model control: the resident on this thread, two lines of
-    /// different lengths streamed in hops, each also decoded as one batch from
-    /// the same frames, both written for listening, with their timings.
+    /// different lengths and the first again (the same request warm), streamed
+    /// in hops, each also decoded as one batch from the same frames, both
+    /// written for listening, with their timings.
     #[test]
     #[ignore = "real native Breeze CUDA; requires immutable-pile custody and a GPU reservation"]
     fn breeze_resident_hops_against_batch() -> anyhow::Result<()> {
         use crate::models::breeze::{
-            audio::{HOP_CONTEXT, HOP_FRAMES, write_float_wav_new},
+            audio::{HOP_CONTEXT, HOP_FRAMES, hop_chunks, write_float_wav_new},
             resident::BreezeResident,
         };
 
@@ -726,14 +729,18 @@ mod breeze_transport_tests {
         let texts = [
             "The rain has stopped, and the room is quiet. Shall we open the window?",
             "There is a little sunlight on the table, and the kettle is still warm. I think this is a good place to begin, so let us take our time.",
+            // The first line again: the same request once the resident is warm.
+            "The rain has stopped, and the room is quiet. Shall we open the window?",
         ];
         let mut requests = Vec::new();
         for (index, text) in texts.into_iter().enumerate() {
             let started = Instant::now();
             let mut pcm = Vec::new();
             let mut arrivals = Vec::new();
+            let mut chunk_frames = Vec::new();
             let streamed = resident.synthesize_stream(text, |chunk| {
                 arrivals.push(started.elapsed().as_secs_f64());
+                chunk_frames.push(chunk.len() / SAMPLES_PER_FRAME);
                 pcm.extend_from_slice(&chunk);
                 Ok(())
             })?;
@@ -746,6 +753,7 @@ mod breeze_transport_tests {
                 pcm.len() == frames * SAMPLES_PER_FRAME && batch.len() == pcm.len(),
                 "hop and batch decodes must both give every frame's samples"
             );
+            anyhow::ensure!(chunk_frames == hop_chunks(frames), "one chunk per hop");
             let hop_wav = inputs
                 .output
                 .join(format!("{:02}-hops-float.wav", index + 1));
@@ -757,8 +765,12 @@ mod breeze_transport_tests {
             // The step between neighbouring samples at each hop seam, beside
             // the largest step anywhere: a click shows as a seam step far
             // above everything else in the line.
-            let seams: Vec<usize> = (1..arrivals.len())
-                .map(|hop| hop * HOP_FRAMES * SAMPLES_PER_FRAME)
+            let seams: Vec<usize> = chunk_frames[..chunk_frames.len() - 1]
+                .iter()
+                .scan(0, |at, frames| {
+                    *at += frames * SAMPLES_PER_FRAME;
+                    Some(*at)
+                })
                 .collect();
             let step = |x: &[f32], i: usize| (x[i] - x[i - 1]).abs();
             let seam_step = |x: &[f32]| seams.iter().map(|&i| step(x, i)).fold(0.0f32, f32::max);
@@ -792,6 +804,7 @@ mod breeze_transport_tests {
                 "generation_seconds":generation,
                 "hop_call_to_first_pcm_seconds":arrivals.first(),
                 "hop_arrival_seconds":arrivals,
+                "hop_chunk_frames":chunk_frames,
                 "hop_codec_seconds":streamed.hop_seconds,
                 "hop_call_to_complete_seconds":total,
                 "batch_codec_seconds":batch_codec,
@@ -802,9 +815,10 @@ mod breeze_transport_tests {
         }
         drop(resident);
         inputs.write_report(&serde_json::json!({
-            "scope":"one resident on the test thread; two lines of different length, hop decode while generating, then a batch decode of the same frames",
+            "scope":"one resident on the test thread; two lines of different length and the first again, hop decode while generating, then a batch decode of the same frames",
             "model_pile":inputs.field("pile"),"reference_wav":inputs.reference_wav,
             "hop_frames":HOP_FRAMES,"hop_context":HOP_CONTEXT,
+            "hop_window_lengths":crate::models::breeze::audio::hop_window_lengths(),
             "codec_warm_seconds_by_window_frames":warm,
             "requests":requests,
         }))
@@ -816,7 +830,7 @@ impl Synthesizer {
     /// Models and native reference codes load once on the owning worker, and
     /// the codec's few hop window lengths are compiled then, before any line.
     /// Each line's PCM arrives in hops while it is generated: the first after
-    /// the prefill and one hop of frames. Dropping a stream stops that line's
+    /// the prefill and two frames. Dropping a stream stops that line's
     /// generation at its next hop, then the resident continues with the next
     /// queued request. Frame/context caps are completion errors, reported by
     /// `finish` after the PCM already sent.
