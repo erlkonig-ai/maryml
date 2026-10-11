@@ -8,8 +8,8 @@
   opaque ids, and `BREEZE_WEIGHTS` / `VOXTRAL_WEIGHTS` are gone. Every linear
   projection the runtime quantized at load is stored as a `Tensor<NVFP4, 2>`
   leaf (`models_import`, packed on the host and gated byte for byte against
-  the device quantizer) and bound from the pile; nothing else changes
-  precision. The prompt pass (more than eight activation rows) runs on the
+  the device quantizer) and copied to device memory once at load; nothing
+  else changes precision. The prompt pass (more than eight activation rows) runs on the
   same four-bit planes (`nn::nvfp4_gemm`, W4A16 by default, W4A4 selectable),
   so no 16-bit copy of a projection is resident. Importers publish into an
   explicit collection handle after a WRITE admission check
