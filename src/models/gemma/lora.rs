@@ -34,7 +34,7 @@ use crate::format::F32Array;
 pub mod attrs {
     use crate::format::F32Array;
     use triblespace::prelude::blobencodings::UTF8String;
-    use triblespace::prelude::inlineencodings::{F64, GenId, Handle, ShortString, U256BE};
+    use triblespace::prelude::inlineencodings::{F64, GenId, Handle, U256BE};
     use triblespace::prelude::*;
 
     attributes! {
@@ -46,7 +46,7 @@ pub mod attrs {
         /// Reference to a LoRA adapter entity (repeated on the LoRA set entity).
         "B93C4E66F4B9553BF0E8B5DBAD116ECF" as lora_adapter: GenId;
         /// Projection name for a LoRA target (e.g. "layers.0.self_attn.q_proj").
-        "FF8335C187823A267E26B4E33EF157E9" as lora_projection: ShortString;
+        "FF8335C187823A267E26B4E33EF157E9" as lora_projection: Handle<UTF8String>;
         /// LoRA A matrix blob [rank, in_features].
         "7CD7F0DC8BDA328735A22DF02B4B8828" as lora_a: Handle<F32Array>;
         /// LoRA B matrix blob [out_features, rank].
@@ -319,7 +319,7 @@ impl<B: Backend> LoraWeights<B> {
             let b_data: Vec<f32> = adapter.lora_b.clone().to_data().to_vec().unwrap();
 
             let adapter_ent = entity! { _ @
-                attrs::lora_projection: key.as_str(),
+                attrs::lora_projection: blobs.put::<blobencodings::UTF8String, _>(key.clone())?,
                 attrs::lora_rank: self.rank as u32,
                 attrs::lora_alpha: self.alpha as f64,
                 attrs::lora_a: blobs.put::<F32Array, _>(a_data)?,
@@ -364,11 +364,13 @@ impl<B: Backend> LoraWeights<B> {
         let mut adapters = HashMap::new();
         let mut parameters = None;
         let mut load_adapter =
-            |proj: String,
+            |proj: Inline<inlineencodings::Handle<blobencodings::UTF8String>>,
              rank_v: Inline<inlineencodings::U256BE>,
              alpha: f64,
              a_h: Inline<inlineencodings::Handle<F32Array>>,
              b_h: Inline<inlineencodings::Handle<F32Array>>| {
+                let proj: anybytes::View<str> = blobs.get(proj).expect("lora_projection blob");
+                let proj = proj.to_string();
                 // U256BE stores the u32 rank big-endian in the low (last) 8 bytes.
                 let rank = u64::from_be_bytes(rank_v.raw[24..32].try_into().unwrap()) as usize;
                 let alpha = alpha as f32;
@@ -409,7 +411,8 @@ impl<B: Backend> LoraWeights<B> {
             root @ crate::format::attrs::member: _?member,
         }])) {
             for (proj, rank, alpha, a_h, b_h) in find!(
-                (proj: String, rank: Inline<inlineencodings::U256BE>, alpha: f64,
+                (proj: Inline<inlineencodings::Handle<blobencodings::UTF8String>>,
+                 rank: Inline<inlineencodings::U256BE>, alpha: f64,
                  a_h: Inline<inlineencodings::Handle<F32Array>>,
                  b_h: Inline<inlineencodings::Handle<F32Array>>),
                 pattern!(tribles, [{ root @ crate::format::attrs::member: _?adapter }, {
@@ -427,7 +430,8 @@ impl<B: Backend> LoraWeights<B> {
             // Old stored sets use native links and set-local parameters. Keep
             // those opaque roots readable without manufacturing shared roots.
             for (proj, rank, alpha, a_h, b_h) in find!(
-                (proj: String, rank: Inline<inlineencodings::U256BE>, alpha: f64,
+                (proj: Inline<inlineencodings::Handle<blobencodings::UTF8String>>,
+                 rank: Inline<inlineencodings::U256BE>, alpha: f64,
                  a_h: Inline<inlineencodings::Handle<F32Array>>,
                  b_h: Inline<inlineencodings::Handle<F32Array>>),
                 pattern!(tribles, [{
@@ -533,21 +537,27 @@ mod tests {
         let device = burn::prelude::Device::<TB>::default();
         let mut blobs = MemoryBlobStore::new();
         let first_adapter = entity! { _ @
-            attrs::lora_projection: "layers.0.self_attn.q_proj",
+            attrs::lora_projection: blobs
+                .put::<blobencodings::UTF8String, _>("layers.0.self_attn.q_proj".to_owned())
+                .unwrap(),
             attrs::lora_rank: 1u32,
             attrs::lora_alpha: 2.0f64,
             attrs::lora_a: blobs.put::<F32Array, _>(vec![1.0, 2.0]).unwrap(),
             attrs::lora_b: blobs.put::<F32Array, _>(vec![3.0, 4.0]).unwrap(),
         };
         let second_adapter = entity! { _ @
-            attrs::lora_projection: "layers.0.self_attn.q_proj",
+            attrs::lora_projection: blobs
+                .put::<blobencodings::UTF8String, _>("layers.0.self_attn.q_proj".to_owned())
+                .unwrap(),
             attrs::lora_rank: 2u32,
             attrs::lora_alpha: 8.0f64,
             attrs::lora_a: blobs.put::<F32Array, _>(vec![10.0, 20.0, 30.0, 40.0]).unwrap(),
             attrs::lora_b: blobs.put::<F32Array, _>(vec![50.0, 60.0, 70.0, 80.0]).unwrap(),
         };
         let unselected_adapter = entity! { _ @
-            attrs::lora_projection: "layers.0.mlp.down_proj",
+            attrs::lora_projection: blobs
+                .put::<blobencodings::UTF8String, _>("layers.0.mlp.down_proj".to_owned())
+                .unwrap(),
             attrs::lora_a: blobs.put::<F32Array, _>(vec![90.0, 91.0]).unwrap(),
             attrs::lora_b: blobs.put::<F32Array, _>(vec![92.0, 93.0]).unwrap(),
         };

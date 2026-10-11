@@ -206,8 +206,9 @@ fn ingest_bf16_members_with(
             _ => "tensor",
         };
         let name_h = blobs.put::<UTF8String, _>(name.to_string())?;
+        let kind_h = blobs.put::<UTF8String, _>(kind.to_owned())?;
         let module = entity! { _ @
-            attrs::kind: kind, attrs::safetensor_path: name_h, attrs::weight: leaf_id
+            attrs::kind: kind_h, attrs::safetensor_path: name_h, attrs::weight: leaf_id
         };
         members.push(module.root().expect("module root"));
         facts += module.into_facts();
@@ -251,7 +252,8 @@ pub fn ingest_tensors(
             _ => "tensor",
         };
         let name_h = blobs.put::<UTF8String, _>(name)?;
-        let m = entity! { _ @ attrs::kind: kind, attrs::safetensor_path: name_h, attrs::weight: leaf_id };
+        let kind_h = blobs.put::<UTF8String, _>(kind.to_owned())?;
+        let m = entity! { _ @ attrs::kind: kind_h, attrs::safetensor_path: name_h, attrs::weight: leaf_id };
         members.push(m.root().expect("module root"));
         facts += m.into_facts();
     }
@@ -297,8 +299,9 @@ pub fn build_model_root(
     // influence: the weight-format tag, the `source` it was imported from, and
     // which files it came from.
     let source_h = blobs.put::<UTF8String, _>(source.to_string())?;
+    let quantization_h = blobs.put::<UTF8String, _>(quantization.to_string())?;
     facts += entity! { ExclusiveId::force_ref(&root_id) @
-        attrs::quantization: quantization,
+        attrs::quantization: quantization_h,
         attrs::source: source_h,
     }
     .into_facts();

@@ -39,7 +39,7 @@ pub struct LearnedExpert {
 
 pub mod attrs {
     use triblespace::prelude::blobencodings::UTF8String;
-    use triblespace::prelude::inlineencodings::{F64, Handle, ShortString, U256BE};
+    use triblespace::prelude::inlineencodings::{F64, Handle, U256BE};
     use triblespace::prelude::*;
 
     pub use crate::format::attrs::parent;
@@ -60,7 +60,7 @@ pub mod attrs {
         /// Why this version exists, in its author's words.
         "365C41C24AB9FF7DF2C78105DB1FDE97" as explanation: Handle<UTF8String>;
         /// The code that learned it: a git revision.
-        "6CEEC82A5A1A1EC65A4609C025E42767" as code_revision: ShortString;
+        "6CEEC82A5A1A1EC65A4609C025E42767" as code_revision: Handle<UTF8String>;
     }
 }
 
@@ -291,6 +291,9 @@ pub fn learned_version(
         let why_h = pile
             .put::<blobencodings::UTF8String, _>(recipe.explanation.clone())
             .map_err(|e| anyhow::anyhow!("store the explanation: {e:?}"))?;
+        let revision_h = pile
+            .put::<blobencodings::UTF8String, _>(recipe.code_revision.clone())
+            .map_err(|e| anyhow::anyhow!("store the code revision: {e:?}"))?;
         added += entity! { ExclusiveId::force_ref(&root) @
             attrs::parent: parent,
             metadata::name: name_h,
@@ -299,7 +302,7 @@ pub fn learned_version(
             attrs::learn_steps: recipe.steps,
             attrs::learned_span: span_h,
             attrs::explanation: why_h,
-            attrs::code_revision: recipe.code_revision.as_str(),
+            attrs::code_revision: revision_h,
         };
         if let Some(w) = recipe.anchor {
             added += entity! { ExclusiveId::force_ref(&root) @ attrs::learn_anchor: w };

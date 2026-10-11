@@ -183,7 +183,7 @@ pub(crate) mod flag {
 }
 
 pub mod attrs {
-    use triblespace::prelude::inlineencodings::{Boolean, F64, GenId, Handle, ShortString, U256BE};
+    use triblespace::prelude::inlineencodings::{Boolean, F64, GenId, Handle, U256BE};
     use triblespace::prelude::*;
 
     attributes! {
@@ -218,8 +218,8 @@ pub mod attrs {
 
         // ── minted 2026-07-16 — bulk leaves ──
         /// A token/subword string (vocab entry, added-token content). A
-        /// `UTF8String` blob, NOT `ShortString`: CLIP has 27 tokens over the
-        /// 32-byte inline ceiling (byte-level BPE emoji clusters, up to 64 B).
+        /// `UTF8String` blob: CLIP has 27 tokens over 32 bytes (byte-level
+        /// BPE emoji clusters, up to 64 B), so no inline value could hold them.
         /// Content-addressed, so identical pieces (incl. merge halves) dedup.
         "AE7FE29F2F38153F58C542D5CA4A9356" as piece: Handle<blobencodings::UTF8String>;
         /// A token's vocab id (vocab entry, added token). Small int in a U256BE.
@@ -243,11 +243,11 @@ pub mod attrs {
 
         // ── minted 2026-07-16 — config-tail model knobs (flat scalars) ──
         /// The unknown-token string (WordPiece "[UNK]", BPE "<|endoftext|>").
-        "68F1A9E6ED735E7C3ADCCA076AFF1742" as unk_token: ShortString;
+        "68F1A9E6ED735E7C3ADCCA076AFF1742" as unk_token: Handle<blobencodings::UTF8String>;
         /// WordPiece continuing-subword prefix ("##"); empty for BPE.
-        "11F76A2C0856C16CB030C4327D5A3B93" as continuing_subword_prefix: ShortString;
+        "11F76A2C0856C16CB030C4327D5A3B93" as continuing_subword_prefix: Handle<blobencodings::UTF8String>;
         /// BPE end-of-word suffix ("</w>").
-        "6FB969E8A3EDD1A657C721DD5A7D42EA" as end_of_word_suffix: ShortString;
+        "6FB969E8A3EDD1A657C721DD5A7D42EA" as end_of_word_suffix: Handle<blobencodings::UTF8String>;
         /// WordPiece max input chars per word (100).
         "DF3F88DBFA2B44A7783169C9640014AF" as max_input_chars: U256BE;
 
@@ -266,9 +266,9 @@ pub mod attrs {
         /// tokenizers use the Regex variant, reconstructed as Regex).
         "C8262D5668B8A1F541B3C35D54201BEC" as pattern: Handle<blobencodings::UTF8String>;
         /// A Replace node's replacement content (e.g. " ").
-        "3AC7574C07D02D389B4E7AD3B3B084D9" as replace_content: ShortString;
+        "3AC7574C07D02D389B4E7AD3B3B084D9" as replace_content: Handle<blobencodings::UTF8String>;
         /// A Split node's SplitDelimiterBehavior name ("Removed"/"Isolated"/…).
-        "964B4FCF7477E7E4436F0325F89B7CB5" as behavior: ShortString;
+        "964B4FCF7477E7E4436F0325F89B7CB5" as behavior: Handle<blobencodings::UTF8String>;
     }
 }
 
@@ -421,6 +421,10 @@ pub fn save_tokenizer_json(
         None => None,
     };
 
+    // The text knobs are stored here: `into_facts` below keeps only facts.
+    let unk = put_optional_text(blobs, unk)?;
+    let csp = put_optional_text(blobs, csp)?;
+    let eows = put_optional_text(blobs, eows)?;
     let tok = entity! { _ @
         metadata::tag*: model_tags.iter(),
         attrs::normalizer?: norm_id,
@@ -519,10 +523,11 @@ pub fn save_tiktoken(
     facts += pretok.into_facts();
 
     let name_h = blobs.put::<blobencodings::UTF8String, _>(source_name.to_string())?;
+    let unk = put_optional_text(blobs, cfg["unk_token"].as_str())?;
     let tok = entity! { _ @
         metadata::tag: ty::TIKTOKEN,
         attrs::pre_tokenizer: pretok_id,
-        attrs::unk_token?: cfg["unk_token"].as_str(),
+        attrs::unk_token?: unk,
         attrs::vocab*: vocab_ids.iter(),
         attrs::added*: added_ids.iter(),
     };
@@ -630,6 +635,10 @@ fn save_config_node(
         other => return Err(format!("unknown config node type: {other:?}").into()),
     }
 
+    // The text fields are stored here: `into_facts` below keeps only facts.
+    let replace_content = put_optional_text(blobs, replace_content)?;
+    let behavior = put_optional_text(blobs, behavior)?;
+    let prefix = put_optional_text(blobs, prefix)?;
     let node = entity! { _ @
         metadata::tag*: tags.iter(),
         attrs::pattern?: pattern_h,
@@ -641,6 +650,17 @@ fn save_config_node(
     let id = node.root().expect("config node root");
     *facts += node.into_facts();
     Ok(id)
+}
+
+/// Store optional text as a `UTF8String` blob and return its handle.
+fn put_optional_text(
+    blobs: &mut impl BlobStorePut,
+    text: Option<&str>,
+) -> Result<Option<Inline<inlineencodings::Handle<blobencodings::UTF8String>>>, Err> {
+    Ok(match text {
+        Some(text) => Some(blobs.put::<blobencodings::UTF8String, _>(text.to_owned())?),
+        None => None,
+    })
 }
 
 /// Read a `UTF8String` blob handle back to an owned `String`.
@@ -850,7 +870,7 @@ fn ordered_members_strict(tribles: &TribleSet, node: Id) -> Result<Vec<Id>, Err>
 // crate is purely the executor, exactly as Burn is for the weight graph.
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Read a node's optional `ShortString` field.
+/// At most one value of a node's field, refusing more.
 #[cfg(feature = "tokenizer")]
 fn optional_one<T>(
     values: impl IntoIterator<Item = T>,
@@ -1015,18 +1035,6 @@ fn load_added_strict(
     Ok(ordered.into_values().collect())
 }
 
-#[cfg(feature = "tokenizer")]
-macro_rules! short_field {
-    ($tribles:expr_2021, $node:expr_2021, $attr:path) => {
-        optional_one(
-            find!((s: String), pattern!($tribles, [{ ($node) @ $attr: ?s }]))
-                .map(|(s,)| s),
-            $node,
-            stringify!($attr),
-        )?
-    };
-}
-
 /// Read a node's optional `UTF8String`-handle field back to a `String`.
 #[cfg(feature = "tokenizer")]
 macro_rules! long_field {
@@ -1090,9 +1098,9 @@ pub fn build_tokenizer_with_added(
         .into_iter()
         .map(|(t, i)| (t, i as u32))
         .collect();
-    let unk = short_field!(tribles, tok_id, attrs::unk_token);
-    let csp = short_field!(tribles, tok_id, attrs::continuing_subword_prefix);
-    let eows = short_field!(tribles, tok_id, attrs::end_of_word_suffix);
+    let unk = long_field!(tribles, blobs, tok_id, attrs::unk_token);
+    let csp = long_field!(tribles, blobs, tok_id, attrs::continuing_subword_prefix);
+    let eows = long_field!(tribles, blobs, tok_id, attrs::end_of_word_suffix);
     let max_chars = optional_one(
         find!(
             (m: u64),
@@ -1212,7 +1220,7 @@ fn build_normalizer(
     } else if has(ty::REPLACE) {
         let pat = long_field!(tribles, blobs, node, attrs::pattern)
             .ok_or("Replace node missing pattern")?;
-        let content = short_field!(tribles, node, attrs::replace_content).unwrap_or_default();
+        let content = long_field!(tribles, blobs, node, attrs::replace_content).unwrap_or_default();
         // Patterns are stored raw from the Regex variant; rebuild as Regex.
         Ok(
             n::Replace::new(n::replace::ReplacePattern::Regex(pat), content)
@@ -1245,8 +1253,8 @@ fn build_pre_tokenizer(
     } else if has(ty::SPLIT) {
         let pat = long_field!(tribles, blobs, node, attrs::pattern)
             .ok_or("Split node missing pattern")?;
-        let behavior =
-            short_field!(tribles, node, attrs::behavior).ok_or("Split node missing behavior")?;
+        let behavior = long_field!(tribles, blobs, node, attrs::behavior)
+            .ok_or("Split node missing behavior")?;
         Ok(p::split::Split::new(
             p::split::SplitPattern::Regex(pat),
             parse_behavior(&behavior)?,
@@ -1281,7 +1289,7 @@ fn build_decoder(
     let tags = node_tags(tribles, node);
     let has = |id: Id| tags.contains(&id);
     if has(ty::WORD_PIECE) {
-        let prefix = short_field!(tribles, node, attrs::continuing_subword_prefix)
+        let prefix = long_field!(tribles, blobs, node, attrs::continuing_subword_prefix)
             .unwrap_or_else(|| "##".to_string());
         Ok(tokenizers::decoders::wordpiece::WordPiece::new(prefix, has(flag::CLEANUP)).into())
     } else if has(ty::BYTE_LEVEL) {

@@ -574,7 +574,9 @@ pub struct ModelAttributeAlias {
     pub label: &'static str,
     /// Literal id present in model piles written before the attribute epoch.
     pub historical: Id,
-    /// Encoding-aware anchored id used by current runtime declarations.
+    /// Encoding-aware anchored id used by current runtime declarations, or
+    /// for the eight short-text fields the retired `ShortString` anchored id
+    /// (see [`retired_short_text`]).
     pub canonical: Id,
 }
 
@@ -610,12 +612,27 @@ pub struct ModelAttributeProjection {
 // piles. `unsafe as` is intentional: unlike the runtime schemas, this side of
 // the mapping must denote the historical literal id exactly. No post-epoch
 // Inkling or dataset/training attributes belong in this module.
+//
+// The eight short-text fields are plain ids rather than declarations: their
+// values are the retired 32-byte `ShortString` layout, which no runtime type
+// describes any more, and the projection only ever copies those bytes.
 mod historical {
     use crate::f16enc::F16Array;
     use crate::format::{F32Array, U32Array, U64Array};
+    use triblespace::core::id::Id;
+    use triblespace::core::id_hex;
     use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
-    use triblespace::prelude::inlineencodings::{Boolean, F64, GenId, Handle, ShortString, U256BE};
+    use triblespace::prelude::inlineencodings::{Boolean, F64, GenId, Handle, U256BE};
     use triblespace::prelude::*;
+
+    pub const KIND: Id = id_hex!("52C4A211D2A08BA25C27FFD79FF24C93");
+    pub const QUANTIZATION: Id = id_hex!("7AF87320C144AA29C29FE2A5EE7C7EB2");
+    pub const LORA_PROJECTION: Id = id_hex!("FF8335C187823A267E26B4E33EF157E9");
+    pub const UNK_TOKEN: Id = id_hex!("68F1A9E6ED735E7C3ADCCA076AFF1742");
+    pub const CONTINUING_SUBWORD_PREFIX: Id = id_hex!("11F76A2C0856C16CB030C4327D5A3B93");
+    pub const END_OF_WORD_SUFFIX: Id = id_hex!("6FB969E8A3EDD1A657C721DD5A7D42EA");
+    pub const REPLACE_CONTENT: Id = id_hex!("3AC7574C07D02D389B4E7AD3B3B084D9");
+    pub const BEHAVIOR: Id = id_hex!("964B4FCF7477E7E4436F0325F89B7CB5");
 
     attributes! {
         // Model format and graph, all present before 6b65f278.
@@ -628,21 +645,18 @@ mod historical {
         "2CC4D16369C4980BCB512937DA204FF5" unsafe as format_marker: GenId;
         "4629D277AD6B52B50DA78DEF63440AF1" unsafe as weight: GenId;
         "18E898172078C843A0351C3D880CC238" unsafe as bias: GenId;
-        "52C4A211D2A08BA25C27FFD79FF24C93" unsafe as kind: ShortString;
         "09EA2F7BCF9B0C9714EE39CF269DF2D5" unsafe as safetensor_path: Handle<UTF8String>;
         "33CE12B1B940B13E48D8E5B0ADFD2421" unsafe as index: U256BE;
         "3F46CDE630964D78D62DA32F4A8558C1" unsafe as model_root: GenId;
         "B4B6EC08A0CD70DE63A690168EE78F0F" unsafe as member: GenId;
         "4C1CD1611863E7854C59C7DC706DF77A" unsafe as model_name: Handle<UTF8String>;
         "D20B8E3556C35FF6D18D104C3443D6CF" unsafe as source: Handle<UTF8String>;
-        "7AF87320C144AA29C29FE2A5EE7C7EB2" unsafe as quantization: ShortString;
 
         // Gemma LoRA, also present before 6b65f278. `model_name` is shared
         // with the format schema above and therefore has only one mapping.
         "1A682F45CE40171DD5C6FDB4F086AD69" unsafe as lora_rank: U256BE;
         "198B03AF556B7505CCC9ABD4A1D6E724" unsafe as lora_alpha: F64;
         "B93C4E66F4B9553BF0E8B5DBAD116ECF" unsafe as lora_adapter: GenId;
-        "FF8335C187823A267E26B4E33EF157E9" unsafe as lora_projection: ShortString;
         "7CD7F0DC8BDA328735A22DF02B4B8828" unsafe as lora_a: Handle<F32Array>;
         "1F21DAE68652A4D8CAD973400F04124D" unsafe as lora_b: Handle<F32Array>;
 
@@ -662,16 +676,50 @@ mod historical {
         "714AE13F801202EB27C83E3AB2290669" unsafe as piece_bytes: Handle<RawBytes>;
         "5723ECE1FF426C58879B79D5669A7CF1" unsafe as merge_left: Handle<UTF8String>;
         "5C78FEB151F35A2C5D07BEC92E860752" unsafe as merge_right: Handle<UTF8String>;
-        "68F1A9E6ED735E7C3ADCCA076AFF1742" unsafe as unk_token: ShortString;
-        "11F76A2C0856C16CB030C4327D5A3B93" unsafe as continuing_subword_prefix: ShortString;
-        "6FB969E8A3EDD1A657C721DD5A7D42EA" unsafe as end_of_word_suffix: ShortString;
         "DF3F88DBFA2B44A7783169C9640014AF" unsafe as max_input_chars: U256BE;
         "3BCB70478942DB710ED2A4FB023F3457" unsafe as piece_score: F64;
         "EE4C6647619A836326196F0DBF84FA98" unsafe as byte_fallback: Boolean;
         "C8262D5668B8A1F541B3C35D54201BEC" unsafe as pattern: Handle<UTF8String>;
-        "3AC7574C07D02D389B4E7AD3B3B084D9" unsafe as replace_content: ShortString;
-        "964B4FCF7477E7E4436F0325F89B7CB5" unsafe as behavior: ShortString;
     }
+}
+
+/// The retired `ShortString` inline encoding's id, as its `MetaDescribe`
+/// declared it. Kept as a literal so the ids post-epoch code wrote short text
+/// under stay derivable once the type is gone.
+pub const RETIRED_SHORT_STRING_ENCODING: Id =
+    triblespace::core::id_hex!("2D848DB0AF112DB226A6BF1A3640D019");
+
+/// The id `"HEX" as name: ShortString` derived for `anchor`, which is where
+/// post-epoch code wrote the eight short-text model fields until they moved to
+/// `Handle<UTF8String>`.
+///
+/// The pre-epoch literal facts are projected HERE, not onto the current
+/// `Handle<UTF8String>` attributes. Their values are 32 inline bytes of text,
+/// and a current reader expects a content handle whose blob is in the store;
+/// the projection only copies bytes and has no store to put text into. So a
+/// pre-epoch pile projects into exactly the shape of a post-epoch pile written
+/// before the move, and one conversion serves both: `trible pile migrate
+/// <PILE> shortstring-to-utf8 <COLLECTION> --anchored HEX` appends the UTF-8
+/// twin, text blob included, under the current id. Until it has run, current
+/// readers do not see these eight fields in either kind of pile.
+pub fn retired_short_text(anchor: Id) -> Id {
+    entity! {
+        metadata::anchor: anchor,
+        metadata::value_encoding: RETIRED_SHORT_STRING_ENCODING,
+        metadata::tag: metadata::KIND_ATTRIBUTE,
+    }
+    .root()
+    .expect("an entity! without an explicit id exports its intrinsic root")
+}
+
+/// Decode the retired `ShortString` layout from its raw 32 bytes: UTF-8, NUL
+/// terminated and zero padded, or all 32 bytes when there is no NUL.
+pub fn decode_retired_short_text(raw: &[u8; 32]) -> Result<&str, String> {
+    let len = raw.iter().position(|&byte| byte == 0).unwrap_or(raw.len());
+    if raw[len..].iter().any(|&byte| byte != 0) {
+        return Err("bytes after its NUL terminator".to_owned());
+    }
+    std::str::from_utf8(&raw[..len]).map_err(|error| format!("invalid UTF-8: {error}"))
 }
 
 /// Return the complete audited mapping used by
@@ -679,7 +727,9 @@ mod historical {
 ///
 /// Gemma is feature-gated, so its LoRA attributes are derived here from the
 /// same anchors and encodings as `models::gemma::lora::attrs`; the remaining
-/// canonical ids come directly from the unconditional runtime declarations.
+/// canonical ids come directly from the unconditional runtime declarations,
+/// except for the eight short-text fields, whose canonical ids are the retired
+/// `ShortString` ones (see [`retired_short_text`]).
 /// Canonical targets are disjoint from all historical sources, so the table
 /// cannot contain an `A -> B -> C` chain that would need a second pass.
 pub fn legacy_model_attribute_aliases() -> [ModelAttributeAlias; LEGACY_MODEL_ATTRIBUTE_ALIAS_COUNT]
@@ -741,8 +791,8 @@ pub fn legacy_model_attribute_aliases() -> [ModelAttributeAlias; LEGACY_MODEL_AT
         ),
         alias(
             "format.kind",
-            historical::kind.id(),
-            current_format::kind.id(),
+            historical::KIND,
+            retired_short_text(historical::KIND),
         ),
         alias(
             "format.safetensor_path",
@@ -776,8 +826,8 @@ pub fn legacy_model_attribute_aliases() -> [ModelAttributeAlias; LEGACY_MODEL_AT
         ),
         alias(
             "format.quantization",
-            historical::quantization.id(),
-            current_format::quantization.id(),
+            historical::QUANTIZATION,
+            retired_short_text(historical::QUANTIZATION),
         ),
         alias(
             "gemma_lora.lora_rank",
@@ -796,9 +846,8 @@ pub fn legacy_model_attribute_aliases() -> [ModelAttributeAlias; LEGACY_MODEL_AT
         ),
         alias(
             "gemma_lora.lora_projection",
-            historical::lora_projection.id(),
-            Attribute::<inlineencodings::ShortString>::anchored(historical::lora_projection.id())
-                .id(),
+            historical::LORA_PROJECTION,
+            retired_short_text(historical::LORA_PROJECTION),
         ),
         alias(
             "gemma_lora.lora_a",
@@ -883,18 +932,18 @@ pub fn legacy_model_attribute_aliases() -> [ModelAttributeAlias; LEGACY_MODEL_AT
         ),
         alias(
             "tokenizer.unk_token",
-            historical::unk_token.id(),
-            current_tokenizer::unk_token.id(),
+            historical::UNK_TOKEN,
+            retired_short_text(historical::UNK_TOKEN),
         ),
         alias(
             "tokenizer.continuing_subword_prefix",
-            historical::continuing_subword_prefix.id(),
-            current_tokenizer::continuing_subword_prefix.id(),
+            historical::CONTINUING_SUBWORD_PREFIX,
+            retired_short_text(historical::CONTINUING_SUBWORD_PREFIX),
         ),
         alias(
             "tokenizer.end_of_word_suffix",
-            historical::end_of_word_suffix.id(),
-            current_tokenizer::end_of_word_suffix.id(),
+            historical::END_OF_WORD_SUFFIX,
+            retired_short_text(historical::END_OF_WORD_SUFFIX),
         ),
         alias(
             "tokenizer.max_input_chars",
@@ -918,13 +967,13 @@ pub fn legacy_model_attribute_aliases() -> [ModelAttributeAlias; LEGACY_MODEL_AT
         ),
         alias(
             "tokenizer.replace_content",
-            historical::replace_content.id(),
-            current_tokenizer::replace_content.id(),
+            historical::REPLACE_CONTENT,
+            retired_short_text(historical::REPLACE_CONTENT),
         ),
         alias(
             "tokenizer.behavior",
-            historical::behavior.id(),
-            current_tokenizer::behavior.id(),
+            historical::BEHAVIOR,
+            retired_short_text(historical::BEHAVIOR),
         ),
     ]
 }

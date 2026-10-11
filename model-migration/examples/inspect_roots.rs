@@ -81,10 +81,10 @@ fn inspect(pile: &mut Pile, path: &std::path::Path) -> Result<()> {
         .map(|(n,)| read_ls(n))
         .collect();
         let quants: Vec<String> = find!(
-            (q: String),
+            (q: Inline<inlineencodings::Handle<blobencodings::UTF8String>>),
             pattern!(&facts, [{ root @ attrs::quantization: ?q }])
         )
-        .map(|(q,)| q)
+        .map(|(q,)| read_ls(q))
         .collect();
         let members: BTreeSet<Id> = find!(
             (m: Id),

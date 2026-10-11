@@ -10,8 +10,7 @@
 //!     a *distinct* entity, so "the v3 snapshot" is a stable address forever and
 //!     a new version never mutates an old one.
 //!   - **Sample** — one training example. Every modality payload is a `Handle`
-//!     (the value model has no inline string past 32 bytes, so anything larger
-//!     than a `ShortString` rides as a content-addressed blob): [`image`],
+//!     to a content-addressed blob: [`image`],
 //!     [`text`], [`sound`] are all optional and independent, so a sample can be
 //!     unimodal or multimodal with the same shape. [`split`] tags train/val/test,
 //!     [`sample_dataset`] links it to its Dataset, [`source`] optionally records
@@ -31,7 +30,7 @@
 //! never by forking this library.
 
 use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
-use triblespace::prelude::inlineencodings::{F64, GenId, Handle, ShortString};
+use triblespace::prelude::inlineencodings::{F64, GenId, Handle};
 use triblespace::prelude::*;
 
 attributes! {
@@ -41,7 +40,7 @@ attributes! {
     /// distinct, immutable entity, so the history of a dataset is just the set
     /// of its snapshots — append-only, never overwritten.
     /// Minted 2026-06-30 (trible genid).
-    "8644CC9146EA9348DB5CF401CD183724" as pub dataset_version: ShortString;
+    "8644CC9146EA9348DB5CF401CD183724" as pub dataset_version: Handle<UTF8String>;
 
     // ── Sample (modality payloads — all Handles, all optional) ───────────
     /// The image payload of a sample (raw encoded bytes — PNG/JPEG/…; the codec
@@ -56,9 +55,9 @@ attributes! {
     /// `RawBytes` carries the encoded stream and the container format is implied
     /// by the dataset, exactly as for `image`. Minted 2026-06-30.
     "B83C144EF2DDEFD3378E13486908D18C" as pub sound: Handle<RawBytes>;
-    /// Which split a sample belongs to: "train" / "val" / "test". A short label,
-    /// so a `ShortString` inline value (no blob). Minted 2026-06-30.
-    "70644EA68C6CF91C2C6ABC8BF96982F9" as pub split: ShortString;
+    /// Which split a sample belongs to: "train" / "val" / "test", as text.
+    /// Minted 2026-06-30.
+    "70644EA68C6CF91C2C6ABC8BF96982F9" as pub split: Handle<UTF8String>;
     /// Membership edge: a sample → the Dataset snapshot it belongs to.
     /// Minted 2026-06-30.
     "7AB92787B113098EFD8700183002892A" as pub sample_dataset: GenId;
@@ -89,9 +88,9 @@ attributes! {
     /// value — standard double precision is the right grain for a learning
     /// signal. Minted 2026-06-30.
     "DF0496BEE2DC1AA8FFE27DB90187D5E2" as pub pref_score: F64;
-    /// Who or what produced the judgement (a model handle, a rater name…). A
-    /// short label, so a `ShortString` inline value. Minted 2026-06-30.
-    "60811D43F4E1DA286624403CBC1BFB91" as pub pref_judge: ShortString;
+    /// Who or what produced the judgement (a model handle, a rater name…), as
+    /// text. Minted 2026-06-30.
+    "60811D43F4E1DA286624403CBC1BFB91" as pub pref_judge: Handle<UTF8String>;
 }
 
 #[cfg(test)]

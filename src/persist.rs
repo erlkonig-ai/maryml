@@ -3070,9 +3070,12 @@ mod native_model_snapshot_tests {
         let root_id = root.root().unwrap();
         facts += root.into_facts();
         let source = pile.put::<UTF8String, _>(source.to_owned()).unwrap();
+        let quantization = pile
+            .put::<UTF8String, _>(QUANTIZATION_NATIVE.to_owned())
+            .unwrap();
         facts += entity! { ExclusiveId::force_ref(&root_id) @
             attrs::source: source,
-            attrs::quantization: QUANTIZATION_NATIVE,
+            attrs::quantization: quantization,
         }
         .into_facts();
         crate::model_collection::publish_model_fragment(

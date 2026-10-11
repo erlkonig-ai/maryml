@@ -28,6 +28,7 @@ use std::collections::BTreeSet;
 
 use anyhow::{anyhow, bail, Context};
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use triblespace::core::attribute::Attribute;
 use triblespace::core::blob::{Blob, IntoBlob, TryFromBlob};
 use triblespace::core::collection::records::{
     collection_name, collection_representation, CollectionHandle, KIND_COLLECTION_DESCRIPTOR,
@@ -37,6 +38,7 @@ use triblespace::core::collection::{
     CollectionRecord, CollectionStore, CollectionStoreExt,
 };
 use triblespace::core::inline::encodings::ed25519::ED25519PublicKey;
+use triblespace::core::inline::encodings::UnknownInline;
 use triblespace::core::metadata::{self, MetaDescribe};
 use triblespace::core::repo::memoryrepo::MemoryRepo;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
@@ -45,7 +47,7 @@ use triblespace::core::repo::{
     SnapshotSource,
 };
 use triblespace::prelude::blobencodings::UTF8String;
-use triblespace::prelude::inlineencodings::{Handle, ShortString};
+use triblespace::prelude::inlineencodings::Handle;
 use triblespace::prelude::*;
 
 use mary::format::attrs;
@@ -106,9 +108,31 @@ mod preauthority_collection {
     pub const KIND_COLLECTION_RECIPE: Id =
         triblespace::macros::id_hex!("89E53D7FF204516307F0421C05E75000");
 
+    /// Literal id of the retired `collection_name: ShortString` declaration.
+    /// Its values are the retired 32-byte short-text layout, which no runtime
+    /// type describes any more, so the attribute is spelled with raw values.
+    pub const COLLECTION_NAME: Id =
+        triblespace::macros::id_hex!("436A04C372CBBFBD9C619CF50F59C4A1");
+
+    /// The retired name attribute, carrying raw 32-byte values.
+    pub fn collection_name() -> Attribute<UnknownInline> {
+        Attribute::from_fragment_unchecked(Fragment::rooted(COLLECTION_NAME, TribleSet::new()))
+    }
+
+    /// A name in the retired short-text layout: UTF-8, NUL padded to 32
+    /// bytes, with no NUL inside.
+    pub fn short_text(name: &str) -> anyhow::Result<Inline<UnknownInline>> {
+        let bytes = name.as_bytes();
+        anyhow::ensure!(
+            bytes.len() <= 32 && !bytes.contains(&0),
+            "collection name {name:?} does not fit the retired 32-byte layout"
+        );
+        let mut raw = [0_u8; 32];
+        raw[..bytes.len()].copy_from_slice(bytes);
+        Ok(Inline::new(raw))
+    }
+
     attributes! {
-        "436A04C372CBBFBD9C619CF50F59C4A1" unsafe as pub collection_name:
-            ShortString;
         "6C1ED6495491E32FEBB9FDD4EE5E8907" unsafe as pub collection_namespace:
             ED25519PublicKey;
         "620FA4F2B456357DCD1882E583B85CC3" unsafe as pub collection_representation:
@@ -304,10 +328,15 @@ fn preauthority_union_recipe_description() -> Fragment {
     }
 }
 
+/// Panics on a name longer than 32 bytes, as the retired encoder did: every
+/// retired descriptor name fitted, so a longer one names no retired descriptor.
 fn preauthority_collection_descriptor(name: &str, namespace: VerifyingKey) -> Fragment {
+    let retired_name = preauthority_collection::collection_name();
+    let name = preauthority_collection::short_text(name)
+        .expect("retired collection names fit the 32-byte layout");
     entity! {
         metadata::tag: KIND_COLLECTION_DESCRIPTOR,
-        preauthority_collection::collection_name: name,
+        retired_name: name,
         preauthority_collection::collection_namespace: namespace,
         preauthority_collection::collection_representation*:
             <blobencodings::SimpleArchive as MetaDescribe>::describe(),
@@ -1039,39 +1068,44 @@ fn source_coordinate_is_missing(
     }
 }
 
+/// Whether the legacy root lacks a quantization coordinate, refusing one that
+/// conflicts with `wanted`.
+///
+/// A coordinate can be in either of two spellings: the current
+/// `Handle<UTF8String>` attribute, compared by content handle, or the retired
+/// 32-byte short text the projection carries pre-epoch facts to, decoded from
+/// its raw bytes.
 fn quantization_coordinate_is_missing(
     fragment: &Fragment,
     root: Id,
     wanted: &str,
 ) -> anyhow::Result<bool> {
-    let values: Vec<Inline<ShortString>> = fragment
-        .facts()
-        .iter()
-        .filter(|fact| fact.e() == &root && fact.a() == &attrs::quantization.id())
-        .map(|fact| *fact.v::<ShortString>())
-        .collect();
-
-    match values.as_slice() {
-        [] => {
-            let _: Inline<ShortString> = wanted.try_to_inline().map_err(|error| {
-                anyhow!("quantization {wanted:?} is not a valid ShortString coordinate: {error:?}")
-            })?;
-            Ok(true)
-        }
-        [value] => {
-            let value = ShortString::validate(*value).map_err(|error| {
-                anyhow!("invalid quantization bytes on legacy model root {root}: {error:?}")
-            })?;
-            let actual: &str = value.try_from_inline().map_err(|error| {
-                anyhow!("invalid quantization UTF-8 on legacy model root {root}: {error}")
-            })?;
+    let retired = mary::model_collection::legacy_model_attribute_aliases()
+        .into_iter()
+        .find(|alias| alias.label == "format.quantization")
+        .expect("the audited table maps format.quantization")
+        .canonical;
+    let wanted_handle: Inline<Handle<UTF8String>> = wanted.to_owned().to_blob().get_handle();
+    let mut present = false;
+    for fact in fragment.facts().iter().filter(|fact| fact.e() == &root) {
+        if fact.a() == &attrs::quantization.id() {
+            if *fact.v::<Handle<UTF8String>>() != wanted_handle {
+                bail!("legacy model root {root} already has a conflicting quantization");
+            }
+            present = true;
+        } else if fact.a() == &retired {
+            let raw = &fact.v::<UnknownInline>().raw;
+            let actual =
+                mary::model_collection::decode_retired_short_text(raw).map_err(|error| {
+                    anyhow!("invalid quantization bytes on legacy model root {root}: {error}")
+                })?;
             if actual != wanted {
                 bail!("legacy model root {root} already has conflicting quantization {actual:?}");
             }
-            Ok(false)
+            present = true;
         }
-        _ => bail!("legacy model root {root} has ambiguous quantization coordinates"),
     }
+    Ok(!present)
 }
 
 /// Publish one frozen legacy `main` snapshot into Mary's native collection.

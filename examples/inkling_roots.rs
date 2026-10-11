@@ -97,13 +97,13 @@ fn main() -> anyhow::Result<()> {
             .push(format!("source={:?}", long(source)));
     }
     for (root, quantization) in find!(
-        (root: Id, quantization: String),
+        (root: Id, quantization: Name),
         pattern!(&facts, [{ ?root @ attrs::quantization: ?quantization }])
     ) {
         labels
             .entry(root)
             .or_default()
-            .push(format!("quantization={quantization:?}"));
+            .push(format!("quantization={:?}", long(quantization)));
     }
     let mut legacy_union: BTreeSet<Id> = BTreeSet::new();
     for (root, members) in &by_root {

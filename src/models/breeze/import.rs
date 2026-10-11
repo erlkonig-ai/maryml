@@ -242,8 +242,9 @@ fn ingest_file(pile: &mut Pile, bytes: &anybytes::Bytes) -> Result<(Vec<Id>, Tri
         let weight = leaf.root().context("leaf root absent")?;
         facts += leaf.into_facts();
         let name = pile.put::<blobencodings::UTF8String, _>(name.to_owned())?;
+        let kind = pile.put::<blobencodings::UTF8String, _>("tensor".to_owned())?;
         let member = entity! { _ @ crate::format::attrs::safetensor_path: name,
-        crate::format::attrs::kind: "tensor", crate::format::attrs::weight: weight };
+        crate::format::attrs::kind: kind, crate::format::attrs::weight: weight };
         members.push(member.root().context("member root absent")?);
         facts += member.into_facts();
     }

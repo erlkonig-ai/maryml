@@ -159,7 +159,7 @@ fn mixed_dtype_scalar_and_documents_reopen_without_source_and_select_opaque_code
     .map(|(m,)| m)
     .collect(); // ephemeral fixture assembly only
     candidate.fragment += entity! { &selected @ crate::format::attrs::member*: members,
-    metadata::name: "arbitrary stored codec identity", metadata::json_kind: "future annotation" };
+    metadata::name: "arbitrary stored codec identity", metadata::description: "future annotation" };
     let other_data = crate::format::put_raw(&mut pile, &[99.0f32], &[1]).unwrap();
     let other_weight = other_data.root().unwrap();
     candidate.fragment += other_data;

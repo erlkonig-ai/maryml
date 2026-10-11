@@ -34,7 +34,7 @@
 
 use burn::prelude::*;
 use triblespace::prelude::blobencodings::{Array, elements};
-use triblespace::prelude::inlineencodings::{GenId, Handle, ShortString, U256BE};
+use triblespace::prelude::inlineencodings::{GenId, Handle, U256BE};
 use triblespace::prelude::*;
 
 /// Flat f32 tensor data.
@@ -47,7 +47,7 @@ pub type U64Array = Array<elements::U64>;
 pub type U32Array = Array<elements::U32>;
 
 pub mod attrs {
-    use super::{F32Array, GenId, Handle, ShortString, U32Array, U64Array, U256BE};
+    use super::{F32Array, GenId, Handle, U32Array, U64Array, U256BE};
     use crate::f16enc::F16Array;
     use triblespace::prelude::*;
 
@@ -106,7 +106,7 @@ pub mod attrs {
 
         // ── module metadata ──
         /// Module kind tag ("linear", "layernorm", "conv", "embedding", …).
-        "52C4A211D2A08BA25C27FFD79FF24C93" as kind: ShortString;
+        "52C4A211D2A08BA25C27FFD79FF24C93" as kind: Handle<blobencodings::UTF8String>;
         /// Provenance: the tensor's original safetensors key (e.g. "…grn.gamma").
         "09EA2F7BCF9B0C9714EE39CF269DF2D5" as safetensor_path: Handle<blobencodings::UTF8String>;
         /// Ordered position among siblings (for layer sequences).
@@ -148,7 +148,7 @@ pub mod attrs {
         /// ids, so the tag needn't be core; and the SAME weights under two
         /// different tags share one entity id.) Minted 2026-07-24.
         /// (`trible genid` → 7AF87320C144AA29C29FE2A5EE7C7EB2)
-        "7AF87320C144AA29C29FE2A5EE7C7EB2" as quantization: ShortString;
+        "7AF87320C144AA29C29FE2A5EE7C7EB2" as quantization: Handle<blobencodings::UTF8String>;
     }
 }
 
@@ -302,7 +302,9 @@ pub fn put_linear<B: Backend>(
         None => None,
     };
 
-    let module = entity! { _ @ attrs::kind: "linear", attrs::weight: w_id, attrs::bias?: bias_id };
+    // The kind text is stored here: `into_facts` below keeps only the facts.
+    let kind_h = blobs.put::<blobencodings::UTF8String, _>("linear".to_owned())?;
+    let module = entity! { _ @ attrs::kind: kind_h, attrs::weight: w_id, attrs::bias?: bias_id };
     let mid = module.root().expect("module root");
     facts += module.into_facts();
     Ok(Fragment::rooted(mid, facts))
@@ -348,7 +350,8 @@ pub fn put_module<B: Backend, const DW: usize>(
         None => None,
     };
     let name_h = blobs.put::<blobencodings::UTF8String, _>(name.to_string())?;
-    let m = entity! { _ @ attrs::kind: kind, attrs::safetensor_path: name_h, attrs::weight: w_id, attrs::bias?: bias_id };
+    let kind_h = blobs.put::<blobencodings::UTF8String, _>(kind.to_owned())?;
+    let m = entity! { _ @ attrs::kind: kind_h, attrs::safetensor_path: name_h, attrs::weight: w_id, attrs::bias?: bias_id };
     let mid = m.root().expect("module root");
     facts += m.into_facts();
     Ok(Fragment::rooted(mid, facts))
