@@ -45,6 +45,8 @@ const KTILE4: usize = 64;
 const GROUP: usize = 16;
 /// E2M1 codes per `u32`.
 const CODES_PER_WORD: usize = 8;
+/// m-tiles one W4A16 plane carries, sharing each decoded weight fragment.
+const W4A16_TILES: usize = 4;
 
 pub use crate::nvfp4::PromptLane;
 
@@ -82,6 +84,12 @@ fn e2m1_value(code: u32) -> f32 {
 }
 
 /// W4A16: `out[r, c] = O(scale * sum_k a[r, k] * w[c, k])` for `r < m`.
+///
+/// One plane per `TILES` m-tiles of one 8-column n-tile: each k-step decodes
+/// the weight fragment once and multiplies it into every m-tile's
+/// accumulator, so a weight word is fetched and decoded once per `TILES * 16`
+/// activation rows rather than once per 16. m-tiles wholly past `m` are
+/// skipped (uniformly across the plane).
 #[cube(launch_unchecked)]
 #[allow(clippy::too_many_arguments)]
 fn w4a16_kernel<AB: Scalar + Cast, NA: Size, NC: Size>(
@@ -92,12 +100,13 @@ fn w4a16_kernel<AB: Scalar + Cast, NA: Size, NC: Size>(
     m: u32,
     #[comptime] size_k: usize,
     #[comptime] size_n: usize,
+    #[comptime] tiles: usize,
     scale: f32,
 ) {
     let def = cmma::MmaDefinition::<AB, AB, f32>::new(MTILE, NTILE, KTILE16);
     let lane = UNIT_POS_PLANE;
     let pack = AB::packing_factor();
-    let m_base = CUBE_POS_X as usize * MTILE;
+    let m_base = CUBE_POS_X as usize * comptime!(MTILE * tiles);
     let n_base = CUBE_POS_Y as usize * NTILE;
     let last = m as usize - 1;
 
@@ -113,9 +122,10 @@ fn w4a16_kernel<AB: Scalar + Cast, NA: Size, NC: Size>(
 
     let mut reg_a = Array::<Vector<AB, NA>>::new(vc_a);
     let mut reg_b = Array::<Vector<AB, NA>>::new(vc_b);
-    let mut acc = Array::<Vector<f32, NC>>::new(vc_c);
+    let mut cur = Array::<Vector<f32, NC>>::new(vc_c);
+    let mut acc = Array::<Vector<f32, NC>>::new(comptime!(tiles * vc_c));
     #[unroll]
-    for i in 0..vc_c {
+    for i in 0..comptime!(tiles * vc_c) {
         acc[i] = Vector::<f32, NC>::cast_from(0.0f32);
     }
 
@@ -124,13 +134,6 @@ fn w4a16_kernel<AB: Scalar + Cast, NA: Size, NC: Size>(
     let k_tiles = comptime!(size_k / KTILE16);
     for t in 0..k_tiles {
         let kbase = t * KTILE16;
-        #[unroll]
-        for i in 0..vc_a {
-            let (row, col) = def.position_of_nth(lane, (i * vs_a * pack) as u32, MatrixIdent::A);
-            let gr = min(row as usize + m_base, last);
-            let gc = col as usize + kbase;
-            reg_a[i] = a[(gr * size_k + gc) / a.vector_size()];
-        }
         #[unroll]
         for i in 0..vc_b {
             // B is the stored [n, k]: `col` indexes n, `row` indexes k. A
@@ -150,23 +153,44 @@ fn w4a16_kernel<AB: Scalar + Cast, NA: Size, NC: Size>(
             }
             reg_b[i] = v;
         }
-        let d = def.execute(&reg_a, &reg_b, &acc);
         #[unroll]
-        for i in 0..vc_c {
-            acc[i] = d[i];
+        for mt in 0..tiles {
+            let tile_base = m_base + mt * MTILE;
+            if tile_base < m as usize {
+                #[unroll]
+                for i in 0..vc_a {
+                    let (row, col) =
+                        def.position_of_nth(lane, (i * vs_a * pack) as u32, MatrixIdent::A);
+                    let gr = min(row as usize + tile_base, last);
+                    let gc = col as usize + kbase;
+                    reg_a[i] = a[(gr * size_k + gc) / a.vector_size()];
+                }
+                #[unroll]
+                for i in 0..vc_c {
+                    cur[i] = acc[mt * vc_c + i];
+                }
+                let d = def.execute(&reg_a, &reg_b, &cur);
+                #[unroll]
+                for i in 0..vc_c {
+                    acc[mt * vc_c + i] = d[i];
+                }
+            }
         }
     }
 
     #[unroll]
-    for i in 0..vc_c {
-        let (row, col) = def.position_of_nth(lane, (i * vs_c) as u32, MatrixIdent::Accumulator);
-        let gr = row as usize + m_base;
-        let gc = col as usize + n_base;
-        if gr < m as usize {
-            let v = acc[i];
-            #[unroll]
-            for j in 0..vs_c {
-                out[gr * size_n + gc + j] = AB::cast_from(v[j] * scale);
+    for mt in 0..tiles {
+        #[unroll]
+        for i in 0..vc_c {
+            let (row, col) = def.position_of_nth(lane, (i * vs_c) as u32, MatrixIdent::Accumulator);
+            let gr = row as usize + m_base + mt * MTILE;
+            let gc = col as usize + n_base;
+            if gr < m as usize {
+                let v = acc[mt * vc_c + i];
+                #[unroll]
+                for j in 0..vs_c {
+                    out[gr * size_n + gc + j] = AB::cast_from(v[j] * scale);
+                }
             }
         }
     }
@@ -346,7 +370,11 @@ impl Nvfp4 {
         unsafe {
             w4a16_kernel::launch_unchecked::<E, CudaRuntime>(
                 client,
-                CubeCount::Static(t.div_ceil(MTILE) as u32, (n / NTILE) as u32, 1),
+                CubeCount::Static(
+                    t.div_ceil(MTILE * W4A16_TILES) as u32,
+                    (n / NTILE) as u32,
+                    1,
+                ),
                 CubeDim::new_1d(32),
                 vs,
                 2,
@@ -357,6 +385,7 @@ impl Nvfp4 {
                 t as u32,
                 k,
                 n,
+                W4A16_TILES,
                 self.scale2,
             );
         }
