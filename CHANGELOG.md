@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Text attributes no longer use the 32-byte inline `ShortString`: module
+  `kind` and root `quantization`, the Gemma LoRA projection, the Inkling code
+  revision, the tokenizer's unknown token, continuing-subword prefix,
+  end-of-word suffix, replace content and split behavior, and the dataset
+  version, split and preference judge now store `Handle<UTF8String>`. The
+  anchors are unchanged, so the attribute ids change. Existing model piles
+  keep these facts under the old ids, and selection by quantization finds no
+  root in them until `trible pile migrate <PILE> shortstring-to-utf8
+  <COLLECTION> --anchored HEX` appends the text twins. Pre-epoch piles
+  project those eight fields onto the retired anchored ids, so the same
+  backfill covers them. A full git revision or a long LoRA path no longer
+  panics the encoder.
+
 ## 0.1.0 - 2026-10-01
 
 - Publish under the package name `maryml`; the Rust library and the optional
