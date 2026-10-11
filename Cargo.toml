@@ -1029,6 +1029,13 @@ required-features = ["import"]
 name = "voxtral_listen"
 required-features = ["voxtral"]
 
+# Re-import a native Breeze or Voxtral pile as one `nvfp4` root in an explicit
+# model collection: projections packed on the host and gated byte for byte
+# against the device quantizer, everything else copied.
+[[bin]]
+name = "models_import"
+required-features = ["breeze-cuda", "voxtral-cuda", "import"]
+
 # Offline hearing through `mary::hear::Ears` (the production seam): transcripts,
 # compute per second of audio, and the paced finish latency, per WAV.
 [[bin]]
