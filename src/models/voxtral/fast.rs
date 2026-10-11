@@ -1217,23 +1217,32 @@ pub fn export_nvfp4_projections(
             .map(|v| v.to_f32())
             .collect();
         let mut stored = q.pack_matching(&name, &values)?;
-        // voxtral-gptq lane: error-feedback packing from a captured H.
-        if let Ok(dir) = std::env::var("VOXTRAL_GPTQ_DIR") {
-            let path = std::path::Path::new(&dir).join(format!("{}.h", capture::stem(&name)));
-            if path.exists() {
+        // voxtral-gptq lane: error-feedback packing from captured H, summed
+        // over every directory VOXTRAL_GPTQ_DIR lists (comma separated).
+        if let Ok(dirs) = std::env::var("VOXTRAL_GPTQ_DIR") {
+            let mut h: Option<Vec<f64>> = None;
+            for dir in dirs.split(',') {
+                let path = std::path::Path::new(dir).join(format!("{}.h", capture::stem(&name)));
+                if !path.exists() {
+                    continue;
+                }
                 let bytes = std::fs::read(&path)?;
                 anyhow::ensure!(bytes.len() == k * k * 4, "{name}: H is {} bytes for k {k}", bytes.len());
-                let h: Vec<f64> = bytes
-                    .chunks_exact(4)
-                    .map(|b| f32::from_le_bytes(b.try_into().unwrap()) as f64)
-                    .collect();
+                let sum = h.get_or_insert_with(|| vec![0f64; k * k]);
+                for (acc, b) in sum.iter_mut().zip(bytes.chunks_exact(4)) {
+                    *acc += f32::from_le_bytes(b.try_into().unwrap()) as f64;
+                }
+            }
+            if let Some(h) = h {
                 let damp: f64 = std::env::var("VOXTRAL_GPTQ_DAMP")
                     .ok()
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(0.01);
+                let scale = crate::calibrate::BlockScale::parse(
+                    &std::env::var("VOXTRAL_GPTQ_SCALE").unwrap_or_else(|_| "max".into()),
+                )?;
                 let t = std::time::Instant::now();
-                let (packed, ratio) =
-                    crate::calibrate::pack_gptq_h(&values, k, h, damp)?;
+                let (packed, ratio) = crate::calibrate::pack_gptq_h(&values, k, h, damp, scale)?;
                 eprintln!(
                     "[gptq] {name}: k {k} n {n} H-weighted error vs nearest {ratio:.4} in {:.1}s",
                     t.elapsed().as_secs_f64()

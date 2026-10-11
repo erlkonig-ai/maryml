@@ -473,11 +473,77 @@ fn lower_inverse(l: &[f64], n: usize) -> Vec<f64> {
     inv
 }
 
+/// How GPTQ picks a block's E4M3 scale when it reaches the block.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BlockScale {
+    /// From the block's maximum, as round-to-nearest does: the largest
+    /// element lands on E2M1's 6.
+    #[default]
+    Max,
+    /// The least-error scale byte among the maximum's and its neighbours,
+    /// four codes below (the largest element then lands near E2M1's 4, which
+    /// is the "Four Over Six" choice, arXiv 2512.02010, and the steps between)
+    /// and one above. Error is the block's squared rounding error, weighted
+    /// per column as GPTQ weighs it.
+    Search,
+}
+
+impl BlockScale {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "max" => Ok(Self::Max),
+            "search" => Ok(Self::Search),
+            other => anyhow::bail!("block scale must be max or search, not {other:?}"),
+        }
+    }
+}
+
+/// The scale byte and unit of `block` under [`BlockScale::Search`]: every
+/// candidate byte from four below the maximum's to one above, the one with
+/// the least `sum weight_i (v_i - q_i)^2`, the maximum's on a tie.
+pub fn block_unit_search(block: &[f32], weights: &[f32], scale2: f32) -> (u8, f32) {
+    let (nominal, unit) = block_unit(block, scale2);
+    if nominal == 0 {
+        return (nominal, unit);
+    }
+    let error = |unit: f32| -> f32 {
+        block
+            .iter()
+            .zip(weights)
+            .map(|(&v, &wt)| {
+                let d = v - decode_code(code_of(v, unit)) * unit;
+                wt * d * d
+            })
+            .sum()
+    };
+    let mut best = (nominal, unit, error(unit));
+    let lo = nominal.saturating_sub(4).max(1);
+    let hi = (nominal + 1).min(0x7E);
+    for byte in lo..=hi {
+        if byte == nominal {
+            continue;
+        }
+        let u = crate::nvfp4::e4m3_to_f32(byte) * scale2;
+        let e = error(u);
+        if e < best.2 {
+            best = (byte, u, e);
+        }
+    }
+    (best.0, best.1)
+}
+
 /// GPTQ NVFP4 of `w` (`[rows, cols]`) from an accumulated `H = X^T X`
 /// (row-major cols x cols, any positive scale), damped by `damp` times its
-/// mean diagonal. Returns the packing and its H-weighted output error
-/// relative to nearest rounding, `tr((W-Wq) H (W-Wq)^T)`.
-pub fn pack_gptq_h(w: &[f32], cols: usize, mut h: Vec<f64>, damp: f64) -> Result<(Packed, f64)> {
+/// mean diagonal, block scales chosen by `scale`. Returns the packing and its
+/// H-weighted output error relative to nearest rounding,
+/// `tr((W-Wq) H (W-Wq)^T)`.
+pub fn pack_gptq_h(
+    w: &[f32],
+    cols: usize,
+    mut h: Vec<f64>,
+    damp: f64,
+    scale: BlockScale,
+) -> Result<(Packed, f64)> {
     let n = cols;
     ensure!(n > 0 && n % BLOCK == 0 && w.len() % n == 0, "bad shape");
     ensure!(h.len() == n * n, "H is not {n} x {n}");
@@ -535,9 +601,19 @@ pub fn pack_gptq_h(w: &[f32], cols: usize, mut h: Vec<f64>, damp: f64) -> Result
                     let mut units = vec![0f32; nrows];
                     for j in 0..n {
                         if j % BLOCK == 0 {
+                            // GPTQ's cost of a rounding error at column c is
+                            // err^2 / U_cc^2.
+                            let mut weights = [0f32; BLOCK];
+                            for (c, wt) in weights.iter_mut().enumerate() {
+                                let d = u[(j + c) * n + j + c];
+                                *wt = 1.0 / (d * d);
+                            }
                             for r in 0..nrows {
                                 let block = &work[r * n + j..r * n + j + BLOCK];
-                                let (byte, unit) = block_unit(block, scale2);
+                                let (byte, unit) = match scale {
+                                    BlockScale::Max => block_unit(block, scale2),
+                                    BlockScale::Search => block_unit_search(block, &weights, scale2),
+                                };
                                 scales[(r * n + j) / BLOCK] = byte;
                                 units[r] = unit;
                             }
@@ -789,8 +865,28 @@ mod tests {
             assert!((v - want).abs() < 1e-9, "L Linv at {i},{j}: {v}");
         }}
         let w = matrix(48, n);
-        let (_, ratio) = pack_gptq_h(&w, n, h, 0.01).unwrap();
+        let (_, ratio) = pack_gptq_h(&w, n, h.clone(), 0.01, BlockScale::Max).unwrap();
         assert!(ratio < 1.0, "gptq ratio {ratio}");
+        let (_, searched) = pack_gptq_h(&w, n, h, 0.01, BlockScale::Search).unwrap();
+        assert!(searched < 1.0, "gptq+search ratio {searched}");
+    }
+
+    #[test]
+    fn block_scale_search_never_loses_to_the_maximum() {
+        let w = matrix(64, 256);
+        let scale2 = global_scale(&w);
+        let ones = [1f32; BLOCK];
+        let mut better = 0;
+        for block in w.chunks(BLOCK) {
+            let err = |unit: f32| -> f32 {
+                block.iter().map(|&v| (v - decode_code(code_of(v, unit)) * unit).powi(2)).sum()
+            };
+            let (_, max_unit) = block_unit(block, scale2);
+            let (_, unit) = block_unit_search(block, &ones, scale2);
+            assert!(err(unit) <= err(max_unit), "search lost: {} > {}", err(unit), err(max_unit));
+            better += (err(unit) < err(max_unit)) as usize;
+        }
+        assert!(better > 0, "search never improved a block");
     }
 
     #[test]
