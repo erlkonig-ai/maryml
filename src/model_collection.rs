@@ -346,6 +346,72 @@ pub fn publish_model_fragment(
         .map_err(|error| anyhow!("publish model fragment: {error}"))
 }
 
+/// Parse an exact collection descriptor handle: 64 hex digits, optionally
+/// `blake3:`-prefixed, the form `trible pile collection init` prints.
+pub fn parse_collection_handle(text: &str) -> anyhow::Result<CollectionHandle> {
+    let raw = text.trim();
+    let raw = raw.strip_prefix("blake3:").unwrap_or(raw);
+    anyhow::ensure!(
+        raw.len() == 64 && raw.bytes().all(|b| b.is_ascii_hexdigit()),
+        "{text:?} is not a 64-digit hexadecimal collection descriptor handle"
+    );
+    let mut bytes = [0u8; 32];
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&raw[2 * i..2 * i + 2], 16).expect("checked hex");
+    }
+    Ok(triblespace::core::inline::Inline::new(bytes))
+}
+
+/// Open one explicit model collection by its descriptor handle. The caller
+/// names the collection; nothing is discovered by name and nothing is created.
+pub fn open_model_collection<R: StoreRead>(
+    store: &R,
+    handle: CollectionHandle,
+) -> anyhow::Result<ModelCollection> {
+    ModelCollection::open(store, handle)
+        .map_err(|error| anyhow!("open model collection {handle:?}: {error}"))
+}
+
+/// Refuse a signer this collection's WRITE policy does not admit in the
+/// current observation of `pile`. An unadmitted commit would be appended and
+/// then never read, so an importer checks this before writing any weights.
+pub fn require_model_writer(
+    pile: &mut Pile,
+    signing_key: &SigningKey,
+    collection: ModelCollection,
+) -> anyhow::Result<()> {
+    pile.refresh().context("refresh before the WRITE admission check")?;
+    let snapshot = pile
+        .snapshot()
+        .context("freeze the WRITE admission observation")?;
+    let signer = signing_key.verifying_key();
+    let admitted = collection
+        .writer_is_admitted(&snapshot, signer)
+        .with_context(|| format!("check WRITE policy of model collection {collection:?}"))?;
+    anyhow::ensure!(
+        admitted,
+        "signer {} is not admitted by the WRITE policy of model collection {collection:?}",
+        signer
+            .to_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    );
+    Ok(())
+}
+
+/// Publish into one explicit collection after the WRITE admission check.
+pub fn publish_model_fragment_into(
+    pile: &mut Pile,
+    signing_key: &SigningKey,
+    collection: ModelCollection,
+    fragment: Fragment,
+) -> anyhow::Result<CollectionCommit> {
+    require_model_writer(pile, signing_key, collection)?;
+    pile.commit(collection, signing_key, fragment)
+        .map_err(|error| anyhow!("publish model fragment: {error}"))
+}
+
 pub fn prepare_model_bundle_fragment(
     model_root: Id,
     fragment: Fragment,

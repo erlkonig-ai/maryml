@@ -1784,6 +1784,11 @@ pub fn load_keymap_from_pile_prefixed(
 /// The default weight-format tag: the faithful import (no derived quantization).
 pub const QUANTIZATION_NATIVE: &str = "native";
 
+/// The weight-format tag of a root whose linear projections are stored as
+/// NVFP4 leaves (`Tensor<NVFP4, 2>`, packed by `nvfp4::pack_nearest`) and
+/// whose other tensors keep their 16- or 32-bit source precision.
+pub const QUANTIZATION_NVFP4: &str = "nvfp4";
+
 #[cfg(test)]
 mod legacy_spelling_tests {
     use super::*;
@@ -1948,6 +1953,23 @@ pub fn read_model_pile_read_only(path: &Path) -> anyhow::Result<ModelPileSource>
     let read = read_model_collections(&mut pile, path);
     let _ = pile.close();
     read
+}
+
+/// One frozen observation of a pile through a read-only file descriptor, for
+/// callers that name the model collection themselves
+/// (`model_collection::snapshot_model_collection_for`). The same custody
+/// caveat as [`read_model_pile_read_only`] applies to GPU aliases.
+pub fn read_model_pile_snapshot_read_only(
+    path: &Path,
+) -> anyhow::Result<triblespace::core::repo::pile::PileSnapshot> {
+    let file = triblespace::core::repo::pile::PileFile::open_read_only(path)
+        .map_err(|e| anyhow::anyhow!("open read-only {path:?}: {e:?}"))?;
+    let mut pile = Pile::new(file);
+    let snapshot = pile
+        .snapshot()
+        .map_err(|error| anyhow::anyhow!("{path:?}: observe model pile: {error}"));
+    let _ = pile.close();
+    snapshot
 }
 
 fn read_model_collections(pile: &mut Pile, path: &Path) -> anyhow::Result<ModelPileSource> {

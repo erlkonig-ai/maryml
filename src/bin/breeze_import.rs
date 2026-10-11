@@ -1,4 +1,4 @@
-//! One native model pile, exact source dtypes, ordinary model publication.
+//! Exact source dtypes, published into one explicit model collection.
 use anyhow::{Context, Result};
 use clap::Parser;
 use mary::models::breeze;
@@ -10,10 +10,15 @@ use triblespace::core::{repo::pile::Pile, signing_key_file};
 struct Args {
     #[arg(long)]
     checkpoint: PathBuf,
-    /// New task-owned destination; existing files are never overwritten/appended.
+    /// Destination pile holding the target collection's descriptor
+    /// (`trible pile collection init`).
     #[arg(long)]
     pile: PathBuf,
-    /// Explicit existing task signer, never generated implicitly.
+    /// Exact target model collection descriptor handle (`blake3:HEX`).
+    #[arg(long)]
+    collection: String,
+    /// Explicit existing signer the collection's WRITE policy admits, never
+    /// generated implicitly.
     #[arg(long)]
     key: PathBuf,
     #[arg(long)]
@@ -23,19 +28,25 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
     let key = signing_key_file::load_existing(&args.key).context("load task signer")?;
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&args.pile)
-        .context("create new task model pile")?;
-    let mut pile = Pile::open(&args.pile).context("open new model pile")?;
+    let handle = mary::model_collection::parse_collection_handle(&args.collection)?;
+    let mut pile = Pile::open(&args.pile).context("open destination model pile")?;
     let result = (|| -> Result<_> {
-        mary::model_collection::model_graph_collection_or_create(&mut pile, &key)?;
+        pile.refresh().context("refresh destination model pile")?;
+        let collection = {
+            let snapshot = pile.snapshot().context("freeze destination")?;
+            mary::model_collection::open_model_collection(&snapshot, handle)?
+        };
+        // Before any tensor is written: a refused signer costs nothing.
+        mary::model_collection::require_model_writer(&mut pile, &key, collection)?;
         let candidate =
             breeze::import::ingest_checkpoint(&mut pile, &args.checkpoint, &args.revision)?;
         let ids = candidate.artifacts;
-        let commit =
-            mary::model_collection::publish_model_fragment(&mut pile, &key, candidate.fragment)?;
+        let commit = mary::model_collection::publish_model_fragment_into(
+            &mut pile,
+            &key,
+            collection,
+            candidate.fragment,
+        )?;
         Ok(serde_json::json!({
             "source":breeze::SOURCE, "revision":args.revision,
             "model_root":format!("{:X}", ids.model_root),
