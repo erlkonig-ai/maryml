@@ -1,0 +1,29 @@
+# Word and character error rates of Voxtral paths against public labelled
+# speech (LibriSpeech, FLEURS, Multilingual LibriSpeech): asr_prep decodes a
+# stable subsample of a published set to 16 kHz WAV plus a manifest, and
+# asr_wer scores hear_offline RESULT lines against it with bootstrap
+# intervals and paired differences. scripts/ fetch the sets (checksums
+# verified), prepare them, and run a path over them.
+#
+# Deliberately its OWN workspace root, like model-migration: parquet and the
+# system libopus (MLS is Ogg/Opus on HuggingFace) are evaluation-only needs.
+[package]
+name = "asr-eval"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace]
+
+[lib]
+name = "asr"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+flate2 = "1"
+tar = "0.4"
+hound = "3.5"
+symphonia = { version = "0.5", default-features = false, features = ["flac", "wav", "pcm", "ogg", "vorbis"] }
+rubato = "0.16"
+parquet = { version = "56", default-features = false, features = ["snap", "zstd"] }
