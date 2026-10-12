@@ -19,7 +19,17 @@
 //!   models_import breeze --source <model.pile> --source-root HEX \
 //!     --pile <dest.pile> --key <signing.key> --collection blake3:HEX
 //!   models_import voxtral --source <voxtral.pile> --source-root HEX \
-//!     --tekken <tekken.json> --pile <dest.pile> --key <signing.key> --collection blake3:HEX
+//!     --tekken <tekken.json> [--calibration DIR[,DIR...]] \
+//!     --pile <dest.pile> --key <signing.key> --collection blake3:HEX
+//!
+//! Voxtral with `--calibration` (the per-projection input statistics
+//! `voxtral_capture` writes) packs every projection by GPTQ with searched
+//! block scales instead, where that lowers the output error on the captured
+//! inputs (`calibrate::pack_gptq_h`). Those planes have no device recipe to
+//! equal byte for byte, so their gate is that they decode through the same
+//! kernels: bound as the runtime binds them, read back unchanged, and their
+//! GEMV and W4A16 prompt-GEMM products agree with an f64 product of the
+//! stored values (`Nvfp4::gate_stored`). The stored format is plain NVFP4.
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use mary::format::attrs;
@@ -66,6 +76,13 @@ enum Model {
         /// tokenizer the source pile already holds.
         #[arg(long)]
         tekken: PathBuf,
+        /// Capture directories (`voxtral_capture --out`), comma separated;
+        /// their H are summed. Packs by GPTQ instead of rounding to nearest.
+        #[arg(long, value_delimiter = ',')]
+        calibration: Vec<PathBuf>,
+        /// Block scales under GPTQ: `search` (least error) or `max`.
+        #[arg(long, default_value = "search")]
+        block_scale: String,
     },
 }
 
@@ -206,6 +223,8 @@ fn label(
     Ok(())
 }
 
+const NEAREST_PACKER: &str = "mary nvfp4::pack_nearest, gated byte for byte against nn::nvfp4_gemv::Nvfp4::quantize on the same 16-bit values";
+
 fn derivation(
     pile: &mut Pile,
     fragment: &mut Fragment,
@@ -214,6 +233,7 @@ fn derivation(
     source_path: &Path,
     projections: usize,
     packed: u64,
+    packer: serde_json::Value,
 ) -> Result<()> {
     let value = serde_json::json!({
         "derivation": "nvfp4 storage of the projections the runtime quantized at load",
@@ -221,7 +241,7 @@ fn derivation(
         "source_root": format!("{:X}", source.root),
         "projections": projections,
         "packed_bytes": packed,
-        "packer": "mary nvfp4::pack_nearest, gated byte for byte against nn::nvfp4_gemv::Nvfp4::quantize on the same 16-bit values",
+        "packer": packer,
         "other_tensors": "copied unchanged at source precision",
     });
     let root = mary::jsonfacts::save_json(&value, pile, fragment.facts_mut())
@@ -375,6 +395,7 @@ fn breeze(
         source_path,
         stored.len(),
         packed,
+        serde_json::json!(NEAREST_PACKER),
     )?;
     let _ = args;
     Ok((
@@ -389,6 +410,7 @@ fn breeze(
 
 fn voxtral(
     tekken: &Path,
+    calibration: Option<mary::calibrate::Calibration>,
     source: &Source,
     source_path: &Path,
     pile: &mut Pile,
@@ -409,7 +431,7 @@ fn voxtral(
     let device = mary::nn::backend::hear::Device::default();
     let mut stored = BTreeMap::new();
     let mut dropped = BTreeSet::new();
-    fast::export_nvfp4_projections(&loader, &device, |projection, replaces| {
+    fast::export_nvfp4_projections(&loader, &device, calibration.as_ref(), |projection, replaces| {
         dropped.extend(replaces);
         stored.insert(projection.name.clone(), projection);
         Ok(())
@@ -453,6 +475,20 @@ fn voxtral(
         "Tekken piece counts differ"
     );
     fragment += tekken_source.to_fragment(SOURCE, pile)?;
+    let packer = match &calibration {
+        None => serde_json::json!(NEAREST_PACKER),
+        Some(c) => serde_json::json!({
+            "packer": format!(
+                "mary calibrate::pack_gptq_h: GPTQ from captured input statistics H = X^T X \
+                 (voxtral_capture), damped {} of the mean diagonal, block scales {:?}; per \
+                 projection where it lowers the H-weighted error below rounding to nearest, \
+                 else {NEAREST_PACKER}",
+                c.damp, c.scale
+            ),
+            "gate": "decodes through the same kernels: nn::nvfp4_gemv::Nvfp4::gate_stored binds the stored planes, reads them back unchanged, and checks GEMV and W4A16 prompt-GEMM products against an f64 product of the stored values",
+            "calibration": c.dirs.iter().map(|d| d.file_name().map(|n| n.to_string_lossy().into_owned())).collect::<Vec<_>>(),
+        }),
+    };
     derivation(
         pile,
         &mut fragment,
@@ -461,6 +497,7 @@ fn voxtral(
         source_path,
         stored.len(),
         packed,
+        packer,
     )?;
     Ok((
         fragment,
@@ -507,7 +544,16 @@ fn main() -> Result<()> {
         model_collection::require_model_writer(&mut pile, &key, collection)?;
         let (fragment, mut receipt) = match &args.model {
             Model::Breeze => breeze(&args, &source, &source_path, &mut pile)?,
-            Model::Voxtral { tekken } => voxtral(tekken, &source, &source_path, &mut pile)?,
+            Model::Voxtral { tekken, calibration, block_scale } => {
+                let calibration = if calibration.is_empty() {
+                    None
+                } else {
+                    let mut c = mary::calibrate::Calibration::new(calibration.clone());
+                    c.scale = mary::calibrate::BlockScale::parse(block_scale)?;
+                    Some(c)
+                };
+                voxtral(tekken, calibration, &source, &source_path, &mut pile)?
+            }
         };
         let commit =
             model_collection::publish_model_fragment_into(&mut pile, &key, collection, fragment)?;

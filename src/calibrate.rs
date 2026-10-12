@@ -473,6 +473,44 @@ fn lower_inverse(l: &[f64], n: usize) -> Vec<f64> {
     inv
 }
 
+/// Captured input statistics for calibrated packing: per projection the
+/// accumulated `H = X^T X` of its inputs, as raw little-endian f32
+/// `{dir}/{stem}.h` files (`voxtral_capture`), summed over `dirs`, so several
+/// capture runs (several machines, several clip sets) add up.
+#[derive(Clone, Debug)]
+pub struct Calibration {
+    pub dirs: Vec<std::path::PathBuf>,
+    /// Damping, as a fraction of `H`'s mean diagonal.
+    pub damp: f64,
+    pub scale: BlockScale,
+}
+
+impl Calibration {
+    /// GPTQ's usual damping and the searched block scale.
+    pub fn new(dirs: Vec<std::path::PathBuf>) -> Self {
+        Self { dirs, damp: 0.01, scale: BlockScale::Search }
+    }
+
+    /// `H` for the projection stored as `stem`, `k x k` row major, summed over
+    /// every directory that has it; None if none has.
+    pub fn h(&self, stem: &str, k: usize) -> Result<Option<Vec<f64>>> {
+        let mut sum: Option<Vec<f64>> = None;
+        for dir in &self.dirs {
+            let path = dir.join(format!("{stem}.h"));
+            if !path.exists() {
+                continue;
+            }
+            let bytes = std::fs::read(&path)?;
+            ensure!(bytes.len() == k * k * 4, "{path:?}: {} bytes for k {k}", bytes.len());
+            let acc = sum.get_or_insert_with(|| vec![0f64; k * k]);
+            for (a, b) in acc.iter_mut().zip(bytes.chunks_exact(4)) {
+                *a += f32::from_le_bytes(b.try_into().expect("four bytes")) as f64;
+            }
+        }
+        Ok(sum)
+    }
+}
+
 /// How GPTQ picks a block's E4M3 scale when it reaches the block.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BlockScale {

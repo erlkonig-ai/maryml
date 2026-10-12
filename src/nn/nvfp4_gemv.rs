@@ -475,6 +475,70 @@ impl Nvfp4 {
         })
     }
 
+    /// The import gate of a projection from a calibrated packer (GPTQ),
+    /// which has no device quantizer to equal byte for byte: bind `payload`
+    /// as the runtime binds a stored projection ([`Nvfp4::upload`]), require
+    /// the planes read back from the device to equal the payload's, and
+    /// multiply a fixed pseudo-random F16 activation through the one-row GEMV
+    /// and the 72-row W4A16 prompt GEMM against an f64 product of the
+    /// payload's decoded values, on 64 sampled output columns: relative RMS
+    /// under 2e-3 (one F16 rounding of the output is about 2e-4).
+    pub(crate) fn gate_stored(name: &str, payload: &[u8], n: usize, k: usize, device: &CudaDevice) -> Result<()> {
+        let q = Self::upload(payload, [n as u64, k as u64], DType::F16, device)?;
+        let client = CudaRuntime::client(device);
+        let (codes, scales) = q.read_planes(&client)?;
+        let (want_codes, want_scales, _) = crate::nvfp4::split_payload(payload, n * k)?;
+        ensure!(
+            codes == want_codes && scales == want_scales,
+            "{name}: device planes differ from the stored payload"
+        );
+        let dense = crate::nvfp4::decode_payload(payload, n * k)?;
+        let mut state = 0x6A7E_5701_u64 ^ (n as u64) << 32 ^ k as u64;
+        let mut normal = move || {
+            let mut next = || {
+                state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = state;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                ((z ^ (z >> 31)) >> 11) as f64 / (1u64 << 53) as f64
+            };
+            let u = next().max(1e-300);
+            (-2.0 * u.ln()).sqrt() * (std::f64::consts::TAU * next()).cos()
+        };
+        let cols: Vec<usize> = (0..n).step_by((n / 64).max(1)).collect();
+        for (rows, lane) in [(1usize, None), (72, Some(crate::nn::nvfp4_gemm::PromptLane::W4a16))] {
+            let xv: Vec<f16> = (0..rows * k).map(|_| f16::from_f64(normal())).collect();
+            let bytes: Vec<u8> = xv.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+            let x = Tensor::new_contiguous(
+                client.clone(),
+                device.clone(),
+                [1, rows, k].into(),
+                client.create_from_slice(&bytes),
+                DType::F16,
+            );
+            let out = match lane {
+                None => q.gemv(&x, rows),
+                Some(lane) => q.project(&x, lane)?,
+            };
+            let got = client
+                .read_one(out.handle.clone())
+                .map_err(|e| anyhow::anyhow!("{name}: output readback: {e:?}"))?;
+            let (mut err, mut norm) = (0.0f64, 0.0f64);
+            for r in 0..rows {
+                for &j in &cols {
+                    let y: f64 = (0..k).map(|i| xv[r * k + i].to_f64() * dense[j * k + i] as f64).sum();
+                    let at = 2 * (r * n + j);
+                    let g = f16::from_bits(u16::from_le_bytes([got[at], got[at + 1]])).to_f64();
+                    err += (g - y).powi(2);
+                    norm += y.powi(2);
+                }
+            }
+            let rel = (err / norm.max(f64::MIN_POSITIVE)).sqrt();
+            ensure!(rel < 2e-3, "{name}: {rows}-row product through the stored planes is off by relative RMS {rel}");
+        }
+        Ok(())
+    }
+
     /// Device bytes this copy holds (codes and block scales).
     pub(crate) fn bytes(&self) -> u64 {
         (self.n * self.k / 2 + self.n * self.k / GROUP) as u64
@@ -713,6 +777,62 @@ mod tests {
         ("encoder o", 1280, 2048),
         ("encoder down", 1280, 5120),
     ];
+
+    #[test]
+    #[ignore = "reserved CUDA: GPTQ-packed planes pass the stored-projection gate and beat nearest through the kernel"]
+    fn cuda_gptq_packing_decodes_through_the_same_kernels() {
+        use crate::calibrate::{BlockScale, pack_gptq_h};
+        use crate::nn::nvfp4_gemm::PromptLane;
+        let device = CudaDevice { index: 0 };
+        let client = client();
+        let mut rng = Rng(0x6A7E_0006);
+        // Correlated inputs, x = z + 0.7 * z shifted by one channel, so the
+        // error feedback has directions to use.
+        let mut sample = |rng: &mut Rng, k: usize| -> Vec<f64> {
+            let z: Vec<f64> = (0..k).map(|_| rng.normal()).collect();
+            (0..k).map(|i| z[i] + 0.7 * z[(i + 1) % k]).collect()
+        };
+        // The encoder's shapes: a full-rank H stays cheap to accumulate.
+        for (name, n, k) in [SHAPES[4], SHAPES[5]] {
+            let w: Vec<f32> = weights(&mut rng, n * k, 0.02).iter().map(|v| v.to_f32()).collect();
+            let mut h = vec![0f64; k * k];
+            for _ in 0..2 * k {
+                let x = sample(&mut rng, k);
+                for i in 0..k {
+                    for j in 0..k {
+                        h[i * k + j] += x[i] * x[j];
+                    }
+                }
+            }
+            let (gptq, ratio) = pack_gptq_h(&w, k, h, 0.01, BlockScale::Search).unwrap();
+            assert!(ratio < 1.0, "{name}: GPTQ did not beat nearest on H ({ratio})");
+            Nvfp4::gate_stored(name, &gptq.payload(), n, k, &device).unwrap();
+            // Fresh inputs from the same distribution, through the W4A16
+            // prompt GEMM on each set of stored planes, against the f64
+            // product of the unquantized weights.
+            let rows = 72;
+            let xs: Vec<f64> = (0..rows).flat_map(|_| sample(&mut rng, k)).collect();
+            let xv: Vec<f16> = xs.iter().map(|&v| f16::from_f64(v)).collect();
+            let x = upload(&client, &xv, &[1, rows, k]);
+            let error = |payload: &[u8]| -> f64 {
+                let q = Nvfp4::upload(payload, [n as u64, k as u64], DType::F16, &device).unwrap();
+                let got = read(&client, &q.project(&x, PromptLane::W4a16).unwrap().handle);
+                let mut err = 0.0f64;
+                for r in 0..rows {
+                    for j in (0..n).step_by(n / 64) {
+                        let y: f64 = (0..k).map(|i| xv[r * k + i].to_f64() * w[j * k + i] as f64).sum();
+                        let at = 2 * (r * n + j);
+                        err += (f16::from_bits(u16::from_le_bytes([got[at], got[at + 1]])).to_f64() - y).powi(2);
+                    }
+                }
+                err
+            };
+            let nearest = crate::nvfp4::pack_nearest(&w, k).unwrap();
+            let (e_gptq, e_near) = (error(&gptq.payload()), error(&nearest.payload()));
+            eprintln!("{name} [{n}, {k}]: output error through the kernel, GPTQ {:.3} of nearest", e_gptq / e_near);
+            assert!(e_gptq < e_near, "{name}: GPTQ {e_gptq} not below nearest {e_near} through the kernel");
+        }
+    }
 
     #[test]
     fn f16_recipe_inverts_on_representable_blocks() {

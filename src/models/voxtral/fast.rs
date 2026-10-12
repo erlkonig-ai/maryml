@@ -263,9 +263,10 @@ impl<B: Backend> Projection<B> {
     }
 }
 
-/// Calibration capture (voxtral-gptq lane, not for main): while active, every
+/// Calibration capture for GPTQ packing ([`export_nvfp4_projections`]): while
+/// active (`begin` to `dump`, on the thread that runs the model), every
 /// projection's input rows accumulate `H = X^T X` in f32 on the device, keyed
-/// by the projection's stored leaf name.
+/// by the projection's stored leaf name. `voxtral_capture` drives it.
 pub mod capture {
     use burn::prelude::*;
     use burn::tensor::FloatDType;
@@ -1182,6 +1183,16 @@ impl<B: Backend> FastDecoder<B> {
 /// is what `sink` receives, with the names of the 16-bit tensors an `nvfp4`
 /// root no longer needs because this projection replaces them.
 ///
+/// With a `calibration` (the captured `H = X^T X` of every projection's
+/// inputs, [`capture`]) each projection is packed by GPTQ instead
+/// ([`crate::calibrate::pack_gptq_h`], block scales searched), wherever that
+/// lowers the H-weighted output error below rounding to nearest. Such a
+/// packing has no device recipe to equal byte for byte, so its gate is
+/// [`Fp4::gate_stored`]: bound as the runtime binds a stored projection, its
+/// planes read back unchanged and its products through the GEMV and the W4A16
+/// prompt GEMM agree with an f64 product of the stored values. The stored
+/// format is plain NVFP4 either way, so the runtime does not change.
+///
 /// Stored names: `{stack}.self_attn.fused_qkv.weight` ([`fused_qkv_name`])
 /// and `{stack}.mlp.fused_gate_up.weight` ([`fused_gate_up_name`]) for the two
 /// fused, folded projections, and the checkpoint's own `o_proj.weight` and
@@ -1190,6 +1201,7 @@ impl<B: Backend> FastDecoder<B> {
 pub fn export_nvfp4_projections(
     loader: &WeightLoader,
     device: &crate::nn::backend::hear::Device,
+    calibration: Option<&crate::calibrate::Calibration>,
     mut sink: impl FnMut(crate::nvfp4::StoredProjection, Vec<String>) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     use crate::nn::backend::hear::RawHalf;
@@ -1217,42 +1229,24 @@ pub fn export_nvfp4_projections(
             .map(|v| v.to_f32())
             .collect();
         let mut stored = q.pack_matching(&name, &values)?;
-        // voxtral-gptq lane: error-feedback packing from captured H, summed
-        // over every directory VOXTRAL_GPTQ_DIR lists (comma separated).
-        if let Ok(dirs) = std::env::var("VOXTRAL_GPTQ_DIR") {
-            let mut h: Option<Vec<f64>> = None;
-            for dir in dirs.split(',') {
-                let path = std::path::Path::new(dir).join(format!("{}.h", capture::stem(&name)));
-                if !path.exists() {
-                    continue;
-                }
-                let bytes = std::fs::read(&path)?;
-                anyhow::ensure!(bytes.len() == k * k * 4, "{name}: H is {} bytes for k {k}", bytes.len());
-                let sum = h.get_or_insert_with(|| vec![0f64; k * k]);
-                for (acc, b) in sum.iter_mut().zip(bytes.chunks_exact(4)) {
-                    *acc += f32::from_le_bytes(b.try_into().unwrap()) as f64;
-                }
+        if let Some(calibration) = calibration {
+            let h = calibration
+                .h(&capture::stem(&name), k)?
+                .ok_or_else(|| anyhow::anyhow!("{name}: no captured H in {:?}", calibration.dirs))?;
+            let t = std::time::Instant::now();
+            let (packed, ratio) =
+                crate::calibrate::pack_gptq_h(&values, k, h, calibration.damp, calibration.scale)?;
+            // Kept only where it beats rounding to nearest on the captured
+            // inputs; the stored format is plain NVFP4 either way.
+            if ratio < 1.0 {
+                stored.payload = packed.payload();
+                Fp4::gate_stored(&name, &stored.payload, n, k, q.device())?;
             }
-            if let Some(h) = h {
-                let damp: f64 = std::env::var("VOXTRAL_GPTQ_DAMP")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(0.01);
-                let scale = crate::calibrate::BlockScale::parse(
-                    &std::env::var("VOXTRAL_GPTQ_SCALE").unwrap_or_else(|_| "max".into()),
-                )?;
-                let t = std::time::Instant::now();
-                let (packed, ratio) = crate::calibrate::pack_gptq_h(&values, k, h, damp, scale)?;
-                eprintln!(
-                    "[gptq] {name}: k {k} n {n} H-weighted error vs nearest {ratio:.4} in {:.1}s",
-                    t.elapsed().as_secs_f64()
-                );
-                if ratio < 1.0 {
-                    stored.payload = packed.payload();
-                }
-            } else {
-                eprintln!("[gptq] {name}: no H, nearest");
-            }
+            eprintln!(
+                "[gptq] {name}: [{n}, {k}] H-weighted error {ratio:.4} of nearest{} in {:.1}s",
+                if ratio < 1.0 { "" } else { ", kept nearest" },
+                t.elapsed().as_secs_f64()
+            );
         }
         sink(stored, replaces)
     };

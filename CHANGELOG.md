@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- `models_import voxtral --calibration DIR[,DIR]` packs the stored NVFP4
+  projections by GPTQ with searched block scales (`calibrate::pack_gptq_h`,
+  `calibrate::BlockScale::Search`: the least-error E4M3 scale among the
+  block maximum's and its neighbours, which includes the "four over six"
+  choice) from per-projection input statistics `H = X^T X` that the new
+  `voxtral_capture` accumulates from the 16-bit model over calibration clips.
+  The stored format is plain NVFP4, so the runtime is unchanged. Those
+  planes have no device recipe to equal, so their import gate is no longer
+  "bit for bit against the device quantizer" but "decodes through the same
+  kernels" (`Nvfp4::gate_stored`: bound as the runtime binds a stored
+  projection, read back unchanged, GEMV and W4A16 prompt-GEMM products
+  against an f64 product of the stored values). Without `--calibration` the
+  export is round to nearest with the byte-for-byte gate, as before.
 - Breeze and Voxtral load from a model collection the caller names, as one
   `nvfp4` root each: `BreezeResident::load` / `Synthesizer::spawn_breeze` and
   `hear::Ears::load` take a frozen `ModelSnapshot` instead of a pile path and

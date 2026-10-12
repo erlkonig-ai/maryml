@@ -1,7 +1,9 @@
-//! voxtral-gptq lane (scratch, not for main): stream clips through the 16-bit
-//! Voxtral (`--weights f16`, one legacy root) and accumulate every projection's
-//! input `H = X^T X` on the device, then write them to `--out DIR`. Prints the
-//! F16 transcripts as `RESULT` lines like `hear_offline --unpaced`.
+//! Calibration for the NVFP4 export: stream clips through the 16-bit Voxtral
+//! (`--weights f16`, one legacy root) and accumulate every projection's input
+//! `H = X^T X` on the device (`fast::capture`), then write them to `--out DIR`
+//! for `models_import voxtral --calibration DIR`. Prints the 16-bit
+//! transcripts as `RESULT` lines like `hear_offline --unpaced`. The F16 model
+//! and the H accumulators (about 16 GB of f32) are resident together.
 //!
 //!   voxtral_capture <pile> --root HEX --out DIR <clip.wav>...
 
