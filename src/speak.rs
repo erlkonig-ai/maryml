@@ -604,6 +604,7 @@ mod breeze_transport_tests {
                 lane: crate::models::breeze::PROMPT_LANE,
                 reference_wav: reference_wav.clone(),
                 reference_text: std::fs::read_to_string(&transcript)?,
+                reference_cache: None,
                 direction: None,
                 options: GenerationOptions {
                     max_frames: 256,

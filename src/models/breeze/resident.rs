@@ -7,7 +7,11 @@
 //! can inject precomputed reference codes, a checkpoint path or a CPU LLM.
 use anyhow::{Result, ensure};
 use cubecl::cuda::CudaDevice;
-use std::{path::PathBuf, time::Instant};
+use std::{
+    path::PathBuf,
+    sync::atomic::{AtomicUsize, Ordering},
+    time::Instant,
+};
 use triblespace::core::repo::BlobStoreGet;
 
 use super::{
@@ -17,11 +21,12 @@ use super::{
     nvfp4::PromptLane,
     pipeline::{self, Streamed},
     prompt::BreezeTokenizer,
-    reference::{encode_reference, read_wav},
+    reference::{decode_wav, encode_reference, read_wav_bytes},
+    reference_cache::{ReferenceKey, encode_reference_cached},
 };
 use crate::{
     model_collection::ModelSnapshot,
-    models::qwen3tts::{codec::CodecDecoder, encoder::CodecEncoder},
+    models::qwen3tts::{codec::CodecDecoder, config::SAMPLES_PER_FRAME, encoder::CodecEncoder},
     nn::{backend::speak::Fused, weight_loader::WeightLoader},
 };
 
@@ -39,6 +44,11 @@ pub struct BreezeVoiceConfig {
     pub reference_wav: PathBuf,
     /// Known transcript, not an ASR request. Outer whitespace is stripped once.
     pub reference_text: String,
+    /// Where the clip's encoded codes are kept between loads
+    /// ([`super::reference_cache`]); `None` encodes on every load. The codes
+    /// are keyed by clip, transcript, encoder weights and encoder version, so
+    /// one directory serves every binary and every voice.
+    pub reference_cache: Option<PathBuf>,
     /// Optional official target direction, fixed for this resident voice.
     pub direction: Option<String>,
     pub options: GenerationOptions,
@@ -97,8 +107,12 @@ impl BreezeVoiceConfig {
 #[derive(Clone, Debug)]
 pub struct ResidentLoadReport {
     pub source_seconds: f64,
+    /// Zero when the reference codes came from the cache: the encoder is
+    /// then not loaded at all.
     pub encoder_load_seconds: f64,
+    /// Reading the cached codes on a hit; encoding the clip on a miss.
     pub reference_encode_seconds: f64,
+    pub reference_codes_cached: bool,
     pub generator_load_seconds: f64,
     pub codec_load_host_seconds: f64,
     /// Per hop window length (frames), the seconds its first decode took:
@@ -148,16 +162,35 @@ impl BreezeResident {
         )?);
         let source_seconds = total.elapsed().as_secs_f64();
 
-        let samples = read_wav(&config.reference_wav)?;
+        let wav_bytes = read_wav_bytes(&config.reference_wav)?;
+        let samples = decode_wav(&wav_bytes)?;
         let reference_samples = samples.len();
+        let key = ReferenceKey::new(
+            &wav_bytes,
+            config.reference_text.trim(),
+            artifacts.external_codec_root,
+        );
+        drop(wav_bytes);
         let started = Instant::now();
-        let encoder = CodecEncoder::load(&loader);
-        let encoder_load_seconds = started.elapsed().as_secs_f64();
-        let started = Instant::now();
-        let reference_codes = encode_reference(&encoder, &samples)?;
-        let reference_encode_seconds = started.elapsed().as_secs_f64();
+        let mut encoder_load_seconds = 0.0;
+        let (reference_codes, cache) = encode_reference_cached(
+            config.reference_cache.as_deref(),
+            &key,
+            reference_samples.div_ceil(SAMPLES_PER_FRAME),
+            || {
+                let started = Instant::now();
+                let encoder = CodecEncoder::load(&loader);
+                encoder_load_seconds = started.elapsed().as_secs_f64();
+                encode_reference(&encoder, &samples)
+            },
+        )?;
+        let reference_encode_seconds = started.elapsed().as_secs_f64() - encoder_load_seconds;
+        let reference_codes_cached = matches!(cache, super::reference_cache::CacheOutcome::Hit(_));
+        eprintln!(
+            "[breeze] reference codes: {cache}; key {key}, {} frames, {reference_encode_seconds:.3}s",
+            reference_codes.len()
+        );
         let reference_frames = reference_codes.len();
-        drop(encoder);
         drop(samples);
 
         let device = CudaDevice { index: 0 };
@@ -189,6 +222,7 @@ impl BreezeResident {
             source_seconds,
             encoder_load_seconds,
             reference_encode_seconds,
+            reference_codes_cached,
             generator_load_seconds,
             codec_load_host_seconds,
             codec_warm_seconds,
@@ -197,7 +231,16 @@ impl BreezeResident {
             reference_frames,
             device_weight_bytes: generator.device_bytes(),
         };
-        eprintln!("[breeze] resident loaded once: {load_report:?}");
+        let ordinal = next_load_ordinal();
+        eprintln!(
+            "[breeze] resident load {ordinal} in pid {}: {load_report:?}",
+            std::process::id()
+        );
+        if ordinal > 1 {
+            eprintln!(
+                "[breeze] WARNING: this process now holds {ordinal} Breeze residents; one owning worker loads once, and every further load pays the device copy again"
+            );
+        }
         Ok(Self {
             generator,
             codec,
@@ -269,6 +312,16 @@ impl BreezeResident {
     }
 }
 
+/// Loads in this process so far. One process has one owning worker and one
+/// resident; the load line names its ordinal and the pid so two reports in
+/// one log can be told apart as two loads in one process or two processes
+/// (the 2026-10-12 cutover log held one of each binary, read as a double
+/// load because neither line said which process it was).
+fn next_load_ordinal() -> usize {
+    static LOADS: AtomicUsize = AtomicUsize::new(0);
+    LOADS.fetch_add(1, Ordering::SeqCst) + 1
+}
+
 /// How many frames a line of `text` may take before it counts as a runaway:
 /// three frames per character plus two seconds, never more than the
 /// configured cap. The live voice speaks 0.75 to 0.9 frames per character
@@ -286,6 +339,7 @@ pub(crate) fn test_config() -> BreezeVoiceConfig {
         lane: super::PROMPT_LANE,
         reference_wav: PathBuf::from("request-reference.wav"),
         reference_text: "Known reference words.".to_owned(),
+        reference_cache: None,
         direction: None,
         options: GenerationOptions {
             max_frames: 256,
@@ -327,6 +381,14 @@ mod tests {
         config.validate().unwrap();
         config.options.cfg_scale = f32::INFINITY;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn load_ordinals_count_up_within_one_process() {
+        let first = next_load_ordinal();
+        let second = next_load_ordinal();
+        assert_eq!(second, first + 1);
+        assert!(first >= 1);
     }
 
     #[test]

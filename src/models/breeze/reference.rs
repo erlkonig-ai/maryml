@@ -11,6 +11,12 @@ const MAX_WAV_BYTES: u64 = 16 * 1024 * 1024;
 /// Read a bounded 24 kHz PCM16/FLOAT32 WAV, mean-downmixing channels once.
 /// Other sample rates are explicit errors: we do not substitute a resampler.
 pub fn read_wav(path: &Path) -> Result<Vec<f32>> {
+    decode_wav(&read_wav_bytes(path)?)
+}
+
+/// The clip's bytes as stored, bounded, for [`decode_wav`] and for the
+/// reference cache key, which names the file rather than its decoding.
+pub fn read_wav_bytes(path: &Path) -> Result<Vec<u8>> {
     let file = File::open(path).with_context(|| format!("open reference {}", path.display()))?;
     let mut bytes = Vec::new();
     file.take(MAX_WAV_BYTES + 1).read_to_end(&mut bytes)?;
@@ -18,7 +24,7 @@ pub fn read_wav(path: &Path) -> Result<Vec<f32>> {
         bytes.len() as u64 <= MAX_WAV_BYTES,
         "reference WAV exceeds 16 MiB"
     );
-    decode_wav(&bytes)
+    Ok(bytes)
 }
 
 pub fn decode_wav(bytes: &[u8]) -> Result<Vec<f32>> {
