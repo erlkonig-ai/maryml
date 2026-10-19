@@ -63,7 +63,8 @@ struct Args {
     external_codec_config_root: Option<String>,
     #[arg(long)]
     text: String,
-    /// Official ref_edit_tata target instruction; no singing guarantee.
+    /// Official ref_edit_tata delivery instruction, separate from spoken text.
+    /// Blank is invalid; omit for reference-only delivery. No singing guarantee.
     #[arg(long)]
     direction: Option<String>,
     /// 24 kHz PCM16 or IEEE FLOAT32 WAV, at most 30 seconds.
@@ -151,16 +152,12 @@ fn main() -> Result<()> {
         (1..=1500).contains(&args.max_frames) && (1..=2048).contains(&args.max_context),
         "bounded endpoint requires frames1..1500 and context1..2048"
     );
-    ensure!(
-        args.cfg_scale.is_finite()
-            && args.cfg_scale > 0.0
-            && (args.cfg_scale == 1.0
-                || args
-                    .direction
-                    .as_deref()
-                    .is_some_and(|text| !text.trim().is_empty())),
-        "CFG must be finite and positive; non-unit scale requires an explicit direction"
-    );
+    mary::speech_options::SpeechOptions {
+        direction: args.direction.clone(),
+        cfg_scale: Some(args.cfg_scale),
+        ..Default::default()
+    }
+    .resolve(None, 1.0)?;
     ensure!(
         args.temperature.is_finite()
             && args.temperature > 0.0

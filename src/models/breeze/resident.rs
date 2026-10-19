@@ -49,7 +49,7 @@ pub struct BreezeVoiceConfig {
     /// are keyed by clip, transcript, encoder weights and encoder version, so
     /// one directory serves every binary and every voice.
     pub reference_cache: Option<PathBuf>,
-    /// Optional official target direction, fixed for this resident voice.
+    /// Default target direction; a request may override it without reloading.
     pub direction: Option<String>,
     pub options: GenerationOptions,
 }
@@ -267,13 +267,30 @@ impl BreezeResident {
         text: &str,
         on_pcm: impl FnMut(Vec<f32>) -> Result<()>,
     ) -> Result<Streamed> {
+        self.synthesize_stream_with_options(
+            text,
+            &crate::speech_options::SpeechOptions::default(),
+            on_pcm,
+        )
+    }
+
+    /// Resolve this request against startup defaults without changing them.
+    /// Neither weights nor reference codes are reloaded for delivery changes.
+    pub fn synthesize_stream_with_options(
+        &mut self,
+        text: &str,
+        options: &crate::speech_options::SpeechOptions,
+        on_pcm: impl FnMut(Vec<f32>) -> Result<()>,
+    ) -> Result<Streamed> {
+        let (direction, cfg_scale) =
+            options.resolve(self.direction.as_deref(), self.options.cfg_scale)?;
         let started = Instant::now();
         let prompt = self.tokenizer.reference_prompts(
             &self.reference_text,
             &self.reference_codes,
             text,
-            self.direction.as_deref(),
-            self.options.cfg_scale,
+            direction,
+            cfg_scale,
         )?;
         let result = pipeline::stream(
             &mut self.generator,
@@ -282,6 +299,7 @@ impl BreezeResident {
             &self.device,
             GenerationOptions {
                 max_frames: frame_budget(text, self.options.max_frames),
+                cfg_scale,
                 ..self.options.clone()
             },
             on_pcm,

@@ -1,5 +1,22 @@
 # mary
 
+## Resident Breeze delivery
+
+`speak::Synthesizer::speak_with_options(text, &SpeechOptions)` accepts optional
+per-utterance direction and CFG strength (`mary::speech_options::SpeechOptions`).
+`BreezeResident::synthesize_stream_with_options` provides the same control for
+direct resident callers. Plain `speak`/`synthesize_stream` use startup defaults.
+Neither call reloads weights or the encoded reference, nor mutates those defaults.
+
+Omitted fields inherit; `clear_direction: true` removes the direction and uses
+CFG 1 unless a scale is explicit. Direction plus clear, blank directions,
+nonpositive/nonfinite scales, and non-unit CFG without an effective direction
+are errors. Direction alone inherits startup CFG, not a hidden stronger value.
+Non-Breeze sessions reject overrides. Direction stays separate from spoken
+text; inline `(laugh)`/`(sigh)` text is passed through, not parsed as a protocol.
+The finite `breeze_say` CLI already exposes `--direction` and `--cfg-scale` and
+uses the same cheap validation (it has no resident defaults to clear).
+
 The Cargo package is named `maryml`; its Rust library and optional CLI are
 still named `mary`. Consumers can retain the familiar dependency alias:
 

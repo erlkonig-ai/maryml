@@ -73,6 +73,7 @@ pub mod sampling;
 /// standalone pile — no safetensors, no separate binary in the path.
 #[cfg(feature = "speak")]
 pub mod speak;
+pub mod speech_options;
 /// tiktoken-style byte-level BPE (Kimi-K3): the rank table IS the merge order,
 /// so there is no merges list — the engine half of what [`tokenizer`]'s
 /// `ty::TIKTOKEN` stores as facts. Gated id-for-id against the shipped

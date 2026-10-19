@@ -469,6 +469,7 @@ impl SpeakStream {
 /// One utterance, as the resident generation thread receives it.
 struct Request {
     text: String,
+    options: crate::speech_options::SpeechOptions,
     /// When the caller asked, so TTFA is speak-to-first-audio as the caller
     /// experienced it.
     called: Instant,
@@ -490,6 +491,66 @@ struct Request {
 /// in-flight utterances complete, later ones are refused.
 pub struct Synthesizer {
     tx: mpsc::Sender<Request>,
+    breeze: bool,
+}
+
+#[cfg(test)]
+mod delivery_transport_tests {
+    use super::*;
+    use crate::speech_options::SpeechOptions;
+
+    #[test]
+    fn queue_keeps_delivery_separate_and_does_not_leak_it() {
+        let (tx, rx) = mpsc::channel();
+        let voice = Synthesizer { tx, breeze: true };
+        let options = SpeechOptions {
+            direction: Some("Calm, conversational".into()),
+            cfg_scale: Some(2.5),
+            ..Default::default()
+        };
+        let _first = voice
+            .speak_with_options("(laugh) Hello.", &options)
+            .unwrap();
+        let _next = voice.speak("(sigh) Next.").unwrap();
+        let first = rx.recv().unwrap();
+        assert_eq!(first.text, "(laugh) Hello.");
+        assert_eq!(first.options, options);
+        let next = rx.recv().unwrap();
+        assert_eq!(next.text, "(sigh) Next.");
+        assert!(next.options.is_default());
+        assert!(
+            voice
+                .speak_with_options(
+                    "invalid",
+                    &SpeechOptions {
+                        direction: Some(" ".into()),
+                        ..Default::default()
+                    }
+                )
+                .is_err()
+        );
+        assert!(rx.try_recv().is_err());
+        let _last = voice.speak("still default").unwrap();
+        assert!(rx.recv().unwrap().options.is_default());
+    }
+
+    #[test]
+    fn other_backend_refuses_options_before_queuing() {
+        let (tx, rx) = mpsc::channel();
+        let voice = Synthesizer { tx, breeze: false };
+        assert!(
+            voice
+                .speak_with_options(
+                    "Hello",
+                    &SpeechOptions {
+                        clear_direction: true,
+                        ..Default::default()
+                    }
+                )
+                .is_err()
+        );
+        assert!(rx.try_recv().is_err());
+    }
 }
 
 #[cfg(feature = "breeze-cuda")]
@@ -847,7 +908,7 @@ impl Synthesizer {
                         Ok(resident) => {
                             let mut first = true;
                             resident
-                                .synthesize_stream(&req.text, |pcm| {
+                                .synthesize_stream_with_options(&req.text, &req.options, |pcm| {
                                     if std::mem::take(&mut first) {
                                         eprintln!(
                                             "[breeze] call-to-first PCM: {:.3}s",
@@ -872,7 +933,7 @@ impl Synthesizer {
                     let _ = req.done.send(result);
                 }
             })?;
-        Ok(Self { tx })
+        Ok(Self { tx, breeze: true })
     }
 
     /// Load everything on a fresh generation thread and return immediately.
@@ -905,11 +966,27 @@ impl Synthesizer {
     /// Queue `text` and hand back its stream of incremental chunks. Call
     /// `finish` for errors.
     pub fn speak(&self, text: &str) -> anyhow::Result<SpeakStream> {
+        self.speak_with_options(text, &crate::speech_options::SpeechOptions::default())
+    }
+
+    /// Queue delivery overrides with these words only. Non-Breeze voices reject
+    /// overrides; callers must never mistake ignored direction for support.
+    pub fn speak_with_options(
+        &self,
+        text: &str,
+        options: &crate::speech_options::SpeechOptions,
+    ) -> anyhow::Result<SpeakStream> {
+        options.validate()?;
+        anyhow::ensure!(
+            self.breeze || options.is_default(),
+            "delivery options require a Breeze voice"
+        );
         let (tx_pcm, rx_pcm) = mpsc::channel::<Vec<f32>>();
         let (tx_done, rx_done) = mpsc::channel::<anyhow::Result<()>>();
         self.tx
             .send(Request {
                 text: text.to_string(),
+                options: options.clone(),
                 called: Instant::now(),
                 pcm: tx_pcm,
                 done: tx_done,
@@ -1501,7 +1578,10 @@ fn spawn_impl<B: EngineBackend>(
         })
         .map_err(|error| anyhow::anyhow!("spawn the speak generation thread: {error}"))?;
 
-    Ok(Synthesizer { tx: tx_req })
+    Ok(Synthesizer {
+        tx: tx_req,
+        breeze: false,
+    })
 }
 
 /// The fused talker decode engine over the session's talker (any raw lane,
