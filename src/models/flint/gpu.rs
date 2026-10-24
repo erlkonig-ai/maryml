@@ -42,7 +42,7 @@ fn matvec_kernel(
 ) {
     let lane = UNIT_POS_X % 32;
     let row = CUBE_POS_X * 8 + UNIT_POS_X / 32;
-    let mut acc = 0.0f32;
+    let mut acc = f32::new(0.0);
     if row < no * batch {
         let token = row / no;
         let wr = row % no;
@@ -52,7 +52,7 @@ fn matvec_kernel(
             i += 32;
         }
     }
-    let mut red = SharedMemory::<f32>::new(256);
+    let mut red = SharedMemory::<f32>::new(256usize);
     red[UNIT_POS_X as usize] = acc;
     sync_cube();
     let mut stride = u32::new(16);
@@ -71,14 +71,14 @@ fn matvec_kernel(
 #[cube(launch_unchecked)]
 fn norm_kernel(x: &Array<f32>, weight: &Array<f32>, y: &mut Array<f32>, width: u32) {
     let base = CUBE_POS_X * width;
-    let mut acc = 0.0f32;
+    let mut acc = f32::new(0.0);
     let mut i = UNIT_POS_X;
     while i < width {
         let v = x[(base + i) as usize];
         acc += v * v;
         i += 256;
     }
-    let mut red = SharedMemory::<f32>::new(256);
+    let mut red = SharedMemory::<f32>::new(256usize);
     red[UNIT_POS_X as usize] = acc;
     sync_cube();
     let mut stride = u32::new(128);
@@ -102,7 +102,7 @@ fn norm_kernel(x: &Array<f32>, weight: &Array<f32>, y: &mut Array<f32>, width: u
 #[cube(launch_unchecked)]
 fn point_kernel(a: &Array<f32>, b: &Array<f32>, y: &mut Array<f32>,
     len: u32, width: u32, #[comptime] op: u32) {
-    let i = ABSOLUTE_POS;
+    let i = ABSOLUTE_POS as u32;
     if i < len {
         let x = a[i as usize];
         if comptime![op == 0] { y[i as usize] = x + b[i as usize]; }
@@ -115,12 +115,12 @@ fn point_kernel(a: &Array<f32>, b: &Array<f32>, y: &mut Array<f32>,
 
 #[cube(launch_unchecked)]
 fn rope_kernel(x: &Array<f32>, positions: &Array<i32>, y: &mut Array<f32>, heads: u32, pairs: u32) {
-    let pair = ABSOLUTE_POS;
+    let pair = ABSOLUTE_POS as u32;
     if pair < pairs {
         let j = pair % 64;
         let head_token = pair / 64;
         let token = head_token / heads;
-        let angle = positions[token as usize] as f32 * 10000.0f32.powf(-2.0 * j as f32 / 128.0);
+        let angle = positions[token as usize] as f32 * f32::new(10000.0).powf(-2.0 * j as f32 / 128.0);
         let sin = angle.sin();
         let cos = angle.cos();
         let i = head_token * 128 + j;
@@ -131,11 +131,11 @@ fn rope_kernel(x: &Array<f32>, positions: &Array<i32>, y: &mut Array<f32>, heads
 
 #[cube(launch_unchecked)]
 fn mask_kernel(positions: &Array<i32>, mask: &mut Array<f32>, t: u32) {
-    let i = ABSOLUTE_POS;
+    let i = ABSOLUTE_POS as u32;
     if i < t * t {
         let query = positions[(i / t) as usize];
         let key = positions[(i % t) as usize];
-        let mut m = 0.0f32;
+        let mut m = f32::new(0.0);
         if key > query || query - key >= 513 { m = f32::NEG_INFINITY; }
         mask[i as usize] = m;
     }
@@ -145,15 +145,15 @@ fn mask_kernel(positions: &Array<i32>, mask: &mut Array<f32>, t: u32) {
 fn attention_kernel(q: &Array<f32>, k: &Array<f32>, v: &Array<f32>, sinks: &Array<f32>,
     mask: &Array<f32>, scores: &mut Array<f32>, probs: &mut Array<f32>,
     heads: &mut Array<f32>, t: u32) {
-    let hq = ABSOLUTE_POS;
+    let hq = ABSOLUTE_POS as u32;
     if hq < 32 * t {
         let h = hq / t;
         let query = hq % t;
         let base = hq * t;
-        let mut logits = Array::<f32>::new(3);
+        let mut logits = Array::<f32>::new(3usize);
         let mut maximum = sinks[h as usize];
         for key in 0..t {
-            let mut dot = 0.0f32;
+            let mut dot = f32::new(0.0);
             for d in 0..128u32 {
                 dot += q[((query * 32 + h) * 128 + d) as usize]
                     * k[((key * 4 + h / 8) * 128 + d) as usize];
@@ -163,7 +163,7 @@ fn attention_kernel(q: &Array<f32>, k: &Array<f32>, v: &Array<f32>, sinks: &Arra
             logits[key as usize] = logit;
             maximum = maximum.max(logit);
         }
-        let mut denom = 0.0f32;
+        let mut denom = f32::new(0.0);
         for key in 0..t {
             let e = (logits[key as usize] - maximum).exp();
             logits[key as usize] = e;
@@ -175,7 +175,7 @@ fn attention_kernel(q: &Array<f32>, k: &Array<f32>, v: &Array<f32>, sinks: &Arra
             probs[(base + key) as usize] = logits[key as usize];
         }
         for d in 0..128u32 {
-            let mut sum = 0.0f32;
+            let mut sum = f32::new(0.0);
             for key in 0..t {
                 sum += logits[key as usize] * v[((key * 4 + h / 8) * 128 + d) as usize];
             }
@@ -186,7 +186,7 @@ fn attention_kernel(q: &Array<f32>, k: &Array<f32>, v: &Array<f32>, sinks: &Arra
 
 #[cube(launch_unchecked)]
 fn join_kernel(heads: &Array<f32>, joined: &mut Array<f32>, t: u32) {
-    let i = ABSOLUTE_POS;
+    let i = ABSOLUTE_POS as u32;
     if i < t * 32 * 128 {
         let d = i % 128;
         let h = (i / 128) % 32;
@@ -199,14 +199,14 @@ fn join_kernel(heads: &Array<f32>, joined: &mut Array<f32>, t: u32) {
 fn route_kernel(prob: &Array<f32>, ids: &mut Array<i32>, selected: &mut Array<f32>,
     sums: &mut Array<f32>, denoms: &mut Array<f32>, weights: &mut Array<f32>,
     margins: &mut Array<f32>, t: u32) {
-    let token = ABSOLUTE_POS;
+    let token = ABSOLUTE_POS as u32;
     if token < t {
-        let mut chosen = Array::<u32>::new(7);
-        let mut vals = Array::<f32>::new(7);
-        let mut sum = 0.0f32;
+        let mut chosen = Array::<u32>::new(7usize);
+        let mut vals = Array::<f32>::new(7usize);
+        let mut sum = f32::new(0.0);
         for slot in 0..7u32 {
-            let mut best = -1.0f32;
-            let mut winner = 0u32;
+            let mut best = f32::new(-1.0);
+            let mut winner = u32::new(0);
             for e in 0..256u32 {
                 let mut used = false;
                 for prev in 0..slot { if chosen[prev as usize] == e { used = true; } }
@@ -234,9 +234,9 @@ fn route_kernel(prob: &Array<f32>, ids: &mut Array<i32>, selected: &mut Array<f3
 
 #[cube(launch_unchecked)]
 fn down_scale_kernel(x: &Array<f32>, scales: &mut Array<f32>, width: u32, rows: u32) {
-    let row = ABSOLUTE_POS;
+    let row = ABSOLUTE_POS as u32;
     if row < rows {
-        let mut amax = 0.0f32;
+        let mut amax = f32::new(0.0);
         for i in 0..width { amax = amax.max(x[(row * width + i) as usize].abs()); }
         let power = ((amax / 1024.0).ln() * std::f32::consts::LOG2_E).ceil().clamp(0.0, 127.0);
         scales[row as usize] = (power * std::f32::consts::LN_2).exp();
@@ -245,7 +245,7 @@ fn down_scale_kernel(x: &Array<f32>, scales: &mut Array<f32>, width: u32, rows: 
 
 #[cube(launch_unchecked)]
 fn moe_sum_kernel(weighted: &Array<f32>, out: &mut Array<f32>, len: u32) {
-    let i = ABSOLUTE_POS;
+    let i = ABSOLUTE_POS as u32;
     if i < len {
         let token = i / 2048;
         let d = i % 2048;
