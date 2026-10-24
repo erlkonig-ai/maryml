@@ -165,6 +165,9 @@ cuda-backend = ["q4", "cubecl?/cuda"]
 # downstream. A portable-f64 CUDA implementation remains test-only as a proof
 # oracle.
 nvfp4-cuda = ["dep:cubecl", "cubecl?/cuda"]
+# Bounded Flint layer arithmetic on the existing raw CubeCL CUDA runtime.
+# Kept separate so the stored-weight/CPU diagnostics need no GPU dependency.
+flint-cuda = ["import", "dep:cubecl", "cubecl?/cuda"]
 # Investigation-only: burn's REAL Cuda backend, for backend_matmul_probe.
 burn-cuda-bench = ["burn/cuda", "burn/autotune"]
 

@@ -1,5 +1,6 @@
-//! Independent CPU F32/math layer-2 diagnostics against retained GGML outputs.
-//! Exit success means the diagnostic completed, NOT numerical layer acceptance.
+//! CPU or CUDA F32/math layer-2 diagnostics against retained reference outputs.
+//! Exit success means diagnostics completed with exact integer stage agreement,
+//! NOT floating-point numerical acceptance. CUDA uses the `flint-cuda` feature.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -45,8 +46,11 @@ fn errors(actual: &[f32], expected: &[f32]) -> Result<Value> {
 }
 
 fn main() -> Result<()> {
-    let args: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
-    ensure!(args.len()==5,"usage: flint_layer2_gate MODEL INPUT_F32 POSITIONS_I32 REFERENCE_DIR NEW_OUTPUT_DIR");
+    let mut args: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
+    let cuda = args.first().is_some_and(|p| p == Path::new("--cuda"));
+    if cuda || args.first().is_some_and(|p| p == Path::new("--cpu")) { args.remove(0); }
+    ensure!(!cuda || cfg!(feature = "flint-cuda"), "--cuda requires the flint-cuda feature");
+    ensure!(args.len()==5,"usage: flint_layer2_gate [--cpu|--cuda] MODEL INPUT_F32 POSITIONS_I32 REFERENCE_DIR NEW_OUTPUT_DIR");
     let [model,input_path,pos_path,reference,out] = args.as_slice() else { unreachable!() };
     let input_bytes = read(input_path,math::H*3*4)?;
     let input = floats(&input_bytes)?;
@@ -57,9 +61,16 @@ fn main() -> Result<()> {
     let table = std::str::from_utf8(&table_bytes)?;
     fs::create_dir(out).context("output directory must not already exist")?;
     let mut weights = GgufWeights::open(model)?;
-    let trace = math::layer2(&mut weights,&input,&positions)?;
+    let trace = if cuda {
+        #[cfg(feature = "flint-cuda")]
+        { mary::models::flint::gpu::layer2(&mut weights,&input,&positions)? }
+        #[cfg(not(feature = "flint-cuda"))]
+        { unreachable!("feature checked before file reads") }
+    } else { math::layer2(&mut weights,&input,&positions)? };
     weights.file.check_identity()?;
     let mut comparisons = Vec::new();
+    let mut exact_integer_stages = Vec::new();
+    let mut integer_mismatches = 0usize;
     let mut shape_text = String::from("name\ttype\tne0\tne1\tne2\tne3\tbytes\tblake3\n");
     ensure!(table.lines().skip(1).count() == trace.stages.len(),"reference stage inventory differs");
     for stage in &trace.stages {
@@ -79,8 +90,13 @@ fn main() -> Result<()> {
         ensure!(expected.len()==raw.len() && expected.len()==cols[6].parse::<usize>()?,"byte length differs");
         let metric = match &stage.values {
             Values::F32(v) => errors(v,&floats(&expected)?)?,
-            Values::I32(v) => json!({"elements":v.len(),"integer_mismatches":expected.chunks_exact(4)
-                .zip(raw.chunks_exact(4)).filter(|(a,b)|a!=b).count()}),
+            Values::I32(v) => {
+                let mismatches = expected.chunks_exact(4).zip(raw.chunks_exact(4)).filter(|(a,b)|a!=b).count();
+                integer_mismatches += mismatches;
+                exact_integer_stages.push(json!({"stage":stage.name,"elements":v.len(),
+                    "mismatches":mismatches,"exact_ordered_match":mismatches==0}));
+                json!({"elements":v.len(),"integer_mismatches":mismatches})
+            },
         };
         println!("{} {}",stage.name,metric);
         fs::write(out.join(filename),&raw)?;
@@ -88,15 +104,22 @@ fn main() -> Result<()> {
             dims[0],dims[1],dims[2],dims[3],raw.len(),hash(&raw)));
         comparisons.push(json!({"stage":stage.name,"ggml_dims":dims,"type":ty,"metric":metric,
             "actual_blake3":hash(&raw),"reference_blake3":hash(&expected),
-            "reference_manifest_sha256_claim":cols[7]}));
+            "reference_manifest_digest_claim":cols[7]}));
     }
     let ref_probs = floats(&read(&reference.join("router_probs.f32"),256*3*4)?)?;
     let reference_margins: Vec<f32> = ref_probs.chunks_exact(256).map(|row|{
         let mut sorted = row.to_vec(); sorted.sort_by(|a,b|b.total_cmp(a)); sorted[5]-sorted[6]
     }).collect();
     let selected_bytes: u64 = weights.reads.iter().map(|r|r.absolute_end-r.absolute_start).sum();
-    let report = json!({"scope":"layer 2 CPU F32/math only; wider scalar dot/RMS reductions; no BF16 or activation quantization",
-        "acceptance":"diagnostics only: exit success is not numerical acceptance; no fitted tolerance",
+    let scope = if cuda {
+        "layer 2 CubeCL CUDA F32 decoded-weight math; per-stage readbacks and CPU-controlled sparse loading; no BF16 or activation quantization"
+    } else { "layer 2 CPU F32/math only; wider scalar dot/RMS reductions; no BF16 or activation quantization" };
+    let arithmetic = if cuda {
+        "F32 values and accumulation; matvec 32-lane strided/tree reduction; RMS 256-lane strided/tree reduction; serial F32 attention/router sums; GPU transcendentals; CUDA compiler may contract multiply-add; fixed kernels without autotune"
+    } else { "F32 operation boundaries with f64 scalar dot/RMS and attention denominator/division reductions; CPU transcendentals" };
+    let report = json!({"scope":scope,"arithmetic":arithmetic,"backend":if cuda {"cuda"} else {"cpu"},
+        "acceptance":"diagnostics only: exact ordered integer stages required; floating errors reported without fitted tolerance or numerical acceptance claim",
+        "exact_integer_stages":exact_integer_stages,"integer_stages_pass":integer_mismatches==0,
         "model_path":model,"model_identity":weights.file.identity,"whole_model_freshly_hashed":false,
         "input_path":input_path,"input_blake3":hash(&input_bytes),"positions_path":pos_path,"positions_blake3":hash(&pos_bytes),
         "reference_dir":reference,"reference_table_blake3":hash(&table_bytes),"positions":positions,
@@ -105,6 +128,7 @@ fn main() -> Result<()> {
         "reads":weights.reads,"comparisons":comparisons});
     fs::write(out.join("tensors.tsv"),shape_text)?;
     fs::write(out.join("report.json"),serde_json::to_vec_pretty(&report)?)?;
+    ensure!(integer_mismatches==0,"integer stage mismatch (including ordered expert IDs); diagnostics retained in {}",out.display());
     Ok(())
 }
 
