@@ -4,6 +4,10 @@
 
 pub mod f5;
 
+// Bounded Flint layer-2 F32/math parity, not a runtime/serving model.
+#[cfg(feature = "import")]
+pub mod flint;
+
 // Qwen2.5-VL text backbone (BiQwen2_5 / nomic-embed-multimodal-7b). Reuses
 // gemma's RoPE table, so it rides the `gemma` feature.
 #[cfg(feature = "gemma")]

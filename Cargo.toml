@@ -929,6 +929,10 @@ burn-ndarray = "0.21.0"
 name = "flint_gguf_gate"
 required-features = ["import"]
 
+[[bin]]
+name = "flint_layer2_gate"
+required-features = ["import"]
+
 [patch.crates-io]
 
 # Section freezes are immutable views, not durability barriers. Keep the same
