@@ -130,13 +130,14 @@ fn rope_kernel(x: &Array<f32>, positions: &Array<i32>, y: &mut Array<f32>, heads
 }
 
 #[cube(launch_unchecked)]
-fn mask_kernel(positions: &Array<i32>, mask: &mut Array<f32>, t: u32) {
+fn mask_kernel(positions: &Array<i32>, mask: &mut Array<f32>, t: u32, negative_infinity: f32) {
     let i = ABSOLUTE_POS as u32;
     if i < t * t {
         let query = positions[(i / t) as usize];
         let key = positions[(i % t) as usize];
         let mut m = f32::new(0.0);
-        if key > query || query - key >= 513 { m = f32::NEG_INFINITY; }
+        // A scalar binding avoids CubeCL emitting the invalid CUDA literal -inf.
+        if key > query || query - key >= 513 { m = negative_infinity; }
         mask[i as usize] = m;
     }
 }
@@ -402,7 +403,7 @@ pub fn layer2(w: &mut impl Weights, input: &[f32], positions: &[i32]) -> Result<
     let joined = dev.empty(Q*D*t);
     unsafe {
         mask_kernel::launch_unchecked::<CudaRuntime>(&dev.client, CubeCount::new_1d(1), CubeDim::new_1d(32),
-            pos.arg(),mask.arg(),t as u32);
+            pos.arg(),mask.arg(),t as u32,f32::NEG_INFINITY);
         attention_kernel::launch_unchecked::<CudaRuntime>(&dev.client,
             CubeCount::new_1d((Q*t).div_ceil(32) as u32), CubeDim::new_1d(32),
             q.arg(),k.arg(),v.arg(),sinks.arg(),mask.arg(),scores.arg(),probs.arg(),heads.arg(),t as u32);
@@ -587,7 +588,7 @@ mod tests {
             let joined = dev.empty(Q*t*D);
             unsafe {
                 mask_kernel::launch_unchecked::<CudaRuntime>(&dev.client,CubeCount::new_1d(1),CubeDim::new_1d(32),
-                    pos.arg(),mask.arg(),t as u32);
+                    pos.arg(),mask.arg(),t as u32,f32::NEG_INFINITY);
                 attention_kernel::launch_unchecked::<CudaRuntime>(&dev.client,CubeCount::new_1d(t as u32),CubeDim::new_1d(32),
                     q.arg(),k.arg(),v.arg(),sinks.arg(),mask.arg(),scores.arg(),probs.arg(),heads.arg(),t as u32);
                 join_kernel::launch_unchecked::<CudaRuntime>(&dev.client,
