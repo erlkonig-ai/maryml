@@ -924,6 +924,11 @@ cubecl = { version = "0.10.0", default-features = false, features = ["std", "cud
 ciborium = "0.2"
 burn-ndarray = "0.21.0"
 
+# Selective stored-weight decoder gate; never loads or executes a full model.
+[[bin]]
+name = "flint_gguf_gate"
+required-features = ["import"]
+
 [patch.crates-io]
 
 # Section freezes are immutable views, not durability barriers. Keep the same
