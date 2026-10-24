@@ -1,7 +1,8 @@
 //! Bounded GGUF v3 little-endian index and selective row reads for import/parity.
 //!
-//! Raw type tags remain opaque unless explicitly supported. No tensor payload
-//! is read while indexing. Unknown types can be named but never decoded or
+//! Raw type tags remain opaque unless explicitly supported. Indexing does not
+//! decode or materialize tensors; buffering/OS read-ahead may fetch payload
+//! bytes beyond the header. Unknown types can be named but never decoded or
 //! assigned a guessed byte size. This is not the runtime weight-loader path.
 
 use std::collections::HashSet;
