@@ -1,7 +1,9 @@
 //! Bounded layer-2 CUDA arithmetic through Mary's existing CubeCL runtime.
 //!
 //! Weights are decoded from stored GGUF NVFP4 (36 bytes / 64 values), then
-//! uploaded as F32. Separate GGUF `.scale` values stay after the matmul. This
+//! uploaded as F32. The explicit packed-K mode decodes only attn_k inside its
+//! matvec, directly from unchanged GGUF bytes. Separate `.scale` values stay
+//! after the matmul in both modes. This
 //! does not use Mary's other FP4 packing, tensor cores, activation quantization,
 //! BF16, or llama.cpp's Q8_1/W4A4 expert-down dispatch.
 //!
@@ -25,6 +27,9 @@ use cubecl::server::Handle;
 
 use super::math::{H, Stage, Trace, Values};
 use super::weights::Weights;
+
+mod packed;
+pub use packed::{KComparison, compare_k as compare_packed_k};
 
 const D: usize = 128;
 const Q: usize = 32;
@@ -343,6 +348,17 @@ impl Device {
         self.trace(tr, label, [no,t,1,1], &out)?;
         Ok(out)
     }
+    fn dense_packed_k(&self, w: &mut impl Weights, tr: &mut Trace, x: &Buffer, t: usize) -> Result<Buffer> {
+        let bytes = w.get_nvfp4("attn_k.weight", &[H,KV*D], None)?;
+        let weight = self.upload_nvfp4(&bytes, H, KV*D)?;
+        let scale = self.upload(&w.get("attn_k.scale", &[1], 0, None)?);
+        let raw = self.empty(KV*D*t);
+        self.packed_matvec(x, &weight, &raw, t, 0, 0)?;
+        self.trace(tr, "k_proj_unscaled", [KV*D,t,1,1], &raw)?;
+        let out = self.point(&raw, &scale, raw.len, 1);
+        self.trace(tr, "k_proj", [KV*D,t,1,1], &out)?;
+        Ok(out)
+    }
     fn experts(&self, w: &mut impl Weights, tr: &mut Trace, suffix: &str, label: &str,
         x: &Buffer, ni: usize, no: usize, t: usize, ids: &[i32], per_slot: bool) -> Result<Buffer> {
         ensure!(ids.len() == K * t && ids.iter().all(|&i| (0..E as i32).contains(&i)), "invalid GPU expert IDs");
@@ -371,6 +387,16 @@ impl Device {
 /// Exactly layer 2 for 1..=3 supplied residual rows, no KV history. Stage names
 /// and GGML fastest-first dimensions match the independent CPU trace.
 pub fn layer2(w: &mut impl Weights, input: &[f32], positions: &[i32]) -> Result<Trace> {
+    layer2_impl(w, input, positions, false)
+}
+
+/// Only attn_k uses packed GGUF bytes; every other operation uses the accepted
+/// decoded-weight path. No tensor-core, activation-quantized or speed claim.
+pub fn layer2_packed_k(w: &mut impl Weights, input: &[f32], positions: &[i32]) -> Result<Trace> {
+    layer2_impl(w, input, positions, true)
+}
+
+fn layer2_impl(w: &mut impl Weights, input: &[f32], positions: &[i32], packed_k: bool) -> Result<Trace> {
     let t = positions.len();
     ensure!((1..=3).contains(&t) && input.len() == H*t, "expected 1..=3 residual rows of width 2048");
     ensure!(positions.iter().all(|&p| p >= 0) && positions.windows(2).all(|p| p[0] < p[1]), "invalid positions");
@@ -384,7 +410,8 @@ pub fn layer2(w: &mut impl Weights, input: &[f32], positions: &[i32]) -> Result<
     let n = dev.norm(&input_gpu, &w.get("attn_norm.weight", &[H], 0, None)?);
     dev.trace(&mut tr, "attn_norm", [H,t,1,1], &n)?;
     let q = dev.dense(w,&mut tr,"attn_q","q_proj",&n,H,Q*D,t)?;
-    let k = dev.dense(w,&mut tr,"attn_k","k_proj",&n,H,KV*D,t)?;
+    let k = if packed_k { dev.dense_packed_k(w,&mut tr,&n,t)? }
+        else { dev.dense(w,&mut tr,"attn_k","k_proj",&n,H,KV*D,t)? };
     let v = dev.dense(w,&mut tr,"attn_v","v_proj",&n,H,KV*D,t)?;
     let qn = dev.norm(&q,&w.get("attn_q_norm.weight",&[D],0,None)?);
     let kn = dev.norm(&k,&w.get("attn_k_norm.weight",&[D],0,None)?);

@@ -45,12 +45,59 @@ fn errors(actual: &[f32], expected: &[f32]) -> Result<Value> {
         "max_abs_over_reference_max":if max_ref>0.0 {Some(max_abs/max_ref)} else {None}}))
 }
 
+#[cfg(feature = "flint-cuda")]
+fn packed_k_probe(args: &[PathBuf]) -> Result<()> {
+    use mary::models::flint::{gpu, weights::Weights};
+    ensure!(args.len() == 3, "usage: flint_layer2_gate --cuda-packed-k-probe MODEL NORMALIZED_INPUT_F32 NEW_OUTPUT_DIR");
+    let [model, input_path, out] = args else { unreachable!() };
+    let input_bytes = read(input_path, math::H*3*4)?;
+    let input = floats(&input_bytes)?;
+    ensure!(input.len() % math::H == 0 && (1..=3).contains(&(input.len()/math::H))
+        && input.iter().all(|v| v.is_finite()), "invalid normalized probe input");
+    fs::create_dir(out).context("probe output directory must not already exist")?;
+    let mut weights = GgufWeights::open(model)?;
+    let raw = weights.get_nvfp4("attn_k.weight", &[math::H,512], None)?;
+    let scale = weights.get("attn_k.scale", &[1], 0, None)?[0];
+    let comparison = gpu::compare_packed_k(&raw, &input, scale)?;
+    weights.file.check_identity()?;
+    let unscaled = errors(&comparison.packed_unscaled, &comparison.decoded_unscaled)?;
+    let scaled = errors(&comparison.packed_scaled, &comparison.decoded_scaled)?;
+    let mut outputs = Vec::new();
+    for (name, values) in [
+        ("packed_unscaled", &comparison.packed_unscaled), ("decoded_unscaled", &comparison.decoded_unscaled),
+        ("packed_scaled", &comparison.packed_scaled), ("decoded_scaled", &comparison.decoded_scaled),
+    ] {
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        fs::write(out.join(format!("{name}.f32")), &bytes)?;
+        outputs.push(json!({"name":name,"elements":values.len(),"blake3":hash(&bytes)}));
+    }
+    let report = json!({
+        "backend":"cuda-packed-k-probe", "projection":"blk.2.attn_k.weight",
+        "scope":"unchanged packed bytes versus unchanged CPU decode uploaded to accepted F32 GPU matvec; standalone diagnostic allocates both representations",
+        "arithmetic":"same 32-lane F32 striding/tree; GPU decode uses exact dyadic operations; CUDA compiler may contract multiply-add; separate post-matmul scale",
+        "acceptance":"diagnostic errors, not a fitted float tolerance; exhaustive decode-bit test is separate",
+        "input_path":input_path,"input_blake3":hash(&input_bytes),"tokens":input.len()/math::H,
+        "model_identity":weights.file.identity,"whole_model_freshly_hashed":false,"reads":weights.reads,
+        "scale":scale,"scale_bits":scale.to_bits(),"unscaled":unscaled,"scaled":scaled,"outputs":outputs,
+    });
+    println!("{report}");
+    fs::write(out.join("report.json"), serde_json::to_vec_pretty(&report)?)?;
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let mut args: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
-    let cuda = args.first().is_some_and(|p| p == Path::new("--cuda"));
+    if args.first().is_some_and(|p| p == Path::new("--cuda-packed-k-probe")) {
+        #[cfg(feature = "flint-cuda")]
+        { return packed_k_probe(&args[1..]); }
+        #[cfg(not(feature = "flint-cuda"))]
+        { anyhow::bail!("--cuda-packed-k-probe requires the flint-cuda feature"); }
+    }
+    let packed_k = args.first().is_some_and(|p| p == Path::new("--cuda-packed-k"));
+    let cuda = packed_k || args.first().is_some_and(|p| p == Path::new("--cuda"));
     if cuda || args.first().is_some_and(|p| p == Path::new("--cpu")) { args.remove(0); }
     ensure!(!cuda || cfg!(feature = "flint-cuda"), "--cuda requires the flint-cuda feature");
-    ensure!(args.len()==5,"usage: flint_layer2_gate [--cpu|--cuda] MODEL INPUT_F32 POSITIONS_I32 REFERENCE_DIR NEW_OUTPUT_DIR");
+    ensure!(args.len()==5,"usage: flint_layer2_gate [--cpu|--cuda|--cuda-packed-k] MODEL INPUT_F32 POSITIONS_I32 REFERENCE_DIR NEW_OUTPUT_DIR");
     let [model,input_path,pos_path,reference,out] = args.as_slice() else { unreachable!() };
     let input_bytes = read(input_path,math::H*3*4)?;
     let input = floats(&input_bytes)?;
@@ -63,7 +110,8 @@ fn main() -> Result<()> {
     let mut weights = GgufWeights::open(model)?;
     let trace = if cuda {
         #[cfg(feature = "flint-cuda")]
-        { mary::models::flint::gpu::layer2(&mut weights,&input,&positions)? }
+        { if packed_k { mary::models::flint::gpu::layer2_packed_k(&mut weights,&input,&positions)? }
+          else { mary::models::flint::gpu::layer2(&mut weights,&input,&positions)? } }
         #[cfg(not(feature = "flint-cuda"))]
         { unreachable!("feature checked before file reads") }
     } else { math::layer2(&mut weights,&input,&positions)? };
@@ -111,13 +159,15 @@ fn main() -> Result<()> {
         let mut sorted = row.to_vec(); sorted.sort_by(|a,b|b.total_cmp(a)); sorted[5]-sorted[6]
     }).collect();
     let selected_bytes: u64 = weights.reads.iter().map(|r|r.absolute_end-r.absolute_start).sum();
-    let scope = if cuda {
+    let scope = if packed_k {
+        "layer 2 CubeCL CUDA F32 math; only attn_k reads unchanged packed GGUF NVFP4 on GPU; other weights decoded; per-stage readbacks and CPU-controlled sparse loading; no tensor cores or activation quantization"
+    } else if cuda {
         "layer 2 CubeCL CUDA F32 decoded-weight math; per-stage readbacks and CPU-controlled sparse loading; no BF16 or activation quantization"
     } else { "layer 2 CPU F32/math only; wider scalar dot/RMS reductions; no BF16 or activation quantization" };
     let arithmetic = if cuda {
         "F32 values and accumulation; matvec 32-lane strided/tree reduction; RMS 256-lane strided/tree reduction; serial F32 attention/router sums; GPU transcendentals; CUDA compiler may contract multiply-add; fixed kernels without autotune"
     } else { "F32 operation boundaries with f64 scalar dot/RMS and attention denominator/division reductions; CPU transcendentals" };
-    let report = json!({"scope":scope,"arithmetic":arithmetic,"backend":if cuda {"cuda"} else {"cpu"},
+    let report = json!({"scope":scope,"arithmetic":arithmetic,"backend":if packed_k {"cuda-packed-k"} else if cuda {"cuda"} else {"cpu"},
         "acceptance":"diagnostics only: exact ordered integer stages required; floating errors reported without fitted tolerance or numerical acceptance claim",
         "exact_integer_stages":exact_integer_stages,"integer_stages_pass":integer_mismatches==0,
         "model_path":model,"model_identity":weights.file.identity,"whole_model_freshly_hashed":false,

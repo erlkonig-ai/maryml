@@ -221,6 +221,7 @@ mod tests {
     struct NoReads;
     impl Weights for NoReads {
         fn get(&mut self,_:&str,_:&[usize],_:u32,_:Option<usize>)->Result<Vec<f32>> { panic!("invalid input must not read weights") }
+        fn get_nvfp4(&mut self,_:&str,_:&[usize],_:Option<usize>)->Result<Vec<u8>> { panic!("invalid input must not read weights") }
     }
     #[test] fn rejects_invalid_inputs_before_weight_reads() {
         assert!(layer2(&mut NoReads,&[],&[]).is_err());
