@@ -9,7 +9,7 @@ use std::collections::HashSet;
 use std::fs::{File, Metadata};
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
-use std::time::UNIX_EPOCH;
+use std::time::{Instant,UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::Serialize;
@@ -390,10 +390,25 @@ impl Index {
     }
 }
 
+/// Completed selected-row suboperations, not metadata parsing or OS syscall
+/// counts. calls/bytes count successful whole reads; errors may leave partial
+/// subspans. Consecutive spans are disjoint; allocation may be lazy zeroing.
+#[derive(Clone,Default,Serialize)]
+pub struct RowReadTimings {
+    pub calls:u64, pub bytes:u64, pub identity_calls:u64,
+    pub geometry_seconds:f64, pub identity_seconds:f64, pub seek_seconds:f64,
+    pub allocation_seconds:f64, pub read_exact_seconds:f64,
+}
+impl RowReadTimings {
+    pub fn selected_seconds(&self)->f64 {
+        self.geometry_seconds+self.identity_seconds+self.seek_seconds+self.allocation_seconds+self.read_exact_seconds
+    }
+}
 pub struct IndexedFile {
     file: File,
     pub identity: FileIdentity,
     pub index: Index,
+    pub row_timings:RowReadTimings,
 }
 
 impl IndexedFile {
@@ -409,12 +424,13 @@ impl IndexedFile {
         ensure!(FileIdentity::from_metadata(&before)? == identity, "GGUF source changed while opening");
         let index = Index::read_with_metadata(BufReader::new(file.try_clone()?), identity.bytes, keys)?;
         ensure!(FileIdentity::from_metadata(&file.metadata()?)? == identity, "GGUF source changed during indexing");
-        Ok(Self { file, identity, index })
+        Ok(Self { file, identity, index, row_timings:RowReadTimings::default() })
     }
 
     /// Read whole rows only, capped at 16 MiB. Returns absolute file offset and
     /// unchanged packed bytes; no decoding or scale_2 association is implicit.
     pub fn read_rows(&mut self, name: &str, first: u64, rows: u64) -> Result<(u64, Vec<u8>)> {
+        let start=Instant::now();
         ensure!(rows > 0, "empty row read");
         let info = self.index.tensor(name)?;
         let total = info.elements()? / info.dims[0];
@@ -425,11 +441,25 @@ impl IndexedFile {
         let offset = self.index.data_offset.checked_add(info.offset)
             .and_then(|v| first.checked_mul(row_bytes).and_then(|b| v.checked_add(b)))
             .context("read offset overflow")?;
+        self.row_timings.geometry_seconds+=start.elapsed().as_secs_f64();
+        let start=Instant::now();
         self.check_identity()?;
+        self.row_timings.identity_seconds+=start.elapsed().as_secs_f64();
+        self.row_timings.identity_calls+=1;
+        let start=Instant::now();
         self.file.seek(SeekFrom::Start(offset))?;
+        self.row_timings.seek_seconds+=start.elapsed().as_secs_f64();
+        let start=Instant::now();
         let mut data = vec![0; usize::try_from(bytes)?];
+        self.row_timings.allocation_seconds+=start.elapsed().as_secs_f64();
+        let start=Instant::now();
         self.file.read_exact(&mut data).context("truncated selected rows")?;
+        self.row_timings.read_exact_seconds+=start.elapsed().as_secs_f64();
+        let start=Instant::now();
         self.check_identity()?;
+        self.row_timings.identity_seconds+=start.elapsed().as_secs_f64();
+        self.row_timings.identity_calls+=1;
+        self.row_timings.calls+=1; self.row_timings.bytes+=bytes;
         Ok((offset, data))
     }
 

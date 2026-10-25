@@ -3,6 +3,7 @@
 //! choices, not a resident-weight/performance claim.
 
 use anyhow::{Context, Result, ensure};
+use std::time::Instant;
 use super::{math::{self, Trace, Values, H}, weights::{GgufWeights, ReadReceipt}};
 use crate::formats::gguf::nvfp4;
 
@@ -27,8 +28,10 @@ pub fn stage_f32<'a>(trace: &'a Trace, name: &str) -> Result<&'a [f32]> {
 
 fn f32_rows(w: &mut GgufWeights, name: &str, dims: &[usize]) -> Result<Vec<f32>> {
     let raw=w.global_rows(name,dims,0,0,1)?;
+    let start=Instant::now();
     let values: Vec<f32>=raw.chunks_exact(4).map(|c|f32::from_le_bytes(c.try_into().unwrap())).collect();
     ensure!(values.iter().all(|v|v.is_finite()),"nonfinite global tensor {name}");
+    w.host.global_conversion.record(start,raw.len(),values.len()*4);
     Ok(values)
 }
 
@@ -67,8 +70,10 @@ pub(super) fn run_core(w:&mut GgufWeights,ids:&[i32],positions:&[i32],backend:Ba
     let mut embedding=Vec::with_capacity(t*H);
     for &id in ids {
         let raw=w.global_rows("token_embd.weight",&[H,VOCAB],30,id as usize,1)?;
+        let start=Instant::now();
         embedding.extend(raw.chunks_exact(2).map(|c|
             f32::from_bits((u16::from_le_bytes(c.try_into().unwrap()) as u32)<<16)));
+        w.host.global_conversion.record(start,raw.len(),H*4);
     }
     ensure!(embedding.iter().all(|v|v.is_finite()),"nonfinite embedding");
     let mut global_reads=std::mem::take(&mut w.reads);
@@ -101,7 +106,9 @@ pub(super) fn run_core(w:&mut GgufWeights,ids:&[i32],positions:&[i32],backend:Ba
         residual=result.residual;
         ensure!(residual.len()==H*t && residual.iter().all(|v|v.is_finite()),"nonfinite/invalid residual at block {block}");
         observe(block,&result.trace,&w.reads)?;
+        let start=Instant::now();
         w.reads.clear();
+        w.host.receipt_drop.record(start,0,0);
         // The full trace and its already-fenced GPU work are dropped here.
     }
     let head_residual=match head { Head::All=>residual.as_slice(),Head::Last=>&residual[(t-1)*H..],Head::Skip=>&[] };

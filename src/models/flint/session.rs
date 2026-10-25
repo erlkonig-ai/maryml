@@ -6,7 +6,7 @@ use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use crate::formats::gguf::index::{FileIdentity,MetadataValue};
 use super::{cache::{self,Admission,LayerCache,Limits},forward::{self,Backend,Head,VOCAB},
-    math::Trace,tokenizer::{FlintTokenizer,EncodeOptions,DECLARED_EOG_IDS},weights::{GgufWeights,ReadReceipt}};
+    math::Trace,tokenizer::{FlintTokenizer,EncodeOptions,DECLARED_EOG_IDS},weights::{GgufWeights,ReadReceipt,HostPhase}};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Options { pub backend:Backend, pub limits:Limits, pub trace:bool }
@@ -18,6 +18,7 @@ pub struct Options { pub backend:Backend, pub limits:Limits, pub trace:bool }
 pub struct GenerationTimings {
     pub encode_validate_seconds:f64, pub reset_seconds:f64, pub prefill_seconds:f64,
     pub decode_seconds:Vec<f64>, pub greedy_host_observer_seconds:f64,
+    pub prefill_host:Option<HostPhase>, pub decode_host:Vec<HostPhase>,
 }
 impl Default for Options {
     fn default()->Self { Self {backend:Backend::PackedAll,limits:Limits::default(),trace:false} }
@@ -139,16 +140,19 @@ impl FlintSession {
         self.reset()?;
         timings.reset_seconds=start.elapsed().as_secs_f64();
         if max_new==0 { return Ok((Generation {ids:Vec::new(),bytes:Vec::new(),prompt_tokens:ids.len(),attended_tokens:0,stop:Stop::Budget},timings)); }
+        self.weights.take_host_phase();
         let start=Instant::now();
         let logits=self.prefill(&ids)?;
         timings.prefill_seconds=start.elapsed().as_secs_f64();
+        timings.prefill_host=Some(self.weights.take_host_phase());
         let Self {weights,caches,sequence,options,codec,..}=self;
         let start=Instant::now();
         let generation=greedy(logits,ids.len(),max_new,options.limits.capacity,
             |id| {
                 let start=Instant::now();
                 let logits=append_parts(weights,caches,sequence,*options,&[id],Head::Last,|_,_,_|Ok(()))?;
-                timings.decode_seconds.push(start.elapsed().as_secs_f64()); Ok(logits)
+                timings.decode_seconds.push(start.elapsed().as_secs_f64());
+                timings.decode_host.push(weights.take_host_phase()); Ok(logits)
             },|id| Ok(codec.token_bytes(id,false)?.to_vec()),observe)?;
         timings.greedy_host_observer_seconds=start.elapsed().as_secs_f64()-timings.decode_seconds.iter().sum::<f64>();
         Ok((generation,timings))
