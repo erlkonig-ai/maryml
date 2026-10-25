@@ -336,12 +336,17 @@ impl Device {
     }
     fn norm(&self, x: &Buffer, weights: &[f32]) -> Result<Buffer> {
         assert!(!weights.is_empty());
-        assert_eq!(x.len % weights.len(), 0);
+        assert_eq!(x.len%weights.len(),0);
         let w = self.upload(weights);
+        self.norm_borrowed(x,&w)
+    }
+    fn norm_borrowed(&self,x:&Buffer,w:&Buffer)->Result<Buffer> {
+        assert!(w.len>0);
+        assert_eq!(x.len%w.len,0);
         let y = self.empty(x.len);
         unsafe { norm_kernel::launch_unchecked::<CudaRuntime>(
-            &self.client, CubeCount::new_1d((x.len / weights.len()) as u32), CubeDim::new_1d(256),
-            x.arg(), w.arg(), y.arg(), weights.len() as u32,
+            &self.client, CubeCount::new_1d((x.len / w.len) as u32), CubeDim::new_1d(256),
+            x.arg(), w.arg(), y.arg(), w.len as u32,
         ); }
         self.sync()?; Ok(y)
     }
@@ -630,18 +635,64 @@ impl OutputHead {
             ProjectionStorage::Decoded(self.dev.upload(&values))
         };
         let weight=Projection {ni:H,no:rows,storage};
-        let out=self.dev.empty(rows*self.tokens);
-        self.dev.project(&weight,&self.normalized,&out,self.tokens,0,0)?;
-        self.dev.read(&self.dev.point(&out,&self.dev.upload(&[scale]),out.len,1)?)
+        self.project_chunk(&weight,&self.dev.upload(&[scale]))
     }
     pub fn native_chunk(&self,view:&triblespace::core::blob::encodings::tensor::TensorView,
         rows:usize,scale:f32)->Result<Vec<f32>> {
         ensure!((1..=8192).contains(&rows) && scale.is_finite(),"invalid native head chunk");
         let weight=Projection {ni:H,no:rows,
             storage:ProjectionStorage::Packed(self.dev.upload_native_nvfp4(view,H,rows)?)};
-        let out=self.dev.empty(rows*self.tokens);
-        self.dev.project(&weight,&self.normalized,&out,self.tokens,0,0)?;
-        self.dev.read(&self.dev.point(&out,&self.dev.upload(&[scale]),out.len,1)?)
+        self.project_chunk(&weight,&self.dev.upload(&[scale]))
+    }
+    fn project_chunk(&self,weight:&Projection,scale:&Buffer)->Result<Vec<f32>> {
+        let out=self.dev.empty(weight.no*self.tokens);
+        self.dev.project(weight,&self.normalized,&out,self.tokens,0,0)?;
+        self.dev.read(&self.dev.point(&out,scale,out.len,1)?)
+    }
+}
+
+/// Native head only. Immutable paired scale and packed planes live with the
+/// session's frozen pile observation; every query keeps the existing fences.
+pub(super) struct ResidentOutputHead {
+    dev:Device, gain:Buffer, scale:Buffer, chunks:Vec<Projection>,
+    admission:super::forward::HeadAdmission,
+}
+impl ResidentOutputHead {
+    pub fn new(gain:&[f32],full:&triblespace::core::blob::encodings::tensor::TensorView,
+        scale:f32,admission:super::forward::HeadAdmission)->Result<Self> {
+        ensure!(admission==super::forward::HeadAdmission::for_rows(admission.rows,admission.gpu_bytes)?,
+            "resident head admission differs");
+        ensure!(gain.len()==H && gain.iter().all(|v|v.is_finite()) && scale.is_finite(),"invalid resident norm/postscale");
+        ensure!(full.dims()==[admission.rows as u64,H as u64],"resident head shape differs");
+        let dev=Device::new();
+        let gain=dev.upload(gain); let scale=dev.upload(&[scale]);
+        let mut chunks=Vec::with_capacity(admission.chunks);
+        for (first,rows) in super::forward::chunks(admission.rows) {
+            let view=super::pile::native_rows(full,first,rows)?;
+            let storage=ProjectionStorage::Packed(dev.upload_native_nvfp4(&view,H,rows)?);
+            dev.sync()?; // Retire the bounded host copy only after upload completes.
+            chunks.push(Projection {ni:H,no:rows,storage});
+        }
+        dev.sync()?;
+        Ok(Self {dev,gain,scale,chunks,admission})
+    }
+    pub fn admission(&self)->super::forward::HeadAdmission { self.admission }
+    pub fn fence(&self)->Result<()> { self.dev.sync() }
+    pub fn run(&self,residual:&[f32])->Result<(Vec<f32>,Vec<f32>)> {
+        ensure!(residual.len()%H==0 && (1..=3).contains(&(residual.len()/H))
+            && residual.iter().all(|v|v.is_finite()),"invalid resident head input");
+        let normalized=self.dev.norm_borrowed(&self.dev.upload(residual),&self.gain)?;
+        let head=OutputHead {dev:Device {client:self.dev.client.clone()},normalized,tokens:residual.len()/H};
+        let normalized=head.normalized()?;
+        let mut logits=vec![0.0;self.admission.rows*head.tokens];
+        let mut first=0;
+        for weight in &self.chunks {
+            let values=head.project_chunk(weight,&self.scale)?;
+            super::forward::insert_chunk(&mut logits,&values,self.admission.rows,first,weight.no,head.tokens)?;
+            first+=weight.no;
+        }
+        ensure!(normalized.iter().chain(&logits).all(|v|v.is_finite()),"nonfinite resident norm/logits");
+        Ok((normalized,logits))
     }
 }
 

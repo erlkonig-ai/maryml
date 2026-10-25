@@ -1,6 +1,6 @@
 //! Shared 49-block composition for empty-history diagnostics and cached sessions.
 //! CPU residual handoff and bounded streamed weights are deliberate first-stage
-//! choices, not a resident-weight/performance claim.
+//! choices. Sessions may retain only the native output head on the device.
 
 use anyhow::{Context, Result, ensure};
 use std::time::Instant;
@@ -14,6 +14,54 @@ pub const BLOCKS: usize = 49;
 #[derive(Clone, Copy, Debug)]
 pub enum Backend { Cpu, Cuda, PackedAll }
 pub(super) enum Head { All, Last, Skip }
+
+/// Logical immutable output-head GPU bytes only, separate from KV/attention.
+/// Allocator padding, runtime, query scratch and host mappings need headroom.
+#[derive(Clone,Copy,Debug,serde::Serialize,PartialEq,Eq)]
+pub struct HeadAdmission { pub rows:usize, pub chunks:usize, pub gpu_bytes:usize }
+impl HeadAdmission {
+    pub fn native(max_bytes:usize)->Result<Self> { Self::for_rows(VOCAB,max_bytes) }
+    pub(super) fn for_rows(rows:usize,max_bytes:usize)->Result<Self> {
+        ensure!(rows>0 && rows<=VOCAB,"invalid resident head row count");
+        let chunks=rows.div_ceil(HEAD_ROWS);
+        let elements=rows.checked_mul(H).context("resident head elements overflow")?;
+        // NVFP4 codes + scales + one intrinsic global per independently packed
+        // chunk, plus F32 RMS gain and ONE paired post-matmul scalar.
+        let gpu_bytes=(elements/2).checked_add(elements/16)
+            .and_then(|n|chunks.checked_mul(4).and_then(|g|n.checked_add(g)))
+            .and_then(|n|n.checked_add(H*4+4)).context("resident head bytes overflow")?;
+        ensure!(gpu_bytes<=max_bytes,"output-head admission: {gpu_bytes} > {max_bytes} bytes");
+        Ok(Self {rows,chunks,gpu_bytes})
+    }
+}
+
+/// Session-owned immutable buffers, never a global cache or a second catalogue.
+pub(super) enum HeadWeights {
+    Streamed,
+    #[cfg(feature="flint-cuda")]
+    Resident(super::gpu::ResidentOutputHead),
+}
+impl HeadWeights {
+    pub fn resident(w:&PileWeights,max_bytes:usize)->Result<Self> {
+        let admission=HeadAdmission::native(max_bytes)?; // Before any device allocation.
+        #[cfg(feature="flint-cuda")]
+        {
+            let gain=w.output_norm()?;
+            let (full,scale)=w.output_projection()?;
+            Ok(Self::Resident(super::gpu::ResidentOutputHead::new(&gain,&full,scale,admission)?))
+        }
+        #[cfg(not(feature="flint-cuda"))]
+        {let _=(w,admission);anyhow::bail!("resident native head requires flint-cuda")}
+    }
+    pub fn admission(&self)->Option<HeadAdmission> { match self {
+        Self::Streamed=>None,
+        #[cfg(feature="flint-cuda")] Self::Resident(head)=>Some(head.admission()),
+    }}
+    pub fn fence(&self)->Result<()> { match self {
+        Self::Streamed=>Ok(()),
+        #[cfg(feature="flint-cuda")] Self::Resident(head)=>head.fence(),
+    }}
+}
 
 /// One storage choice, not a second forward/cache implementation. Native views
 /// and tokenizer metadata are retained by the same frozen pile snapshot.
@@ -103,7 +151,7 @@ pub fn chunks(rows: usize) -> impl Iterator<Item=(usize,usize)> {
     (0..rows).step_by(HEAD_ROWS).map(move |first|(first,(rows-first).min(HEAD_ROWS)))
 }
 
-fn insert_chunk(logits: &mut [f32], values: &[f32], vocab: usize, first: usize, rows: usize, t: usize) -> Result<()> {
+pub(super) fn insert_chunk(logits: &mut [f32], values: &[f32], vocab: usize, first: usize, rows: usize, t: usize) -> Result<()> {
     ensure!(rows>0 && first.checked_add(rows).is_some_and(|end|end<=vocab)
         && logits.len()==vocab*t && values.len()==rows*t,"head chunk output geometry differs");
     for token in 0..t {
@@ -116,11 +164,12 @@ fn insert_chunk(logits: &mut [f32], values: &[f32], vocab: usize, first: usize, 
 /// weights while the trace is being examined. Runtime errors leave no KV state.
 pub fn run(w: &mut Source, ids: &[i32], positions: &[i32], backend: Backend,
     observe: impl FnMut(usize,&Trace,&[ReadReceipt])->Result<()>) -> Result<Output> {
-    run_core(w,ids,positions,backend,None,true,Head::All,observe)
+    run_core(w,ids,positions,backend,None,true,Head::All,&HeadWeights::Streamed,observe)
 }
 
 pub(super) fn run_core(w:&mut Source,ids:&[i32],positions:&[i32],backend:Backend,
     mut caches:Option<&mut [super::cache::LayerCache]>,trace:bool,head:Head,
+    head_weights:&HeadWeights,
     mut observe:impl FnMut(usize,&Trace,&[ReadReceipt])->Result<()>)->Result<Output> {
     let t=ids.len();
     ensure!((1..=3).contains(&t) && positions.len()==t,"expected T1..3 token IDs and positions");
@@ -129,6 +178,7 @@ pub(super) fn run_core(w:&mut Source,ids:&[i32],positions:&[i32],backend:Backend
     ensure!(matches!(backend,Backend::Cpu) || cfg!(feature="flint-cuda"),"CUDA feature required");
     if let Some(c)=caches.as_ref() { ensure!(c.len()==BLOCKS,"expected all49 layer caches"); }
     ensure!(!matches!(w,Source::Native(_)) || matches!(backend,Backend::PackedAll),"native pile requires PackedAll");
+    ensure!(head_weights.admission().is_none() || matches!(w,Source::Native(_)),"resident head requires its native source");
     if let Source::Gguf(w)=w { ensure!(!w.file.index.tensors.iter().any(|info|
         info.name=="output.input_scale" || (info.name.starts_with("blk.") && info.name.ends_with(".bias"))),
         "unsupported input scale or block bias tensor"); }
@@ -171,8 +221,11 @@ pub(super) fn run_core(w:&mut Source,ids:&[i32],positions:&[i32],backend:Backend
     }
     let head_residual=match head { Head::All=>residual.as_slice(),Head::Last=>&residual[(t-1)*H..],Head::Skip=>&[] };
     let (normalized,logits)=if head_residual.is_empty() { (Vec::new(),Vec::new()) }
-        else { match w {Source::Gguf(w)=>output_head(w,head_residual,backend)?,
-            Source::Native(w)=>native_head(w,head_residual)?} };
+        else { match head_weights {
+            #[cfg(feature="flint-cuda")] HeadWeights::Resident(head)=>head.run(head_residual)?,
+            HeadWeights::Streamed=>match w {Source::Gguf(w)=>output_head(w,head_residual,backend)?,
+                Source::Native(w)=>native_head(w,head_residual)?},
+        }};
     global_reads.extend(w.take_reads());
     w.check_identity()?;
     Ok(Output {embedding,residual,normalized,logits,global_reads})
@@ -236,6 +289,17 @@ fn output_head(w:&mut GgufWeights,residual:&[f32],backend:Backend)->Result<(Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test] fn resident_head_checked_logical_admission() -> Result<()> {
+        let a=HeadAdmission::native(192<<20)?;
+        assert_eq!(a,HeadAdmission {rows:VOCAB,chunks:19,gpu_bytes:172_974_160});
+        assert!(HeadAdmission::native(a.gpu_bytes-1).is_err());
+        assert_eq!(HeadAdmission::native(a.gpu_bytes)?,a);
+        for rows in [0,VOCAB+1,usize::MAX] {assert!(HeadAdmission::for_rows(rows,usize::MAX).is_err());}
+        let tail=HeadAdmission::for_rows(HEAD_ROWS+3,usize::MAX)?;
+        assert_eq!(tail.chunks,2);
+        assert_eq!(tail.gpu_bytes,(HEAD_ROWS+3)*H*9/16+2*4+H*4+4);
+        Ok(())
+    }
     #[test] fn head_partition_and_token_order() -> Result<()> {
         let parts: Vec<_>=chunks(VOCAB).collect();
         assert_eq!(parts.len(),19); assert_eq!(parts.last(),Some(&(147456,2688)));

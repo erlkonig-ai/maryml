@@ -259,8 +259,13 @@ impl PileWeights {
         small_floats(self.typed_at::<F32,1>(self.root,"output_norm.weight",&[super::math::H],None)?.payload(),0)
     }
     pub fn output_rows(&self,first:usize,rows:usize)->Result<(TensorView,f32)> {
-        let (full,scale)=self.projection_at(self.root,"output",&[super::math::H,super::forward::VOCAB],None)?;
+        let (full,scale)=self.output_projection()?;
         Ok((native_rows(&full,first,rows)?,scale))
+    }
+    /// One joined weight/postscale choice in this frozen snapshot. Consumers
+    /// select both native planes when materializing bounded row chunks.
+    pub(super) fn output_projection(&self)->Result<(TensorView,f32)> {
+        self.projection_at(self.root,"output",&[super::math::H,super::forward::VOCAB],None)
     }
 
     /// Diagnostic only; runtime get/get_packed do not hash per-weight bytes.

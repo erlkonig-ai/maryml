@@ -4,7 +4,7 @@ use std::{fs::{self,OpenOptions},io::Write,path::{Path,PathBuf},time::Instant};
 use anyhow::{Context,Result,ensure};
 use clap::{Parser,ValueEnum};
 use serde_json::json;
-use mary::models::flint::{cache::Limits,forward::Backend,session::{FlintSession,Options,greedy_id},weights::ReceiptPolicy};
+use mary::models::flint::{cache::Limits,forward::Backend,session::{FlintSession,Options,NativeHead,greedy_id},weights::ReceiptPolicy};
 
 #[derive(Clone,Copy,ValueEnum)]
 enum Mode { Cpu,Cuda,PackedAll }
@@ -12,6 +12,8 @@ enum Mode { Cpu,Cuda,PackedAll }
 enum Receipts { Collect,None }
 #[derive(Clone,Copy,Debug,PartialEq,Eq,ValueEnum)]
 enum PromptMode { Raw,TrustedFramed }
+#[derive(Clone,Copy,ValueEnum)]
+enum HeadMode { Streamed,Resident }
 #[derive(Parser)]
 struct Args {
     model:PathBuf, prompt:PathBuf, output:PathBuf,
@@ -28,6 +30,10 @@ struct Args {
     #[arg(long,default_value_t=8)] max_new:usize,
     #[arg(long,default_value_t=256)] max_cache_mib:usize,
     #[arg(long,default_value_t=64)] max_attention_mib:usize,
+    /// Native pile only; GGUF stays streamed. Immutable head survives reset.
+    #[arg(long,value_enum,default_value="resident")] native_head:HeadMode,
+    /// Immutable head buffers only, excluding workspace/runtime/host overhead.
+    #[arg(long,default_value_t=192)] max_head_mib:usize,
     #[arg(long)] trace:bool,
     /// Saves each last-row vocabulary distribution for independent prefix replay.
     #[arg(long)] save_logits:bool,
@@ -50,7 +56,9 @@ fn main()->Result<()> {
     let prompt=std::str::from_utf8(&raw).context("prompt is not UTF-8")?;
     let options=Options {backend:match args.backend {Mode::Cpu=>Backend::Cpu,Mode::Cuda=>Backend::Cuda,Mode::PackedAll=>Backend::PackedAll},
         limits:Limits {capacity:args.capacity,max_cache_bytes:args.max_cache_mib.checked_mul(1<<20).context("KV MiB overflow")?,
-            max_attention_bytes:args.max_attention_mib.checked_mul(1<<20).context("attention MiB overflow")?},trace:args.trace};
+            max_attention_bytes:args.max_attention_mib.checked_mul(1<<20).context("attention MiB overflow")?},trace:args.trace,
+        native_head:match args.native_head {HeadMode::Streamed=>NativeHead::Streamed,
+            HeadMode::Resident=>NativeHead::Resident {max_bytes:args.max_head_mib.checked_mul(1<<20).context("head MiB overflow")?}}};
     fs::create_dir(&args.output).context("output directory must be new")?;
     let process_setup_seconds=process_start.elapsed().as_secs_f64();
     let start=Instant::now();
@@ -102,6 +110,9 @@ fn main()->Result<()> {
         "weight_receipts":session.receipt_policy(),
         "capacity":session.capacity(),"cache_admission_bytes":session.admission().cache_bytes,
         "attention_admission_bytes":session.admission().attention_bytes,"trace":args.trace,
+        "head_admission":session.head_admission(),"max_head_mib":args.max_head_mib,
+        "head_admission_scope":"immutable native GPU head buffers only; not total GPU/runtime/workspace/host memory",
+        "head_initialization":"resident native head validation/upload is included in model_init_seconds; immutable buffers survive reset; GGUF stays streamed",
         "prompt_ids":ids,"prompt_bytes_blake3":blake3::hash(&raw).to_hex().to_string(),"choices":choices,"saved_logits":args.save_logits,
         "generation_bytes_blake3":blake3::hash(&generation.bytes).to_hex().to_string(),"result":generation,
         "accounting":"attended_tokens excludes the final emitted token when no subsequent prediction is requested; EOG is neither emitted nor fed back"});
@@ -121,6 +132,9 @@ mod tests {
         let framed=Args::try_parse_from(["flint_generate","model","prompt","out","--prompt-mode","trusted-framed"]).unwrap();
         assert_eq!(framed.prompt_mode,PromptMode::TrustedFramed);
         assert!(Args::try_parse_from(["flint_generate","model","prompt","out","--prompt-mode","chat"]).is_err());
+        assert!(matches!(raw.native_head,HeadMode::Resident));assert_eq!(raw.max_head_mib,192);
+        let streamed=Args::try_parse_from(["flint_generate","pile","prompt","out","--native-head","streamed"]).unwrap();
+        assert!(matches!(streamed.native_head,HeadMode::Streamed));
     }
     #[test]
     fn descriptor_requires_native_root_and_is_not_a_root_alias() {

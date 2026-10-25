@@ -1,6 +1,7 @@
 //! Bounded, single-sequence ID generation; no chat rendering or serving layer.
 //! Every append uses the same block/forward core as empty-history diagnostics.
-//! Weights come from explicit GGUF or a frozen native pile. KV stays until reset.
+//! Weights come from explicit GGUF or a frozen native pile. KV stays until reset;
+//! an optional immutable native output head stays until the session is dropped.
 use std::{path::Path,time::Instant};
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
@@ -8,8 +9,13 @@ use crate::formats::gguf::index::{FileIdentity,MetadataValue};
 use super::{cache::{self,Admission,LayerCache,Limits},forward::{self,Backend,Head,VOCAB},
     math::Trace,tokenizer::{FlintTokenizer,DECLARED_EOG_IDS},weights::{GgufWeights,ReadReceipt,HostPhase,ReceiptPolicy}};
 
+#[derive(Clone,Copy,Debug)]
+pub enum NativeHead { Streamed, Resident {max_bytes:usize} }
+impl Default for NativeHead {
+    fn default()->Self {Self::Resident {max_bytes:192<<20}}
+}
 #[derive(Clone, Copy, Debug)]
-pub struct Options { pub backend:Backend, pub limits:Limits, pub trace:bool }
+pub struct Options { pub backend:Backend, pub limits:Limits, pub trace:bool, pub native_head:NativeHead }
 /// Experimental wall-clock instrumentation only; no arithmetic or cache changes.
 /// Prefill/append include streamed weight IO, first-use compilation and the
 /// existing synchronous GPU readbacks/fences. No observer or file dump is inside
@@ -21,7 +27,7 @@ pub struct GenerationTimings {
     pub prefill_host:Option<HostPhase>, pub decode_host:Vec<Option<HostPhase>>,
 }
 impl Default for Options {
-    fn default()->Self { Self {backend:Backend::PackedAll,limits:Limits::default(),trace:false} }
+    fn default()->Self { Self {backend:Backend::PackedAll,limits:Limits::default(),trace:false,native_head:NativeHead::default()} }
 }
 
 #[derive(Default)]
@@ -55,6 +61,7 @@ impl Sequence {
 pub struct FlintSession {
     weights:forward::Source, codec:FlintTokenizer, caches:Vec<LayerCache>,
     sequence:Sequence, options:Options, admission:Admission,
+    head_weights:forward::HeadWeights,
 }
 impl FlintSession {
     /// Reads metadata/index, admits cache geometry, then allocates KV. No tensor
@@ -76,7 +83,8 @@ impl FlintSession {
         ensure!(identity==weights.file.identity,"tokenizer and weights are different file observations");
         weights.file.check_identity()?;
         let caches=cache::allocate(options.backend,options.limits.capacity)?;
-        Ok(Self {weights:forward::Source::Gguf(weights),codec,caches,sequence:Sequence::default(),options,admission})
+        Ok(Self {weights:forward::Source::Gguf(weights),codec,caches,sequence:Sequence::default(),options,admission,
+            head_weights:forward::HeadWeights::Streamed})
     }
     pub fn open_pile(path:&Path,root:triblespace::prelude::Id,options:Options)->Result<Self> {
         Self::open_pile_with_collection(path,root,None,options)
@@ -93,13 +101,19 @@ impl FlintSession {
         } else {None}).context("missing native context length")?;
         let admission=options.limits.admit(context)?;
         let codec=weights.tokenizer()?; // Same snapshot/root; no second file observation.
+        let head_weights=match options.native_head {
+            NativeHead::Streamed=>forward::HeadWeights::Streamed,
+            NativeHead::Resident {max_bytes}=>forward::HeadWeights::resident(&weights,max_bytes)?,
+        };
         let caches=cache::allocate(options.backend,options.limits.capacity)?;
-        Ok(Self {weights:forward::Source::Native(weights),codec,caches,sequence:Sequence::default(),options,admission})
+        Ok(Self {weights:forward::Source::Native(weights),codec,caches,sequence:Sequence::default(),options,admission,head_weights})
     }
     pub fn identity(&self)->Option<&FileIdentity> { self.weights.gguf().map(|w|&w.file.identity) }
     pub fn source_identity(&self)->serde_json::Value {self.weights.identity()}
     pub fn receipt_policy(&self)->ReceiptPolicy { self.weights.receipt_policy() }
     pub fn admission(&self)->Admission { self.admission }
+    /// Immutable head buffers only, NOT total GPU memory. None means streamed.
+    pub fn head_admission(&self)->Option<forward::HeadAdmission> {self.head_weights.admission()}
     pub fn capacity(&self)->usize { self.options.limits.capacity }
     /// Attended tokens only. The last emitted non-EOG token may not yet be in KV.
     pub fn attended_len(&self)->usize { self.sequence.attended }
@@ -116,8 +130,9 @@ impl FlintSession {
     /// A failed CUDA fence leaves the session poisoned. Fatal device/context
     /// failures can require dropping/reconstructing it; reset is not GPU recovery.
     pub fn reset(&mut self)->Result<()> {
-        let Self {sequence,caches,weights,..}=self;
+        let Self {sequence,caches,weights,head_weights,..}=self;
         sequence.reset(|| {
+            head_weights.fence()?; // Keep immutable weights, including after poison.
             for cache in caches { cache.reset()?; }
             weights.clear_reads(); weights.check_identity()?; Ok(())
         })
@@ -131,7 +146,7 @@ impl FlintSession {
     /// not reenter the session. Observer errors also poison, providing a diagnostic
     /// partial-execution witness without special production failure injection.
     pub fn append_observed(&mut self,ids:&[u32],observe:impl FnMut(usize,&Trace,&[ReadReceipt])->Result<()>)->Result<Vec<f32>> {
-        append_parts(&mut self.weights,&mut self.caches,&mut self.sequence,self.options,ids,Head::Last,observe)
+        append_parts(&mut self.weights,&mut self.caches,&mut self.sequence,self.options,&self.head_weights,ids,Head::Last,observe)
     }
     /// New sequence only; all IDs/capacity checked before the first mutation.
     /// Intermediate chunks skip the head. A failed later chunk requires reset.
@@ -141,7 +156,7 @@ impl FlintSession {
         let chunks=ids.chunks(cache::MAX_QUERY);
         let count=chunks.len(); let mut logits=Vec::new();
         for (index,chunk) in chunks.enumerate() {
-            logits=append_parts(&mut self.weights,&mut self.caches,&mut self.sequence,self.options,chunk,
+            logits=append_parts(&mut self.weights,&mut self.caches,&mut self.sequence,self.options,&self.head_weights,chunk,
                 if index+1==count {Head::Last} else {Head::Skip},|_,_,_|Ok(()))?;
         }
         Ok(logits)
@@ -193,12 +208,12 @@ impl FlintSession {
         let logits=self.prefill(ids)?;
         timings.prefill_seconds=start.elapsed().as_secs_f64();
         timings.prefill_host=self.weights.take_host_phase();
-        let Self {weights,caches,sequence,options,codec,..}=self;
+        let Self {weights,caches,sequence,options,codec,head_weights,..}=self;
         let start=Instant::now();
         let generation=greedy(logits,ids.len(),max_new,options.limits.capacity,
             |id| {
                 let start=Instant::now();
-                let logits=append_parts(weights,caches,sequence,*options,&[id],Head::Last,|_,_,_|Ok(()))?;
+                let logits=append_parts(weights,caches,sequence,*options,head_weights,&[id],Head::Last,|_,_,_|Ok(()))?;
                 timings.decode_seconds.push(start.elapsed().as_secs_f64());
                 timings.decode_host.push(weights.take_host_phase()); Ok(logits)
             },|id| Ok(codec.token_bytes(id,false)?.to_vec()),observe)?;
@@ -208,6 +223,7 @@ impl FlintSession {
 }
 
 fn append_parts(w:&mut forward::Source,caches:&mut [LayerCache],sequence:&mut Sequence,options:Options,
+    head_weights:&forward::HeadWeights,
     ids:&[u32],head:Head,observe:impl FnMut(usize,&Trace,&[ReadReceipt])->Result<()>)->Result<Vec<f32>> {
     ensure!(ids.len()<=cache::MAX_QUERY,"append query length must be1..3; use prefill for longer prompts");
     let end=sequence.preflight(ids,options.limits.capacity)?;
@@ -219,7 +235,7 @@ fn append_parts(w:&mut forward::Source,caches:&mut [LayerCache],sequence:&mut Se
     let expect_logits=!matches!(head,Head::Skip);
     let result=sequence.execute(end,|| {
         w.check_identity()?;
-        let result=forward::run_core(w,&signed,&positions,options.backend,Some(&mut *caches),options.trace,head,observe)?;
+        let result=forward::run_core(w,&signed,&positions,options.backend,Some(&mut *caches),options.trace,head,head_weights,observe)?;
         ensure!(caches.iter().all(|c|c.len()==end),"incomplete layer cache append");
         ensure!(if expect_logits { result.logits.len()==VOCAB && result.logits.iter().all(|v|v.is_finite()) } else {result.logits.is_empty()},
             "invalid next-token logits");

@@ -69,7 +69,7 @@ fn main()->Result<()> {
         |b,t,_|baseline_routes.observe(b,t))?;
     ensure!(baseline.logits.len()==3*VOCAB,"baseline logits shape");
     save(&args.output.join("uncached-logits.f32"),&baseline.logits.iter().flat_map(|v|v.to_le_bytes()).collect::<Vec<_>>())?;
-    let options=Options {backend,limits:Limits::default(),trace:true};
+    let options=Options {backend,limits:Limits::default(),trace:true,..Options::default()};
     let mut session=match root {Some(root)=>FlintSession::open_pile(&args.model,root,options)?,
         None=>FlintSession::open(&args.model,options)?};
     let mut records=Vec::new();

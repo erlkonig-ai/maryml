@@ -29,6 +29,50 @@ fn raw_matrix(ni: usize, no: usize, id: usize) -> Vec<u8> {
     }}
     raw
 }
+
+#[test]
+#[ignore = "requires an exclusive GB10 GPU reservation; synthetic head only"]
+fn cuda_resident_native_head_t1_t3_reuse_and_postscale() -> Result<()> {
+    use super::super::forward::{self,HeadAdmission,HEAD_ROWS};
+    use crate::{formats::gguf::nvfp4::typed,leaf};
+    let rows=HEAD_ROWS+3; // Full chunk plus a partial output cube/tail.
+    let raw=raw_matrix(H,rows,17);
+    let full=leaf::read_leaf(typed::to_tensor(&raw,[rows as u64,H as u64])?)?;
+    let gain:Vec<f32>=(0..H).map(|i|0.5+(i%7) as f32/8.0).collect();
+    let admission=HeadAdmission::for_rows(rows,192<<20)?;
+    for scale in [0.0,-0.5,0.75] {
+        let resident=ResidentOutputHead::new(&gain,&full,scale,admission)?;
+        assert_eq!(resident.admission(),admission);
+        let mut cache=KvCache::new(3)?;
+        // The same immutable object is used across cache reset, varying token
+        // shapes and an exact repeated input. No payload reads/uploads in run().
+        let mut first:Option<Vec<f32>>=None;
+        for t in [1,3,1] {
+            let residual:Vec<f32>=(0..H*t).map(|i|((i%H*7+i/H*13)%23) as f32/32.0-11.0/32.0).collect();
+            let (normalized,actual)=resident.run(&residual)?;
+            let streamed=OutputHead::new(&residual,&gain)?;
+            exact(&normalized,&streamed.normalized()?);
+            let mut expected=vec![0.0;rows*t];
+            for (offset,n) in forward::chunks(rows) {
+                let view=super::super::pile::native_rows(&full,offset,n)?;
+                let values=streamed.native_chunk(&view,n,scale)?;
+                forward::insert_chunk(&mut expected,&values,rows,offset,n,t)?;
+            }
+            exact(&actual,&expected);
+            if t==1 {
+                if let Some(ref prior)=first {exact(&actual,prior);} else {first=Some(actual);}
+            }
+            let values=cache.dev.upload(&vec![0.25;KV*D*t]);
+            cache.append(&values,&values,&(0..t as i32).collect::<Vec<_>>())?;
+            resident.fence()?; cache.reset()?;
+            assert_eq!(cache.len(),0);
+        }
+        println!("resident native head: T1/T3/repeatedT1, {rows} rows, postscale{scale}; streamed value-exact, retained across KV reset");
+    }
+    assert!(ResidentOutputHead::new(&gain[..H-1],&full,1.0,admission).is_err());
+    assert!(ResidentOutputHead::new(&gain,&full,f32::NAN,admission).is_err());
+    Ok(())
+}
 fn scale(id: usize) -> f32 { match id { 0 => 0.0, 255 => -0.5, _ => 0.75 } }
 fn expected(ni: usize, no: usize, id: usize, input: &[f32]) -> Vec<f32> {
     let w = nvfp4::decode(&raw_matrix(ni,no,id), ni*no).unwrap();
