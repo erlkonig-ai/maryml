@@ -43,7 +43,7 @@ impl BlockConfig {
             let mut matching = entries.iter().filter(|e| e.key == key);
             let entry = matching.next().with_context(|| format!("missing Flint metadata {key}"))?;
             ensure!(matching.next().is_none(), "duplicate Flint metadata {key}");
-            let tag = match &entry.value { U32(_) => 4, F32(_) => 6, Bool(_) => 7, String(_) => 8, BoolArray(_) => 9 };
+            let tag = entry.value.gguf_type();
             ensure!(entry.gguf_type == tag, "Flint metadata type differs: {key}");
             Ok(&entry.value)
         };
@@ -134,6 +134,7 @@ mod tests {
             changed[index].value = match &entries[index].value {
                 U32(v) => U32(v+1), F32(_) => F32(f32::NAN), Bool(v) => Bool(!v),
                 String(_) => String("not-flint".into()), BoolArray(_) => BoolArray(vec![false;48]),
+                I32Array(_) | StringArray(_) => unreachable!("not block-config fixture metadata"),
             };
             assert!(BlockConfig::from_metadata(&changed,5).is_err());
         }

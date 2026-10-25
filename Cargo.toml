@@ -1264,3 +1264,7 @@ required-features = ["inkling-cuda"]
 # inside RUST_BACKTRACE frames, and gdb locals.
 [profile.dev]
 debug = 0
+
+[[bin]]
+name = "flint_tokenizer_gate"
+required-features = ["import", "tokenizer"]

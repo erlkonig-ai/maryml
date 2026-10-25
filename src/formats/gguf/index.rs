@@ -96,7 +96,70 @@ pub struct Index {
 pub struct MetadataEntry { pub key: String, pub gguf_type: u32, pub value: MetadataValue }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
-pub enum MetadataValue { U32(u32), F32(f32), Bool(bool), String(String), BoolArray(Vec<bool>) }
+pub enum MetadataValue {
+    U32(u32), F32(f32), Bool(bool), String(String), BoolArray(Vec<bool>),
+    I32Array(Vec<i32>), StringArray(Vec<String>),
+}
+
+impl MetadataValue {
+    pub fn gguf_type(&self) -> u32 {
+        match self {
+            Self::U32(_) => 4, Self::F32(_) => 6, Self::Bool(_) => 7, Self::String(_) => 8,
+            Self::BoolArray(_) | Self::I32Array(_) | Self::StringArray(_) => 9,
+        }
+    }
+}
+
+/// Explicit allocation/read limits, not inferred from an untrusted GGUF count.
+#[derive(Clone, Copy, Debug)]
+pub struct MetadataLimits {
+    pub header_bytes: u64,
+    pub string_bytes: u64,
+    pub array_entries: u64,
+    pub retained_bytes: u64,
+}
+
+impl MetadataLimits {
+    pub const SCALARS: Self = Self {
+        header_bytes: MAX_HEADER, string_bytes: 4096, array_entries: 4096,
+        retained_bytes: 1024 * 1024,
+    };
+    /// Fits Flint's 5,436,996-byte metadata section and 150,144-token vocabulary.
+    /// The retained budget includes string-array slots as well as UTF-8 bytes.
+    pub const TOKENIZER: Self = Self {
+        header_bytes: 8 * 1024 * 1024, string_bytes: 64 * 1024, array_entries: 262_144,
+        retained_bytes: 16 * 1024 * 1024,
+    };
+}
+
+/// Metadata only: stops before the tensor directory, never seeks to a tensor.
+#[derive(Debug, Serialize)]
+pub struct SelectedMetadata {
+    pub version: u32,
+    pub tensor_count: u64,
+    pub alignment: u64,
+    pub entries: Vec<MetadataEntry>,
+    pub end: u64,
+}
+
+impl SelectedMetadata {
+    pub fn read<R: Read + Seek>(reader: R, len: u64, keys: &[&str], limits: MetadataLimits) -> Result<Self> {
+        Header { reader, len: len.min(limits.header_bytes) }.metadata(keys, limits)
+    }
+
+    /// Unbuffered userspace reads prevent read-ahead into tensor payloads. OS
+    /// page-cache read-ahead is outside this API's byte-read contract.
+    pub fn open(path: &Path, keys: &[&str], limits: MetadataLimits) -> Result<(FileIdentity, Self)> {
+        let before = path.symlink_metadata()?;
+        ensure!(!before.file_type().is_symlink(), "GGUF source must not be a symlink");
+        let mut file = File::open(path)?;
+        let identity = FileIdentity::from_metadata(&file.metadata()?)?;
+        ensure!(FileIdentity::from_metadata(&before)? == identity, "GGUF source changed while opening");
+        let selected = Self::read(&mut file, identity.bytes, keys, limits)?;
+        ensure!(FileIdentity::from_metadata(&file.metadata()?)? == identity, "GGUF source changed during metadata read");
+        Ok((identity, selected))
+    }
+}
 
 struct Header<R> {
     reader: R,
@@ -167,7 +230,7 @@ impl<R: Read + Seek> Header<R> {
         }
     }
 
-    fn selected_value(&mut self, tag: u32) -> Result<MetadataValue> {
+    fn selected_value(&mut self, tag: u32, limits: MetadataLimits, budget: &mut u64) -> Result<MetadataValue> {
         fn boolean(byte: u8) -> Result<bool> {
             ensure!(byte <= 1, "invalid GGUF BOOL value");
             Ok(byte != 0)
@@ -176,36 +239,64 @@ impl<R: Read + Seek> Header<R> {
             4 => MetadataValue::U32(self.u32()?),
             6 => MetadataValue::F32(f32::from_le_bytes(self.take()?)),
             7 => MetadataValue::Bool(boolean(self.take::<1>()?[0])?),
-            8 => {
-                let size = self.u64()?;
-                ensure!(size <= 4096, "selected metadata string exceeds limit");
-                self.check(size)?;
-                let mut bytes = vec![0; usize::try_from(size)?];
-                self.reader.read_exact(&mut bytes)?;
-                MetadataValue::String(String::from_utf8(bytes).context("selected metadata is not UTF-8")?)
-            }
+            8 => MetadataValue::String(self.selected_string(limits, budget)?),
             9 => {
-                ensure!(self.u32()? == 7, "selected metadata array must contain BOOL values");
+                let element = self.u32()?;
                 let count = self.u64()?;
-                ensure!(count <= 4096, "selected metadata array exceeds limit");
-                self.check(count)?;
-                let mut values = Vec::with_capacity(usize::try_from(count)?);
-                for _ in 0..count { values.push(boolean(self.take::<1>()?[0])?); }
-                MetadataValue::BoolArray(values)
+                ensure!(count <= limits.array_entries, "selected metadata array exceeds limit");
+                let width = match element {
+                    7 => 1, 5 => 4, 8 => std::mem::size_of::<String>() as u64,
+                    _ => bail!("unsupported selected GGUF array element type {element}"),
+                };
+                Self::charge(budget, count.checked_mul(width).context("selected array overflow")?)?;
+                let capacity = usize::try_from(count)?;
+                match element {
+                    7 => {
+                        self.check(count)?;
+                        let mut values = Vec::with_capacity(capacity);
+                        for _ in 0..count { values.push(boolean(self.take::<1>()?[0])?); }
+                        MetadataValue::BoolArray(values)
+                    }
+                    5 => {
+                        self.check(count * 4)?;
+                        let mut values = Vec::with_capacity(capacity);
+                        for _ in 0..count { values.push(i32::from_le_bytes(self.take()?)); }
+                        MetadataValue::I32Array(values)
+                    }
+                    8 => {
+                        self.check(count * 8)?;
+                        let mut values = Vec::with_capacity(capacity);
+                        for _ in 0..count { values.push(self.selected_string(limits, budget)?); }
+                        MetadataValue::StringArray(values)
+                    }
+                    _ => unreachable!(),
+                }
             }
             _ => bail!("unsupported selected GGUF metadata type {tag}"),
         })
     }
-}
 
-impl Index {
-    pub fn read<R: Read + Seek>(reader: R, len: u64) -> Result<Self> {
-        Self::read_with_metadata(reader, len, &[])
+    fn charge(budget: &mut u64, bytes: u64) -> Result<()> {
+        *budget = budget.checked_sub(bytes).context("selected metadata retained-byte limit exceeded")?;
+        Ok(())
     }
 
-    pub fn read_with_metadata<R: Read + Seek>(reader: R, len: u64, keys: &[&str]) -> Result<Self> {
+    fn selected_string(&mut self, limits: MetadataLimits, budget: &mut u64) -> Result<String> {
+        let size = self.u64()?;
+        ensure!(size <= limits.string_bytes, "selected metadata string exceeds limit");
+        Self::charge(budget, size)?;
+        self.check(size)?;
+        let mut bytes = vec![0; usize::try_from(size)?];
+        self.reader.read_exact(&mut bytes)?;
+        String::from_utf8(bytes).context("selected metadata is not UTF-8")
+    }
+
+    fn metadata(&mut self, keys: &[&str], limits: MetadataLimits) -> Result<SelectedMetadata> {
         ensure!(keys.len() <= 64, "too many selected metadata keys");
-        let mut h = Header { reader, len };
+        ensure!(limits.header_bytes <= MAX_HEADER && limits.string_bytes <= MAX_STRING
+            && limits.array_entries <= MAX_ARRAY && limits.retained_bytes <= MAX_HEADER,
+            "selected metadata limits exceed hard bounds");
+        let h = self;
         ensure!(h.reader.stream_position()? == 0, "GGUF reader must start at byte zero");
         let magic = h.take::<4>()?;
         ensure!(magic != *b"FUGG", "big-endian GGUF is not supported by this reader");
@@ -218,6 +309,7 @@ impl Index {
         let mut alignment = 32u64;
         let mut alignment_seen = false;
         let mut selected = Vec::<MetadataEntry>::new();
+        let mut budget = limits.retained_bytes;
         for _ in 0..metadata {
             let key = h.string()?;
             let ty = h.u32()?;
@@ -228,12 +320,26 @@ impl Index {
                 ensure!(alignment.is_power_of_two() && alignment <= MAX_HEADER, "invalid GGUF alignment");
             } else if keys.contains(&key.as_str()) {
                 ensure!(!selected.iter().any(|entry| entry.key == key), "duplicate selected metadata key {key}");
-                selected.push(MetadataEntry { key, gguf_type: ty, value: h.selected_value(ty)? });
+                Self::charge(&mut budget, key.len() as u64 + std::mem::size_of::<MetadataEntry>() as u64)?;
+                selected.push(MetadataEntry { key, gguf_type: ty, value: h.selected_value(ty, limits, &mut budget)? });
             } else {
                 h.value(ty)?;
             }
         }
         let metadata_end = h.reader.stream_position()?;
+        Ok(SelectedMetadata { version, tensor_count: tensors, alignment, entries: selected, end: metadata_end })
+    }
+}
+
+impl Index {
+    pub fn read<R: Read + Seek>(reader: R, len: u64) -> Result<Self> {
+        Self::read_with_metadata(reader, len, &[])
+    }
+
+    pub fn read_with_metadata<R: Read + Seek>(reader: R, len: u64, keys: &[&str]) -> Result<Self> {
+        let mut h = Header { reader, len };
+        let SelectedMetadata { version, tensor_count: tensors, alignment, entries: selected, end: metadata_end } =
+            h.metadata(keys, MetadataLimits::SCALARS)?;
         let mut infos = Vec::new();
         let mut names = HashSet::new(); // Ephemeral format validation, not retained collection state.
         for _ in 0..tensors {
@@ -380,6 +486,33 @@ mod tests {
         let data = fixture(&[64, 2, 2], 40, 0);
         for len in 0..data.len() { assert!(parse(&data[..len]).is_err(), "accepted truncation at {len}"); }
         assert!(parse(&data).is_ok());
+    }
+
+    #[test]
+    fn tokenizer_metadata_is_bounded_and_stops_before_tensor_directory() {
+        let mut bytes = b"GGUF".to_vec();
+        bytes.extend(3u32.to_le_bytes()); bytes.extend(1264u64.to_le_bytes()); bytes.extend(2u64.to_le_bytes());
+        string(&mut bytes, "tokens"); bytes.extend(9u32.to_le_bytes()); bytes.extend(8u32.to_le_bytes());
+        bytes.extend(2u64.to_le_bytes()); string(&mut bytes, "hello"); string(&mut bytes, "Ġ世界");
+        string(&mut bytes, "types"); bytes.extend(9u32.to_le_bytes()); bytes.extend(5u32.to_le_bytes());
+        bytes.extend(2u64.to_le_bytes()); bytes.extend(1i32.to_le_bytes()); bytes.extend(4i32.to_le_bytes());
+        let end = bytes.len();
+        bytes.extend(b"NOT A TENSOR DIRECTORY OR PAYLOAD");
+        let read = |data: &[u8], limits| SelectedMetadata::read(Cursor::new(data), data.len() as u64, &["tokens", "types"], limits);
+        let selected = read(&bytes, MetadataLimits::TOKENIZER).unwrap();
+        assert_eq!(selected.tensor_count, 1264);
+        assert_eq!(selected.end, end as u64);
+        assert_eq!(selected.entries[0].value, MetadataValue::StringArray(vec!["hello".into(), "Ġ世界".into()]));
+        assert_eq!(selected.entries[1].value, MetadataValue::I32Array(vec![1, 4]));
+        for length in 0..end { assert!(read(&bytes[..length], MetadataLimits::TOKENIZER).is_err()); }
+        for limits in [
+            MetadataLimits { header_bytes: end as u64 - 1, ..MetadataLimits::TOKENIZER },
+            MetadataLimits { string_bytes: 4, ..MetadataLimits::TOKENIZER },
+            MetadataLimits { array_entries: 1, ..MetadataLimits::TOKENIZER },
+            MetadataLimits { retained_bytes: 1, ..MetadataLimits::TOKENIZER },
+        ] { assert!(read(&bytes, limits).is_err()); }
+        // No tensor table is needed for metadata-only reading; indexing still rejects it.
+        assert!(parse(&bytes).is_err());
     }
 }
     #[test]

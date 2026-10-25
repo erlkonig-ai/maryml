@@ -7,5 +7,9 @@ pub mod weights;
 pub mod config;
 pub mod forward;
 
+// Direct raw-text codec, independent of persisted tokenizer graphs or chat framing.
+#[cfg(feature = "tokenizer")]
+pub mod tokenizer;
+
 #[cfg(feature = "flint-cuda")]
 pub mod gpu;
