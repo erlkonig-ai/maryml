@@ -107,9 +107,9 @@ fn attention_pending_failure_cancel_and_reset_protocol() {
 fn source() -> SourceBinding {
     use triblespace::prelude::genid;
     SourceBinding {
-        model_root: genid(),
-        layer: genid(),
-        operations: [genid(), genid(), genid(), genid()],
+        model_root: *genid(),
+        layer: *genid(),
+        operations: [*genid(), *genid(), *genid(), *genid()],
     }
 }
 

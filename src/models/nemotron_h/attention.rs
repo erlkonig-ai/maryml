@@ -137,14 +137,14 @@ pub struct Output {
     pub values: CudaTensor,
     pub working_bytes: usize,
     #[cfg(test)]
-    stages: Stages,
+    pub(super) stages: Stages,
 }
 #[cfg(test)]
-struct Stages {
-    q: CudaTensor,
-    k: CudaTensor,
-    v: CudaTensor,
-    attention: CudaTensor,
+pub(super) struct Stages {
+    pub(super) q: CudaTensor,
+    pub(super) k: CudaTensor,
+    pub(super) v: CudaTensor,
+    pub(super) attention: CudaTensor,
 }
 
 fn checked_elements(dims: &[usize], bytes: usize) -> Result<usize> {
@@ -459,6 +459,19 @@ impl Attention {
         self.sequence.reset(|| {
             cubecl::future::block_on(client.sync()).map_err(|e| format!("attention reset: {e:?}"))
         })
+    }
+    /// Test-only committed prefix readback; never exports uninitialized tail.
+    #[cfg(test)]
+    pub(super) fn diagnostic_kv(&self) -> Result<[Vec<u8>; 2]> {
+        if self.sequence.phase != Phase::Ready {
+            return Err("diagnostic KV read requires committed ready state".into());
+        }
+        let bytes = self.sequence.attended * KV_WIDTH * 2;
+        let read = |h: &Handle| -> Result<Vec<u8>> {
+            self.client.read_one(h.clone()).map(|v| v[..bytes].to_vec())
+                .map_err(|e| format!("diagnostic KV read: {e:?}"))
+        };
+        Ok([read(&self.keys)?, read(&self.values)?])
     }
 }
 

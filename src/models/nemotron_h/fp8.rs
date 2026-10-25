@@ -35,6 +35,10 @@ use cubek::{
 };
 use half::bf16;
 
+#[cfg(all(test, feature = "import"))]
+#[path = "real_layers.rs"]
+mod real_layers;
+
 pub type CudaTensor = CubeTensor<CudaRuntime>;
 type Result<T> = std::result::Result<T, String>;
 const THREADS: u32 = 128;
