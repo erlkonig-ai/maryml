@@ -1,4 +1,4 @@
-//! Flint's isolated sparse block-2/block-5 fixtures as bounded F32 math. This is an import/parity
+//! Flint's isolated dense block-0 and sparse block-2/block-5 fixtures as bounded F32 math. This is an import/parity
 //! seam, not a model loader, serving implementation, or quantized kernel claim.
 //! The independently supplied residual/position bytes are the entire input.
 

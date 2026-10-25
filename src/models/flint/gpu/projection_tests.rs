@@ -4,8 +4,8 @@
 use super::*;
 use crate::formats::gguf::nvfp4;
 
-const DENSE: [&str; 7] = ["attn_q", "attn_k", "attn_v", "attn_output",
-    "ffn_up_shexp", "ffn_gate_shexp", "ffn_down_shexp"];
+const DENSE: [&str; 10] = ["attn_q", "attn_k", "attn_v", "attn_output",
+    "ffn_up_shexp", "ffn_gate_shexp", "ffn_down_shexp", "ffn_up", "ffn_gate", "ffn_down"];
 const EXPERTS: [&str; 3] = ["ffn_up_exps", "ffn_gate_exps", "ffn_down_exps"];
 
 #[test]
@@ -104,7 +104,58 @@ fn cuda_packed_dense_and_selected_experts_t1_t3() -> Result<()> {
             exact(&dev.read(&out)?,&scaled);
             assert_eq!(w.reads,ids.iter().map(|&id|(format!("{suffix}.weight"),Some(id as usize))).collect::<Vec<_>>());
         }
-        println!("packed common projection T={t}: seven dense + three routed families; repeated/boundary IDs, token/slot offsets and post-scales exact");
+        println!("packed common projection T={t}: ten ordinary + three routed families; repeated/boundary IDs, token/slot offsets and post-scales exact");
     }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires an exclusive GB10 GPU reservation"]
+fn cuda_packed_dense0_actual_shapes_t1_t3() -> Result<()> {
+    let dev = Device::new();
+    for (suffix,ni,no) in [("ffn_up",2048,6144),("ffn_gate",2048,6144),("ffn_down",6144,2048)] {
+        for t in [1,3] {
+            let input: Vec<f32> = (0..ni*t).map(|i|
+                ((i%ni*7+i/ni*13)%23) as f32/32.0-11.0/32.0).collect();
+            let mut w = PackedOnly {ni,no,reads:Vec::new()};
+            let mut tr = Trace::default();
+            let out = dev.dense(&mut w,&mut tr,suffix,"dense_test",&dev.upload(&input),ni,no,t,ProjectionMode::PackedAll)?;
+            // Decode once for the independent dyadic scalar-dot check.
+            let decoded = nvfp4::decode(&raw_matrix(ni,no,17),ni*no)?;
+            let raw: Vec<f32> = input.chunks_exact(ni).flat_map(|x|
+                decoded.chunks_exact(ni).map(move |row|
+                    row.iter().zip(x).map(|(&w,&v)|w as f64*v as f64).sum::<f64>() as f32)).collect();
+            exact(trace_f32(&tr,"dense_test_unscaled"),&raw);
+            exact(&dev.read(&out)?,&raw.iter().map(|v|v*0.75).collect::<Vec<_>>());
+            assert_eq!(w.reads,vec![(format!("{suffix}.weight"),None)]);
+            println!("packed dense0 shape {suffix} [{ni},{no}] T={t}: asymmetric dyadic input and nonunit postscale exact");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires an exclusive GB10 GPU reservation"]
+fn cuda_dense_parallel_swiglu_controls() -> Result<()> {
+    let dev = Device::new();
+    // Asymmetric signed raw projections, nonunit distinct postscales. Values
+    // exceed the MoE adaptive threshold so a down-input normalization is visible.
+    let up = dev.upload(&[4.0,-8.0,8192.0,-16384.0]);
+    let gate = dev.upload(&[-4.0,2.0,4.0,8.0]);
+    let u = dev.point(&up,&dev.upload(&[-0.5]),4,1);
+    let g = dev.point(&gate,&dev.upload(&[0.75]),4,1);
+    let sw = dev.point(&g,&u,4,3);
+    let actual = dev.read(&sw)?;
+    let swapped = dev.read(&dev.point(&u,&g,4,3))?;
+    let wrong = dev.point(&gate,&u,4,3);
+    let wrong = dev.read(&dev.point(&wrong,&dev.upload(&[0.75]),4,1))?;
+    assert!(actual.iter().zip(swapped).any(|(&a,b)|a.to_bits()!=b.to_bits()));
+    assert!(actual.iter().zip(wrong).any(|(&a,b)|a.to_bits()!=b.to_bits()));
+    assert!(actual.iter().any(|v|v.abs()>1024.0));
+    let zero = dev.point(&sw,&dev.upload(&[0.0]),4,1);
+    assert!(dev.read(&zero)?.iter().all(|&v|v==0.0));
+    let residual = dev.upload(&[1.0,-2.0,3.0,-4.0]);
+    exact(&dev.read(&dev.point(&residual,&zero,4,0))?,&[1.0,-2.0,3.0,-4.0]);
+    println!("dense controls: swapped gate/up and moving gate scale after SiLU differ; zero contribution preserves residual; activation exceeds1024");
     Ok(())
 }

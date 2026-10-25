@@ -1,4 +1,4 @@
-//! CPU or CUDA F32/math block-2/block-5 diagnostics against reference outputs.
+//! CPU or CUDA F32/math block-0/block-2/block-5 diagnostics against reference outputs.
 //! Exit success means diagnostics completed with exact integer stage agreement,
 //! NOT floating-point numerical acceptance. CUDA uses the `flint-cuda` feature.
 
@@ -6,6 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, ensure};
 use mary::models::flint::{math::{self, Values}, weights::GgufWeights};
+use mary::models::flint::config::FfnKind;
 use serde_json::{Value, json};
 
 fn read(path: &Path, max: usize) -> Result<Vec<u8>> {
@@ -103,9 +104,9 @@ fn main() -> Result<()> {
         args.drain(..2);
         value
     } else { 2 };
-    ensure!(matches!(block, 2 | 5), "only block 2 or block 5 is implemented");
+    ensure!(matches!(block, 0 | 2 | 5), "only blocks 0, 2 and 5 are implemented");
     ensure!(!cuda || cfg!(feature = "flint-cuda"), "--cuda requires the flint-cuda feature");
-    ensure!(args.len()==5,"usage: flint_layer2_gate [--cpu|--cuda|--cuda-packed-k|--cuda-packed-all] [--block 2|5] MODEL INPUT_F32 POSITIONS_I32 REFERENCE_DIR NEW_OUTPUT_DIR");
+    ensure!(args.len()==5,"usage: flint_layer2_gate [--cpu|--cuda|--cuda-packed-k|--cuda-packed-all] [--block 0|2|5] MODEL INPUT_F32 POSITIONS_I32 REFERENCE_DIR NEW_OUTPUT_DIR");
     let [model,input_path,pos_path,reference,out] = args.as_slice() else { unreachable!() };
     let input_bytes = read(input_path,math::H*3*4)?;
     let input = floats(&input_bytes)?;
@@ -164,13 +165,15 @@ fn main() -> Result<()> {
             "actual_blake3":hash(&raw),"reference_blake3":hash(&expected),
             "reference_manifest_digest_claim":cols[7]}));
     }
-    let ref_probs = floats(&read(&reference.join("router_probs.f32"),256*3*4)?)?;
-    let reference_margins: Vec<f32> = ref_probs.chunks_exact(256).map(|row|{
-        let mut sorted = row.to_vec(); sorted.sort_by(|a,b|b.total_cmp(a)); sorted[5]-sorted[6]
-    }).collect();
+    let reference_margins = if config.ffn == FfnKind::Moe {
+        let ref_probs = floats(&read(&reference.join("router_probs.f32"),256*3*4)?)?;
+        Some(ref_probs.chunks_exact(256).map(|row|{
+            let mut sorted = row.to_vec(); sorted.sort_by(|a,b|b.total_cmp(a)); sorted[5]-sorted[6]
+        }).collect::<Vec<f32>>())
+    } else { None };
     let selected_bytes: u64 = weights.reads.iter().map(|r|r.absolute_end-r.absolute_start).sum();
     let scope = if packed_all {
-        "metadata-bound isolated block CubeCL CUDA F32 math; all ten type40 projection families read unchanged packed GGUF NVFP4 on GPU; F32 norms/scales and BF16 router storage unchanged; per-stage readbacks and CPU-controlled sparse expert loading; no tensor cores or activation quantization"
+        "metadata-bound isolated block CubeCL CUDA F32 math; every type40 projection in the selected dense or MoE branch reads unchanged packed GGUF NVFP4 on GPU; per-stage readbacks; no tensor cores or activation quantization"
     } else if packed_k {
         "metadata-bound isolated block CubeCL CUDA F32 math; only attn_k reads unchanged packed GGUF NVFP4 on GPU; other weights decoded; per-stage readbacks and CPU-controlled sparse loading; no tensor cores or activation quantization"
     } else if cuda {
@@ -186,7 +189,9 @@ fn main() -> Result<()> {
         "block_config":config,"gguf_metadata":weights.file.index.metadata,"metadata_end":weights.file.index.metadata_end,
         "input_path":input_path,"input_blake3":hash(&input_bytes),"positions_path":pos_path,"positions_blake3":hash(&pos_bytes),
         "reference_dir":reference,"reference_table_blake3":hash(&table_bytes),"positions":positions,
-        "router_sixth_seventh_margins":trace.router_margins,"reference_router_sixth_seventh_margins":reference_margins,
+        "projection_family_count":if config.ffn == FfnKind::Moe {10} else {7},
+        "ordinary_ffn_clamp":0.0,"clamp_source":"llama.cpp 1ddffe9: llama-model.cpp:1471 initializes zero; flint.cpp:3-18 has no override",
+        "router_sixth_seventh_margins":if config.ffn == FfnKind::Moe {Some(trace.router_margins)} else {None},"reference_router_sixth_seventh_margins":reference_margins,
         "selected_payload_bytes_returned":selected_bytes,"read_accounting":"explicit row returns including repeats; excludes header/buffering/OS read-ahead",
         "reads":weights.reads,"comparisons":comparisons});
     fs::write(out.join("tensors.tsv"),shape_text)?;

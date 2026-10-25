@@ -1,7 +1,7 @@
-//! Bounded block-2/block-5 CUDA arithmetic through Mary's existing CubeCL runtime.
+//! Bounded block-0/block-2/block-5 CUDA arithmetic through Mary's existing CubeCL runtime.
 //!
 //! Weights are decoded from stored GGUF NVFP4 (36 bytes / 64 values), then
-//! uploaded as F32. Explicit packed-K/all modes decode only attn_k or all ten
+//! uploaded as F32. Explicit packed-K/all modes decode only attn_k or all
 //! type-40 projection families inside the same matvec, directly from unchanged
 //! GGUF bytes. Norms/sinks and the BF16 router keep their existing paths.
 //! Separate `.scale` values stay
@@ -29,7 +29,7 @@ use cubecl::server::Handle;
 
 use super::math::{H, Stage, Trace, Values};
 use super::weights::Weights;
-use super::config::BlockConfig;
+use super::config::{BlockConfig, FfnKind};
 
 mod packed;
 pub use packed::{KComparison, compare_k as compare_packed_k};
@@ -407,6 +407,16 @@ impl Device {
         self.trace(tr, label, [no,K,t,1], &out)?;
         Ok(out)
     }
+    fn dense_ffn(&self, w: &mut impl Weights, tr: &mut Trace, n: &Buffer,
+        hidden: usize, width: usize, t: usize, mode: ProjectionMode) -> Result<Buffer> {
+        let up = self.dense(w,tr,"ffn_up","dense_up",n,hidden,width,t,mode)?;
+        let gate = self.dense(w,tr,"ffn_gate","dense_gate",n,hidden,width,t,mode)?;
+        // Clamp=0 follows the exact pinned common loader plus Flint loader.
+        let sw = self.point(&gate,&up,width,3);
+        self.trace(tr,"dense_swiglu",[width,t,1,1],&sw)?;
+        self.trace(tr,"dense_down_input",[width,t,1,1],&sw)?;
+        self.dense(w,tr,"ffn_down","dense_down",&sw,width,hidden,t,mode)
+    }
 }
 
 /// Exactly layer 2 for 1..=3 supplied residual rows, no KV history. Stage names
@@ -476,52 +486,56 @@ pub fn block(w: &mut impl Weights, input: &[f32], positions: &[i32], config: Blo
     dev.trace(&mut tr,"ffn_inp",[H,t,1,1],&residual)?;
     let n = dev.norm(&residual,&w.get("ffn_norm.weight",&[H],0,None)?);
     dev.trace(&mut tr,"ffn_norm",[H,t,1,1],&n)?;
-    let router = dev.upload(&w.get("ffn_gate_inp.weight",&[H,E],30,None)?);
-    let logits = dev.empty(E*t);
-    dev.matvec(&n,&router,&logits,H,E,t,0,0);
-    let prob = dev.point(&logits,&logits,E,2);
-    dev.trace(&mut tr,"router_logits",[E,t,1,1],&logits)?;
-    dev.trace(&mut tr,"router_probs",[E,t,1,1],&prob)?;
-    let ids_gpu = dev.empty(K*t);
-    let selected = dev.empty(K*t);
-    let sums = dev.empty(t);
-    let denoms = dev.empty(t);
-    let rw = dev.empty(K*t);
-    let margins = dev.empty(t);
-    unsafe { route_kernel::launch_unchecked::<CudaRuntime>(&dev.client, CubeCount::new_1d(1), CubeDim::new_1d(32),
-        prob.arg(),ids_gpu.arg(),selected.arg(),sums.arg(),denoms.arg(),rw.arg(),margins.arg(),t as u32); }
-    let ids = dev.read_ids(&ids_gpu)?;
-    tr.stages.push(Stage { name: "router_ids".into(), dims: [K,t,1,1], values: Values::I32(ids.clone()) });
-    dev.trace(&mut tr,"router_selected_probs",[1,K,t,1],&selected)?;
-    dev.trace(&mut tr,"router_sum",[1,t,1,1],&sums)?;
-    dev.trace(&mut tr,"router_denominator",[1,t,1,1],&denoms)?;
-    dev.trace(&mut tr,"router_weights",[1,K,t,1],&rw)?;
-    tr.router_margins = dev.read(&margins)?;
-    let up = dev.experts(w,&mut tr,"ffn_up_exps","expert_up",&n,H,F,t,&ids,false,mode)?;
-    let gate = dev.experts(w,&mut tr,"ffn_gate_exps","expert_gate",&n,H,F,t,&ids,false,mode)?;
-    let sw = dev.point(&gate,&up,F,3);
-    dev.trace(&mut tr,"expert_swiglu",[F,K,t,1],&sw)?;
-    let scales = dev.empty(K*t);
-    unsafe { down_scale_kernel::launch_unchecked::<CudaRuntime>(&dev.client, CubeCount::new_1d(1), CubeDim::new_1d(32),
-        sw.arg(),scales.arg(),F as u32,(K*t) as u32); }
-    dev.trace(&mut tr,"expert_down_scale",[1,K,t,1],&scales)?;
-    let di = dev.point(&sw,&scales,F,4);
-    dev.trace(&mut tr,"expert_down_input",[F,K,t,1],&di)?;
-    let before = dev.experts(w,&mut tr,"ffn_down_exps","expert_down_before_rescale",&di,F,H,t,&ids,true,mode)?;
-    let down = dev.point(&before,&scales,H,1);
-    dev.trace(&mut tr,"expert_down",[H,K,t,1],&down)?;
-    let weighted = dev.point(&down,&rw,H,1);
-    dev.trace(&mut tr,"expert_weighted",[H,K,t,1],&weighted)?;
-    let moe = dev.empty(H*t);
-    unsafe { moe_sum_kernel::launch_unchecked::<CudaRuntime>(&dev.client,
-        CubeCount::new_1d(moe.len.div_ceil(256) as u32),CubeDim::new_1d(256),weighted.arg(),moe.arg(),moe.len as u32); }
-    dev.trace(&mut tr,"moe_out",[H,t,1,1],&moe)?;
-    let su = dev.dense(w,&mut tr,"ffn_up_shexp","shared_up",&n,H,SH,t,mode)?;
-    let sg = dev.dense(w,&mut tr,"ffn_gate_shexp","shared_gate",&n,H,SH,t,mode)?;
-    let ss = dev.point(&sg,&su,SH,3);
-    dev.trace(&mut tr,"shared_swiglu",[SH,t,1,1],&ss)?;
-    let sd = dev.dense(w,&mut tr,"ffn_down_shexp","shared_down",&ss,SH,H,t,mode)?;
-    let ffn = dev.point(&moe,&sd,H,0);
+    let ffn = if let FfnKind::Dense { width } = config.ffn {
+        dev.dense_ffn(w,&mut tr,&n,H,width,t,mode)?
+    } else {
+        let router = dev.upload(&w.get("ffn_gate_inp.weight",&[H,E],30,None)?);
+        let logits = dev.empty(E*t);
+        dev.matvec(&n,&router,&logits,H,E,t,0,0);
+        let prob = dev.point(&logits,&logits,E,2);
+        dev.trace(&mut tr,"router_logits",[E,t,1,1],&logits)?;
+        dev.trace(&mut tr,"router_probs",[E,t,1,1],&prob)?;
+        let ids_gpu = dev.empty(K*t);
+        let selected = dev.empty(K*t);
+        let sums = dev.empty(t);
+        let denoms = dev.empty(t);
+        let rw = dev.empty(K*t);
+        let margins = dev.empty(t);
+        unsafe { route_kernel::launch_unchecked::<CudaRuntime>(&dev.client, CubeCount::new_1d(1), CubeDim::new_1d(32),
+            prob.arg(),ids_gpu.arg(),selected.arg(),sums.arg(),denoms.arg(),rw.arg(),margins.arg(),t as u32); }
+        let ids = dev.read_ids(&ids_gpu)?;
+        tr.stages.push(Stage { name: "router_ids".into(), dims: [K,t,1,1], values: Values::I32(ids.clone()) });
+        dev.trace(&mut tr,"router_selected_probs",[1,K,t,1],&selected)?;
+        dev.trace(&mut tr,"router_sum",[1,t,1,1],&sums)?;
+        dev.trace(&mut tr,"router_denominator",[1,t,1,1],&denoms)?;
+        dev.trace(&mut tr,"router_weights",[1,K,t,1],&rw)?;
+        tr.router_margins = dev.read(&margins)?;
+        let up = dev.experts(w,&mut tr,"ffn_up_exps","expert_up",&n,H,F,t,&ids,false,mode)?;
+        let gate = dev.experts(w,&mut tr,"ffn_gate_exps","expert_gate",&n,H,F,t,&ids,false,mode)?;
+        let sw = dev.point(&gate,&up,F,3);
+        dev.trace(&mut tr,"expert_swiglu",[F,K,t,1],&sw)?;
+        let scales = dev.empty(K*t);
+        unsafe { down_scale_kernel::launch_unchecked::<CudaRuntime>(&dev.client, CubeCount::new_1d(1), CubeDim::new_1d(32),
+            sw.arg(),scales.arg(),F as u32,(K*t) as u32); }
+        dev.trace(&mut tr,"expert_down_scale",[1,K,t,1],&scales)?;
+        let di = dev.point(&sw,&scales,F,4);
+        dev.trace(&mut tr,"expert_down_input",[F,K,t,1],&di)?;
+        let before = dev.experts(w,&mut tr,"ffn_down_exps","expert_down_before_rescale",&di,F,H,t,&ids,true,mode)?;
+        let down = dev.point(&before,&scales,H,1);
+        dev.trace(&mut tr,"expert_down",[H,K,t,1],&down)?;
+        let weighted = dev.point(&down,&rw,H,1);
+        dev.trace(&mut tr,"expert_weighted",[H,K,t,1],&weighted)?;
+        let moe = dev.empty(H*t);
+        unsafe { moe_sum_kernel::launch_unchecked::<CudaRuntime>(&dev.client,
+            CubeCount::new_1d(moe.len.div_ceil(256) as u32),CubeDim::new_1d(256),weighted.arg(),moe.arg(),moe.len as u32); }
+        dev.trace(&mut tr,"moe_out",[H,t,1,1],&moe)?;
+        let su = dev.dense(w,&mut tr,"ffn_up_shexp","shared_up",&n,H,SH,t,mode)?;
+        let sg = dev.dense(w,&mut tr,"ffn_gate_shexp","shared_gate",&n,H,SH,t,mode)?;
+        let ss = dev.point(&sg,&su,SH,3);
+        dev.trace(&mut tr,"shared_swiglu",[SH,t,1,1],&ss)?;
+        let sd = dev.dense(w,&mut tr,"ffn_down_shexp","shared_down",&ss,SH,H,t,mode)?;
+        dev.point(&moe,&sd,H,0)
+    };
     dev.trace(&mut tr,"ffn_out",[H,t,1,1],&ffn)?;
     let out = dev.point(&ffn,&residual,H,0);
     dev.trace(&mut tr,"l_out",[H,t,1,1],&out)?;

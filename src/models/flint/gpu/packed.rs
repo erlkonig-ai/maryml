@@ -174,6 +174,10 @@ mod tests {
     #[test]
     fn packed_geometry_rejects_invalid_before_launch() {
         assert_eq!(packed_bytes(2048, 512).unwrap(), 589824);
+        assert_eq!(packed_bytes(6144, 2048).unwrap(), 7077888);
+        assert!(launch_geometry(6144, 9, 31104, 3, 24576, 45, 6144, 9).is_ok());
+        assert!(launch_geometry(6144, 9, 31103, 3, 24576, 45, 6144, 9).is_err());
+        assert!(launch_geometry(6144, 9, 31104, 3, 24575, 45, 6144, 9).is_err());
         assert!(packed_bytes(63, 1).is_err());
         assert!(packed_bytes(0, 1).is_err());
         assert!(packed_bytes(64, 0).is_err());
@@ -223,7 +227,7 @@ mod tests {
     #[ignore = "requires an exclusive GB10 GPU reservation"]
     fn cuda_nvfp4_matvec_exact_t1_t3() -> Result<()> {
         let dev = Device::new();
-        for ni in [64, 128, 192, 512, 1024, 2048, 4096] { for t in [1, 3] {
+        for ni in [64, 128, 192, 512, 1024, 2048, 4096, 6144] { for t in [1, 3] {
             let no = 9;
             let mut raw = Vec::new();
             for row in 0..no { for block in 0..ni / 64 {

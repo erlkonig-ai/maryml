@@ -5,7 +5,7 @@
 
 use anyhow::{Result, ensure};
 use super::weights::Weights;
-use super::config::BlockConfig;
+use super::config::{BlockConfig, FfnKind};
 
 pub const H: usize = 2048;
 const D: usize = 128;
@@ -60,6 +60,19 @@ fn dense(w: &mut impl Weights, tr: &mut Trace, suffix: &str, label: &str,
     let out: Vec<f32> = raw.iter().map(|&v| v * scale).collect();
     tr.f(label, [no,t,1,1], &out);
     Ok(out)
+}
+
+fn dense_ffn(w: &mut impl Weights, tr: &mut Trace, n: &[f32], hidden: usize,
+    width: usize, t: usize) -> Result<Vec<f32>> {
+    let up = dense(w,tr,"ffn_up","dense_up",n,hidden,width,t)?;
+    let gate = dense(w,tr,"ffn_gate","dense_gate",n,hidden,width,t)?;
+    // Pinned Flint loader initializes ordinary-FFN clamp to zero. Parallel
+    // gating consumes the same normalized residual, with post-matmul scales.
+    let sw = swiglu(&gate,&up);
+    tr.f("dense_swiglu",[width,t,1,1],&sw);
+    // Unlike routed expert down, there is no adaptive input normalization.
+    tr.f("dense_down_input",[width,t,1,1],&sw);
+    dense(w,tr,"ffn_down","dense_down",&sw,width,hidden,t)
 }
 
 fn rope(x: &[f32], heads: usize, positions: &[i32]) -> Vec<f32> {
@@ -151,38 +164,43 @@ pub fn block(w: &mut impl Weights, input: &[f32], positions: &[i32], config: Blo
     let residual = add(input,&ao); tr.f("ffn_inp",[H,t,1,1],&residual);
     let n = norm(&residual,&w.get("ffn_norm.weight",&[H],0,None)?);
     tr.f("ffn_norm",[H,t,1,1],&n);
-    let router = w.get("ffn_gate_inp.weight",&[H,E],30,None)?;
-    let logits: Vec<f32> = n.chunks_exact(H).flat_map(|row|matvec(&router,row,H)).collect();
-    let prob: Vec<f32> = logits.iter().map(|&v|sigmoid(v)).collect();
-    tr.f("router_logits",[E,t,1,1],&logits); tr.f("router_probs",[E,t,1,1],&prob);
-    let mut ids = Vec::new(); let mut rw = Vec::new(); let mut sums = Vec::new(); let mut selected = Vec::new();
-    for row in prob.chunks_exact(E) {
-        let (ii,ww,sum,margin) = route(row);
-        selected.extend(ii.iter().map(|&i|row[i])); ids.extend(ii.iter().map(|&i|i as i32)); rw.extend(ww); sums.push(sum); tr.router_margins.push(margin);
-    }
-    tr.i("router_ids",[K,t,1,1],&ids); tr.f("router_selected_probs",[1,K,t,1],&selected);
-    tr.f("router_sum",[1,t,1,1],&sums); tr.f("router_denominator",[1,t,1,1],&sums.iter().map(|&s|s.max(6.103515625e-5)).collect::<Vec<_>>());
-    tr.f("router_weights",[1,K,t,1],&rw);
-    let up = experts(w,&mut tr,"ffn_up_exps","expert_up",&n,H,F,t,&ids,false)?;
-    let gate = experts(w,&mut tr,"ffn_gate_exps","expert_gate",&n,H,F,t,&ids,false)?;
-    let sw = swiglu(&gate,&up); tr.f("expert_swiglu",[F,K,t,1],&sw);
-    let scales: Vec<f32> = sw.chunks_exact(F).map(down_scale).collect();
-    let di: Vec<f32> = sw.chunks_exact(F).zip(&scales).flat_map(|(row,&s)|row.iter().map(move |&x|x/s)).collect();
-    tr.f("expert_down_scale",[1,K,t,1],&scales); tr.f("expert_down_input",[F,K,t,1],&di);
-    let before = experts(w,&mut tr,"ffn_down_exps","expert_down_before_rescale",&di,F,H,t,&ids,true)?;
-    let down: Vec<f32> = before.chunks_exact(H).zip(&scales).flat_map(|(row,&s)|row.iter().map(move |&x|x*s)).collect();
-    tr.f("expert_down",[H,K,t,1],&down);
-    let weighted: Vec<f32> = down.chunks_exact(H).zip(&rw).flat_map(|(row,&s)|row.iter().map(move |&x|x*s)).collect();
-    tr.f("expert_weighted",[H,K,t,1],&weighted);
-    let mut moe = vec![0.0;H*t];
-    for token in 0..t { for d in 0..H { let mut sum = weighted[token*K*H+d]; for slot in 1..K { sum += weighted[(token*K+slot)*H+d]; } moe[token*H+d] = sum; }}
-    tr.f("moe_out",[H,t,1,1],&moe);
-    let su = dense(w,&mut tr,"ffn_up_shexp","shared_up",&n,H,SH,t)?;
-    let sg = dense(w,&mut tr,"ffn_gate_shexp","shared_gate",&n,H,SH,t)?;
-    let ss = swiglu(&sg,&su); tr.f("shared_swiglu",[SH,t,1,1],&ss);
-    let sd = dense(w,&mut tr,"ffn_down_shexp","shared_down",&ss,SH,H,t)?;
-    // Shared expert is ungated and outside routed-top-six normalization.
-    let ffn = add(&moe,&sd); tr.f("ffn_out",[H,t,1,1],&ffn);
+    let ffn = if let FfnKind::Dense { width } = config.ffn {
+        dense_ffn(w,&mut tr,&n,H,width,t)?
+    } else {
+        let router = w.get("ffn_gate_inp.weight",&[H,E],30,None)?;
+        let logits: Vec<f32> = n.chunks_exact(H).flat_map(|row|matvec(&router,row,H)).collect();
+        let prob: Vec<f32> = logits.iter().map(|&v|sigmoid(v)).collect();
+        tr.f("router_logits",[E,t,1,1],&logits); tr.f("router_probs",[E,t,1,1],&prob);
+        let mut ids = Vec::new(); let mut rw = Vec::new(); let mut sums = Vec::new(); let mut selected = Vec::new();
+        for row in prob.chunks_exact(E) {
+            let (ii,ww,sum,margin) = route(row);
+            selected.extend(ii.iter().map(|&i|row[i])); ids.extend(ii.iter().map(|&i|i as i32)); rw.extend(ww); sums.push(sum); tr.router_margins.push(margin);
+        }
+        tr.i("router_ids",[K,t,1,1],&ids); tr.f("router_selected_probs",[1,K,t,1],&selected);
+        tr.f("router_sum",[1,t,1,1],&sums); tr.f("router_denominator",[1,t,1,1],&sums.iter().map(|&s|s.max(6.103515625e-5)).collect::<Vec<_>>());
+        tr.f("router_weights",[1,K,t,1],&rw);
+        let up = experts(w,&mut tr,"ffn_up_exps","expert_up",&n,H,F,t,&ids,false)?;
+        let gate = experts(w,&mut tr,"ffn_gate_exps","expert_gate",&n,H,F,t,&ids,false)?;
+        let sw = swiglu(&gate,&up); tr.f("expert_swiglu",[F,K,t,1],&sw);
+        let scales: Vec<f32> = sw.chunks_exact(F).map(down_scale).collect();
+        let di: Vec<f32> = sw.chunks_exact(F).zip(&scales).flat_map(|(row,&s)|row.iter().map(move |&x|x/s)).collect();
+        tr.f("expert_down_scale",[1,K,t,1],&scales); tr.f("expert_down_input",[F,K,t,1],&di);
+        let before = experts(w,&mut tr,"ffn_down_exps","expert_down_before_rescale",&di,F,H,t,&ids,true)?;
+        let down: Vec<f32> = before.chunks_exact(H).zip(&scales).flat_map(|(row,&s)|row.iter().map(move |&x|x*s)).collect();
+        tr.f("expert_down",[H,K,t,1],&down);
+        let weighted: Vec<f32> = down.chunks_exact(H).zip(&rw).flat_map(|(row,&s)|row.iter().map(move |&x|x*s)).collect();
+        tr.f("expert_weighted",[H,K,t,1],&weighted);
+        let mut moe = vec![0.0;H*t];
+        for token in 0..t { for d in 0..H { let mut sum = weighted[token*K*H+d]; for slot in 1..K { sum += weighted[(token*K+slot)*H+d]; } moe[token*H+d] = sum; }}
+        tr.f("moe_out",[H,t,1,1],&moe);
+        let su = dense(w,&mut tr,"ffn_up_shexp","shared_up",&n,H,SH,t)?;
+        let sg = dense(w,&mut tr,"ffn_gate_shexp","shared_gate",&n,H,SH,t)?;
+        let ss = swiglu(&sg,&su); tr.f("shared_swiglu",[SH,t,1,1],&ss);
+        let sd = dense(w,&mut tr,"ffn_down_shexp","shared_down",&ss,SH,H,t)?;
+        // Shared expert is ungated and outside routed-top-six normalization.
+        add(&moe,&sd)
+    };
+    tr.f("ffn_out",[H,t,1,1],&ffn);
     tr.f("l_out",[H,t,1,1],&add(&ffn,&residual));
     Ok(tr)
 }
@@ -207,6 +225,48 @@ fn experts(w: &mut impl Weights, tr: &mut Trace, suffix: &str, label: &str,
 #[cfg(test)]
 mod tests {
     use super::*;
+    struct DenseOnly { reads: Vec<String>, down_scale: f32 }
+    impl Weights for DenseOnly {
+        fn get(&mut self, name: &str, dims: &[usize], ty: u32, expert: Option<usize>) -> Result<Vec<f32>> {
+            assert!(expert.is_none(), "dense FFN must not load experts");
+            self.reads.push(name.into());
+            let (shape, kind, values) = match name {
+                "ffn_up.weight" => (vec![2,3],40,vec![1.0,0.0,0.0,1.0,1.0,-1.0]),
+                "ffn_gate.weight" => (vec![2,3],40,vec![2.0,-1.0,1.0,2.0,-1.0,-2.0]),
+                "ffn_down.weight" => (vec![3,2],40,vec![1.0,0.0,-1.0,0.0,1.0,1.0]),
+                "ffn_up.scale" => (vec![1],0,vec![-0.5]),
+                "ffn_gate.scale" => (vec![1],0,vec![0.75]),
+                "ffn_down.scale" => (vec![1],0,vec![self.down_scale]),
+                _ => panic!("unexpected dense request {name}"),
+            };
+            assert_eq!(dims,shape); assert_eq!(ty,kind); Ok(values)
+        }
+        fn get_nvfp4(&mut self,_:&str,_:&[usize],_:Option<usize>)->Result<Vec<u8>> { panic!("CPU math uses decoded weights") }
+    }
+    #[test] fn dense_parallel_branch_scales_and_no_moe() -> Result<()> {
+        for t in [1,3] {
+            let x: Vec<f32> = (0..t).flat_map(|token|[2.0+token as f32,-4.0+token as f32]).collect();
+            let mut w = DenseOnly {reads:Vec::new(),down_scale:-1.25};
+            let mut tr = Trace::default();
+            let out = dense_ffn(&mut w,&mut tr,&x,2,3,t)?;
+            let mut expected = Vec::new();
+            for row in x.chunks_exact(2) {
+                let u = [-0.5*row[0],-0.5*row[1],-0.5*(row[0]-row[1])];
+                let g = [0.75*(2.0*row[0]-row[1]),0.75*(row[0]+2.0*row[1]),0.75*(-row[0]-2.0*row[1])];
+                let z: Vec<f32> = g.iter().zip(u).map(|(&g,u)|(g*(1.0/(1.0+(-g).exp())))*u).collect();
+                expected.extend([(z[0]-z[2])*-1.25,(z[1]+z[2])*-1.25]);
+            }
+            assert_eq!(out,expected);
+            let get = |name: &str| match &tr.stages.iter().find(|s|s.name==name).unwrap().values {
+                Values::F32(v) => v.clone(), _ => unreachable!(),
+            };
+            assert_eq!(get("dense_down_input"),get("dense_swiglu"));
+            assert_eq!(tr.stages.len(),8);
+            assert_eq!(w.reads,["ffn_up.weight","ffn_up.scale","ffn_gate.weight","ffn_gate.scale","ffn_down.weight","ffn_down.scale"]);
+            w.down_scale=0.0;
+            assert!(dense_ffn(&mut w,&mut Trace::default(),&x,2,3,t)?.iter().all(|&v|v==0.0));
+        }
+        Ok(())
     #[test] fn norm_rope_and_swiglu() {
         assert_eq!(norm(&[0.0;4],&[1.0;4]),[0.0;4]);
         let x: Vec<f32> = (0..D).map(|i|i as f32).collect();

@@ -1,4 +1,4 @@
-// Independent CPU F32/math reference for isolated Flint blocks 2/5; no quantized runtime parity.
+// Independent CPU F32/math reference for isolated Flint blocks 0/2/5; no quantized runtime parity.
 // Successor of retained layer2-reference.cpp (a3b3d5ad...); sparse expert selection
 // is computed by GGML, then mapped explicitly from global IDs to local slices.
 // Graph follows llama.cpp 1ddffe9f70a63e2d260d4bfad9ad200009007f62:
@@ -120,7 +120,7 @@ struct Weights {
     Weights(const std::string &path, int block_id, const fs::path &out) : block(block_id) {
         struct stat st;
         require(stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode), "model is not regular");
-        require(block == 2 || block == 5, "only block 2/5");
+        require(block == 0 || block == 2 || block == 5, "only block 0/2/5");
         require(st.st_size == 22863084160ll && st.st_dev == 66306 && st.st_ino == 32399645
             && st.st_mtim.tv_sec == 1792849073 && st.st_mtim.tv_nsec == 87120678, "model identity changed");
         identity = st;
@@ -134,7 +134,7 @@ struct Weights {
         };
         require(std::string(gguf_get_val_str(header,key("general.architecture",GGUF_TYPE_STRING))) == "flint","architecture differs");
         for(const auto &[name,value] : std::vector<std::pair<std::string,uint32_t>>{
-            {"block_count",49},{"context_length",262144},{"embedding_length",2048},
+            {"block_count",49},{"context_length",262144},{"embedding_length",2048},{"feed_forward_length",6144},
             {"attention.head_count",32},{"attention.head_count_kv",4},
             {"attention.key_length",128},{"attention.value_length",128},
             {"leading_dense_block_count",2},{"expert_count",256},{"expert_used_count",6},
@@ -263,13 +263,19 @@ struct Weights {
         for (const auto &s : {"attn_norm.weight", "ffn_norm.weight"}) load(s,{2048,1,1,1},GGML_TYPE_F32);
         for (const auto &s : {"attn_q_norm.weight", "attn_k_norm.weight"}) load(s,{128,1,1,1},GGML_TYPE_F32);
         load("attn_sinks.weight",{32,1,1,1},GGML_TYPE_F32);
-        load("ffn_gate_inp.weight",{2048,256,1,1},GGML_TYPE_BF16);
-        const std::vector<std::pair<std::string,std::array<int64_t,4>>> mats = {
+        std::vector<std::pair<std::string,std::array<int64_t,4>>> mats = {
             {"attn_q",{2048,4096,1,1}}, {"attn_k",{2048,512,1,1}},
-            {"attn_v",{2048,512,1,1}}, {"attn_output",{4096,2048,1,1}},
+            {"attn_v",{2048,512,1,1}}, {"attn_output",{4096,2048,1,1}}};
+        if(block==0) {
+            mats.insert(mats.end(), {{"ffn_gate",{2048,6144,1,1}},
+                {"ffn_up",{2048,6144,1,1}}, {"ffn_down",{6144,2048,1,1}}});
+        } else {
+            load("ffn_gate_inp.weight",{2048,256,1,1},GGML_TYPE_BF16);
+            mats.insert(mats.end(), {
             {"ffn_gate_shexp",{2048,1024,1,1}}, {"ffn_up_shexp",{2048,1024,1,1}},
             {"ffn_down_shexp",{1024,2048,1,1}}, {"ffn_gate_exps",{2048,512,256,1}},
-            {"ffn_up_exps",{2048,512,256,1}}, {"ffn_down_exps",{512,2048,256,1}}};
+            {"ffn_up_exps",{2048,512,256,1}}, {"ffn_down_exps",{512,2048,256,1}}});
+        }
         for (const auto &[name,shape] : mats) {
             if(shape[2] == 1) load(name+".weight",shape,GGML_TYPE_NVFP4);
             load(name+".scale",{shape[2],1,1,1},GGML_TYPE_F32);
@@ -343,44 +349,57 @@ static void block(Weights &w, const fs::path &out, const std::vector<float> &val
     auto *attn=mm(g,w,"attn_output",joined,"attention_output");
     auto *r=g.mark("ffn_inp",ggml_add(g.ctx,attn,x));
     auto *n=norm(g,r,w.at("ffn_norm.weight"),"ffn_norm");
-    auto *logits=g.mark("router_logits",ggml_mul_mat(g.ctx,w.at("ffn_gate_inp.weight"),n));
-    ggml_prec_set_acc(logits,GGML_PREC_F32);
-    auto *ids=route(g,logits,T);
-    g.run(); // GGML computes routing before any selected expert payload read.
-    const auto selected_global=w.load_selected(ids,T);
-    auto *local_ids=ggml_new_tensor_2d(g.ctx,GGML_TYPE_I32,6,T);
-    memcpy(local_ids->data,w.local_selection.data(),6*T*4);
-    auto *in3=ggml_reshape_3d(g.ctx,n,2048,1,T);
-    auto *up=expert_mm(g,w,"ffn_up_exps",in3,ids,local_ids,T,"expert_up");
-    auto *gate=expert_mm(g,w,"ffn_gate_exps",in3,ids,local_ids,T,"expert_gate");
-    auto *act=g.mark("expert_swiglu",ggml_swiglu_split(g.ctx,gate,up));
-    auto *amax=ggml_pool_1d(g.ctx,ggml_abs(g.ctx,act),GGML_OP_POOL_MAX,512,512,0);
-    auto *e=ggml_scale(g.ctx,amax,1.0f/1024.0f);
-    e=ggml_scale(g.ctx,ggml_log(g.ctx,e),1.4426950408889634f);
-    e=ggml_clamp(g.ctx,ggml_ceil(g.ctx,e),0.0f,127.0f);
-    e=g.mark("expert_down_scale",ggml_exp(g.ctx,ggml_scale(g.ctx,e,0.6931471805599453f)));
-    auto *down_in=g.mark("expert_down_input",ggml_div(g.ctx,act,e));
-    auto *down=expert_mm(g,w,"ffn_down_exps",down_in,ids,local_ids,T,"expert_down_before_rescale");
-    down=g.mark("expert_down",ggml_mul(g.ctx,down,e));
-    auto *weighted=g.mark("expert_weighted",ggml_mul(g.ctx,down,named(g,"router_weights")));
-    auto *moe=ggml_view_2d(g.ctx,weighted,2048,T,weighted->nb[2],0);
-    for (int slot=1;slot<6;++slot)
-        moe=ggml_add(g.ctx,moe,ggml_view_2d(g.ctx,weighted,2048,T,weighted->nb[2],slot*weighted->nb[1]));
-    g.mark("moe_out",moe);
-    auto *su=mm(g,w,"ffn_up_shexp",n,"shared_up");
-    auto *sg=mm(g,w,"ffn_gate_shexp",n,"shared_gate");
-    auto *sa=g.mark("shared_swiglu",ggml_swiglu_split(g.ctx,sg,su));
-    auto *sd=mm(g,w,"ffn_down_shexp",sa,"shared_down");
-    auto *ff=g.mark("ffn_out",ggml_add(g.ctx,moe,sd));
+    Tensor *logits=nullptr, *ids=nullptr, *ff=nullptr;
+    std::vector<int32_t> selected_global;
+    if(w.block==0) {
+        auto *up=mm(g,w,"ffn_up",n,"dense_up");
+        auto *gate=mm(g,w,"ffn_gate",n,"dense_gate");
+        // Common loader initializes swiglu_clamp_shexp=0 before Flint's loader,
+        // which does not override it (1ddffe9 llama-model.cpp:1471/1567).
+        auto *act=g.mark("dense_swiglu",ggml_swiglu_split(g.ctx,gate,up));
+        auto *di=g.mark("dense_down_input",act); // no MoE adaptive normalization
+        auto *down=mm(g,w,"ffn_down",di,"dense_down");
+        ff=g.mark("ffn_out",down);
+    } else {
+        logits=g.mark("router_logits",ggml_mul_mat(g.ctx,w.at("ffn_gate_inp.weight"),n));
+        ggml_prec_set_acc(logits,GGML_PREC_F32);
+        ids=route(g,logits,T);
+        g.run(); // GGML computes routing before any selected expert payload read.
+        selected_global=w.load_selected(ids,T);
+        auto *local_ids=ggml_new_tensor_2d(g.ctx,GGML_TYPE_I32,6,T);
+        memcpy(local_ids->data,w.local_selection.data(),6*T*4);
+        auto *in3=ggml_reshape_3d(g.ctx,n,2048,1,T);
+        auto *up=expert_mm(g,w,"ffn_up_exps",in3,ids,local_ids,T,"expert_up");
+        auto *gate=expert_mm(g,w,"ffn_gate_exps",in3,ids,local_ids,T,"expert_gate");
+        auto *act=g.mark("expert_swiglu",ggml_swiglu_split(g.ctx,gate,up));
+        auto *amax=ggml_pool_1d(g.ctx,ggml_abs(g.ctx,act),GGML_OP_POOL_MAX,512,512,0);
+        auto *e=ggml_scale(g.ctx,amax,1.0f/1024.0f);
+        e=ggml_scale(g.ctx,ggml_log(g.ctx,e),1.4426950408889634f);
+        e=ggml_clamp(g.ctx,ggml_ceil(g.ctx,e),0.0f,127.0f);
+        e=g.mark("expert_down_scale",ggml_exp(g.ctx,ggml_scale(g.ctx,e,0.6931471805599453f)));
+        auto *down_in=g.mark("expert_down_input",ggml_div(g.ctx,act,e));
+        auto *down=expert_mm(g,w,"ffn_down_exps",down_in,ids,local_ids,T,"expert_down_before_rescale");
+        down=g.mark("expert_down",ggml_mul(g.ctx,down,e));
+        auto *weighted=g.mark("expert_weighted",ggml_mul(g.ctx,down,named(g,"router_weights")));
+        auto *moe=ggml_view_2d(g.ctx,weighted,2048,T,weighted->nb[2],0);
+        for (int slot=1;slot<6;++slot)
+            moe=ggml_add(g.ctx,moe,ggml_view_2d(g.ctx,weighted,2048,T,weighted->nb[2],slot*weighted->nb[1]));
+        g.mark("moe_out",moe);
+        auto *su=mm(g,w,"ffn_up_shexp",n,"shared_up");
+        auto *sg=mm(g,w,"ffn_gate_shexp",n,"shared_gate");
+        auto *sa=g.mark("shared_swiglu",ggml_swiglu_split(g.ctx,sg,su));
+        auto *sd=mm(g,w,"ffn_down_shexp",sa,"shared_down");
+        ff=g.mark("ffn_out",ggml_add(g.ctx,moe,sd));
+    }
     g.mark("l_out",ggml_add(g.ctx,ff,r));
     g.run(); g.dump(out);
     w.check_identity();
-    for(int t=0;t<T;++t) for(int slot=0;slot<6;++slot)
+    if(ids) for(int t=0;t<T;++t) for(int slot=0;slot<6;++slot)
         require(static_cast<int32_t *>(ids->data)[t*ids->nb[1]/4+slot]==selected_global[t*6+slot],"GGML routing changed after sparse load");
     // Negative controls are attention-only GGML graphs, not new block or model runs.
-    // They use actual block-5 Q/K/V and demonstrate the gapped fixture's sensitivity.
-    if(w.block==5 && T==3) {
-        require(positions==std::vector<int32_t>({0,512,513}),"block5 T3 control requires gapped positions");
+    // They use actual full-attention Q/K/V and demonstrate gapped-fixture sensitivity.
+    if((w.block==0 || w.block==5) && T==3) {
+        require(positions==std::vector<int32_t>({0,512,513}),"full-attention T3 control requires gapped positions");
         auto changed = [](Tensor *a, Tensor *b) {
             require(ggml_nelements(a)==ggml_nelements(b),"control shape mismatch");
             size_t count=0;
@@ -422,6 +441,7 @@ static void block(Weights &w, const fs::path &out, const std::vector<float> &val
         require(static_cast<float *>(mask_t->data)[6]==0.0f && wrong_mask[6]==-INFINITY,"full/SWA distance513 control");
         control.close(); require(bool(control),"control receipt failed");
     }
+    if(ids) {
     const auto *id_data=static_cast<int32_t *>(ids->data);
     std::ofstream margins(out/"router-margins.tsv");
     margins << "token\tselected_ids\tprob6_minus_prob7\tlogit6_minus_logit7\n";
@@ -436,6 +456,33 @@ static void block(Weights &w, const fs::path &out, const std::vector<float> &val
                 << '\t' << double(l[t*256+order[5]])-l[t*256+order[6]] << '\n';
     }
     margins.close(); require(bool(margins),"margin receipt write failed");
+    }
+    if(w.block==0) {
+        // Independent GGML controls of the actual dense activation; no fabricated
+        // routed IDs/margins or compensated MoE normalization in this branch.
+        auto *up=named(g,"dense_up"), *gate=named(g,"dense_gate");
+        auto *sw=named(g,"dense_swiglu");
+        auto *swapped=ggml_swiglu_split(g.ctx,up,gate);
+        auto *wrong=ggml_swiglu_split(g.ctx,named(g,"dense_gate_unscaled"),up);
+        wrong=ggml_mul(g.ctx,wrong,w.at("ffn_gate.scale"));
+        auto *controls=ggml_new_graph_custom(g.ctx,4096,false);
+        ggml_build_forward_expand(controls,swapped); ggml_build_forward_expand(controls,wrong);
+        require(ggml_graph_compute_with_ctx(g.ctx,controls,4)==GGML_STATUS_SUCCESS,"dense controls failed");
+        std::ofstream control(out/"dense-negative-controls.tsv");
+        control << "deliberate_change\tbit_mismatches\n";
+        for(const auto &[label,tensor]:std::vector<std::pair<std::string,Tensor *>>{
+            {"swap_gate_up",swapped},{"gate_scale_after_silu",wrong}}) {
+            size_t count=0;
+            for(int64_t i=0;i<ggml_nelements(sw);++i) {
+                uint32_t a,b; memcpy(&a,static_cast<char *>(sw->data)+i*4,4);
+                memcpy(&b,static_cast<char *>(tensor->data)+i*4,4); count += a!=b;
+            }
+            require(count>0,"dense control lacks sensitivity: "+label);
+            control << label << '\t' << count << '\n';
+        }
+        control.close(); require(bool(control),"dense control receipt failed");
+        require(named(g,"dense_down_input")==sw,"dense down input must be unmodified activation");
+    }
     std::cout << "block T=" << T << " outputs=" << g.outputs.size() << " status=success dir=" << out << std::endl;
 }
 
