@@ -29,7 +29,7 @@ fn row_selection(dims: &[usize], expert: Option<usize>) -> Result<(u64, u64, usi
     Ok((u64::try_from(first)?, u64::try_from(rows)?, elements))
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct ReadReceipt {
     pub name: String,
     pub ggml_dims: Vec<u64>,
@@ -56,6 +56,26 @@ impl GgufWeights {
         let file = IndexedFile::open_with_metadata(path, METADATA_KEYS)?;
         let config = BlockConfig::from_metadata(&file.index.metadata, block)?;
         Ok(Self { file, reads: Vec::new(), config })
+    }
+    pub fn select_block(&mut self, block: usize) -> Result<()> {
+        self.config = BlockConfig::from_metadata(&self.file.index.metadata, block)?;
+        Ok(())
+    }
+    /// Checked global tensor rows. No prefix escape, whole-head read or changed
+    /// MAX_READ: the same IndexedFile row/overflow/stat checks apply.
+    pub fn global_rows(&mut self, name: &str, dims: &[usize], ty: u32,
+        first: usize, rows: usize) -> Result<Vec<u8>> {
+        ensure!(matches!(name,"token_embd.weight"|"output_norm.weight"|"output.weight"|"output.scale"),
+            "unsupported global tensor {name}");
+        let info = self.file.index.tensor(name)?.clone();
+        ensure!(info.dims == dims.iter().map(|&d|d as u64).collect::<Vec<_>>() && info.ggml_type == ty,
+            "unexpected global tensor shape/type: {name}");
+        let (start,raw) = self.file.read_rows(name,first.try_into()?,rows.try_into()?)?;
+        self.reads.push(ReadReceipt {name:name.into(),ggml_dims:info.dims,ggml_type:ty,expert:None,
+            first_row:first.try_into()?,rows:rows.try_into()?,absolute_start:start,
+            absolute_end:start.checked_add(raw.len().try_into()?).context("global receipt overflow")?,
+            raw_blake3:blake3::hash(&raw).to_hex().to_string()});
+        Ok(raw)
     }
     fn read_weight(&mut self, suffix: &str, dims: &[usize], ty: u32, expert: Option<usize>)
         -> Result<(Vec<u8>, usize, ReadReceipt)> {

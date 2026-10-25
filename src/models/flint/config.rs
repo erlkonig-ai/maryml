@@ -1,4 +1,4 @@
-//! Actual GGUF semantics for bounded dense/sparse block fixtures, not HF defaults.
+//! Actual GGUF semantics for the fixed-width, 49-block Flint diagnostic profile.
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use crate::formats::gguf::index::{MetadataEntry, MetadataValue};
@@ -13,6 +13,12 @@ pub const METADATA_KEYS: &[&str] = &[
     "flint.expert_shared_count", "flint.expert_weights_norm", "flint.expert_weights_scale",
     "flint.attention.sliding_window", "flint.attention.sliding_window_pattern",
     "flint.attention.rope_pattern",
+    // This F32 profile implements no Prism transforms. Selecting every pinned
+    // native key makes presence fail closed (including unsupported array types).
+    "prism.hadamard.version", "prism.hadamard.tied_output", "prism.hadamard.block_size",
+    "prism.hadamard.transform", "prism.hadamard.axis", "prism.hadamard.sign_mode",
+    "prism.hadamard.sign_widths", "prism.hadamard.sign_values", "prism.hadamard.weight_names",
+    "prism.hadamard.inverse_weight_names", "prism.hadamard.gdn_v_grouped",
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -30,7 +36,9 @@ impl BlockConfig {
 
     pub fn from_metadata(entries: &[MetadataEntry], block: usize) -> Result<Self> {
         use MetadataValue::*;
-        ensure!(matches!(block, 0 | 2 | 5), "only isolated blocks 0, 2 and 5 are implemented");
+        ensure!(block < 49, "block index outside the 49-block profile");
+        ensure!(!entries.iter().any(|e| e.key.starts_with("prism.hadamard.")),
+            "Prism Hadamard metadata is unsupported by this F32 profile");
         let get = |key: &str| -> Result<&MetadataValue> {
             let mut matching = entries.iter().filter(|e| e.key == key);
             let entry = matching.next().with_context(|| format!("missing Flint metadata {key}"))?;
@@ -60,7 +68,6 @@ impl BlockConfig {
         };
         let swa = pattern("flint.attention.sliding_window_pattern")?;
         let rope = pattern("flint.attention.rope_pattern")?;
-        ensure!(swa == (block == 2) && rope == (block == 2), "fixture attention semantics differ from actual GGUF");
         // Leading-dense count and dense width were checked above against bytes.
         // Clamp=0 is pinned loader behavior, not an absent-key assumption:
         // llama.cpp 1ddffe9 llama-model.cpp:1471, flint.cpp:3-18.
@@ -98,13 +105,18 @@ mod tests {
     }
 
     #[test]
-    fn actual_semantics_select_only_supported_isolated_blocks() {
+    fn metadata_selects_all_49_blocks_and_both_families() {
         let mut entries = fixture();
         entries.push(MetadataEntry { key: "unrelated.open.world".into(), gguf_type: 8, value: String("ignored".into()) });
         assert_eq!(BlockConfig::from_metadata(&entries,2).unwrap(),BlockConfig::LAYER2);
         assert_eq!(BlockConfig::from_metadata(&entries,5).unwrap(),BlockConfig {block:5,sliding_window:None,rope:false,ffn:FfnKind::Moe});
         assert_eq!(BlockConfig::from_metadata(&entries,0).unwrap(),BlockConfig {block:0,sliding_window:None,rope:false,ffn:FfnKind::Dense {width:6144}});
-        assert!(BlockConfig::from_metadata(&entries,1).is_err());
+        for block in 0..49 {
+            let config = BlockConfig::from_metadata(&entries,block).unwrap();
+            assert_eq!(config.ffn,if block<2 {FfnKind::Dense {width:6144}} else {FfnKind::Moe});
+            let local = ![0,1,5,9,13,17,21,25,29,33,37,41,45,48].contains(&block);
+            assert_eq!(config.rope,local); assert_eq!(config.sliding_window,local.then_some(513));
+        }
         assert!(BlockConfig::from_metadata(&entries,49).is_err());
     }
 
@@ -128,6 +140,8 @@ mod tests {
         let mut changed = entries;
         let BoolArray(flags) = &mut changed.last_mut().unwrap().value else { unreachable!() };
         flags[5] = true;
+        assert!(BlockConfig::from_metadata(&changed,5).unwrap().rope);
+        changed.push(MetadataEntry {key:"prism.hadamard.version".into(),gguf_type:4,value:U32(1)});
         assert!(BlockConfig::from_metadata(&changed,5).is_err());
     }
 }

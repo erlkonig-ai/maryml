@@ -936,6 +936,10 @@ required-features = ["import"]
 name = "flint_layer2_gate"
 required-features = ["import"]
 
+[[bin]]
+name = "flint_forward_gate"
+required-features = ["import"]
+
 [patch.crates-io]
 
 # Section freezes are immutable views, not durability barriers. Keep the same

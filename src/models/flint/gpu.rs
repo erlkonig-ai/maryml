@@ -1,4 +1,4 @@
-//! Bounded block-0/block-2/block-5 CUDA arithmetic through Mary's existing CubeCL runtime.
+//! Bounded shared Flint block CUDA arithmetic through Mary's existing CubeCL runtime.
 //!
 //! Weights are decoded from stored GGUF NVFP4 (36 bytes / 64 values), then
 //! uploaded as F32. Explicit packed-K/all modes decode only attn_k or all
@@ -13,7 +13,7 @@
 //! a diagnostic graph: every named stage is read back; selected IDs return to
 //! the host to choose bounded expert slices. It is not a GPU-resident runtime.
 //! Weight uploads are retired after each projection readback; no full bank is
-//! retained. There is no KV history or full-model loader.
+//! retained. The forward diagnostic composes these blocks; there is no KV history.
 //!
 //! Numerical tier, fixed before comparison: F32 input/weight/output and F32
 //! accumulation. Matvec uses 32 strided lanes per row and a five-step tree;
@@ -540,6 +540,35 @@ pub fn block(w: &mut impl Weights, input: &[f32], positions: &[i32], config: Blo
     let out = dev.point(&ffn,&residual,H,0);
     dev.trace(&mut tr,"l_out",[H,t,1,1],&out)?;
     Ok(tr)
+}
+
+/// Diagnostic final RMS plus a streamed output head. Every chunk is read back
+/// before its upload is dropped; this is deliberately not a no-fence runtime.
+pub struct OutputHead { dev: Device, normalized: Buffer, tokens: usize }
+impl OutputHead {
+    pub fn new(residual: &[f32], gain: &[f32]) -> Result<Self> {
+        ensure!(gain.len()==H && residual.len()%H==0 && (1..=3).contains(&(residual.len()/H)),
+            "invalid output RMS geometry");
+        ensure!(residual.iter().chain(gain).all(|v|v.is_finite()),"nonfinite output RMS input");
+        let dev=Device::new();
+        let normalized=dev.norm(&dev.upload(residual),gain);
+        Ok(Self {dev,normalized,tokens:residual.len()/H})
+    }
+    pub fn normalized(&self) -> Result<Vec<f32>> { self.dev.read(&self.normalized) }
+    pub fn chunk(&self, raw: &[u8], rows: usize, scale: f32, mode: ProjectionMode) -> Result<Vec<f32>> {
+        ensure!((1..=8192).contains(&rows) && raw.len()==rows*(H/64)*36 && scale.is_finite(),
+            "invalid bounded output chunk");
+        let storage = if matches!(mode,ProjectionMode::PackedAll) {
+            ProjectionStorage::Packed(self.dev.upload_nvfp4(raw,H,rows)?)
+        } else {
+            let values=crate::formats::gguf::nvfp4::decode(raw,H*rows)?;
+            ProjectionStorage::Decoded(self.dev.upload(&values))
+        };
+        let weight=Projection {ni:H,no:rows,storage};
+        let out=self.dev.empty(rows*self.tokens);
+        self.dev.project(&weight,&self.normalized,&out,self.tokens,0,0)?;
+        self.dev.read(&self.dev.point(&out,&self.dev.upload(&[scale]),out.len,1))
+    }
 }
 
 #[cfg(test)]

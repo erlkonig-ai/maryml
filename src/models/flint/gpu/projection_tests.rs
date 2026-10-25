@@ -159,3 +159,33 @@ fn cuda_dense_parallel_swiglu_controls() -> Result<()> {
     println!("dense controls: swapped gate/up and moving gate scale after SiLU differ; zero contribution preserves residual; activation exceeds1024");
     Ok(())
 }
+
+#[test]
+#[ignore = "requires an exclusive GB10 GPU reservation"]
+fn cuda_output_head_real_chunk_shapes_t1_t3() -> Result<()> {
+    for t in [1,3] {
+        let mut residual=vec![0.0;H*t];
+        for token in 0..t { residual[token*H+17+token]=if token==1 {-1.0} else {1.0}; }
+        let head=OutputHead::new(&residual,&vec![1.0;H])?;
+        let normalized=head.normalized()?;
+        for rows in [8192,2688] {
+            let raw=raw_matrix(H,rows,17);
+            let decoded=nvfp4::decode(&raw,H*rows)?;
+            let scale=-0.5;
+            // One nonzero input per token makes each dot a single product:
+            // an independent exact indexing/postscale check, not a tolerance.
+            let expected:Vec<f32>=(0..t).flat_map(|token| {
+                let decoded=&decoded; let normalized=&normalized;
+                (0..rows).map(move |row|decoded[row*H+17+token]*normalized[token*H+17+token]*scale)
+            }).collect();
+            for mode in [ProjectionMode::Decoded,ProjectionMode::PackedAll] {
+                exact(&head.chunk(&raw,rows,scale,mode)?,&expected);
+            }
+            assert!(head.chunk(&raw[..raw.len()-1],rows,scale,ProjectionMode::PackedAll).is_err());
+            assert!(head.chunk(&raw,rows,f32::NAN,ProjectionMode::PackedAll).is_err());
+        }
+        assert!(head.chunk(&[],8193,1.0,ProjectionMode::PackedAll).is_err());
+        println!("head T={t}: 8192/2688 row chunks, token addressing and negative postscale checked");
+    }
+    Ok(())
+}

@@ -1,4 +1,4 @@
-// Independent CPU F32/math reference for isolated Flint blocks 0/2/5; no quantized runtime parity.
+// Independent CPU F32/math reference for shared Flint blocks and whole49; no quantized runtime parity.
 // Successor of retained layer2-reference.cpp (a3b3d5ad...); sparse expert selection
 // is computed by GGML, then mapped explicitly from global IDs to local slices.
 // Graph follows llama.cpp 1ddffe9f70a63e2d260d4bfad9ad200009007f62:
@@ -72,11 +72,12 @@ struct Graph {
         const auto rc = ggml_graph_compute_with_ctx(ctx, gf, 4);
         require(rc == GGML_STATUS_SUCCESS, "GGML compute failed: " + std::to_string(rc));
     }
-    void dump(const fs::path &out) {
+    void dump(const fs::path &out, bool compact=false) {
         require(fs::create_directory(out), "output directory already exists");
         std::ofstream index(out / "tensors.tsv");
         index << "name\ttype\tne0\tne1\tne2\tne3\tbytes\tsha256\tmin\tmax\trms\n";
         for (auto &[name, t] : outputs) {
+            if(compact && name!="l_out" && name!="router_ids" && name!="router_probs") continue;
             require(t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_I32, "unsupported readback type");
             std::vector<unsigned char> bytes(ggml_nelements(t)*4);
             size_t dst = 0;
@@ -120,13 +121,16 @@ struct Weights {
     Weights(const std::string &path, int block_id, const fs::path &out) : block(block_id) {
         struct stat st;
         require(stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode), "model is not regular");
-        require(block == 0 || block == 2 || block == 5, "only block 0/2/5");
+        require(block >= 0 && block < 49, "block outside49");
         require(st.st_size == 22863084160ll && st.st_dev == 66306 && st.st_ino == 32399645
             && st.st_mtim.tv_sec == 1792849073 && st.st_mtim.tv_nsec == 87120678, "model identity changed");
         identity = st;
         header = gguf_init_from_file(path.c_str(), {true, nullptr});
         require(header, "GGUF index failed");
         require(gguf_get_data_offset(header) == 5512960 && gguf_get_n_tensors(header) == 1264, "header identity changed");
+        for(int64_t id=0;id<gguf_get_n_kv(header);++id)
+            require(std::string(gguf_get_key(header,id)).find("prism.hadamard.")!=0,"unsupported Prism metadata");
+        require(gguf_find_tensor(header,"output.input_scale")<0,"unsupported output input scale");
         auto key = [&](const std::string &name, gguf_type type) {
             const auto id = gguf_find_key(header,name.c_str());
             require(id >= 0 && gguf_get_kv_type(header,id) == type,"metadata type/missing: "+name);
@@ -152,7 +156,6 @@ struct Weights {
         };
         rope = flag("flint.attention.rope_pattern");
         swa = flag("flint.attention.sliding_window_pattern");
-        require(rope == (block == 2) && swa == (block == 2),"fixture metadata semantics differ");
         std::cout << "metadata_bound=true block=" << block << " rope=" << rope << " swa=" << swa << std::endl;
         file = fopen(path.c_str(), "rb"); require(file, "model open failed");
         ctx = ggml_init({512ull << 20, nullptr, false}); require(ctx, "weight arena allocation failed");
@@ -166,6 +169,15 @@ struct Weights {
                   << " data_offset=" << gguf_get_data_offset(header) << '\n';
     }
     ~Weights() { fclose(file); gguf_free(header); ggml_free(ctx); }
+    void select_block(int next) {
+        require(next>=0 && next<49,"block outside49"); block=next;
+        const auto rp=gguf_find_key(header,"flint.attention.rope_pattern");
+        const auto sp=gguf_find_key(header,"flint.attention.sliding_window_pattern");
+        rope=static_cast<const bool *>(gguf_get_arr_data(header,rp))[block];
+        swa=static_cast<const bool *>(gguf_get_arr_data(header,sp))[block];
+        tensors.clear(); local_selection.clear(); ggml_free(ctx);
+        ctx=ggml_init({512ull<<20,nullptr,false}); require(ctx,"block weight arena failed");
+    }
     void check_identity() {
         struct stat st;
         require(fstat(fileno(file),&st) == 0 && st.st_size == identity.st_size
@@ -177,6 +189,33 @@ struct Weights {
         const size_t data=gguf_get_data_offset(header), relative=gguf_get_tensor_offset(header,tensor);
         require(data<=size_t(identity.st_size) && relative<=size_t(identity.st_size)-data,"tensor offset outside model");
         return data+relative;
+    }
+    std::vector<float> global_rows(const std::string &name,std::array<int64_t,4> expected,
+        ggml_type type,size_t first,size_t rows) {
+        const auto id=gguf_find_tensor(header,name.c_str());
+        require(id>=0 && gguf_get_tensor_type(header,id)==type,"global type/missing: "+name);
+        const auto *ne=gguf_get_tensor_ne(header,id);
+        for(int j=0;j<4;++j) require(ne[j]==expected[j],"global shape: "+name);
+        require(rows>0 && first<=size_t(ne[1]) && rows<=size_t(ne[1])-first && ne[2]==1 && ne[3]==1,"global rows out of range");
+        const size_t row_bytes=ggml_row_size(type,ne[0]);
+        require(row_bytes>0 && rows<=(16ull<<20)/row_bytes,"global read exceeds16MiB");
+        const size_t size=rows*row_bytes,base=absolute_offset(id);
+        require(first<=(size_t(identity.st_size)-base)/row_bytes,"global offset overflow");
+        const size_t off=base+first*row_bytes;
+        require(size<=size_t(identity.st_size)-off,"global extent outside model");
+        check_identity();
+        std::vector<unsigned char> raw(size);
+        require(fseeko(file,off,SEEK_SET)==0 && fread(raw.data(),1,size,file)==size,"global row read failed");
+        std::vector<float> values(size_t(ne[0])*rows);
+        if(type==GGML_TYPE_NVFP4) dequantize_row_nvfp4(raw.data(),values.data(),values.size());
+        else if(type==GGML_TYPE_BF16) ggml_bf16_to_fp32_row(reinterpret_cast<const ggml_bf16_t *>(raw.data()),values.data(),values.size());
+        else {require(type==GGML_TYPE_F32 && size==values.size()*4,"unsupported global decode"); memcpy(values.data(),raw.data(),size);}
+        for(float v:values) require(std::isfinite(v),"nonfinite global row");
+        receipt << name << "[first=" << first << ",rows=" << rows << "]\t" << ggml_type_name(type)
+            << '\t' << ne[0] << '\t' << rows << "\t1\t1\t" << off << '\t' << size
+            << '\t' << digest(raw.data(),raw.size()) << '\t' << digest(values.data(),values.size()*4) << '\n';
+        receipt.flush(); require(bool(receipt),"global receipt write failed"); check_identity();
+        return values;
     }
     Tensor *load(const std::string &stem, std::array<int64_t,4> expected, ggml_type type) {
         const std::string name = "blk." + std::to_string(block) + "." + stem;
@@ -266,7 +305,7 @@ struct Weights {
         std::vector<std::pair<std::string,std::array<int64_t,4>>> mats = {
             {"attn_q",{2048,4096,1,1}}, {"attn_k",{2048,512,1,1}},
             {"attn_v",{2048,512,1,1}}, {"attn_output",{4096,2048,1,1}}};
-        if(block==0) {
+        if(block<2) {
             mats.insert(mats.end(), {{"ffn_gate",{2048,6144,1,1}},
                 {"ffn_up",{2048,6144,1,1}}, {"ffn_down",{6144,2048,1,1}}});
         } else {
@@ -314,7 +353,7 @@ static Tensor *named(Graph &g, const std::string &name) {
     for (auto &[s,t] : g.outputs) if (s==name) return t;
     throw std::runtime_error("missing graph name: "+name);
 }
-static void block(Weights &w, const fs::path &out, const std::vector<float> &values, const std::vector<int32_t> &positions) {
+static std::vector<float> block(Weights &w, const fs::path &out, const std::vector<float> &values, const std::vector<int32_t> &positions, bool compact=false) {
     const int T=positions.size();
     Graph g;
     require(T >= 1 && T <= 3 && values.size()==size_t(2048*T),"input shape differs");
@@ -351,7 +390,7 @@ static void block(Weights &w, const fs::path &out, const std::vector<float> &val
     auto *n=norm(g,r,w.at("ffn_norm.weight"),"ffn_norm");
     Tensor *logits=nullptr, *ids=nullptr, *ff=nullptr;
     std::vector<int32_t> selected_global;
-    if(w.block==0) {
+    if(w.block<2) {
         auto *up=mm(g,w,"ffn_up",n,"dense_up");
         auto *gate=mm(g,w,"ffn_gate",n,"dense_gate");
         // Common loader initializes swiglu_clamp_shexp=0 before Flint's loader,
@@ -392,13 +431,13 @@ static void block(Weights &w, const fs::path &out, const std::vector<float> &val
         ff=g.mark("ffn_out",ggml_add(g.ctx,moe,sd));
     }
     g.mark("l_out",ggml_add(g.ctx,ff,r));
-    g.run(); g.dump(out);
+    g.run(); g.dump(out,compact);
     w.check_identity();
     if(ids) for(int t=0;t<T;++t) for(int slot=0;slot<6;++slot)
         require(static_cast<int32_t *>(ids->data)[t*ids->nb[1]/4+slot]==selected_global[t*6+slot],"GGML routing changed after sparse load");
     // Negative controls are attention-only GGML graphs, not new block or model runs.
     // They use actual full-attention Q/K/V and demonstrate gapped-fixture sensitivity.
-    if((w.block==0 || w.block==5) && T==3) {
+    if(!compact && (w.block==0 || w.block==5) && T==3) {
         require(positions==std::vector<int32_t>({0,512,513}),"full-attention T3 control requires gapped positions");
         auto changed = [](Tensor *a, Tensor *b) {
             require(ggml_nelements(a)==ggml_nelements(b),"control shape mismatch");
@@ -457,7 +496,7 @@ static void block(Weights &w, const fs::path &out, const std::vector<float> &val
     }
     margins.close(); require(bool(margins),"margin receipt write failed");
     }
-    if(w.block==0) {
+    if(!compact && w.block==0) {
         // Independent GGML controls of the actual dense activation; no fabricated
         // routed IDs/margins or compensated MoE normalization in this branch.
         auto *up=named(g,"dense_up"), *gate=named(g,"dense_gate");
@@ -483,7 +522,14 @@ static void block(Weights &w, const fs::path &out, const std::vector<float> &val
         control.close(); require(bool(control),"dense control receipt failed");
         require(named(g,"dense_down_input")==sw,"dense down input must be unmodified activation");
     }
-    std::cout << "block T=" << T << " outputs=" << g.outputs.size() << " status=success dir=" << out << std::endl;
+    auto *output=named(g,"l_out");
+    require(ggml_is_contiguous(output) && ggml_nelements(output)==2048*T,"residual output layout differs");
+    std::vector<float> residual(2048*T);
+    memcpy(residual.data(),output->data,residual.size()*4);
+    for(float v:residual) require(std::isfinite(v),"nonfinite block residual");
+    std::cout << "block=" << w.block << " T=" << T << " graph_outputs=" << g.outputs.size()
+        << " compact_readbacks=" << compact << " status=success dir=" << out << std::endl;
+    return residual;
 }
 
 template<typename T> static std::vector<T> read_input(const fs::path &path,size_t limit) {
@@ -495,12 +541,92 @@ template<typename T> static std::vector<T> read_input(const fs::path &path,size_
     require(bool(in),"input read failed");
     return values;
 }
+
+static void forward_all(Weights &w,const fs::path &out,const std::vector<int32_t> &ids,const std::vector<int32_t> &positions) {
+    constexpr int H=2048,V=150144,chunk=8192;
+    const int T=ids.size();
+    require(T>=1 && T<=3 && positions.size()==ids.size(),"whole forward token/position shape");
+    for(int t=0;t<T;++t) {
+        require(ids[t]>=0 && ids[t]<V,"token outside vocabulary");
+        require(positions[t]>=0 && (t==0 || positions[t]>positions[t-1]),"invalid positions");
+    }
+    write_bytes(out/"token_ids.i32",ids.data(),ids.size()*4);
+    write_bytes(out/"positions.i32",positions.data(),positions.size()*4);
+    std::vector<float> embedding;
+    for(int id:ids) {
+        const auto row=w.global_rows("token_embd.weight",{H,V,1,1},GGML_TYPE_BF16,id,1);
+        embedding.insert(embedding.end(),row.begin(),row.end());
+    }
+    auto residual=embedding;
+    for(int index=0;index<49;++index) {
+        w.select_block(index); w.all();
+        const auto name=std::string("block-")+(index<10?"0":"")+std::to_string(index);
+        // Each independent GGML block consumes its own previous output, not
+        // any Mary intermediate/router decision. Arena ownership ends per block.
+        residual=block(w,out/name,residual,positions,true);
+    }
+    const auto gain=w.global_rows("output_norm.weight",{H,1,1,1},GGML_TYPE_F32,0,1);
+    std::vector<float> normalized(H*T);
+    {
+        Graph g;
+        auto *input=g.input("residual",H,T,residual);
+        auto *weight=g.input("gain",H,1,gain);
+        auto *n=norm(g,input,weight,"output_norm");
+        g.run(); memcpy(normalized.data(),n->data,normalized.size()*4);
+    }
+    const float scale=w.global_rows("output.scale",{1,1,1,1},GGML_TYPE_F32,0,1)[0];
+    std::vector<float> logits(V*T);
+    for(int first=0;first<V;first+=chunk) {
+        const int rows=std::min(chunk,V-first);
+        auto decoded=w.global_rows("output.weight",{H,V,1,1},GGML_TYPE_NVFP4,first,rows);
+        Graph g;
+        auto *input=g.input("normalized",H,T,normalized);
+        auto *weight=g.input("head_weight",H,rows,decoded);
+        auto *raw=g.mark("head_unscaled",ggml_mul_mat(g.ctx,weight,input));
+        ggml_prec_set_acc(raw,GGML_PREC_F32);
+        auto *factor=g.input("head_scale",1,1,{scale});
+        auto *scaled=g.mark("head_scaled",ggml_mul(g.ctx,raw,factor));
+        g.run(); require(ggml_is_contiguous(scaled),"head chunk layout differs");
+        for(int t=0;t<T;++t)
+            memcpy(logits.data()+t*V+first,static_cast<float *>(scaled->data)+t*rows,rows*4);
+        std::cout << "head_first=" << first << " rows=" << rows << " all_output_tokens=" << T << std::endl;
+    }
+    for(float v:logits) require(std::isfinite(v),"nonfinite full logits");
+    {
+        Graph g;
+        g.input("embedding",H,T,embedding); g.input("residual",H,T,residual);
+        g.input("output_norm",H,T,normalized); g.input("logits",V,T,logits);
+        g.dump(out/"globals");
+    }
+    std::ofstream tops(out/"top20.tsv");
+    tops << "token\trank\tid\tlogit\n";
+    for(int t=0;t<T;++t) {
+        std::vector<int> order(V); for(int i=0;i<V;++i) order[i]=i;
+        std::partial_sort(order.begin(),order.begin()+20,order.end(),[&](int a,int b){
+            return logits[t*V+a]>logits[t*V+b] || (logits[t*V+a]==logits[t*V+b] && a<b);
+        });
+        for(int rank=0;rank<20;++rank) tops << t << '\t' << rank << '\t' << order[rank] << '\t'
+            << std::setprecision(17) << logits[t*V+order[rank]] << '\n';
+    }
+    tops.close(); require(bool(tops),"top-ID receipt failed"); w.check_identity();
+    std::cout << "whole49_completed=true all_output_tokens=" << T << " logit_rows=" << V
+        << " activation_quantization=none comparison_tier=independent_GGML_F32" << std::endl;
+}
+
 int main(int argc,char **argv) {
     try {
-        require(argc==6,"usage: flint-block-reference MODEL BLOCK INPUT_F32 POSITIONS_I32 NEW_OUTPUT");
+        require(argc==6,"usage: flint-block-reference MODEL BLOCK|all RESIDUAL_F32|TOKEN_IDS_I32 POSITIONS_I32 NEW_OUTPUT");
         const fs::path out(argv[5]); require(!fs::exists(out),"output exists");
-        const auto values=read_input<float>(argv[3],2048*3*4);
         const auto positions=read_input<int32_t>(argv[4],3*4);
+        if(std::string(argv[2])=="all") {
+            const auto ids=read_input<int32_t>(argv[3],3*4);
+            require(fs::create_directory(out),"output exists");
+            require(fs::create_directory(out/"reads"),"read directory exists");
+            Weights w(argv[1],0,out/"reads"/"tensor-ranges.tsv");
+            forward_all(w,out,ids,positions);
+            return 0;
+        }
+        const auto values=read_input<float>(argv[3],2048*3*4);
         const fs::path receipts=out.string()+"-reads";
         require(fs::create_directory(receipts),"read receipt directory exists");
         std::cout << "tier=decoded_F32_math cpu_threads=4 flash=false KV=none activation_quantization=none\n";

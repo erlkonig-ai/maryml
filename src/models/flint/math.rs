@@ -35,10 +35,10 @@ impl Trace {
 fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(&x, &y)| (x as f64) * (y as f64)).sum::<f64>() as f32
 }
-fn matvec(w: &[f32], input: &[f32], width: usize) -> Vec<f32> {
+pub(super) fn matvec(w: &[f32], input: &[f32], width: usize) -> Vec<f32> {
     w.chunks_exact(width).map(|row| dot(row, input)).collect()
 }
-fn norm(x: &[f32], weight: &[f32]) -> Vec<f32> {
+pub(super) fn norm(x: &[f32], weight: &[f32]) -> Vec<f32> {
     x.chunks_exact(weight.len()).flat_map(|row| {
         let ss = row.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>();
         let inv = ((ss / row.len() as f64 + EPS as f64).sqrt().recip()) as f32;
