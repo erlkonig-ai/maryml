@@ -214,12 +214,14 @@ pub(super) fn insert_chunk(logits: &mut [f32], values: &[f32], vocab: usize, fir
 /// weights while the trace is being examined. Runtime errors leave no KV state.
 pub fn run(w: &mut Source, ids: &[i32], positions: &[i32], backend: Backend,
     observe: impl FnMut(usize,&Trace,&[ReadReceipt])->Result<()>) -> Result<Output> {
-    run_core(w,ids,positions,backend,None,true,Head::All,&HeadWeights::Streamed,&FixedWeights::Streamed,observe)
+    run_core(w,ids,positions,backend,None,true,Head::All,&HeadWeights::Streamed,&FixedWeights::Streamed,
+        None,super::residual::Phase::Append,observe)
 }
 
 pub(super) fn run_core(w:&mut Source,ids:&[i32],positions:&[i32],backend:Backend,
     mut caches:Option<&mut [super::cache::LayerCache]>,trace:bool,head:Head,
     head_weights:&HeadWeights,fixed_weights:&FixedWeights,
+    mut residual_request:Option<&mut super::residual::Prepared<'_, '_>>,phase:super::residual::Phase,
     mut observe:impl FnMut(usize,&Trace,&[ReadReceipt])->Result<()>)->Result<Output> {
     let t=ids.len();
     ensure!((1..=3).contains(&t) && positions.len()==t,"expected T1..3 token IDs and positions");
@@ -269,6 +271,13 @@ pub(super) fn run_core(w:&mut Source,ids:&[i32],positions:&[i32],backend:Backend
         };
         residual=result.residual;
         ensure!(residual.len()==H*t && residual.iter().all(|v|v.is_finite()),"nonfinite/invalid residual at block {block}");
+        // Logical post-complete-block l_out, before the next norm. Reuse the
+        // completed residual; no extra GPU launch/upload/readback or full trace.
+        // This block's saved l_out trace remains PRE-add. Downstream block
+        // traces naturally reflect any earlier intervention.
+        if let Some(request)=residual_request.as_deref_mut() {
+            request.apply(block,ids,positions,phase,&mut residual)?;
+        }
         observe(block,&result.trace,w.reads())?;
         w.clear_reads();
         // The full trace and its already-fenced GPU work are dropped here.

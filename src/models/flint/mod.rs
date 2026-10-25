@@ -5,6 +5,7 @@
 pub mod math;
 pub mod weights;
 pub mod native_setup;
+pub mod residual;
 pub mod config;
 pub mod pile;
 pub mod forward;

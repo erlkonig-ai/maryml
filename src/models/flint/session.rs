@@ -8,6 +8,7 @@ use serde::Serialize;
 use crate::formats::gguf::index::{FileIdentity,MetadataValue};
 use super::{cache::{self,Admission,LayerCache,Limits},forward::{self,Backend,Head,VOCAB},
     math::Trace,tokenizer::{FlintTokenizer,DECLARED_EOG_IDS},weights::{GgufWeights,ReadReceipt,HostPhase,ReceiptPolicy}};
+use super::residual::{Request as ResidualRequest,Prepared as PreparedResidual,Phase as ResidualPhase};
 
 #[derive(Clone,Copy,Debug)]
 pub enum NativeHead { Streamed, Resident {max_bytes:usize} }
@@ -172,18 +173,43 @@ impl FlintSession {
     /// not reenter the session. Observer errors also poison, providing a diagnostic
     /// partial-execution witness without special production failure injection.
     pub fn append_observed(&mut self,ids:&[u32],observe:impl FnMut(usize,&Trace,&[ReadReceipt])->Result<()>)->Result<Vec<f32>> {
-        append_parts(&mut self.weights,&mut self.caches,&mut self.sequence,self.options,&self.head_weights,&self.fixed_weights,ids,Head::Last,observe)
+        self.append_observed_with_residual(ids,None,observe)
+    }
+    /// Experimental native-only request, never installed on the session. All
+    /// plan/source/budget checks precede mutation. Removing a plan does NOT undo
+    /// its downstream KV effects: low-level append intentionally retains history.
+    /// Trace l_out is before this block's add; captures label pre/post explicitly.
+    pub fn append_observed_with_residual(&mut self,ids:&[u32],request:Option<ResidualRequest<'_, '_>>,
+        observe:impl FnMut(usize,&Trace,&[ReadReceipt])->Result<()>)->Result<Vec<f32>> {
+        ensure!(ids.len()<=cache::MAX_QUERY,"append query length must be1..3; use prefill for longer prompts");
+        let end=self.sequence.preflight(ids,self.capacity())?;
+        let mut request=request.map(|r|r.prepare(&self.source_identity(),self.capacity(),self.sequence.attended..end))
+            .transpose()?.flatten();
+        append_parts(&mut self.weights,&mut self.caches,&mut self.sequence,self.options,&self.head_weights,&self.fixed_weights,
+            ids,Head::Last,request.as_mut(),ResidualPhase::Append,observe)
     }
     /// New sequence only; all IDs/capacity checked before the first mutation.
     /// Intermediate chunks skip the head. A failed later chunk requires reset.
     pub fn prefill(&mut self,ids:&[u32])->Result<Vec<f32>> {
+        self.prefill_with_residual(ids,None)
+    }
+    /// One invocation spans ALL prefill chunks, including head-skipped chunks.
+    /// Absolute input positions and independent layer selection are chunk-invariant.
+    pub fn prefill_with_residual(&mut self,ids:&[u32],request:Option<ResidualRequest<'_, '_>>)->Result<Vec<f32>> {
+        ensure!(self.sequence.attended==0,"prefill requires reset/empty session");
+        self.sequence.preflight(ids,self.capacity())?;
+        let mut request=request.map(|r|r.prepare(&self.source_identity(),self.capacity(),0..ids.len()))
+            .transpose()?.flatten();
+        self.prefill_prepared(ids,request.as_mut())
+    }
+    fn prefill_prepared(&mut self,ids:&[u32],mut request:Option<&mut PreparedResidual<'_, '_>>)->Result<Vec<f32>> {
         ensure!(self.sequence.attended==0,"prefill requires reset/empty session");
         self.sequence.preflight(ids,self.capacity())?;
         let chunks=ids.chunks(cache::MAX_QUERY);
         let count=chunks.len(); let mut logits=Vec::new();
         for (index,chunk) in chunks.enumerate() {
             logits=append_parts(&mut self.weights,&mut self.caches,&mut self.sequence,self.options,&self.head_weights,&self.fixed_weights,chunk,
-                if index+1==count {Head::Last} else {Head::Skip},|_,_,_|Ok(()))?;
+                if index+1==count {Head::Last} else {Head::Skip},request.as_deref_mut(),ResidualPhase::Prefill,|_,_,_|Ok(()))?;
         }
         Ok(logits)
     }
@@ -221,9 +247,30 @@ impl FlintSession {
     /// caller; encode_validate_seconds here measures ID validation only.
     pub fn generate_ids_observed_timed(&mut self,ids:&[u32],max_new:usize,
         observe:impl FnMut(usize,&[f32])->Result<()>)->Result<(Generation,GenerationTimings)> {
+        self.generate_ids_observed_timed_with_residual(ids,max_new,None,observe)
+    }
+    /// Experimental native capture/steering through the existing ID loop.
+    /// No tokenizer mode is changed: caller chooses actual raw/trusted IDs.
+    pub fn generate_ids_with_residual(&mut self,ids:&[u32],max_new:usize,request:ResidualRequest<'_, '_>)->Result<Generation> {
+        self.generate_ids_observed_timed_with_residual(ids,max_new,Some(request),|_,_|Ok(())).map(|(generation,_)|generation)
+    }
+    /// Request-owned borrowed plan/sink, discarded on success or error; never
+    /// sticky configuration. Preflight occurs BEFORE reset, even max_new=0.
+    /// New generations reset KV, making independent arms possible. A final
+    /// emission may not be attended, and EOG is never emitted/appended/captured.
+    /// Capture callbacks execute inside prefill/append wall spans. Their failure
+    /// has the same poison/reset semantics as a failed block observer.
+    /// encode_validate_seconds includes plan binding/admission when supplied.
+    pub fn generate_ids_observed_timed_with_residual(&mut self,ids:&[u32],max_new:usize,
+        request:Option<ResidualRequest<'_, '_>>,observe:impl FnMut(usize,&[f32])->Result<()>)->Result<(Generation,GenerationTimings)> {
         let mut timings=GenerationTimings::default();
         let start=Instant::now();
         self.sequence.prompt_preflight(ids,self.capacity())?;
+        // At most max_new-1 emissions are appended. Capacity clips the horizon
+        // without overflowing, even when max_new is usize::MAX.
+        let horizon=attended_horizon(ids.len(),max_new,self.capacity())?;
+        let mut request=request.map(|r|r.prepare(&self.source_identity(),self.capacity(),0..horizon))
+            .transpose()?.flatten();
         timings.encode_validate_seconds=start.elapsed().as_secs_f64();
         let start=Instant::now();
         self.reset()?;
@@ -232,7 +279,7 @@ impl FlintSession {
         let _=self.weights.take_host_phase();
         let _=self.weights.take_native_setup();
         let start=Instant::now();
-        let logits=self.prefill(ids)?;
+        let logits=self.prefill_prepared(ids,request.as_mut())?;
         timings.prefill_seconds=start.elapsed().as_secs_f64();
         timings.prefill_host=self.weights.take_host_phase();
         timings.prefill_native=self.weights.take_native_setup();
@@ -241,7 +288,8 @@ impl FlintSession {
         let generation=greedy(logits,ids.len(),max_new,options.limits.capacity,
             |id| {
                 let start=Instant::now();
-                let logits=append_parts(weights,caches,sequence,*options,head_weights,fixed_weights,&[id],Head::Last,|_,_,_|Ok(()))?;
+                let logits=append_parts(weights,caches,sequence,*options,head_weights,fixed_weights,&[id],Head::Last,
+                    request.as_mut(),ResidualPhase::Decode,|_,_,_|Ok(()))?;
                 timings.decode_seconds.push(start.elapsed().as_secs_f64());
                 timings.decode_host.push(weights.take_host_phase());
                 timings.decode_native.push(weights.take_native_setup()); Ok(logits)
@@ -251,9 +299,15 @@ impl FlintSession {
     }
 }
 
+fn attended_horizon(prompt:usize,max_new:usize,capacity:usize)->Result<usize> {
+    ensure!(prompt>0 && prompt<=capacity,"invalid prompt horizon");
+    Ok(if max_new==0 {0} else {prompt+(capacity-prompt).min(max_new-1)})
+}
+
 fn append_parts(w:&mut forward::Source,caches:&mut [LayerCache],sequence:&mut Sequence,options:Options,
     head_weights:&forward::HeadWeights,fixed_weights:&forward::FixedWeights,
-    ids:&[u32],head:Head,observe:impl FnMut(usize,&Trace,&[ReadReceipt])->Result<()>)->Result<Vec<f32>> {
+    ids:&[u32],head:Head,request:Option<&mut PreparedResidual<'_, '_>>,phase:ResidualPhase,
+    observe:impl FnMut(usize,&Trace,&[ReadReceipt])->Result<()>)->Result<Vec<f32>> {
     ensure!(ids.len()<=cache::MAX_QUERY,"append query length must be1..3; use prefill for longer prompts");
     let end=sequence.preflight(ids,options.limits.capacity)?;
     if !caches.iter().all(|c|c.len()==sequence.attended) {
@@ -264,7 +318,8 @@ fn append_parts(w:&mut forward::Source,caches:&mut [LayerCache],sequence:&mut Se
     let expect_logits=!matches!(head,Head::Skip);
     let result=sequence.execute(end,|| {
         w.check_identity()?;
-        let result=forward::run_core(w,&signed,&positions,options.backend,Some(&mut *caches),options.trace,head,head_weights,fixed_weights,observe)?;
+        let result=forward::run_core(w,&signed,&positions,options.backend,Some(&mut *caches),options.trace,head,head_weights,fixed_weights,
+            request,phase,observe)?;
         ensure!(caches.iter().all(|c|c.len()==end),"incomplete layer cache append");
         ensure!(if expect_logits { result.logits.len()==VOCAB && result.logits.iter().all(|v|v.is_finite()) } else {result.logits.is_empty()},
             "invalid next-token logits");
@@ -307,7 +362,84 @@ fn greedy(mut logits:Vec<f32>,prompt_tokens:usize,max_new:usize,capacity:usize,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::residual::{self,Plan,Capture,CaptureSink,CapturedRow,Positions,Steering};
     fn logits(id:u32)->Vec<f32> { let mut v=vec![0.0;VOCAB]; v[id as usize]=1.0; v }
+    #[test] fn residual_horizon_is_attended_not_emitted_and_checked() -> Result<()> {
+        assert_eq!(attended_horizon(4,0,10)?,0);
+        assert_eq!(attended_horizon(4,1,10)?,4);
+        assert_eq!(attended_horizon(4,3,10)?,6);
+        assert_eq!(attended_horizon(4,usize::MAX,10)?,10);
+        assert_eq!(attended_horizon(usize::MAX,2,usize::MAX)?,usize::MAX);
+        assert!(attended_horizon(0,1,10).is_err());
+        assert!(attended_horizon(11,1,10).is_err()); Ok(())
+    }
+    #[test] fn residual_none_zero_capture_only_preserve_synthetic_ids_and_bytes() -> Result<()> {
+        let source=serde_json::json!({"storage":"native-pile","model_root":"synthetic"});
+        let direction=vec![1.0;super::super::math::H];
+        for mode in 0..3 {
+            let mut captures=Vec::new();
+            let mut emit=|row:CapturedRow<'_>| {captures.push((row.input_token_id,row.absolute_position,row.phase));Ok(())};
+            let plan=Plan {source_identity:&source,
+                steering:(mode==1).then_some(Steering {block:4,positions:Positions::AllAttended,direction:&direction,alpha:0.0,cap:1.0}),
+                capture:(mode==2).then_some(Capture {blocks:&[4],positions:Positions::AllAttended,post_add:false})};
+            let mut request=if mode==0 {None} else {residual::Request {plan,
+                sink:if mode==2 {Some(CaptureSink::new(2*super::super::math::H*4,&mut emit))}else{None}}
+                .prepare(&source,10,0..attended_horizon(1,2,10)?)?};
+            let mut s=Sequence::default();let mut values=vec![2.0;super::super::math::H];
+            s.execute(1,|| {
+                if let Some(r)=request.as_mut() {r.apply(4,&[7],&[0],ResidualPhase::Prefill,&mut values)?;}
+                Ok(())
+            })?;
+            let out=greedy(logits(3),1,2,10,|id| {
+                let position=s.attended;let end=s.preflight(&[id],10)?;
+                s.execute(end,|| {
+                    if let Some(r)=request.as_mut() {r.apply(4,&[id as i32],&[position as i32],ResidualPhase::Decode,&mut values)?;}
+                    Ok(logits(4))
+                })
+            },|id|Ok(vec![b'A'+id as u8]),|_,_|Ok(()))?;
+            drop(request);
+            assert_eq!(out.ids,[3,4]);assert_eq!(out.bytes,b"DE");assert_eq!(out.attended_tokens,2);
+            assert!(values.iter().all(|&v|v==2.0));
+            if mode==2 {assert_eq!(captures,[(7,0,ResidualPhase::Prefill),(3,1,ResidualPhase::Decode)]);}
+            else {assert!(captures.is_empty());}
+            // The final emitted4 was not appended; it is not a capture input.
+        }
+        Ok(())
+    }
+    #[test] fn residual_preflight_and_capture_failure_keep_poison_reset_contract() -> Result<()> {
+        let source=serde_json::json!({"storage":"native-pile","model_root":"synthetic"});
+        let mut s=Sequence {attended:2,poisoned:false};
+        let bad=residual::Request {plan:Plan {source_identity:&source,
+            steering:Some(Steering {block:4,positions:Positions::AllAttended,direction:&[],alpha:0.0,cap:1.0}),capture:None},sink:None};
+        let attempt=(|| -> Result<()> {
+            s.prompt_preflight(&[7],10)?;
+            let _=bad.prepare(&source,10,0..1)?; // Same before-reset ordering as public generation.
+            s.reset(||Ok(()))
+        })();
+        assert!(attempt.is_err());assert_eq!(s.attended,2);assert!(!s.poisoned);
+        s.reset(||Ok(()))?;
+        let mut fail=|_:CapturedRow<'_>|anyhow::bail!("injected capture sink failure");
+        let request=residual::Request {plan:Plan {source_identity:&source,steering:None,
+            capture:Some(Capture {blocks:&[4],positions:Positions::AllAttended,post_add:false})},
+            sink:Some(CaptureSink::new(super::super::math::H*4,&mut fail))};
+        let mut prepared=request.prepare(&source,10,0..1)?.unwrap();
+        let mut row=vec![1.0;super::super::math::H];
+        assert!(s.execute(1,||prepared.apply(4,&[7],&[0],ResidualPhase::Append,&mut row)).is_err());
+        assert!(s.poisoned);assert_eq!(s.attended,0);assert!(s.preflight(&[7],10).is_err());
+        drop(prepared); // No request is a Sequence/FlintSession field.
+        s.reset(||Ok(()))?;
+        let direction=vec![1.0;super::super::math::H];
+        let mut steered=residual::Request {plan:Plan {source_identity:&source,capture:None,
+            steering:Some(Steering {block:4,positions:Positions::AllAttended,direction:&direction,alpha:0.5,cap:1.0})},sink:None}
+            .prepare(&source,10,0..1)?.unwrap();
+        s.execute(1,||steered.apply(4,&[7],&[0],ResidualPhase::Append,&mut row))?;
+        assert_eq!(row[0],1.5);drop(steered);
+        s.reset(||Ok(()))?;
+        let baseline=vec![1.0;super::super::math::H];
+        let next=s.execute(1,||Ok(baseline.clone()))?; // Next invocation passes no request.
+        assert_eq!(next,baseline);assert!(!s.poisoned);assert_eq!(s.attended,1);
+        Ok(())
+    }
     #[test] fn explicit_prompt_ids_validate_before_reset() -> Result<()> {
         let mut s=Sequence {attended:4,poisoned:false};
         // Previous history does not consume the replacement prompt's capacity.
