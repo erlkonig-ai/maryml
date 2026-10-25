@@ -23,6 +23,13 @@ pub trait Weights {
     fn get_packed(&mut self, suffix: &str, dims: &[usize], expert: Option<usize>) -> Result<PackedWeight> {
         Ok(PackedWeight::Gguf(self.get_nvfp4(suffix,dims,expert)?))
     }
+    /// Native relations must bind weight and post-scale through the SAME
+    /// operation. None preserves the GGUF reader's existing separate scale read.
+    fn packed_projection(&mut self, suffix:&str,dims:&[usize],expert:Option<usize>)
+        ->Result<(PackedWeight,Option<f32>)> {
+        Ok((self.get_packed(&format!("{suffix}.weight"),dims,expert)?,None))
+    }
+    fn paired_scales(&self)->bool { false }
 }
 
 pub(super) fn row_selection(dims: &[usize], expert: Option<usize>) -> Result<(u64, u64, usize)> {

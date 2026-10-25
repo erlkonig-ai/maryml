@@ -23,7 +23,7 @@
 //! multiply-add contraction may differ from CPU scalar f64 reductions. No
 //! autotuning, fitted tolerance, or claim of GGML reduction-order parity.
 
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use cubecl::cuda::CudaRuntime;
 use cubecl::prelude::*;
 use cubecl::server::Handle;
@@ -367,11 +367,14 @@ impl Device {
         self.sync()?; Ok(y)
     }
     fn projection(&self, w: &mut impl Weights, suffix: &str, dims: &[usize],
-        expert: Option<usize>, mode: ProjectionMode) -> Result<Projection> {
+        expert: Option<usize>, mode: ProjectionMode) -> Result<(Projection,Option<f32>)> {
         ensure!(matches!(dims.len(), 2 | 3), "projection requires matrix/expert dimensions");
         let name = format!("{suffix}.weight");
+        let mut post_scale=None;
         let storage = if mode.packed(suffix) {
-            let packed = match w.get_packed(&name, dims, expert)? {
+            let (weight,scale)=w.packed_projection(suffix,dims,expert)?;
+            post_scale=scale;
+            let packed = match weight {
                 PackedWeight::Gguf(bytes) => self.upload_nvfp4(&bytes, dims[0], dims[1])?,
                 PackedWeight::Native(view) => self.upload_native_nvfp4(&view, dims[0], dims[1])?,
             };
@@ -379,7 +382,7 @@ impl Device {
         } else {
             ProjectionStorage::Decoded(self.upload(&w.get(&name, dims, 40, expert)?))
         };
-        Ok(Projection { ni: dims[0], no: dims[1], storage })
+        Ok((Projection { ni: dims[0], no: dims[1], storage },post_scale))
     }
     fn project(&self, weight: &Projection, x: &Buffer, y: &Buffer, t: usize,
         input_offset: usize, output_offset: usize) -> Result<()> {
@@ -391,8 +394,9 @@ impl Device {
     }
     fn dense(&self, w: &mut impl Weights, tr: &mut Trace, suffix: &str, label: &str,
         x: &Buffer, ni: usize, no: usize, t: usize, mode: ProjectionMode) -> Result<Buffer> {
-        let weight = self.projection(w, suffix, &[ni,no], None, mode)?;
-        let scale = self.upload(&w.get(&format!("{suffix}.scale"), &[1], 0, None)?);
+        let (weight,paired) = self.projection(w, suffix, &[ni,no], None, mode)?;
+        let scale = self.upload(&[match paired {Some(v)=>v,
+            None=>w.get(&format!("{suffix}.scale"), &[1], 0, None)?[0]}]);
         let raw = self.empty(no * t);
         self.project(&weight, x, &raw, t, 0, 0)?;
         self.trace(tr, &format!("{label}_unscaled"), [no,t,1,1], &raw)?;
@@ -403,18 +407,20 @@ impl Device {
     fn experts(&self, w: &mut impl Weights, tr: &mut Trace, suffix: &str, label: &str,
         x: &Buffer, ni: usize, no: usize, t: usize, ids: &[i32], per_slot: bool, mode: ProjectionMode) -> Result<Buffer> {
         ensure!(ids.len() == K * t && ids.iter().all(|&i| (0..E as i32).contains(&i)), "invalid GPU expert IDs");
-        let scales = w.get(&format!("{suffix}.scale"), &[E], 0, None)?;
+        let scales = if w.paired_scales() {Vec::new()}
+            else {w.get(&format!("{suffix}.scale"), &[E], 0, None)?};
         let raw = self.empty(no * K * t);
         let mut selected = Vec::with_capacity(ids.len());
         // One packed or decoded expert matrix at a time. Synchronizing the
         // completed slot retires its upload before loading the next one.
         for (slot, &id) in ids.iter().enumerate() {
-            let weight = self.projection(w, suffix, &[ni,no,E], Some(id as usize), mode)?;
+            let (weight,paired) = self.projection(w, suffix, &[ni,no,E], Some(id as usize), mode)?;
             let row = if per_slot { slot } else { slot / K };
             self.project(&weight, x, &raw, 1, row * ni, slot * no)?;
             cubecl::future::block_on(self.client.sync())
                 .map_err(|e| anyhow!("CUDA expert synchronization: {e:?}"))?;
-            selected.push(scales[id as usize]);
+            selected.push(match paired {Some(v)=>v,None=>*scales.get(id as usize)
+                .context("paired native expert scale missing")?});
         }
         let scale = self.upload(&selected);
         let out = self.point(&raw, &scale, no, 1)?;
@@ -624,6 +630,15 @@ impl OutputHead {
             ProjectionStorage::Decoded(self.dev.upload(&values))
         };
         let weight=Projection {ni:H,no:rows,storage};
+        let out=self.dev.empty(rows*self.tokens);
+        self.dev.project(&weight,&self.normalized,&out,self.tokens,0,0)?;
+        self.dev.read(&self.dev.point(&out,&self.dev.upload(&[scale]),out.len,1)?)
+    }
+    pub fn native_chunk(&self,view:&triblespace::core::blob::encodings::tensor::TensorView,
+        rows:usize,scale:f32)->Result<Vec<f32>> {
+        ensure!((1..=8192).contains(&rows) && scale.is_finite(),"invalid native head chunk");
+        let weight=Projection {ni:H,no:rows,
+            storage:ProjectionStorage::Packed(self.dev.upload_native_nvfp4(view,H,rows)?)};
         let out=self.dev.empty(rows*self.tokens);
         self.dev.project(&weight,&self.normalized,&out,self.tokens,0,0)?;
         self.dev.read(&self.dev.point(&out,&self.dev.upload(&[scale]),out.len,1)?)

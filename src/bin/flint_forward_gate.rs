@@ -61,8 +61,14 @@ fn compare_f32(out:&Path,reference:&Path,name:&str,values:&[f32])->Result<Value>
 }
 
 fn main()->Result<()> {
-    let args:Vec<PathBuf>=std::env::args_os().skip(1).map(PathBuf::from).collect();
-    ensure!(args.len()==6,"usage: flint_forward_gate cpu|cuda|packed-all MODEL TOKEN_IDS_I32 POSITIONS_I32 REFERENCE_DIR NEW_OUTPUT");
+    let mut args:Vec<PathBuf>=std::env::args_os().skip(1).map(PathBuf::from).collect();
+    let root=if args.first().is_some_and(|p|p==Path::new("--typed-pile")) {
+        ensure!(args.len()>=2,"missing native model root");
+        let id=triblespace::prelude::Id::from_hex(args[1].to_str().context("root is not UTF-8")?)
+            .context("invalid native model root")?;
+        args.drain(..2);Some(id)
+    } else {None};
+    ensure!(args.len()==6,"usage: flint_forward_gate [--typed-pile ROOT] cpu|cuda|packed-all MODEL_OR_PILE TOKEN_IDS_I32 POSITIONS_I32 REFERENCE_DIR NEW_OUTPUT");
     let [mode,model,ids_path,pos_path,reference,out]=args.as_slice() else {unreachable!()};
     let backend=match mode.to_str() {
         Some("cpu")=>Backend::Cpu,Some("cuda")=>Backend::Cuda,Some("packed-all")=>Backend::PackedAll,
@@ -72,8 +78,12 @@ fn main()->Result<()> {
     let ids=ints(&id_bytes)?; let positions=ints(&pos_bytes)?;
     fs::create_dir(out).context("output directory must be new")?;
     let mut records=create(&out.join("blocks.jsonl"))?;
-    let mut weights=GgufWeights::open_block(model,0)?;
-    let metadata=weights.file.index.metadata.clone();
+    ensure!(root.is_none() || matches!(backend,Backend::PackedAll),"native pile requires packed-all");
+    let mut weights=match root {
+        Some(root)=>forward::Source::Native(mary::models::flint::pile::PileWeights::open(model,root)?),
+        None=>forward::Source::Gguf(GgufWeights::open_block(model,0)?),
+    };
+    let metadata=weights.metadata()?;
     let mut first_float_difference=None; let mut first_router_difference=None;
     let result=forward::run(&mut weights,&ids,&positions,backend,|block,trace:&Trace,reads|{
         let name=format!("block-{block:02}");
@@ -114,8 +124,9 @@ fn main()->Result<()> {
     let ref_logits=floats(&bytes(&refglobals.join("logits.f32"),forward::VOCAB*3*4)?)?;
     let report=json!({"backend":format!("{backend:?}"),"scope":"49-block empty-history F32 diagnostic, all T output rows in token-major order; no generation or quantized-runtime equivalence",
         "acceptance":"exit0 only certifies completed structural/finite diagnostics; float and ordered-router differences are reported, not fitted quality thresholds",
-        "model_path":model,"model_identity":weights.file.identity,"whole_model_freshly_hashed":false,
-        "metadata_end":weights.file.index.metadata_end,"gguf_metadata":metadata,
+        "model_path":if root.is_none(){Some(model)}else{None},"pile_path":root.map(|_|model),
+        "source":weights.identity(),"model_identity":weights.gguf().map(|w|&w.file.identity),"whole_model_freshly_hashed":false,
+        "metadata_end":weights.gguf().map(|w|w.file.index.metadata_end),"gguf_metadata":metadata,
         "token_ids":ids,"positions":positions,"ids_blake3":hash(&id_bytes),"positions_blake3":hash(&pos_bytes),
         "blocks":49,"head_chunk_rows":forward::HEAD_ROWS,"head_chunks":19,"logit_ggml_shape":[forward::VOCAB,positions.len(),1,1],
         "first_float_bit_difference":first_float_difference,"first_ordered_router_difference":first_router_difference,

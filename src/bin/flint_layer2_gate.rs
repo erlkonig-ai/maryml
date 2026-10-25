@@ -26,6 +26,10 @@ impl Weights for Source {
     fn get_packed(&mut self,s:&str,d:&[usize],e:Option<usize>)->Result<PackedWeight> {
         match self {Self::Gguf(w)=>w.get_packed(s,d,e),Self::Native(w)=>w.get_packed(s,d,e)}
     }
+    fn packed_projection(&mut self,s:&str,d:&[usize],e:Option<usize>)->Result<(PackedWeight,Option<f32>)> {
+        match self {Self::Gguf(w)=>w.packed_projection(s,d,e),Self::Native(w)=>w.packed_projection(s,d,e)}
+    }
+    fn paired_scales(&self)->bool { matches!(self,Self::Native(_)) }
 }
 
 fn read(path: &Path, max: usize) -> Result<Vec<u8>> {

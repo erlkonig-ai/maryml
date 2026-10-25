@@ -1,4 +1,4 @@
-//! Explicit fresh scratch-pile block0 witness, not a full model publication.
+//! Explicit fresh scratch-pile ingress: block0 witness or full typed model.
 //! No default pile/key: every invocation names the local model, identity and
 //! new output directory. A throwaway signer is generated in memory; it never
 //! opens a home/default key or a live collection. Never overwrites an output.
@@ -15,6 +15,9 @@ struct Args {
     new_output_dir:PathBuf,
     /// Exact FileIdentity JSON from prior admission; no whole-model hash pass.
     #[arg(long)] expected_identity:String,
+    /// Stream all49 blocks plus global weights and tokenizer metadata.
+    /// Default retains the bounded block0 witness.
+    #[arg(long)] full:bool,
 }
 
 fn main()->Result<()> {
@@ -25,6 +28,42 @@ fn main()->Result<()> {
     fs::create_dir(&args.new_output_dir).context("scratch output directory must be new")?;
     let mut source=GgufWeights::open_block(&args.model,0)?;
     ensure!(serde_json::to_value(&source.file.identity)?==expected,"source identity differs from admission");
+    if args.full {
+        #[cfg(feature="tokenizer")]
+        {
+            use mary::formats::gguf::index::{SelectedMetadata,MetadataLimits};
+            use mary::models::flint::{tokenizer,pile::import};
+            let (identity,metadata)=SelectedMetadata::open(&args.model,tokenizer::METADATA_KEYS,MetadataLimits::TOKENIZER)?;
+            ensure!(identity==source.file.identity,"tokenizer/source observations differ");
+            let pile_path=args.new_output_dir.join("flint.pile");
+            fs::OpenOptions::new().write(true).create_new(true).open(&pile_path)?;
+            let mut pile=Pile::open(&pile_path).map_err(|e|anyhow::anyhow!("{e}"))?;
+            let (fragment,summary)=import::full(&mut source,&mut pile,&metadata.entries)?;
+            let root=fragment.root().context("full model root")?;
+            let commit=mary::model_collection::publish_model_fragment(&mut pile,&key,fragment)?;
+            pile.close().map_err(|e|anyhow::anyhow!("{e}"))?;
+            let mut reopened=PileWeights::open(&pile_path,root)?;
+            for block in 0..49 {reopened.select_block(block)?;}
+            reopened.tokenizer()?;
+            source.file.check_identity()?;
+            let report=json!({"scope":"native full Flint typed import/reopen; no forward or quality claim",
+                "model_path":args.model,"model_identity":source.file.identity,"whole_model_freshly_hashed":false,
+                "metadata_end":source.file.index.metadata_end,"tokenizer_metadata_end":metadata.end,
+                "pile":pile_path,"model_root":format!("{root:X}"),"model_collection":reopened.collection(),
+                "support_members":reopened.support_members(),"support_handles":reopened.support_handles(),
+                "native_commit":format!("{commit:?}"),
+                "signer":"fresh throwaway in-memory key; secret never saved",
+                "signer_public_key_bytes":key.verifying_key().to_bytes().to_vec(),
+                "import":summary,"reopen":"all49 block bindings and tokenizer read from same frozen snapshot",
+                "integrity":"core typed blob/content validation; no redundant full-model reread",
+                "memory":"one leaf payload plus tensor_blob copy; largest BF16 payload614989824B, header256B; graph/metadata/store/pagecache additional",
+                "layout":"native NVFP4 planes/global1; indexed rank2 experts; separate post-matmul scales"});
+            fs::write(args.new_output_dir.join("report.json"),serde_json::to_vec_pretty(&report)?)?;
+            println!("{report}");return Ok(());
+        }
+        #[cfg(not(feature="tokenizer"))]
+        anyhow::bail!("--full requires tokenizer feature");
+    }
     let (fragment,tensors)=import_block0(&mut source)?;
     let root=fragment.root().context("import root")?;
     let source_bytes:u64=tensors.iter().map(|t|t.source.absolute_end-t.source.absolute_start).sum();

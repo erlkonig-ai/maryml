@@ -1,7 +1,7 @@
 //! Optional model witnesses, not a model-quality or bitwise numeric gate.
 //! The external pinned GGML continuation oracle is a separate comparison.
 use std::{fs::{self,OpenOptions},io::Write,path::{Path,PathBuf}};
-use anyhow::{Result,ensure};
+use anyhow::{Context,Result,ensure};
 use clap::Parser;
 use serde_json::{Value,json};
 use mary::models::flint::{forward::{self,Backend,VOCAB,BLOCKS},math::{Trace,Values},
@@ -10,6 +10,7 @@ use mary::models::flint::{forward::{self,Backend,VOCAB,BLOCKS},math::{Trace,Valu
 #[derive(Parser)]
 struct Args {
     backend:String, model:PathBuf, output:PathBuf,
+    #[arg(long)] typed_pile:Option<String>,
     /// Adds trace-off, partial failure/refusal/reset, and fresh-prefix witnesses.
     #[arg(long)] extended:bool,
 }
@@ -57,12 +58,20 @@ fn main()->Result<()> {
     let ids=[150003u32,9479,13]; let signed=ids.map(|id|id as i32);
     let mut progress=OpenOptions::new().create_new(true).write(true).open(args.output.join("progress.jsonl"))?;
     let mut baseline_routes=Routing::new();
-    let baseline=forward::run(&mut GgufWeights::open_block(&args.model,0)?,&signed,&[0,1,2],backend,
+    let root=args.typed_pile.as_ref().map(|s|triblespace::prelude::Id::from_hex(s)
+        .context("invalid native model root")).transpose()?;
+    ensure!(root.is_none() || matches!(backend,Backend::PackedAll),"native pile requires packed-all");
+    let mut source=match root {
+        Some(root)=>forward::Source::Native(mary::models::flint::pile::PileWeights::open(&args.model,root)?),
+        None=>forward::Source::Gguf(GgufWeights::open_block(&args.model,0)?),
+    };
+    let baseline=forward::run(&mut source,&signed,&[0,1,2],backend,
         |b,t,_|baseline_routes.observe(b,t))?;
     ensure!(baseline.logits.len()==3*VOCAB,"baseline logits shape");
     save(&args.output.join("uncached-logits.f32"),&baseline.logits.iter().flat_map(|v|v.to_le_bytes()).collect::<Vec<_>>())?;
     let options=Options {backend,limits:Limits::default(),trace:true};
-    let mut session=FlintSession::open(&args.model,options)?;
+    let mut session=match root {Some(root)=>FlintSession::open_pile(&args.model,root,options)?,
+        None=>FlintSession::open(&args.model,options)?};
     let mut records=Vec::new();
     for partition in [vec![1,1,1],vec![2,1]] {
         session.reset()?; let mut first=0; let mut routes=Routing::new();
@@ -93,7 +102,9 @@ fn main()->Result<()> {
         records.push(json!({"reset_after_partial_failure":compare(&logits,&baseline.logits[..VOCAB])?}));
     }
     session.reset()?;
-    let report=json!({"backend":args.backend,"model_identity":session.identity(),"capacity":session.capacity(),"ids":ids,
+    let report=json!({"backend":args.backend,"model_identity":session.identity(),"source":session.source_identity(),
+        "model_path":if root.is_none(){Some(&args.model)}else{None},"pile_path":root.map(|_|&args.model),
+        "capacity":session.capacity(),"ids":ids,
         "acceptance":"shape, finite values, capacity/state invariants only; numeric/routing/argmax differences remain diagnostics",
         "independence":"this gate compares shared-core execution partitions; pinned GGML continuation comparison is separate",
         "reference_routing":{"ids":baseline_routes.ids,"margins":baseline_routes.margins},"checks":records,"reset_completed":true});

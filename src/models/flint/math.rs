@@ -11,10 +11,10 @@ pub const H: usize = 2048;
 const D: usize = 128;
 const Q: usize = 32;
 const KV: usize = 4;
-const E: usize = 256;
+pub(super) const E: usize = 256;
 const K: usize = 6;
-const F: usize = 512;
-const SH: usize = 1024;
+pub(super) const F: usize = 512;
+pub(super) const SH: usize = 1024;
 const EPS: f32 = 1e-6;
 
 pub enum Values { F32(Vec<f32>), I32(Vec<i32>) }

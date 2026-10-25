@@ -1,7 +1,7 @@
-//! Block0-only native model witness, using Mary's existing model collection,
+//! Native Flint model, using Mary's existing model collection,
 //! member/index/kind/weight relations, jsonfacts and typed Tensor leaves.
 //!
-//! Root members are one metadata-config node and one indexed block. Block
+//! Root members are metadata-config/tokenizer nodes, indexed blocks and globals. Block
 //! members are named operations (attn_q, ffn_up, attn_norm, ...). Each operation
 //! has a typed weight leaf; a projection additionally has a member of kind
 //! post-matmul-scale with its OWN F32 weight leaf. Nothing folds that scale into
@@ -11,8 +11,8 @@
 //! Reopen retains a frozen ModelPileSnapshot. Each weight query joins those
 //! relations at use; TensorView owns the mapped payload through upload. Packed
 //! weights have no F32 fallback. Small F32/BF16 tensors alone materialize F32
-//! for the existing diagnostic math tier. Actual dense block0 has no BF16
-//! router; BF16 support is exercised by synthetic tests, not invented weights.
+//! for the existing diagnostic math tier. Full import preserves the actual
+//! BF16 embedding/router, F32 norms/scales and packed NVFP4 projections.
 
 use std::path::Path;
 use anyhow::{Context,Result,ensure};
@@ -24,6 +24,7 @@ use triblespace::prelude::*;
 use crate::{format::attrs,leaf,model_collection::{self,ModelPileSnapshot}};
 use crate::formats::gguf::{index::{MetadataEntry,MAX_READ},nvfp4::typed};
 use super::{config::{BlockConfig,FfnKind},weights::{GgufWeights,PackedWeight,ReadReceipt,ReceiptPolicy,Weights,row_selection}};
+pub mod import;
 
 // Exact bounded inventory, not an index of stored model entities. GGML dims.
 pub const PROJECTIONS:[(&str,usize,usize);7]=[
@@ -52,20 +53,50 @@ fn leaf_fragment<T:TensorElement,const R:usize>(blob:Blob<Tensor<T,R>>)->Fragmen
 
 /// Check the shape BEFORE invoking the core TensorView reader's dim product.
 /// The caller's bounded expected shape, not an unchecked stored header, sizes
-/// the payload. This reader handles rank1/2 only; selected experts are not yet
-/// part of this block0 witness.
+/// the payload. Indexed expert children are independent rank2 leaves.
 fn checked_view<T:TensorElement,const R:usize>(blob:Blob<Tensor<T,R>>,dims:&[usize])->Result<TensorView> {
     ensure!(R>0 && R<=2 && dims.len()==R,"typed witness rank differs");
     let (_,_,elements)=row_selection(dims,None)?;
-    ensure!(elements<=MAX_READ as usize*2,"typed witness element bound exceeded");
+    // Full mapped embedding/head geometry is admitted separately from bounded
+    // selected row materialization. The frozen snapshot owns these mapped bytes.
+    ensure!(elements<=super::forward::VOCAB*super::math::H,"typed full geometry bound exceeded");
     let payload=T::payload_len(elements);
-    ensure!(payload<=MAX_READ as usize+4,"typed witness payload bound exceeded");
     ensure!(blob.bytes.len()==TENSOR_HEADER_LEN+payload,"typed tensor byte length differs");
     for (axis,&expected) in dims.iter().rev().enumerate() {
         let got=u64::from_le_bytes(blob.bytes[axis*8..axis*8+8].try_into()?);
         ensure!(got==u64::try_from(expected)?,"typed row-major axis{axis} differs");
     }
     leaf::read_leaf(blob)
+}
+
+fn row_range(view:&TensorView,first:usize,rows:usize)->Result<(usize,usize,usize)> {
+    ensure!(view.dims().len()==2 && rows>0 && rows<=super::forward::HEAD_ROWS,"invalid bounded typed rows");
+    let cols=usize::try_from(view.dims()[1])?;
+    let total=usize::try_from(view.dims()[0])?;
+    ensure!(first.checked_add(rows).is_some_and(|end|end<=total),"typed row range outside matrix");
+    let start=first.checked_mul(cols).context("typed row offset overflow")?;
+    let elements=rows.checked_mul(cols).context("typed row elements overflow")?;
+    Ok((cols,start,elements))
+}
+
+/// Native planes are NOT interleaved rows. Copy the matching codes AND scale
+/// ranges, retaining the original intrinsic global unchanged. Never dequantize.
+pub(super) fn native_rows(view:&TensorView,first:usize,rows:usize)->Result<TensorView> {
+    let (cols,start,elements)=row_range(view,first,rows)?;
+    ensure!(cols%64==0,"native row alignment differs");
+    let (codes,scales,global)=crate::nvfp4::split_payload(view.payload(),view.elems())?;
+    ensure!(NVFP4::payload_len(elements)<=MAX_READ as usize+4,"native selected payload exceeds bound");
+    let mut payload=Vec::with_capacity(NVFP4::payload_len(elements));
+    payload.extend_from_slice(&codes[start/2..(start+elements)/2]);
+    payload.extend_from_slice(&scales[start/16..(start+elements)/16]);
+    payload.extend_from_slice(&global.to_le_bytes());
+    leaf::read_leaf(leaf::leaf_blob::<NVFP4,2>([rows as u64,cols as u64],Bytes::from_source(payload))?)
+}
+
+fn bf16_rows(view:&TensorView,first:usize,rows:usize)->Result<Vec<f32>> {
+    let (_,start,elements)=row_range(view,first,rows)?;
+    ensure!(elements.checked_mul(2).is_some_and(|n|n<=MAX_READ as usize),"BF16 row bound exceeded");
+    small_floats(&view.payload()[start*2..(start+elements)*2],30)
 }
 
 fn small_floats(raw:&[u8],ty:u32)->Result<Vec<f32>> {
@@ -172,6 +203,46 @@ impl PileWeights {
         Hash::<Blake3>::to_hex(&self.snapshot.support().collection().handle().transmute())
     }
     pub fn support_members(&self)->usize { self.snapshot.support().len() }
+    pub fn support_handles(&self)->Vec<String> {
+        use triblespace::core::inline::encodings::hash::{Hash,Blake3};
+        self.snapshot.support().members().map(|h|Hash::<Blake3>::to_hex(&h.transmute())).collect()
+    }
+    pub fn metadata(&self)->Result<Vec<MetadataEntry>> {
+        Ok(serde_json::from_value(crate::jsonfacts::load_json(self.snapshot.facts(),
+            self.snapshot.store(),self.config_node).map_err(|e|anyhow::anyhow!("{e}"))?)?)
+    }
+    pub fn select_block(&mut self,index:usize)->Result<()> {
+        let config=BlockConfig::from_metadata(&self.metadata()?,index)?;
+        let root=self.root;
+        let block=find!(b:Id,pattern!(self.snapshot.facts(),[
+            {root @ attrs::member:?b},{?b @ attrs::kind:"flint-block",attrs::index:index as u64}
+        ])).next().context("model has no requested Flint block")?;
+        self.block=block; self.config=config; Ok(())
+    }
+    #[cfg(feature="tokenizer")]
+    pub fn tokenizer(&self)->Result<super::tokenizer::FlintTokenizer> {
+        let root=self.root;
+        for node in find!(node:Id,pattern!(self.snapshot.facts(),[
+            {root @ attrs::member:_?metadata},
+            {_?metadata @ attrs::kind:"flint-tokenizer-metadata",crate::jsonfacts::attrs::document_root:?node}
+        ])) {
+            let Ok(value)=crate::jsonfacts::load_json(self.snapshot.facts(),self.snapshot.store(),node) else {continue};
+            let Ok(entries)=serde_json::from_value::<Vec<MetadataEntry>>(value) else {continue};
+            if let Ok(codec)=super::tokenizer::FlintTokenizer::from_metadata(&entries) {return Ok(codec)}
+        }
+        anyhow::bail!("root has no supported Flint tokenizer metadata in this snapshot")
+    }
+    pub fn embedding(&self,id:usize)->Result<Vec<f32>> {
+        let view=self.typed_at::<BF16,2>(self.root,"token_embd.weight",&[super::math::H,super::forward::VOCAB],None)?;
+        bf16_rows(&view,id,1)
+    }
+    pub fn output_norm(&self)->Result<Vec<f32>> {
+        small_floats(self.typed_at::<F32,1>(self.root,"output_norm.weight",&[super::math::H],None)?.payload(),0)
+    }
+    pub fn output_rows(&self,first:usize,rows:usize)->Result<(TensorView,f32)> {
+        let (full,scale)=self.projection_at(self.root,"output",&[super::math::H,super::forward::VOCAB],None)?;
+        Ok((native_rows(&full,first,rows)?,scale))
+    }
 
     /// Diagnostic only; runtime get/get_packed do not hash per-weight bytes.
     pub fn check_imported(&self,receipts:&[ImportedTensor])->Result<()> {
@@ -192,9 +263,11 @@ impl PileWeights {
     }
 
     fn typed<T:TensorElement,const R:usize>(&self,suffix:&str,dims:&[usize],expert:Option<usize>)->Result<TensorView> {
+        self.typed_at::<T,R>(self.block,suffix,dims,expert)
+    }
+    fn typed_at<T:TensorElement,const R:usize>(&self,block:Id,suffix:&str,dims:&[usize],expert:Option<usize>)->Result<TensorView> {
         row_selection(dims,expert)?;
-        ensure!(expert.is_none(),"typed block0 witness does not import expert banks/slices");
-        let block=self.block;
+        ensure!(expert.is_none(),"expert matrices require paired operation selection");
         ensure!(suffix.len()<=32,"parameter kind exceeds ShortString bound");
         let h=if let Some(kind)=suffix.strip_suffix(".weight") {
             find!(h:Inline<inlineencodings::Handle<Tensor<T,R>>>,pattern!(self.snapshot.facts(),[
@@ -215,6 +288,39 @@ impl PileWeights {
             .map_err(|e|anyhow::anyhow!("read typed parameter {suffix}: {e}"))?;
         checked_view(blob,dims)
     }
+
+    fn projection_at(&self,parent:Id,kind:&str,dims:&[usize],expert:Option<usize>)->Result<(TensorView,f32)> {
+        row_selection(dims,expert)?;
+        ensure!(matches!(dims.len(),2|3) && kind.len()<=32,"invalid projection request");
+        // Both arms project the SAME typed tuple. The expert child and scale
+        // vector are joined through their operation, never independent lookups.
+        let pair=if let Some(index)=expert {
+            find!((w:Inline<inlineencodings::Handle<Tensor<NVFP4,2>>>,
+                s:Inline<inlineencodings::Handle<Tensor<F32,1>>>),pattern!(self.snapshot.facts(),[
+                {parent @ attrs::member:_?op},
+                {_?op @ attrs::kind:kind,attrs::member:_?child,attrs::member:_?post},
+                {_?child @ attrs::index:index as u64,attrs::weight:_?weight},
+                {_?weight @ leaf::leaf::<NVFP4,2>():?w},
+                {_?post @ attrs::kind:"post-matmul-scale",attrs::weight:_?scale},
+                {_?scale @ leaf::leaf::<F32,1>():?s}
+            ])).next()
+        } else {
+            find!((w:Inline<inlineencodings::Handle<Tensor<NVFP4,2>>>,
+                s:Inline<inlineencodings::Handle<Tensor<F32,1>>>),pattern!(self.snapshot.facts(),[
+                {parent @ attrs::member:_?op},
+                {_?op @ attrs::kind:kind,attrs::weight:_?weight,attrs::member:_?post},
+                {_?weight @ leaf::leaf::<NVFP4,2>():?w},
+                {_?post @ attrs::kind:"post-matmul-scale",attrs::weight:_?scale},
+                {_?scale @ leaf::leaf::<F32,1>():?s}
+            ])).next()
+        }.with_context(||format!("no paired native projection {kind}"))?;
+        let weight:Blob<Tensor<NVFP4,2>>=self.snapshot.store().get(pair.0).map_err(|e|anyhow::anyhow!("{e}"))?;
+        let scale:Blob<Tensor<F32,1>>=self.snapshot.store().get(pair.1).map_err(|e|anyhow::anyhow!("{e}"))?;
+        let weight=checked_view(weight,&dims[..2])?;
+        let scales=checked_view(scale,&[expert.map(|_|dims[2]).unwrap_or(1)])?;
+        let scales=small_floats(scales.payload(),0)?;
+        Ok((weight,scales[expert.unwrap_or(0)]))
+    }
 }
 
 impl Weights for PileWeights {
@@ -226,6 +332,7 @@ impl Weights for PileWeights {
             (30,2)=>self.typed::<BF16,2>(suffix,dims,expert)?,
             _=>anyhow::bail!("typed block witness refuses packed-to-F32/unsupported dtype or rank"),
         };
+        ensure!(view.payload().len()<=MAX_READ as usize,"small typed parameter exceeds bound");
         small_floats(view.payload(),ty)
     }
     fn get_nvfp4(&mut self,_:&str,_:&[usize],_:Option<usize>)->Result<Vec<u8>> {
@@ -234,11 +341,139 @@ impl Weights for PileWeights {
     fn get_packed(&mut self,suffix:&str,dims:&[usize],expert:Option<usize>)->Result<PackedWeight> {
         Ok(PackedWeight::Native(self.typed::<NVFP4,2>(suffix,dims,expert)?))
     }
+    fn packed_projection(&mut self,suffix:&str,dims:&[usize],expert:Option<usize>)->Result<(PackedWeight,Option<f32>)> {
+        let (view,scale)=self.projection_at(self.block,suffix,dims,expert)?;
+        ensure!(view.payload().len()<=MAX_READ as usize+4,"selected native matrix exceeds bound");
+        Ok((PackedWeight::Native(view),Some(scale)))
+    }
+    fn paired_scales(&self)->bool {true}
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn with_snapshot(fragment:Fragment,check:impl FnOnce(PileWeights)->Result<()>)->Result<()> {
+        let root=fragment.root().context("fixture root")?;
+        let path=std::env::temp_dir().join(format!("mary-flint-full-{}.pile",fucid().id));
+        std::fs::OpenOptions::new().write(true).create_new(true).open(&path)?;
+        let mut pile=Pile::open(&path).map_err(|e|anyhow::anyhow!("{e}"))?;
+        let key=ed25519_dalek::SigningKey::from_bytes(&[42;32]);
+        model_collection::publish_model_fragment(&mut pile,&key,fragment)?;
+        pile.close().map_err(|e|anyhow::anyhow!("{e}"))?;
+        check(PileWeights::open(&path,root)?)?;
+        std::fs::remove_file(path)?; Ok(())
+    }
+    fn packed_fixture(code:u8)->Result<Fragment> {
+        let mut raw=[code;36];raw[..4].fill(0x38);
+        Ok(leaf_fragment(typed::to_tensor(&raw,[1,64])?))
+    }
+    fn scale_fixture(values:&[f32])->Result<Fragment> {
+        let bytes=values.iter().flat_map(|v|v.to_le_bytes()).collect::<Vec<_>>();
+        let weight=leaf_fragment(leaf::leaf_blob::<F32,1>([values.len() as u64],Bytes::from_source(bytes))?);
+        Ok(entity! {attrs::kind:"post-matmul-scale",attrs::weight*:weight})
+    }
+
+    #[test]
+    fn native_rows_select_both_planes_global_and_bf16_bits()->Result<()> {
+        let mut raw=Vec::new();
+        for row in 0..4u8 {
+            let mut block=[(row+1)*0x11;36];block[..4].fill(0x30+row);raw.extend(block);
+        }
+        let full=checked_view(typed::to_tensor(&raw,[4,64])?,&[64,4])?;
+        let selected=native_rows(&full,1,2)?;
+        assert_eq!(&selected.payload()[..],typed::payload(&raw[36..108],128)?);
+        assert_eq!(selected.dims(),[2,64]);
+        assert!(native_rows(&full,3,2).is_err());
+        assert!(native_rows(&full,0,0).is_err());
+        assert!(native_rows(&full,usize::MAX,1).is_err());
+        assert!(native_rows(&full,0,8193).is_err());
+        // Preserve, rather than silently set, an intrinsic global in row slicing.
+        let mut payload=full.payload().to_vec();let end=payload.len();
+        payload[end-4..].copy_from_slice(&0.75f32.to_le_bytes());
+        let full=checked_view(leaf::leaf_blob::<NVFP4,2>([4,64],Bytes::from_source(payload))?,&[64,4])?;
+        let selected=native_rows(&full,2,1)?;
+        assert_eq!(crate::nvfp4::split_payload(selected.payload(),64)?.2,0.75);
+        let raw=[0x3f80u16,0x4000,0x8000,0x4040,0xc000,0x0000].into_iter().flat_map(u16::to_le_bytes).collect::<Vec<_>>();
+        let embedding=checked_view(leaf::leaf_blob::<BF16,2>([3,2],Bytes::from_source(raw))?,&[2,3])?;
+        assert_eq!(bf16_rows(&embedding,1,1)?.iter().map(|v|v.to_bits()).collect::<Vec<_>>(),[0x80000000,0x40400000]);
+        assert!(bf16_rows(&embedding,3,1).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn paired_alternatives_and_indexed_experts_never_cross_operations()->Result<()> {
+        let mut params=Fragment::empty();
+        for (code,scale) in [(0x11,2.0),(0x22,3.0)] {
+            let weight=packed_fixture(code)?;let post=scale_fixture(&[scale])?;
+            params+=entity! {attrs::kind:"paired",attrs::weight*:weight,attrs::member*:post};
+            let mut children=Fragment::empty();
+            for index in 0..2u64 {
+                let weight=packed_fixture(code+index as u8*0x22)?;
+                children+=entity! {attrs::index:index,attrs::weight*:weight};
+            }
+            let post=scale_fixture(&[scale,scale+4.0])?;
+            let members=children+post;
+            params+=entity! {attrs::kind:"experts",attrs::member*:members};
+        }
+        // Incomplete alternatives must not mix a stray weight and stray scale.
+        let stray=packed_fixture(0x33)?;
+        params+=entity! {attrs::kind:"incomplete",attrs::weight*:stray};
+        let post=scale_fixture(&[9.0])?;
+        params+=entity! {attrs::kind:"incomplete",attrs::member*:post};
+        with_snapshot(model_fragment(params,&super::super::config::tests::fixture())?,|mut weights| {
+            let (PackedWeight::Native(view),Some(scale))=weights.packed_projection("paired",&[64,1],None)?
+                else {panic!("native pair missing")};
+            let code=view.payload()[0];
+            assert!((code==0x11 && scale==2.0)||(code==0x22 && scale==3.0));
+            let (PackedWeight::Native(view),Some(scale))=weights.packed_projection("experts",&[64,1,2],Some(1))?
+                else {panic!("native expert pair missing")};
+            assert!((view.payload()[0]==0x33 && scale==6.0)||(view.payload()[0]==0x44 && scale==7.0));
+            assert!(weights.packed_projection("experts",&[64,1,2],Some(2)).is_err());
+            assert!(weights.packed_projection("incomplete",&[64,1],None).is_err());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn opaque_root_block_selection_and_tokenizer_metadata_relations()->Result<()> {
+        let mut fragment=model_fragment(Fragment::empty(),&super::super::config::tests::fixture())?;
+        let original=fragment.root().unwrap();
+        let members:Vec<Id>=find!(m:Id,pattern!(fragment.facts(),[{original @ attrs::member:?m}])).collect();
+        let alias=fucid();
+        let last=entity! {attrs::kind:"flint-block",attrs::index:48u64};
+        fragment+=entity! {&alias @ attrs::member*:members,attrs::member*:last,metadata::name:"opaque native alias"};
+        let tiny=vec![
+            MetadataEntry {key:"tokenizer.ggml.add_bos_token".into(),gguf_type:7,value:crate::formats::gguf::index::MetadataValue::Bool(false)},
+            MetadataEntry {key:"tokenizer.ggml.eog_token_ids".into(),gguf_type:9,value:crate::formats::gguf::index::MetadataValue::I32Array(vec![150001,150003,150005,150018])},
+        ];
+        let mut metadata_fragment=Fragment::empty();let mut facts=TribleSet::new();
+        let node=crate::jsonfacts::save_json(&serde_json::to_value(&tiny)?,metadata_fragment.blobs_mut(),&mut facts)
+            .map_err(|e|anyhow::anyhow!("{e}"))?;
+        *metadata_fragment.facts_mut()+=facts;
+        metadata_fragment+=entity! {attrs::kind:"flint-tokenizer-metadata",crate::jsonfacts::attrs::document_root:node};
+        fragment+=entity! {&alias @ attrs::member*:metadata_fragment,metadata::name:"unknown annotation"};
+        let (_,facts,metafacts,blobs)=fragment.into_parts();
+        let fragment=Fragment::rooted_from_parts(alias.id,facts,metafacts,blobs);
+        with_snapshot(fragment,|mut weights| {
+            assert_eq!(weights.root,alias.id);
+            weights.select_block(48)?;assert_eq!(weights.config.block,48);
+            assert!(!weights.config.rope);assert!(weights.config.sliding_window.is_none());
+            assert!(weights.select_block(49).is_err());
+            let root=weights.root;
+            let saved=find!(n:Id,pattern!(weights.snapshot.facts(),[
+                {root @ attrs::member:_?m},{_?m @ attrs::kind:"flint-tokenizer-metadata",crate::jsonfacts::attrs::document_root:?n}
+            ])).next().context("root-linked tokenizer missing")?;
+            let restored:Vec<MetadataEntry>=serde_json::from_value(crate::jsonfacts::load_json(
+                weights.snapshot.facts(),weights.snapshot.store(),saved).map_err(|e|anyhow::anyhow!("{e}"))?)?;
+            assert_eq!(restored,tiny); // Boolean flags/types/order survive semantic storage.
+            #[cfg(feature="tokenizer")]
+            assert!(weights.tokenizer().is_err()); // Tiny graph is deliberately NOT a valid full vocabulary.
+            let mut source=super::super::forward::Source::Native(weights);
+            assert!(super::super::forward::run(&mut source,&[0],&[0],
+                super::super::forward::Backend::Cpu,|_,_,_|Ok(())).is_err());
+            Ok(())
+        })
+    }
     #[test]
     fn scratch_pile_reopen_uses_typed_relations_and_opaque_root()->Result<()> {
         let raw:Vec<u8>=[0x8000u16,0x3f80,0x4000,0xc000].into_iter().flat_map(u16::to_le_bytes).collect();

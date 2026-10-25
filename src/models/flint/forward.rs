@@ -4,7 +4,7 @@
 
 use anyhow::{Context, Result, ensure};
 use std::time::Instant;
-use super::{math::{self, Trace, Values, H}, weights::{GgufWeights, ReadReceipt}};
+use super::{math::{self, Trace, Values, H}, weights::{GgufWeights, ReadReceipt,Weights,PackedWeight,HostPhase,ReceiptPolicy},pile::PileWeights};
 use crate::formats::gguf::nvfp4;
 
 pub const VOCAB: usize = 150144;
@@ -14,6 +14,70 @@ pub const BLOCKS: usize = 49;
 #[derive(Clone, Copy, Debug)]
 pub enum Backend { Cpu, Cuda, PackedAll }
 pub(super) enum Head { All, Last, Skip }
+
+/// One storage choice, not a second forward/cache implementation. Native views
+/// and tokenizer metadata are retained by the same frozen pile snapshot.
+pub enum Source { Gguf(GgufWeights), Native(PileWeights) }
+impl Source {
+    pub fn gguf(&self)->Option<&GgufWeights> {match self {Self::Gguf(w)=>Some(w),_=>None}}
+    pub fn metadata(&self)->Result<Vec<crate::formats::gguf::index::MetadataEntry>> {
+        match self {Self::Gguf(w)=>Ok(w.file.index.metadata.clone()),Self::Native(w)=>w.metadata()}
+    }
+    pub fn identity(&self)->serde_json::Value {
+        match self {
+            Self::Gguf(w)=>serde_json::json!({"storage":"gguf","file":w.file.identity}),
+            Self::Native(w)=>serde_json::json!({"storage":"native-pile","model_root":format!("{:X}",w.root),
+                "collection":w.collection(),"support_members":w.support_members(),"support_handles":w.support_handles()}),
+        }
+    }
+    pub fn check_identity(&self)->Result<()> {
+        match self {Self::Gguf(w)=>w.file.check_identity(),Self::Native(_)=>Ok(())}
+    }
+    pub fn receipt_policy(&self)->ReceiptPolicy {
+        match self {Self::Gguf(w)=>w.receipt_policy(),Self::Native(_)=>ReceiptPolicy::None}
+    }
+    pub fn take_host_phase(&mut self)->Option<HostPhase> {
+        match self {Self::Gguf(w)=>Some(w.take_host_phase()),Self::Native(_)=>None}
+    }
+    pub fn reads(&self)->&[ReadReceipt] {match self {Self::Gguf(w)=>&w.reads,Self::Native(_)=>&[]}}
+    pub fn take_reads(&mut self)->Vec<ReadReceipt> {
+        match self {Self::Gguf(w)=>std::mem::take(&mut w.reads),Self::Native(_)=>Vec::new()}
+    }
+    pub fn clear_reads(&mut self) {
+        if let Self::Gguf(w)=self {let start=Instant::now();w.reads.clear();w.host.receipt_drop.record(start,0,0);}
+    }
+    fn select_block(&mut self,index:usize)->Result<super::config::BlockConfig> {
+        match self {Self::Gguf(w)=>{w.select_block(index)?;Ok(w.config)},
+            Self::Native(w)=>{w.select_block(index)?;Ok(w.config)}}
+    }
+    fn embedding(&mut self,id:usize)->Result<Vec<f32>> {
+        match self {
+            Self::Native(w)=>w.embedding(id),
+            Self::Gguf(w)=>{
+                let raw=w.global_rows("token_embd.weight",&[H,VOCAB],30,id,1)?;
+                let start=Instant::now();
+                let values=raw.chunks_exact(2).map(|c|f32::from_bits(
+                    u32::from(u16::from_le_bytes(c.try_into().unwrap()))<<16)).collect();
+                w.host.global_conversion.record(start,raw.len(),H*4); Ok(values)
+            }
+        }
+    }
+}
+impl Weights for Source {
+    fn get(&mut self,s:&str,d:&[usize],t:u32,e:Option<usize>)->Result<Vec<f32>> {
+        match self {Self::Gguf(w)=>w.get(s,d,t,e),Self::Native(w)=>w.get(s,d,t,e)}
+    }
+    fn get_nvfp4(&mut self,s:&str,d:&[usize],e:Option<usize>)->Result<Vec<u8>> {
+        match self {Self::Gguf(w)=>w.get_nvfp4(s,d,e),Self::Native(w)=>w.get_nvfp4(s,d,e)}
+    }
+    fn get_packed(&mut self,s:&str,d:&[usize],e:Option<usize>)->Result<PackedWeight> {
+        match self {Self::Gguf(w)=>w.get_packed(s,d,e),Self::Native(w)=>w.get_packed(s,d,e)}
+    }
+    fn packed_projection(&mut self,s:&str,d:&[usize],e:Option<usize>)->Result<(PackedWeight,Option<f32>)> {
+        match self {Self::Gguf(w)=>w.packed_projection(s,d,e),Self::Native(w)=>w.packed_projection(s,d,e)}
+    }
+    fn paired_scales(&self)->bool {matches!(self,Self::Native(_))}
+}
 
 pub struct Output {
     pub embedding: Vec<f32>, pub residual: Vec<f32>, pub normalized: Vec<f32>,
@@ -50,12 +114,12 @@ fn insert_chunk(logits: &mut [f32], values: &[f32], vocab: usize, first: usize, 
 
 /// Observer borrows one completed block at a time. It must not launch work on
 /// weights while the trace is being examined. Runtime errors leave no KV state.
-pub fn run(w: &mut GgufWeights, ids: &[i32], positions: &[i32], backend: Backend,
+pub fn run(w: &mut Source, ids: &[i32], positions: &[i32], backend: Backend,
     observe: impl FnMut(usize,&Trace,&[ReadReceipt])->Result<()>) -> Result<Output> {
     run_core(w,ids,positions,backend,None,true,Head::All,observe)
 }
 
-pub(super) fn run_core(w:&mut GgufWeights,ids:&[i32],positions:&[i32],backend:Backend,
+pub(super) fn run_core(w:&mut Source,ids:&[i32],positions:&[i32],backend:Backend,
     mut caches:Option<&mut [super::cache::LayerCache]>,trace:bool,head:Head,
     mut observe:impl FnMut(usize,&Trace,&[ReadReceipt])->Result<()>)->Result<Output> {
     let t=ids.len();
@@ -64,23 +128,19 @@ pub(super) fn run_core(w:&mut GgufWeights,ids:&[i32],positions:&[i32],backend:Ba
     ensure!(positions.iter().all(|&p|p>=0) && positions.windows(2).all(|p|p[0]<p[1]),"invalid positions");
     ensure!(matches!(backend,Backend::Cpu) || cfg!(feature="flint-cuda"),"CUDA feature required");
     if let Some(c)=caches.as_ref() { ensure!(c.len()==BLOCKS,"expected all49 layer caches"); }
-    ensure!(!w.file.index.tensors.iter().any(|info|
+    ensure!(!matches!(w,Source::Native(_)) || matches!(backend,Backend::PackedAll),"native pile requires PackedAll");
+    if let Source::Gguf(w)=w { ensure!(!w.file.index.tensors.iter().any(|info|
         info.name=="output.input_scale" || (info.name.starts_with("blk.") && info.name.ends_with(".bias"))),
-        "unsupported input scale or block bias tensor");
+        "unsupported input scale or block bias tensor"); }
     let mut embedding=Vec::with_capacity(t*H);
     for &id in ids {
-        let raw=w.global_rows("token_embd.weight",&[H,VOCAB],30,id as usize,1)?;
-        let start=Instant::now();
-        embedding.extend(raw.chunks_exact(2).map(|c|
-            f32::from_bits((u16::from_le_bytes(c.try_into().unwrap()) as u32)<<16)));
-        w.host.global_conversion.record(start,raw.len(),H*4);
+        embedding.extend(w.embedding(id as usize)?);
     }
     ensure!(embedding.iter().all(|v|v.is_finite()),"nonfinite embedding");
-    let mut global_reads=std::mem::take(&mut w.reads);
+    let mut global_reads=w.take_reads();
     let mut residual=embedding.clone();
     for block in 0..BLOCKS {
-        w.select_block(block)?;
-        let config=w.config;
+        let config=w.select_block(block)?;
         let cache=caches.as_deref_mut().map(|c|&mut c[block]);
         let result=match backend {
             Backend::Cpu => {
@@ -105,18 +165,35 @@ pub(super) fn run_core(w:&mut GgufWeights,ids:&[i32],positions:&[i32],backend:Ba
         };
         residual=result.residual;
         ensure!(residual.len()==H*t && residual.iter().all(|v|v.is_finite()),"nonfinite/invalid residual at block {block}");
-        observe(block,&result.trace,&w.reads)?;
-        let start=Instant::now();
-        w.reads.clear();
-        w.host.receipt_drop.record(start,0,0);
+        observe(block,&result.trace,w.reads())?;
+        w.clear_reads();
         // The full trace and its already-fenced GPU work are dropped here.
     }
     let head_residual=match head { Head::All=>residual.as_slice(),Head::Last=>&residual[(t-1)*H..],Head::Skip=>&[] };
     let (normalized,logits)=if head_residual.is_empty() { (Vec::new(),Vec::new()) }
-        else { output_head(w,head_residual,backend)? };
-    global_reads.extend(std::mem::take(&mut w.reads));
-    w.file.check_identity()?;
+        else { match w {Source::Gguf(w)=>output_head(w,head_residual,backend)?,
+            Source::Native(w)=>native_head(w,head_residual)?} };
+    global_reads.extend(w.take_reads());
+    w.check_identity()?;
     Ok(Output {embedding,residual,normalized,logits,global_reads})
+}
+
+fn native_head(w:&PileWeights,residual:&[f32])->Result<(Vec<f32>,Vec<f32>)> {
+    #[cfg(feature="flint-cuda")]
+    {
+        let head=super::gpu::OutputHead::new(residual,&w.output_norm()?)?;
+        let normalized=head.normalized()?; let t=residual.len()/H;
+        let mut logits=vec![0.0;VOCAB*t];
+        for (first,rows) in chunks(VOCAB) {
+            let (view,scale)=w.output_rows(first,rows)?;
+            let values=head.native_chunk(&view,rows,scale)?;
+            insert_chunk(&mut logits,&values,VOCAB,first,rows,t)?;
+        }
+        ensure!(normalized.iter().chain(&logits).all(|v|v.is_finite()),"nonfinite native final norm/logits");
+        Ok((normalized,logits))
+    }
+    #[cfg(not(feature="flint-cuda"))]
+    { let _=(w,residual);anyhow::bail!("native pile requires flint-cuda") }
 }
 
 fn output_head(w:&mut GgufWeights,residual:&[f32],backend:Backend)->Result<(Vec<f32>,Vec<f32>)> {

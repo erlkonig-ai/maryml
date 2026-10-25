@@ -12,6 +12,8 @@ enum Receipts { Collect,None }
 #[derive(Parser)]
 struct Args {
     model:PathBuf, prompt:PathBuf, output:PathBuf,
+    /// Model entity in the explicitly named positional pile path (not a GGUF).
+    #[arg(long)] typed_pile:Option<String>,
     #[arg(long,value_enum,default_value="packed-all")] backend:Mode,
     #[arg(long,default_value_t=1024)] capacity:usize,
     #[arg(long,default_value_t=8)] max_new:usize,
@@ -42,8 +44,12 @@ fn main()->Result<()> {
     fs::create_dir(&args.output).context("output directory must be new")?;
     let process_setup_seconds=process_start.elapsed().as_secs_f64();
     let start=Instant::now();
-    let mut session=FlintSession::open_with_receipts(&args.model,options,match args.weight_receipts {
-        Receipts::Collect=>ReceiptPolicy::Collect,Receipts::None=>ReceiptPolicy::None})?;
+    let mut session=if let Some(root)=&args.typed_pile {
+        ensure!(matches!(args.weight_receipts,Receipts::None),"native pile has no GGUF read receipts");
+        let root=triblespace::prelude::Id::from_hex(root).context("invalid native model root")?;
+        FlintSession::open_pile(&args.model,root,options)?
+    } else {FlintSession::open_with_receipts(&args.model,options,match args.weight_receipts {
+        Receipts::Collect=>ReceiptPolicy::Collect,Receipts::None=>ReceiptPolicy::None})?};
     let model_init_seconds=start.elapsed().as_secs_f64();
     let start=Instant::now();
     let ids=session.encode_raw(prompt)?;
@@ -75,6 +81,9 @@ fn main()->Result<()> {
             "main_entry_to_report_seconds":process_start.elapsed().as_secs_f64(),
             "boundaries":"prefill and decode end after existing synchronous readback/fences; include streamed weight IO and any first-use compilation; exclude observer and file dumps; model_init includes metadata/tokenizer/CUDA/cache allocation fences, not full weight loading; main_entry excludes dynamic loader; final report write/reset/process teardown only in external process wall time"},
         "backend":format!("{:?}",options.backend),"model_identity":session.identity(),"whole_model_hashed":false,
+        "source":session.source_identity(),"pile_path":args.typed_pile.as_ref().map(|_|&args.model),
+        "model_path":if args.typed_pile.is_none(){Some(&args.model)}else{None},
+        "native_host_timings":"GGUF-specific host counters are absent for native pile, not fabricated zeros",
         "weight_receipts":session.receipt_policy(),
         "capacity":session.capacity(),"cache_admission_bytes":session.admission().cache_bytes,
         "attention_admission_bytes":session.admission().attention_bytes,"trace":args.trace,
