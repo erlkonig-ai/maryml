@@ -9,6 +9,9 @@
 
 use anyhow::{Result, ensure};
 
+/// Import-only, scale-preserving conversion to the existing typed tensor ABI.
+pub mod typed;
+
 pub const ELEMENTS: usize = 64;
 pub const BYTES: usize = 36;
 const VALUES: [f32; 16] = [
