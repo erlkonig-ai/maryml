@@ -1,7 +1,7 @@
 //! Bounded, single-sequence raw generation; no chat rendering or serving layer.
 //! Every append uses the same block/forward core as empty-history diagnostics.
 //! Weights stream from the unchanged GGUF. All KV rows remain until reset.
-use std::path::Path;
+use std::{path::Path,time::Instant};
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use crate::formats::gguf::index::{FileIdentity,MetadataValue};
@@ -10,6 +10,15 @@ use super::{cache::{self,Admission,LayerCache,Limits},forward::{self,Backend,Hea
 
 #[derive(Clone, Copy, Debug)]
 pub struct Options { pub backend:Backend, pub limits:Limits, pub trace:bool }
+/// Experimental wall-clock instrumentation only; no arithmetic or cache changes.
+/// Prefill/append include streamed weight IO, first-use compilation and the
+/// existing synchronous GPU readbacks/fences. No observer or file dump is inside
+/// those intervals. The residual greedy interval includes host selection/observer.
+#[derive(Default,Serialize)]
+pub struct GenerationTimings {
+    pub encode_validate_seconds:f64, pub reset_seconds:f64, pub prefill_seconds:f64,
+    pub decode_seconds:Vec<f64>, pub greedy_host_observer_seconds:f64,
+}
 impl Default for Options {
     fn default()->Self { Self {backend:Backend::PackedAll,limits:Limits::default(),trace:false} }
 }
@@ -112,19 +121,37 @@ impl FlintSession {
     /// This supports independent empty-history prefix replay without full traces.
     pub fn generate_raw_observed(&mut self,prompt:&str,max_new:usize,
         observe:impl FnMut(usize,&[f32])->Result<()>)->Result<Generation> {
+        self.generate_raw_observed_timed(prompt,max_new,observe).map(|(generation,_)|generation)
+    }
+    /// Same accepted path, with clocks at completed prefill/cached-append boundaries.
+    pub fn generate_raw_observed_timed(&mut self,prompt:&str,max_new:usize,
+        observe:impl FnMut(usize,&[f32])->Result<()>)->Result<(Generation,GenerationTimings)> {
+        let mut timings=GenerationTimings::default();
+        let start=Instant::now();
         let ids=self.encode_raw(prompt)?;
         ensure!(!ids.is_empty(),"empty raw prompt; no implicit BOS");
         ensure!(ids.len()<=self.capacity(),"prompt exceeds context capacity");
         // An implicitly successful reset must not disguise a previously failed
         // session: the caller must explicitly acknowledge it through reset().
         ensure!(!self.is_poisoned(),"session is poisoned; explicit successful reset required");
+        timings.encode_validate_seconds=start.elapsed().as_secs_f64();
+        let start=Instant::now();
         self.reset()?;
-        if max_new==0 { return Ok(Generation {ids:Vec::new(),bytes:Vec::new(),prompt_tokens:ids.len(),attended_tokens:0,stop:Stop::Budget}); }
+        timings.reset_seconds=start.elapsed().as_secs_f64();
+        if max_new==0 { return Ok((Generation {ids:Vec::new(),bytes:Vec::new(),prompt_tokens:ids.len(),attended_tokens:0,stop:Stop::Budget},timings)); }
+        let start=Instant::now();
         let logits=self.prefill(&ids)?;
+        timings.prefill_seconds=start.elapsed().as_secs_f64();
         let Self {weights,caches,sequence,options,codec,..}=self;
-        greedy(logits,ids.len(),max_new,options.limits.capacity,
-            |id| append_parts(weights,caches,sequence,*options,&[id],Head::Last,|_,_,_|Ok(())),
-            |id| Ok(codec.token_bytes(id,false)?.to_vec()),observe)
+        let start=Instant::now();
+        let generation=greedy(logits,ids.len(),max_new,options.limits.capacity,
+            |id| {
+                let start=Instant::now();
+                let logits=append_parts(weights,caches,sequence,*options,&[id],Head::Last,|_,_,_|Ok(()))?;
+                timings.decode_seconds.push(start.elapsed().as_secs_f64()); Ok(logits)
+            },|id| Ok(codec.token_bytes(id,false)?.to_vec()),observe)?;
+        timings.greedy_host_observer_seconds=start.elapsed().as_secs_f64()-timings.decode_seconds.iter().sum::<f64>();
+        Ok((generation,timings))
     }
 }
 

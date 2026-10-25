@@ -1,5 +1,5 @@
 //! Raw greedy completion. Requires explicit model, prompt file and new output dir.
-use std::{fs::{self,OpenOptions},io::Write,path::{Path,PathBuf}};
+use std::{fs::{self,OpenOptions},io::Write,path::{Path,PathBuf},time::Instant};
 use anyhow::{Context,Result,ensure};
 use clap::{Parser,ValueEnum};
 use serde_json::json;
@@ -23,6 +23,7 @@ fn save(path:&Path,bytes:&[u8])->Result<()> {
     OpenOptions::new().create_new(true).write(true).open(path)?.write_all(bytes)?; Ok(())
 }
 fn main()->Result<()> {
+    let process_start=Instant::now();
     let args=Args::parse();
     let before=fs::symlink_metadata(&args.prompt)?;
     ensure!(before.is_file() && before.len()<=1024*1024,"prompt must be a regular UTF-8 file <=1MiB");
@@ -34,21 +35,39 @@ fn main()->Result<()> {
         limits:Limits {capacity:args.capacity,max_cache_bytes:args.max_cache_mib.checked_mul(1<<20).context("KV MiB overflow")?,
             max_attention_bytes:args.max_attention_mib.checked_mul(1<<20).context("attention MiB overflow")?},trace:args.trace};
     fs::create_dir(&args.output).context("output directory must be new")?;
+    let process_setup_seconds=process_start.elapsed().as_secs_f64();
+    let start=Instant::now();
     let mut session=FlintSession::open(&args.model,options)?;
+    let model_init_seconds=start.elapsed().as_secs_f64();
+    let start=Instant::now();
     let ids=session.encode_raw(prompt)?;
+    let report_encode_seconds=start.elapsed().as_secs_f64();
     let mut choices=Vec::new();
-    let generation=session.generate_raw_observed(prompt,args.max_new,|attended,logits| {
+    let mut observer_seconds=0.0;
+    let start=Instant::now();
+    let (generation,generation_timings)=session.generate_raw_observed_timed(prompt,args.max_new,|attended,logits| {
+        let start=Instant::now();
         let id=greedy_id(logits)? as usize;
         let second=logits.iter().enumerate().filter(|&(i,_)|i!=id).map(|(_,v)|*v).fold(f32::NEG_INFINITY,f32::max);
         let bytes:Vec<u8>=logits.iter().flat_map(|v|v.to_le_bytes()).collect();
         if args.save_logits { save(&args.output.join(format!("logits-prefix-{attended}.f32")),&bytes)?; }
         choices.push(json!({"attended":attended,"argmax":id,"logit":logits[id],"top1_minus_top2":logits[id]-second,
-            "logits_blake3":blake3::hash(&bytes).to_hex().to_string()})); Ok(())
+            "logits_blake3":blake3::hash(&bytes).to_hex().to_string()}));
+        observer_seconds+=start.elapsed().as_secs_f64(); Ok(())
     })?;
+    let generation_seconds=start.elapsed().as_secs_f64();
     ensure!(session.attended_len()==generation.attended_tokens,"generation/cache accounting differs");
+    let start=Instant::now();
     save(&args.output.join("generation.bin"),&generation.bytes)?;
     save(&args.output.join("prompt_ids.i32"),&ids.iter().flat_map(|&id|(id as i32).to_le_bytes()).collect::<Vec<_>>())?;
-    let report=json!({"scope":"raw greedy completion; no chat template, quality or performance claim",
+    let diagnostic_files_before_report_seconds=start.elapsed().as_secs_f64();
+    let report=json!({"scope":"instrumented release baseline of raw greedy completion; no chat template or quality claim",
+        "timings":{"process_setup_seconds":process_setup_seconds,"model_init_seconds":model_init_seconds,
+            "report_encode_seconds":report_encode_seconds,"generation_seconds":generation_seconds,
+            "phases":generation_timings,"observer_seconds":observer_seconds,
+            "diagnostic_files_before_report_seconds":diagnostic_files_before_report_seconds,
+            "main_entry_to_report_seconds":process_start.elapsed().as_secs_f64(),
+            "boundaries":"prefill and decode end after existing synchronous readback/fences; include streamed weight IO and any first-use compilation; exclude observer and file dumps; model_init includes metadata/tokenizer/CUDA/cache allocation fences, not full weight loading; main_entry excludes dynamic loader; final report write/reset/process teardown only in external process wall time"},
         "backend":format!("{:?}",options.backend),"model_identity":session.identity(),"whole_model_hashed":false,
         "capacity":session.capacity(),"cache_admission_bytes":session.admission().cache_bytes,
         "attention_admission_bytes":session.admission().attention_bytes,"trace":args.trace,
