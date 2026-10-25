@@ -7,8 +7,8 @@ use triblespace::prelude::genid;
 
 fn source() -> SourceBinding {
     SourceBinding {
-        model_root: genid(),
-        layer: genid(),
+        model_root: *genid(),
+        layer: *genid(),
     }
 }
 fn limits() -> Limits {
@@ -75,7 +75,7 @@ fn moe_host_admission_calibrated_scales_and_finite_operands() {
     assert!(finite_bf16(&[0xc0, 0x7f], 1, 1).is_err());
     let invalid_bias = vec![f32::NAN; EXPERTS];
     let invalid_fixed = FixedOperands {
-        operations: [genid(), genid(), genid(), genid()],
+        operations: [*genid(), *genid(), *genid(), *genid()],
         router_bf16: &[],
         correction_bias: &invalid_bias,
         fc1_bf16: &[],
@@ -154,7 +154,7 @@ fn packed(n: usize, k: usize, global: f32) -> Vec<u8> {
 }
 fn operation(payload: &[u8], input_scale: f32) -> PackedOperation<'_> {
     PackedOperation {
-        operation: genid(),
+        operation: *genid(),
         payload,
         input_scale,
     }
@@ -530,7 +530,7 @@ fn moe_gpu_full_geometry_stages_for_stock_reference() {
         binding,
         up,
         down,
-        operations: (0..EXPERTS).map(|_| [genid(), genid()]).collect(),
+        operations: (0..EXPERTS).map(|_| [*genid(), *genid()]).collect(),
         calls: Cell::new(0),
         fail: Cell::new(None),
     };
@@ -538,18 +538,18 @@ fn moe_gpu_full_geometry_stages_for_stock_reference() {
         device.clone(),
         binding,
         FixedOperands {
-            operations: [genid(), genid(), genid(), genid()],
+            operations: [*genid(), *genid(), *genid(), *genid()],
             router_bf16: &router,
             correction_bias: &bias,
             fc1_bf16: &fc1,
             fc2_bf16: &fc2,
             shared_up: PackedOperation {
-                operation: genid(),
+                operation: *genid(),
                 payload: &shared_up,
                 input_scale: 1.0 / 256.0,
             },
             shared_down: PackedOperation {
-                operation: genid(),
+                operation: *genid(),
                 payload: &shared_down,
                 input_scale: 1.0 / 4096.0,
             },
