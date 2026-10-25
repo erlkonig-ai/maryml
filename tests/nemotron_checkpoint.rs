@@ -2,12 +2,8 @@
 #![allow(dead_code)]
 #![cfg(all(feature = "import", feature = "tokenizer"))]
 use mary::models::nemotron_h::ingress::{checkpoint, tokenizer_binding};
+use mary::models::nemotron_h::pile as native_pile;
 use mary::{format, jsonfacts, leaf, model_collection, tokenizer};
-mod ingress {
-    pub use mary::models::nemotron_h::ingress::native;
-}
-#[path = "../src/models/nemotron_h/pile.rs"]
-mod native_pile;
 use anyhow::Result;
 use ed25519_dalek::SigningKey;
 use format::attrs;
