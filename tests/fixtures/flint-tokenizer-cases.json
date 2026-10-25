@@ -2,7 +2,7 @@
   "status": "Proposed independent tests, not executed here. Exact token IDs must come from the pinned native reference.",
   "reference_commit": "1ddffe9f70a63e2d260d4bfad9ad200009007f62",
   "retained_witnesses": {
-    "directory": "/home/liora/lanes/flint-trial-jnSiwYQa/interactive-IGaFVYXx",
+    "source": "Retained llama.cpp b11853 server tokenizer/template responses",
     "tokenize-plain.response.json_sha256": "8d063b2538d4b761c81bdb7cb8c378b100d1b765cc8b136dd64e7e3bffd8c871",
     "tokenize-rendered.response.json_sha256": "9355297f81933c4a60600c5ab5cbaf8ecb31dd378f3d0dd8fb1cd1ea8e481ea2",
     "scope": "The basic rendered user prompt and its IDs were independently observed; this harness does not execute a Jinja renderer."
