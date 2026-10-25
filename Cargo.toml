@@ -1004,6 +1004,10 @@ name = "flint_head_repeat"
 required-features = ["flint-cuda", "tokenizer"]
 
 [[bin]]
+name = "flint_residual_probe"
+required-features = ["flint-cuda", "tokenizer"]
+
+[[bin]]
 name = "flint_session_gate"
 required-features = ["import", "tokenizer"]
 

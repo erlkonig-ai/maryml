@@ -24,8 +24,9 @@ impl Default for NativeFixed {
 pub struct Options { pub backend:Backend, pub limits:Limits, pub trace:bool, pub native_head:NativeHead, pub native_fixed:NativeFixed }
 /// Experimental wall-clock instrumentation only; no arithmetic or cache changes.
 /// Prefill/append include streamed weight IO, first-use compilation and the
-/// existing synchronous GPU readbacks/fences. No observer or file dump is inside
-/// those intervals. The residual greedy interval includes host selection/observer.
+/// existing synchronous GPU readbacks/fences. Residual capture callbacks (and
+/// any IO they perform) are inside those intervals. Prediction observers are
+/// outside them, in the remaining greedy host/observer interval.
 #[derive(Default,Serialize)]
 pub struct GenerationTimings {
     pub encode_validate_seconds:f64, pub reset_seconds:f64, pub prefill_seconds:f64,
@@ -257,7 +258,8 @@ impl FlintSession {
     /// Request-owned borrowed plan/sink, discarded on success or error; never
     /// sticky configuration. Preflight occurs BEFORE reset, even max_new=0.
     /// New generations reset KV, making independent arms possible. A final
-    /// emission may not be attended, and EOG is never emitted/appended/captured.
+    /// emission may not be attended. A generated stopping EOG is never emitted,
+    /// appended or captured; explicit prompt EOG/control IDs remain attended.
     /// Capture callbacks execute inside prefill/append wall spans. Their failure
     /// has the same poison/reset semantics as a failed block observer.
     /// encode_validate_seconds includes plan binding/admission when supplied.
