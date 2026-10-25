@@ -62,6 +62,18 @@ pub mod inkling;
 // `mary::models::inkling::spectree`.
 #[cfg(not(feature = "inkling-cuda"))]
 pub mod inkling {
+    // Reuse the existing runtime-generic online attention without enabling
+    // Inkling's importer/model stack. No second copy of either kernel file.
+    #[cfg(feature = "nemotron-cuda")]
+    #[path = "flash.rs"]
+    pub mod flash;
+    #[cfg(feature = "nemotron-cuda")]
+    #[path = "fp4quant.rs"]
+    pub mod fp4quant;
+    // Existing flash device tests compare their packed reader with this codec.
+    #[cfg(all(test, feature = "nemotron-cuda"))]
+    #[path = "nvfp4.rs"]
+    pub mod nvfp4;
     #[path = "cache_pile.rs"]
     pub mod cache_pile;
     #[path = "spectree.rs"]
