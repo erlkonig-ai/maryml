@@ -6,7 +6,7 @@ use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use crate::formats::gguf::index::{FileIdentity,MetadataValue};
 use super::{cache::{self,Admission,LayerCache,Limits},forward::{self,Backend,Head,VOCAB},
-    math::Trace,tokenizer::{FlintTokenizer,EncodeOptions,DECLARED_EOG_IDS},weights::{GgufWeights,ReadReceipt,HostPhase}};
+    math::Trace,tokenizer::{FlintTokenizer,EncodeOptions,DECLARED_EOG_IDS},weights::{GgufWeights,ReadReceipt,HostPhase,ReceiptPolicy}};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Options { pub backend:Backend, pub limits:Limits, pub trace:bool }
@@ -55,8 +55,13 @@ impl FlintSession {
     /// payloads are deliberately selected until append/prefill. IndexedFile's
     /// buffered header reading may read ahead; this is not a metadata-only probe.
     pub fn open(path:&Path,options:Options)->Result<Self> {
+        Self::open_with_receipts(path,options,ReceiptPolicy::Collect)
+    }
+    /// Explicit per-session provenance policy. None leaves block/global receipt
+    /// collections empty, including append_observed; all validation is unchanged.
+    pub fn open_with_receipts(path:&Path,options:Options,receipts:ReceiptPolicy)->Result<Self> {
         ensure!(matches!(options.backend,Backend::Cpu)||cfg!(feature="flint-cuda"),"CUDA feature required");
-        let weights=GgufWeights::open_block(path,0)?;
+        let weights=GgufWeights::open_block_with_receipts(path,0,receipts)?;
         let context=weights.file.index.metadata.iter().find_map(|e|
             if e.key=="flint.context_length" { if let MetadataValue::U32(n)=&e.value {Some(*n as usize)} else {None} } else {None})
             .context("missing declared context length")?;
@@ -68,6 +73,7 @@ impl FlintSession {
         Ok(Self {weights,codec,caches,sequence:Sequence::default(),options,admission})
     }
     pub fn identity(&self)->&FileIdentity { &self.weights.file.identity }
+    pub fn receipt_policy(&self)->ReceiptPolicy { self.weights.receipt_policy() }
     pub fn admission(&self)->Admission { self.admission }
     pub fn capacity(&self)->usize { self.options.limits.capacity }
     /// Attended tokens only. The last emitted non-EOG token may not yet be in KV.

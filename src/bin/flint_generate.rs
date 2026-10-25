@@ -3,10 +3,12 @@ use std::{fs::{self,OpenOptions},io::Write,path::{Path,PathBuf},time::Instant};
 use anyhow::{Context,Result,ensure};
 use clap::{Parser,ValueEnum};
 use serde_json::json;
-use mary::models::flint::{cache::Limits,forward::Backend,session::{FlintSession,Options,greedy_id}};
+use mary::models::flint::{cache::Limits,forward::Backend,session::{FlintSession,Options,greedy_id},weights::ReceiptPolicy};
 
 #[derive(Clone,Copy,ValueEnum)]
 enum Mode { Cpu,Cuda,PackedAll }
+#[derive(Clone,Copy,ValueEnum)]
+enum Receipts { Collect,None }
 #[derive(Parser)]
 struct Args {
     model:PathBuf, prompt:PathBuf, output:PathBuf,
@@ -18,6 +20,9 @@ struct Args {
     #[arg(long)] trace:bool,
     /// Saves each last-row vocabulary distribution for independent prefix replay.
     #[arg(long)] save_logits:bool,
+    /// Selected-weight provenance is unused by this raw generator. Collect is
+    /// available for paired diagnostics; neither mode changes validation or math.
+    #[arg(long,value_enum,default_value="none")] weight_receipts:Receipts,
 }
 fn save(path:&Path,bytes:&[u8])->Result<()> {
     OpenOptions::new().create_new(true).write(true).open(path)?.write_all(bytes)?; Ok(())
@@ -37,7 +42,8 @@ fn main()->Result<()> {
     fs::create_dir(&args.output).context("output directory must be new")?;
     let process_setup_seconds=process_start.elapsed().as_secs_f64();
     let start=Instant::now();
-    let mut session=FlintSession::open(&args.model,options)?;
+    let mut session=FlintSession::open_with_receipts(&args.model,options,match args.weight_receipts {
+        Receipts::Collect=>ReceiptPolicy::Collect,Receipts::None=>ReceiptPolicy::None})?;
     let model_init_seconds=start.elapsed().as_secs_f64();
     let start=Instant::now();
     let ids=session.encode_raw(prompt)?;
@@ -69,6 +75,7 @@ fn main()->Result<()> {
             "main_entry_to_report_seconds":process_start.elapsed().as_secs_f64(),
             "boundaries":"prefill and decode end after existing synchronous readback/fences; include streamed weight IO and any first-use compilation; exclude observer and file dumps; model_init includes metadata/tokenizer/CUDA/cache allocation fences, not full weight loading; main_entry excludes dynamic loader; final report write/reset/process teardown only in external process wall time"},
         "backend":format!("{:?}",options.backend),"model_identity":session.identity(),"whole_model_hashed":false,
+        "weight_receipts":session.receipt_policy(),
         "capacity":session.capacity(),"cache_admission_bytes":session.admission().cache_bytes,
         "attention_admission_bytes":session.admission().attention_bytes,"trace":args.trace,
         "prompt_ids":ids,"prompt_bytes_blake3":blake3::hash(&raw).to_hex().to_string(),"choices":choices,"saved_logits":args.save_logits,
