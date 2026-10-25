@@ -1,19 +1,10 @@
 //! Synthetic CPU ingress gate. No GPU or full checkpoint payload acceptance.
 #![allow(dead_code)]
 #![cfg(all(feature = "import", feature = "tokenizer"))]
+use mary::models::nemotron_h::ingress::{checkpoint, tokenizer_binding};
 use mary::{format, jsonfacts, leaf, model_collection, tokenizer};
-#[path = "../src/models/nemotron_h/ingress/checkpoint.rs"]
-mod checkpoint;
-#[path = "../src/models/nemotron_h/ingress/config.rs"]
-mod config;
-#[path = "../src/models/nemotron_h/ingress/native.rs"]
-pub mod native;
-#[path = "../src/models/nemotron_h/ingress/packing.rs"]
-mod packing;
-#[path = "../src/models/nemotron_h/ingress/tokenizer_binding.rs"]
-mod tokenizer_binding;
 mod ingress {
-    pub use super::native;
+    pub use mary::models::nemotron_h::ingress::native;
 }
 #[path = "../src/models/nemotron_h/pile.rs"]
 mod native_pile;
@@ -351,8 +342,16 @@ fn checkpoint_publish_reopen_native_weights_config_and_tokenizer() -> Result<()>
     let base = tokenizer_binding::bases(snapshot.facts(), imported.tokenizer)
         .next()
         .unwrap();
-    let rebuilt =
-        tokenizer_binding::rebuild(snapshot.facts(), snapshot.store(), imported.tokenizer, base)?;
+    let sequence = tokenizer_binding::pre_tokenizers(snapshot.facts(), imported.tokenizer)
+        .next()
+        .unwrap();
+    let rebuilt = tokenizer_binding::rebuild(
+        snapshot.facts(),
+        snapshot.store(),
+        imported.tokenizer,
+        base,
+        sequence,
+    )?;
     assert_tokenizer_parity(&rebuilt, &token_json())?;
     Ok(())
 }
@@ -477,7 +476,10 @@ fn added_flags_are_local_to_each_binding_after_union() -> Result<()> {
         let base = tokenizer_binding::bases(snapshot.facts(), binding)
             .next()
             .unwrap();
-        tokenizer_binding::rebuild(snapshot.facts(), snapshot.store(), binding, base)
+        let sequence = tokenizer_binding::pre_tokenizers(snapshot.facts(), binding)
+            .next()
+            .unwrap();
+        tokenizer_binding::rebuild(snapshot.facts(), snapshot.store(), binding, base, sequence)
     };
     let a = build(ar)?;
     let b = build(br)?;
@@ -485,6 +487,98 @@ fn added_flags_are_local_to_each_binding_after_union() -> Result<()> {
     assert_eq!(b.decode(&[8], true).unwrap(), "");
     assert!(!a.get_added_tokens_decoder()[&8].normalized);
     assert!(b.get_added_tokens_decoder()[&8].normalized);
+    Ok(())
+}
+
+#[test]
+fn reversed_pre_tokenizer_order_survives_union_with_generic_collision() -> Result<()> {
+    let dir = Scratch::new();
+    let (mut pile, key, collection) = destination(&dir.0)?;
+    let forward = token_json();
+    let mut reverse = forward.clone();
+    reverse["pre_tokenizer"]["pretokenizers"]
+        .as_array_mut()
+        .unwrap()
+        .reverse();
+    let fbytes = serde_json::to_vec(&forward)?;
+    let rbytes = serde_json::to_vec(&reverse)?;
+    // Reproduce the old writer's identity collision, including polluted child
+    // indexes in the SAME collection. The native writer must not share them.
+    let generic_f = tokenizer::save_tokenizer_json(&fbytes, "generic-collision", &mut pile)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let generic_r = tokenizer::save_tokenizer_json(&rbytes, "generic-collision", &mut pile)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let generic_root = generic_f.root().unwrap();
+    assert_eq!(generic_f.root(), generic_r.root());
+    let a = tokenizer_binding::save(&fbytes, "native", &mut pile)?;
+    let b = tokenizer_binding::save(&rbytes, "native", &mut pile)?;
+    let ar = a.root().unwrap();
+    let br = b.root().unwrap();
+    assert_ne!(ar, br, "pre-tokenizer order is identity");
+    let alias = ufoid();
+    let members = find!(member: Id, pattern!(a.facts(), [{ ar @ attrs::member: ?member }]))
+        .collect::<Vec<_>>();
+    let alias_facts =
+        entity! { &alias @ attrs::kind: tokenizer_binding::BINDING, attrs::member*: members };
+    model_collection::publish_model_fragment_into(
+        &mut pile,
+        &key,
+        collection,
+        generic_f + generic_r + a + b + alias_facts,
+    )?;
+    pile.close()?;
+    let mut pile = Pile::open(&dir.0.join("model.pile"))?;
+    pile.refresh()?;
+    let store = pile.snapshot()?;
+    let snapshot = model_collection::snapshot_model_collection_for(&store, collection)?;
+    assert!(
+        tokenizer::build_tokenizer(snapshot.facts(), snapshot.store(), generic_root).is_err(),
+        "generic shared-index collision reproduced"
+    );
+    for (binding, expected) in [(ar, &forward), (br, &reverse), (alias.id, &forward)] {
+        let base = tokenizer_binding::bases(snapshot.facts(), binding)
+            .next()
+            .unwrap();
+        let sequence = tokenizer_binding::pre_tokenizers(snapshot.facts(), binding)
+            .next()
+            .unwrap();
+        let rebuilt = tokenizer_binding::rebuild(
+            snapshot.facts(),
+            snapshot.store(),
+            binding,
+            base,
+            sequence,
+        )?;
+        assert_eq!(
+            serde_json::to_value(rebuilt.get_pre_tokenizer())?,
+            expected["pre_tokenizer"]
+        );
+        assert_tokenizer_parity(&rebuilt, expected)?;
+    }
+    pile.close()?;
+    Ok(())
+}
+
+#[test]
+fn unsupported_bpe_and_config_knobs_are_rejected_explicitly() -> Result<()> {
+    for (field, unsupported) in [
+        ("byte_fallback", json!(true)),
+        ("fuse_unk", json!(true)),
+        ("dropout", json!(0.1)),
+        ("continuing_subword_prefix", json!("##")),
+        ("end_of_word_suffix", json!("</w>")),
+    ] {
+        let mut value = token_json();
+        value["model"][field] = unsupported;
+        let error = tokenizer_binding::validate(&serde_json::to_vec(&value)?).unwrap_err();
+        assert!(error.to_string().contains(field), "{error:#}");
+    }
+    let mut value = token_json();
+    value["normalizer"] = json!({"type":"Lowercase"});
+    assert!(tokenizer_binding::validate(&serde_json::to_vec(&value)?).is_err());
+    let mut value = token_json();
+    value["pre_tokenizer"]["pretokenizers"][0]["invert"] = json!(true);
+    assert!(tokenizer_binding::validate(&serde_json::to_vec(&value)?).is_err());
     Ok(())
 }
 
@@ -571,7 +665,11 @@ fn pinned_inventory_and_real_tokenizer_rebuild() -> Result<()> {
     let base = tokenizer_binding::bases(snapshot.facts(), root)
         .next()
         .unwrap();
-    let rebuilt = tokenizer_binding::rebuild(snapshot.facts(), snapshot.store(), root, base)?;
+    let sequence = tokenizer_binding::pre_tokenizers(snapshot.facts(), root)
+        .next()
+        .unwrap();
+    let rebuilt =
+        tokenizer_binding::rebuild(snapshot.facts(), snapshot.store(), root, base, sequence)?;
     eprintln!("pinned tokenizer rebuilt after pile close/reopen");
     let original = tokenizers::Tokenizer::from_bytes(&bytes).map_err(|e| anyhow::anyhow!("{e}"))?;
     let markers = source["added_tokens"]
