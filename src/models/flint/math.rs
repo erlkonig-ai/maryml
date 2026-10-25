@@ -19,18 +19,22 @@ const EPS: f32 = 1e-6;
 
 pub enum Values { F32(Vec<f32>), I32(Vec<i32>) }
 pub struct Stage { pub name: String, pub dims: [usize; 4], pub values: Values }
-#[derive(Default)]
-pub struct Trace { pub stages: Vec<Stage>, pub router_margins: Vec<f32> }
+pub struct Trace { pub stages: Vec<Stage>, pub router_margins: Vec<f32>, pub(super) enabled: bool }
+impl Default for Trace { fn default()->Self { Self::new(true) } }
 impl Trace {
+    pub(super) fn new(enabled:bool)->Self { Self {stages:Vec::new(),router_margins:Vec::new(),enabled} }
     fn f(&mut self, name: &str, dims: [usize; 4], x: &[f32]) {
         assert_eq!(dims.iter().product::<usize>(), x.len());
+        if !self.enabled { return; }
         self.stages.push(Stage { name: name.into(), dims, values: Values::F32(x.to_vec()) });
     }
     fn i(&mut self, name: &str, dims: [usize; 4], x: &[i32]) {
         assert_eq!(dims.iter().product::<usize>(), x.len());
+        if !self.enabled { return; }
         self.stages.push(Stage { name: name.into(), dims, values: Values::I32(x.to_vec()) });
     }
 }
+pub(super) struct BlockOutput { pub residual:Vec<f32>, pub trace:Trace }
 
 fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(&x, &y)| (x as f64) * (y as f64)).sum::<f64>() as f32
@@ -115,11 +119,17 @@ pub fn layer2(w: &mut impl Weights, input: &[f32], positions: &[i32]) -> Result<
 }
 
 pub fn block(w: &mut impl Weights, input: &[f32], positions: &[i32], config: BlockConfig) -> Result<Trace> {
+    Ok(block_core(w,input,positions,config,None,true)?.trace)
+}
+
+pub(super) fn block_core(w:&mut impl Weights,input:&[f32],positions:&[i32],config:BlockConfig,
+    cache:Option<&mut super::cache::CpuKv>,trace:bool)->Result<BlockOutput> {
     let t = positions.len();
     ensure!((1..=3).contains(&t) && input.len() == H*t, "expected 1..=3 residual rows of width 2048");
     ensure!(positions.iter().all(|&p| p >= 0) && positions.windows(2).all(|p| p[0] < p[1]), "invalid positions");
     ensure!(input.iter().all(|v| v.is_finite()), "non-finite residual input");
-    let mut tr = Trace::default();
+    ensure!(config.sliding_window.is_none_or(|w|w>0),"sliding window must be positive");
+    let mut tr = Trace::new(trace);
     tr.f("input", [H,t,1,1], input);
     tr.i("positions", [t,1,1,1], positions);
     let an = w.get("attn_norm.weight", &[H], 0, None)?;
@@ -135,29 +145,35 @@ pub fn block(w: &mut impl Weights, input: &[f32], positions: &[i32], config: Blo
     let k = if config.rope { rope(&kn,KV,positions) } else { kn };
     tr.f(if config.rope { "q_rope" } else { "q_no_rope" },[D,Q,t,1],&q);
     tr.f(if config.rope { "k_rope" } else { "k_no_rope" },[D,KV,t,1],&k);
+    let (k,v,key_positions)=if let Some(c)=cache {
+        c.append(&k,&v,positions)?; (c.k.as_slice(),c.v.as_slice(),c.positions.as_slice())
+    } else { (k.as_slice(),v.as_slice(),positions) };
+    let nt=key_positions.len();
+    let geometry=super::cache::Geometry::new(t,nt)?;
     let sinks = w.get("attn_sinks.weight", &[Q],0,None)?;
-    let mut scores = vec![0.0;t*t*Q]; let mut probs = scores.clone();
-    let mut mask = vec![0.0;t*t]; let mut heads = vec![0.0;D*t*Q];
-    for query in 0..t { for key in 0..t {
-        if positions[key] > positions[query] || config.sliding_window.is_some_and(|window| positions[query] - positions[key] >= window) { mask[query*t+key] = f32::NEG_INFINITY; }
+    let mut scores = super::cache::zeros(geometry.scores)?;
+    let mut probs = super::cache::zeros(geometry.scores)?;
+    let mut mask = super::cache::zeros(geometry.mask)?; let mut heads = vec![0.0;D*t*Q];
+    for query in 0..t { for key in 0..nt {
+        if !super::cache::visible(positions[query],key_positions[key],config.sliding_window) { mask[query*nt+key] = f32::NEG_INFINITY; }
     }}
     for h in 0..Q { for query in 0..t {
-        let base = (h*t+query)*t;
-        let mut logits = vec![0.0;t];
-        for key in 0..t {
+        let base = (h*t+query)*nt;
+        let mut logits = super::cache::zeros(nt)?;
+        for key in 0..nt {
             scores[base+key] = dot(&q[(query*Q+h)*D..(query*Q+h+1)*D], &k[(key*KV+h/(Q/KV))*D..(key*KV+h/(Q/KV)+1)*D]);
-            logits[key] = scores[base+key] * (D as f32).sqrt().recip() + mask[query*t+key];
+            logits[key] = scores[base+key] * (D as f32).sqrt().recip() + mask[query*nt+key];
         }
         let max = logits.iter().copied().fold(sinks[h],f32::max);
         let exps: Vec<f32> = logits.iter().map(|&v| (v-max).exp()).collect();
         let denom = exps.iter().map(|&v| v as f64).sum::<f64>() + ((sinks[h]-max).exp() as f64);
-        for key in 0..t { probs[base+key] = (exps[key] as f64 / denom) as f32; }
+        for key in 0..nt { probs[base+key] = (exps[key] as f64 / denom) as f32; }
         for d in 0..D {
-            heads[(h*t+query)*D+d] = (0..t).map(|key| (probs[base+key] as f64) * (v[(key*KV+h/(Q/KV))*D+d] as f64)).sum::<f64>() as f32;
+            heads[(h*t+query)*D+d] = (0..nt).map(|key| (probs[base+key] as f64) * (v[(key*KV+h/(Q/KV))*D+d] as f64)).sum::<f64>() as f32;
         }
     }}
-    tr.f("attention_scores",[t,t,Q,1],&scores); tr.f("attention_mask",[t,t,1,1],&mask);
-    tr.f("attention_probs",[t,t,Q,1],&probs); tr.f("attention_heads",[D,t,Q,1],&heads);
+    tr.f("attention_scores",[nt,t,Q,1],&scores); tr.f("attention_mask",[nt,t,1,1],&mask);
+    tr.f("attention_probs",[nt,t,Q,1],&probs); tr.f("attention_heads",[D,t,Q,1],&heads);
     let mut joined = vec![0.0;Q*D*t];
     for token in 0..t { for h in 0..Q { for d in 0..D { joined[(token*Q+h)*D+d] = heads[(h*t+token)*D+d]; }}}
     let ao = dense(w,&mut tr,"attn_output","attention_output",&joined,Q*D,H,t)?;
@@ -201,8 +217,9 @@ pub fn block(w: &mut impl Weights, input: &[f32], positions: &[i32], config: Blo
         add(&moe,&sd)
     };
     tr.f("ffn_out",[H,t,1,1],&ffn);
-    tr.f("l_out",[H,t,1,1],&add(&ffn,&residual));
-    Ok(tr)
+    let residual=add(&ffn,&residual);
+    tr.f("l_out",[H,t,1,1],&residual);
+    Ok(BlockOutput {residual,trace:tr})
 }
 
 fn experts(w: &mut impl Weights, tr: &mut Trace, suffix: &str, label: &str,
@@ -263,6 +280,9 @@ mod tests {
             assert_eq!(get("dense_down_input"),get("dense_swiglu"));
             assert_eq!(tr.stages.len(),8);
             assert_eq!(w.reads,["ffn_up.weight","ffn_up.scale","ffn_gate.weight","ffn_gate.scale","ffn_down.weight","ffn_down.scale"]);
+            let mut quiet=Trace::new(false);
+            assert_eq!(dense_ffn(&mut w,&mut quiet,&x,2,3,t)?,out);
+            assert!(quiet.stages.is_empty());
             w.down_scale=0.0;
             assert!(dense_ffn(&mut w,&mut Trace::default(),&x,2,3,t)?.iter().all(|&v|v==0.0));
         }

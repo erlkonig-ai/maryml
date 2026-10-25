@@ -151,12 +151,12 @@ pub fn compare_k(raw: &[u8], input: &[f32], scale: f32) -> Result<KComparison> {
     let a = dev.empty(no * t);
     let b = dev.empty(no * t);
     dev.packed_matvec(&x, &packed, &a, t, 0, 0)?;
-    dev.matvec(&x, &plain, &b, H, no, t, 0, 0);
+    dev.matvec(&x, &plain, &b, H, no, t, 0, 0)?;
     let scale = dev.upload(&[scale]);
     Ok(KComparison {
         packed_unscaled: dev.read(&a)?, decoded_unscaled: dev.read(&b)?,
-        packed_scaled: dev.read(&dev.point(&a, &scale, a.len, 1))?,
-        decoded_scaled: dev.read(&dev.point(&b, &scale, b.len, 1))?,
+        packed_scaled: dev.read(&dev.point(&a, &scale, a.len, 1)?)?,
+        decoded_scaled: dev.read(&dev.point(&b, &scale, b.len, 1)?)?,
     })
 }
 
@@ -245,7 +245,7 @@ mod tests {
             let a = dev.upload(&vec![-123.0; no * (t + 2)]);
             let b = dev.upload(&vec![-123.0; no * (t + 2)]);
             dev.packed_matvec(&x, &packed, &a, t, ni, no)?;
-            dev.matvec(&x, &dev.upload(&decoded), &b, ni, no, t, ni, no);
+            dev.matvec(&x, &dev.upload(&decoded), &b, ni, no, t, ni, no)?;
             let mut expected = vec![-123.0; no * (t + 2)];
             for token in 0..t { for row in 0..no {
                 expected[(token + 1) * no + row] = (0..ni).map(|i|
@@ -259,7 +259,7 @@ mod tests {
                 assert_eq!(a, e, "exact dyadic ni={ni} T={t} index={i}");
             }
             let scale = dev.upload(&[0.75]);
-            let scaled = dev.read(&dev.point(&a, &scale, a.len, 1))?;
+            let scaled = dev.read(&dev.point(&a, &scale, a.len, 1)?)?;
             for (&s, &e) in scaled.iter().zip(&expected) { assert_eq!(s, e * 0.75); }
             println!("NVFP4 exact matvec: ni={ni} no={no} T={t}; offsets, sentinels, post-scale checked");
         }}

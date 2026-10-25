@@ -1,11 +1,14 @@
-//! Flint's shared dense/MoE block math and bounded 49-block F32 diagnostic.
-//! Standalone fixtures consume external residuals; forward consumes fixed token
-//! IDs and empty history. Neither is a serving/KV or quantized-runtime claim.
+//! Flint's shared dense/MoE block math, bounded forward diagnostics and raw cached
+//! generation. Query chunks<=3; explicitly admitted context capacity; streamed
+//! weights and CPU residual handoff, not a serving or performance claim.
 
 pub mod math;
 pub mod weights;
 pub mod config;
 pub mod forward;
+pub mod cache;
+#[cfg(feature = "tokenizer")]
+pub mod session;
 
 // Direct raw-text codec, independent of persisted tokenizer graphs or chat framing.
 #[cfg(feature = "tokenizer")]

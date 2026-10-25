@@ -10,10 +10,9 @@
 //! BF16, or llama.cpp's Q8_1/W4A4 expert-down dispatch.
 //!
 //! All layer arithmetic, including top-six selection, runs on the GPU. This is
-//! a diagnostic graph: every named stage is read back; selected IDs return to
-//! the host to choose bounded expert slices. It is not a GPU-resident runtime.
-//! Weight uploads are retired after each projection readback; no full bank is
-//! retained. The forward diagnostic composes these blocks; there is no KV history.
+//! a bounded graph: optional named stages and required expert IDs return to the
+//! host. Cached and diagnostic blocks share the same arithmetic. Explicit fences
+//! retire temporary uploads even with tracing off; no full expert bank is retained.
 //!
 //! Numerical tier, fixed before comparison: F32 input/weight/output and F32
 //! accumulation. Matvec uses 32 strided lanes per row and a five-step tree;
@@ -151,11 +150,12 @@ fn rope_kernel(x: &Array<f32>, positions: &Array<i32>, y: &mut Array<f32>, heads
 }
 
 #[cube(launch_unchecked)]
-fn mask_kernel(positions: &Array<i32>, mask: &mut Array<f32>, t: u32, window: i32, negative_infinity: f32) {
+fn mask_kernel(positions: &Array<i32>, keys: &Array<i32>, mask: &mut Array<f32>,
+    t: u32, nt:u32, window: i32, negative_infinity: f32) {
     let i = ABSOLUTE_POS as u32;
-    if i < t * t {
-        let query = positions[(i / t) as usize];
-        let key = positions[(i % t) as usize];
+    if i < t * nt {
+        let query = positions[(i / nt) as usize];
+        let key = keys[(i % nt) as usize];
         let mut m = f32::new(0.0);
         // A scalar binding avoids CubeCL emitting the invalid CUDA literal -inf.
         if key > query || (window > 0 && query - key >= window) { m = negative_infinity; }
@@ -166,44 +166,50 @@ fn mask_kernel(positions: &Array<i32>, mask: &mut Array<f32>, t: u32, window: i3
 #[cube(launch_unchecked)]
 fn attention_kernel(q: &Array<f32>, k: &Array<f32>, v: &Array<f32>, sinks: &Array<f32>,
     mask: &Array<f32>, scores: &mut Array<f32>, probs: &mut Array<f32>,
-    heads: &mut Array<f32>, t: u32) {
+    heads: &mut Array<f32>, t: u32, nt:u32) {
     let hq = ABSOLUTE_POS as u32;
     if hq < 32 * t {
         let h = hq / t;
         let query = hq % t;
-        let base = hq * t;
-        let mut logits = Array::<f32>::new(3usize);
+        let base = hq * nt;
+        // Each thread owns one complete [head,query] row of global scratch.
+        // No fixed local key array: query<=3 does not limit cached key length.
         let mut maximum = sinks[h as usize];
-        for key in 0..t {
+        for key in 0..nt {
             let mut dot = f32::new(0.0);
             for d in 0..128u32 {
                 dot += q[((query * 32 + h) * 128 + d) as usize]
                     * k[((key * 4 + h / 8) * 128 + d) as usize];
             }
             scores[(base + key) as usize] = dot;
-            let logit = dot * (1.0 / 128.0f32.sqrt()) + mask[(query * t + key) as usize];
-            logits[key as usize] = logit;
+            let logit = dot * (1.0 / 128.0f32.sqrt()) + mask[(query * nt + key) as usize];
+            probs[(base + key) as usize] = logit;
             maximum = maximum.max(logit);
         }
         let mut denom = f32::new(0.0);
-        for key in 0..t {
-            let e = (logits[key as usize] - maximum).exp();
-            logits[key as usize] = e;
+        for key in 0..nt {
+            let e = (probs[(base + key) as usize] - maximum).exp();
+            probs[(base + key) as usize] = e;
             denom += e;
         }
         denom += (sinks[h as usize] - maximum).exp();
-        for key in 0..t {
-            logits[key as usize] = logits[key as usize] / denom;
-            probs[(base + key) as usize] = logits[key as usize];
+        for key in 0..nt {
+            probs[(base + key) as usize] = probs[(base + key) as usize] / denom;
         }
         for d in 0..128u32 {
             let mut sum = f32::new(0.0);
-            for key in 0..t {
-                sum += logits[key as usize] * v[((key * 4 + h / 8) * 128 + d) as usize];
+            for key in 0..nt {
+                sum += probs[(base + key) as usize] * v[((key * 4 + h / 8) * 128 + d) as usize];
             }
             heads[(hq * 128 + d) as usize] = sum;
         }
     }
+}
+
+#[cube(launch_unchecked)]
+fn append_kernel(k:&Array<f32>,v:&Array<f32>,keys:&mut Array<f32>,values:&mut Array<f32>,len:u32,offset:u32) {
+    let i=ABSOLUTE_POS as u32;
+    if i<len { keys[(offset+i) as usize]=k[i as usize]; values[(offset+i) as usize]=v[i as usize]; }
 }
 
 #[cube(launch_unchecked)]
@@ -296,6 +302,9 @@ impl Device {
     fn positions(&self, x: &[i32]) -> Buffer {
         Buffer { handle: self.client.create_from_slice(i32::as_bytes(x)), len: x.len() }
     }
+    fn sync(&self)->Result<()> {
+        cubecl::future::block_on(self.client.sync()).map_err(|e|anyhow!("CUDA synchronization: {e:?}"))
+    }
     fn read(&self, x: &Buffer) -> Result<Vec<f32>> {
         let bytes = self.client.read_one(x.handle.clone()).map_err(|e| anyhow!("CUDA readback: {e:?}"))?;
         ensure!(bytes.len() == x.len * 4, "CUDA readback length differs");
@@ -308,11 +317,12 @@ impl Device {
     }
     fn trace(&self, tr: &mut Trace, name: &str, dims: [usize; 4], x: &Buffer) -> Result<()> {
         ensure!(dims.iter().product::<usize>() == x.len, "trace shape mismatch: {name}");
+        if !tr.enabled { return Ok(()); }
         tr.stages.push(Stage { name: name.into(), dims, values: Values::F32(self.read(x)?) });
         Ok(())
     }
     fn matvec(&self, x: &Buffer, w: &Buffer, y: &Buffer, ni: usize, no: usize,
-        batch: usize, input_offset: usize, output_offset: usize) {
+        batch: usize, input_offset: usize, output_offset: usize) -> Result<()> {
         assert_eq!(w.len, ni * no);
         assert!(input_offset + ni * batch <= x.len && output_offset + no * batch <= y.len);
         unsafe { matvec_kernel::launch_unchecked::<CudaRuntime>(
@@ -320,8 +330,9 @@ impl Device {
             x.arg(), w.arg(), y.arg(), ni as u32, no as u32, batch as u32,
             input_offset as u32, output_offset as u32,
         ); }
+        self.sync()
     }
-    fn norm(&self, x: &Buffer, weights: &[f32]) -> Buffer {
+    fn norm(&self, x: &Buffer, weights: &[f32]) -> Result<Buffer> {
         assert!(!weights.is_empty());
         assert_eq!(x.len % weights.len(), 0);
         let w = self.upload(weights);
@@ -330,9 +341,9 @@ impl Device {
             &self.client, CubeCount::new_1d((x.len / weights.len()) as u32), CubeDim::new_1d(256),
             x.arg(), w.arg(), y.arg(), weights.len() as u32,
         ); }
-        y
+        self.sync()?; Ok(y)
     }
-    fn point(&self, a: &Buffer, b: &Buffer, width: usize, op: u32) -> Buffer {
+    fn point(&self, a: &Buffer, b: &Buffer, width: usize, op: u32) -> Result<Buffer> {
         assert!(width > 0);
         match op { 0 | 3 => assert_eq!(a.len, b.len), 1 | 4 => {
             assert_eq!(a.len % width, 0); assert_eq!(b.len, a.len / width);
@@ -342,16 +353,16 @@ impl Device {
             &self.client, CubeCount::new_1d(a.len.div_ceil(256) as u32), CubeDim::new_1d(256),
             a.arg(), b.arg(), y.arg(), a.len as u32, width as u32, op,
         ); }
-        y
+        self.sync()?; Ok(y)
     }
-    fn rope(&self, x: &Buffer, positions: &Buffer, heads: usize) -> Buffer {
+    fn rope(&self, x: &Buffer, positions: &Buffer, heads: usize) -> Result<Buffer> {
         assert_eq!(x.len, positions.len * heads * D);
         let y = self.empty(x.len);
         unsafe { rope_kernel::launch_unchecked::<CudaRuntime>(
             &self.client, CubeCount::new_1d((x.len / 2).div_ceil(256) as u32), CubeDim::new_1d(256),
             x.arg(), positions.arg(), y.arg(), heads as u32, (x.len / 2) as u32,
         ); }
-        y
+        self.sync()?; Ok(y)
     }
     fn projection(&self, w: &mut impl Weights, suffix: &str, dims: &[usize],
         expert: Option<usize>, mode: ProjectionMode) -> Result<Projection> {
@@ -368,10 +379,10 @@ impl Device {
     fn project(&self, weight: &Projection, x: &Buffer, y: &Buffer, t: usize,
         input_offset: usize, output_offset: usize) -> Result<()> {
         match &weight.storage {
-            ProjectionStorage::Decoded(w) => self.matvec(x, w, y, weight.ni, weight.no, t, input_offset, output_offset),
+            ProjectionStorage::Decoded(w) => self.matvec(x, w, y, weight.ni, weight.no, t, input_offset, output_offset)?,
             ProjectionStorage::Packed(w) => self.packed_matvec(x, w, y, t, input_offset, output_offset)?,
         }
-        Ok(())
+        self.sync()
     }
     fn dense(&self, w: &mut impl Weights, tr: &mut Trace, suffix: &str, label: &str,
         x: &Buffer, ni: usize, no: usize, t: usize, mode: ProjectionMode) -> Result<Buffer> {
@@ -380,7 +391,7 @@ impl Device {
         let raw = self.empty(no * t);
         self.project(&weight, x, &raw, t, 0, 0)?;
         self.trace(tr, &format!("{label}_unscaled"), [no,t,1,1], &raw)?;
-        let out = self.point(&raw, &scale, raw.len, 1);
+        let out = self.point(&raw, &scale, raw.len, 1)?;
         self.trace(tr, label, [no,t,1,1], &out)?;
         Ok(out)
     }
@@ -401,7 +412,7 @@ impl Device {
             selected.push(scales[id as usize]);
         }
         let scale = self.upload(&selected);
-        let out = self.point(&raw, &scale, no, 1);
+        let out = self.point(&raw, &scale, no, 1)?;
         self.trace(tr, &format!("{label}_unscaled"), [no,K,t,1], &raw)?;
         self.trace(tr, &format!("{label}_selected_scale"), [1,K,t,1], &scale)?;
         self.trace(tr, label, [no,K,t,1], &out)?;
@@ -412,10 +423,37 @@ impl Device {
         let up = self.dense(w,tr,"ffn_up","dense_up",n,hidden,width,t,mode)?;
         let gate = self.dense(w,tr,"ffn_gate","dense_gate",n,hidden,width,t,mode)?;
         // Clamp=0 follows the exact pinned common loader plus Flint loader.
-        let sw = self.point(&gate,&up,width,3);
+        let sw = self.point(&gate,&up,width,3)?;
         self.trace(tr,"dense_swiglu",[width,t,1,1],&sw)?;
         self.trace(tr,"dense_down_input",[width,t,1,1],&sw)?;
         self.dense(w,tr,"ffn_down","dense_down",&sw,width,hidden,t,mode)
+    }
+}
+
+/// Reserved token-major [capacity,4,128] buffers on the fixed default device.
+/// The owner must poison the whole sequence on a failed partially executed block.
+pub(super) struct KvCache {
+    dev:Device, k:Buffer, v:Buffer, positions:Vec<i32>, capacity:usize,
+}
+impl KvCache {
+    pub fn new(capacity:usize)->Result<Self> {
+        super::cache::Geometry::new(3,capacity)?;
+        let elements=capacity.checked_mul(KV*D).ok_or_else(||anyhow!("KV allocation overflow"))?;
+        elements.checked_mul(4).ok_or_else(||anyhow!("KV byte count overflow"))?;
+        let mut positions=Vec::new(); positions.try_reserve_exact(capacity)?;
+        let dev=Device::new(); let k=dev.empty(elements); let v=dev.empty(elements);
+        dev.sync()?; Ok(Self {dev,k,v,positions,capacity})
+    }
+    pub fn len(&self)->usize { self.positions.len() }
+    pub fn reset(&mut self)->Result<()> { self.dev.sync()?; self.positions.clear(); Ok(()) }
+    fn append(&mut self,k:&Buffer,v:&Buffer,positions:&[i32])->Result<()> {
+        super::cache::validate_append(&self.positions,positions,self.capacity)?;
+        ensure!(k.len==positions.len()*KV*D && v.len==k.len,"GPU KV row shape differs");
+        let offset=self.positions.len()*KV*D;
+        unsafe { append_kernel::launch_unchecked::<CudaRuntime>(&self.dev.client,
+            CubeCount::new_1d(k.len.div_ceil(256) as u32),CubeDim::new_1d(256),
+            k.arg(),v.arg(),self.k.arg(),self.v.arg(),k.len as u32,offset as u32); }
+        self.dev.sync()?; self.positions.extend_from_slice(positions); Ok(())
     }
 }
 
@@ -438,61 +476,73 @@ pub fn layer2_packed_all(w: &mut impl Weights, input: &[f32], positions: &[i32])
 }
 
 pub fn block(w: &mut impl Weights, input: &[f32], positions: &[i32], config: BlockConfig, mode: ProjectionMode) -> Result<Trace> {
+    Ok(block_core(w,input,positions,config,mode,None,true)?.trace)
+}
+pub(super) fn block_core(w:&mut impl Weights,input:&[f32],positions:&[i32],config:BlockConfig,
+    mode:ProjectionMode,mut cache:Option<&mut KvCache>,trace:bool)->Result<super::math::BlockOutput> {
     let t = positions.len();
     ensure!((1..=3).contains(&t) && input.len() == H*t, "expected 1..=3 residual rows of width 2048");
     ensure!(positions.iter().all(|&p| p >= 0) && positions.windows(2).all(|p| p[0] < p[1]), "invalid positions");
     ensure!(input.iter().all(|v| v.is_finite()), "non-finite residual input");
-    let dev = Device::new();
-    let mut tr = Trace::default();
+    ensure!(config.sliding_window.is_none_or(|w|w>0),"sliding window must be positive");
+    let dev = match cache.as_ref() { Some(c)=>Device {client:c.dev.client.clone()},None=>Device::new() };
+    let mut tr = Trace::new(trace);
     let input_gpu = dev.upload(input);
     let pos = dev.positions(positions);
     dev.trace(&mut tr, "input", [H,t,1,1], &input_gpu)?;
-    tr.stages.push(Stage { name: "positions".into(), dims: [t,1,1,1], values: Values::I32(dev.read_ids(&pos)?) });
-    let n = dev.norm(&input_gpu, &w.get("attn_norm.weight", &[H], 0, None)?);
+    if trace { tr.stages.push(Stage { name: "positions".into(), dims: [t,1,1,1], values: Values::I32(positions.to_vec()) }); }
+    let n = dev.norm(&input_gpu, &w.get("attn_norm.weight", &[H], 0, None)?)?;
     dev.trace(&mut tr, "attn_norm", [H,t,1,1], &n)?;
     let q = dev.dense(w,&mut tr,"attn_q","q_proj",&n,H,Q*D,t,mode)?;
     let k = dev.dense(w,&mut tr,"attn_k","k_proj",&n,H,KV*D,t,mode)?;
     let v = dev.dense(w,&mut tr,"attn_v","v_proj",&n,H,KV*D,t,mode)?;
-    let qn = dev.norm(&q,&w.get("attn_q_norm.weight",&[D],0,None)?);
-    let kn = dev.norm(&k,&w.get("attn_k_norm.weight",&[D],0,None)?);
+    let qn = dev.norm(&q,&w.get("attn_q_norm.weight",&[D],0,None)?)?;
+    let kn = dev.norm(&k,&w.get("attn_k_norm.weight",&[D],0,None)?)?;
     dev.trace(&mut tr,"q_norm",[D,Q,t,1],&qn)?;
     dev.trace(&mut tr,"k_norm",[D,KV,t,1],&kn)?;
-    let q = if config.rope { dev.rope(&qn,&pos,Q) } else { qn };
-    let k = if config.rope { dev.rope(&kn,&pos,KV) } else { kn };
+    let q = if config.rope { dev.rope(&qn,&pos,Q)? } else { qn };
+    let k = if config.rope { dev.rope(&kn,&pos,KV)? } else { kn };
     dev.trace(&mut tr,if config.rope { "q_rope" } else { "q_no_rope" },[D,Q,t,1],&q)?;
     dev.trace(&mut tr,if config.rope { "k_rope" } else { "k_no_rope" },[D,KV,t,1],&k)?;
+    let (k,v,key_positions)=if let Some(c)=cache.as_deref_mut() {
+        c.append(&k,&v,positions)?; (&c.k,&c.v,c.positions.as_slice())
+    } else { (&k,&v,positions) };
+    let nt=key_positions.len();
+    let key_pos=dev.positions(key_positions);
+    let geometry=super::cache::Geometry::new(t,nt)?;
     let sinks = dev.upload(&w.get("attn_sinks.weight",&[Q],0,None)?);
     ensure!(sinks.len == Q, "attention sink shape differs");
-    let scores = dev.empty(t*t*Q);
-    let probs = dev.empty(t*t*Q);
-    let mask = dev.empty(t*t);
+    let scores = dev.empty(geometry.scores);
+    let probs = dev.empty(geometry.scores);
+    let mask = dev.empty(geometry.mask);
     let heads = dev.empty(D*t*Q);
     let joined = dev.empty(Q*D*t);
     unsafe {
-        mask_kernel::launch_unchecked::<CudaRuntime>(&dev.client, CubeCount::new_1d(1), CubeDim::new_1d(32),
-            pos.arg(),mask.arg(),t as u32,config.sliding_window.unwrap_or(0),f32::NEG_INFINITY);
+        mask_kernel::launch_unchecked::<CudaRuntime>(&dev.client, CubeCount::new_1d(geometry.mask.div_ceil(32) as u32), CubeDim::new_1d(32),
+            pos.arg(),key_pos.arg(),mask.arg(),t as u32,nt as u32,config.sliding_window.unwrap_or(0),f32::NEG_INFINITY);
         attention_kernel::launch_unchecked::<CudaRuntime>(&dev.client,
             CubeCount::new_1d((Q*t).div_ceil(32) as u32), CubeDim::new_1d(32),
-            q.arg(),k.arg(),v.arg(),sinks.arg(),mask.arg(),scores.arg(),probs.arg(),heads.arg(),t as u32);
+            q.arg(),k.arg(),v.arg(),sinks.arg(),mask.arg(),scores.arg(),probs.arg(),heads.arg(),t as u32,nt as u32);
         join_kernel::launch_unchecked::<CudaRuntime>(&dev.client,
             CubeCount::new_1d(joined.len.div_ceil(256) as u32), CubeDim::new_1d(256),heads.arg(),joined.arg(),t as u32);
     }
-    dev.trace(&mut tr,"attention_scores",[t,t,Q,1],&scores)?;
-    dev.trace(&mut tr,"attention_mask",[t,t,1,1],&mask)?;
-    dev.trace(&mut tr,"attention_probs",[t,t,Q,1],&probs)?;
+    dev.sync()?;
+    dev.trace(&mut tr,"attention_scores",[nt,t,Q,1],&scores)?;
+    dev.trace(&mut tr,"attention_mask",[nt,t,1,1],&mask)?;
+    dev.trace(&mut tr,"attention_probs",[nt,t,Q,1],&probs)?;
     dev.trace(&mut tr,"attention_heads",[D,t,Q,1],&heads)?;
     let ao = dev.dense(w,&mut tr,"attn_output","attention_output",&joined,Q*D,H,t,mode)?;
-    let residual = dev.point(&input_gpu,&ao,H,0);
+    let residual = dev.point(&input_gpu,&ao,H,0)?;
     dev.trace(&mut tr,"ffn_inp",[H,t,1,1],&residual)?;
-    let n = dev.norm(&residual,&w.get("ffn_norm.weight",&[H],0,None)?);
+    let n = dev.norm(&residual,&w.get("ffn_norm.weight",&[H],0,None)?)?;
     dev.trace(&mut tr,"ffn_norm",[H,t,1,1],&n)?;
     let ffn = if let FfnKind::Dense { width } = config.ffn {
         dev.dense_ffn(w,&mut tr,&n,H,width,t,mode)?
     } else {
         let router = dev.upload(&w.get("ffn_gate_inp.weight",&[H,E],30,None)?);
         let logits = dev.empty(E*t);
-        dev.matvec(&n,&router,&logits,H,E,t,0,0);
-        let prob = dev.point(&logits,&logits,E,2);
+        dev.matvec(&n,&router,&logits,H,E,t,0,0)?;
+        let prob = dev.point(&logits,&logits,E,2)?;
         dev.trace(&mut tr,"router_logits",[E,t,1,1],&logits)?;
         dev.trace(&mut tr,"router_probs",[E,t,1,1],&prob)?;
         let ids_gpu = dev.empty(K*t);
@@ -504,42 +554,46 @@ pub fn block(w: &mut impl Weights, input: &[f32], positions: &[i32], config: Blo
         unsafe { route_kernel::launch_unchecked::<CudaRuntime>(&dev.client, CubeCount::new_1d(1), CubeDim::new_1d(32),
             prob.arg(),ids_gpu.arg(),selected.arg(),sums.arg(),denoms.arg(),rw.arg(),margins.arg(),t as u32); }
         let ids = dev.read_ids(&ids_gpu)?;
-        tr.stages.push(Stage { name: "router_ids".into(), dims: [K,t,1,1], values: Values::I32(ids.clone()) });
+        if trace { tr.stages.push(Stage { name: "router_ids".into(), dims: [K,t,1,1], values: Values::I32(ids.clone()) }); }
         dev.trace(&mut tr,"router_selected_probs",[1,K,t,1],&selected)?;
         dev.trace(&mut tr,"router_sum",[1,t,1,1],&sums)?;
         dev.trace(&mut tr,"router_denominator",[1,t,1,1],&denoms)?;
         dev.trace(&mut tr,"router_weights",[1,K,t,1],&rw)?;
-        tr.router_margins = dev.read(&margins)?;
+        if trace { tr.router_margins = dev.read(&margins)?; }
         let up = dev.experts(w,&mut tr,"ffn_up_exps","expert_up",&n,H,F,t,&ids,false,mode)?;
         let gate = dev.experts(w,&mut tr,"ffn_gate_exps","expert_gate",&n,H,F,t,&ids,false,mode)?;
-        let sw = dev.point(&gate,&up,F,3);
+        let sw = dev.point(&gate,&up,F,3)?;
         dev.trace(&mut tr,"expert_swiglu",[F,K,t,1],&sw)?;
         let scales = dev.empty(K*t);
         unsafe { down_scale_kernel::launch_unchecked::<CudaRuntime>(&dev.client, CubeCount::new_1d(1), CubeDim::new_1d(32),
             sw.arg(),scales.arg(),F as u32,(K*t) as u32); }
+        dev.sync()?;
         dev.trace(&mut tr,"expert_down_scale",[1,K,t,1],&scales)?;
-        let di = dev.point(&sw,&scales,F,4);
+        let di = dev.point(&sw,&scales,F,4)?;
         dev.trace(&mut tr,"expert_down_input",[F,K,t,1],&di)?;
         let before = dev.experts(w,&mut tr,"ffn_down_exps","expert_down_before_rescale",&di,F,H,t,&ids,true,mode)?;
-        let down = dev.point(&before,&scales,H,1);
+        let down = dev.point(&before,&scales,H,1)?;
         dev.trace(&mut tr,"expert_down",[H,K,t,1],&down)?;
-        let weighted = dev.point(&down,&rw,H,1);
+        let weighted = dev.point(&down,&rw,H,1)?;
         dev.trace(&mut tr,"expert_weighted",[H,K,t,1],&weighted)?;
         let moe = dev.empty(H*t);
         unsafe { moe_sum_kernel::launch_unchecked::<CudaRuntime>(&dev.client,
             CubeCount::new_1d(moe.len.div_ceil(256) as u32),CubeDim::new_1d(256),weighted.arg(),moe.arg(),moe.len as u32); }
+        dev.sync()?;
         dev.trace(&mut tr,"moe_out",[H,t,1,1],&moe)?;
         let su = dev.dense(w,&mut tr,"ffn_up_shexp","shared_up",&n,H,SH,t,mode)?;
         let sg = dev.dense(w,&mut tr,"ffn_gate_shexp","shared_gate",&n,H,SH,t,mode)?;
-        let ss = dev.point(&sg,&su,SH,3);
+        let ss = dev.point(&sg,&su,SH,3)?;
         dev.trace(&mut tr,"shared_swiglu",[SH,t,1,1],&ss)?;
         let sd = dev.dense(w,&mut tr,"ffn_down_shexp","shared_down",&ss,SH,H,t,mode)?;
-        dev.point(&moe,&sd,H,0)
+        dev.point(&moe,&sd,H,0)?
     };
     dev.trace(&mut tr,"ffn_out",[H,t,1,1],&ffn)?;
-    let out = dev.point(&ffn,&residual,H,0);
+    let out = dev.point(&ffn,&residual,H,0)?;
     dev.trace(&mut tr,"l_out",[H,t,1,1],&out)?;
-    Ok(tr)
+    let residual=dev.read(&out)?;
+    ensure!(residual.iter().all(|v|v.is_finite()),"nonfinite CUDA block output");
+    Ok(super::math::BlockOutput {residual,trace:tr})
 }
 
 /// Diagnostic final RMS plus a streamed output head. Every chunk is read back
@@ -551,7 +605,7 @@ impl OutputHead {
             "invalid output RMS geometry");
         ensure!(residual.iter().chain(gain).all(|v|v.is_finite()),"nonfinite output RMS input");
         let dev=Device::new();
-        let normalized=dev.norm(&dev.upload(residual),gain);
+        let normalized=dev.norm(&dev.upload(residual),gain)?;
         Ok(Self {dev,normalized,tokens:residual.len()/H})
     }
     pub fn normalized(&self) -> Result<Vec<f32>> { self.dev.read(&self.normalized) }
@@ -567,13 +621,88 @@ impl OutputHead {
         let weight=Projection {ni:H,no:rows,storage};
         let out=self.dev.empty(rows*self.tokens);
         self.dev.project(&weight,&self.normalized,&out,self.tokens,0,0)?;
-        self.dev.read(&self.dev.point(&out,&self.dev.upload(&[scale]),out.len,1))
+        self.dev.read(&self.dev.point(&out,&self.dev.upload(&[scale]),out.len,1)?)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires an exclusive GB10 GPU reservation; synthetic, no model"]
+    fn cuda_cached_514_keys_full_local_and_crossing_chunk() -> Result<()> {
+        let mut cache=KvCache::new(514)?;
+        let dev=Device {client:cache.dev.client.clone()};
+        let positions:Vec<i32>=(0..514).collect();
+        let key_values:Vec<f32>=(0..514*KV*D).map(|i| {
+            let key=i/(KV*D); let head=i/D%KV; let d=i%D;
+            match d {0=>((key*7+head*3)%17) as f32/16.0-0.5,7=>(key%11) as f32/32.0-0.125,_=>0.0}
+        }).collect();
+        let value_values:Vec<f32>=(0..514*KV*D).map(|i| {
+            let key=i/(KV*D); let head=i/D%KV; let d=i%D;
+            (key%19) as f32/16.0 + head as f32/8.0 - d as f32/256.0 + if key==0 {10.0} else {0.0}
+        }).collect();
+        for part in positions.chunks(3) {
+            let first=part[0] as usize*KV*D; let end=first+part.len()*KV*D;
+            cache.append(&dev.upload(&key_values[first..end]),&dev.upload(&value_values[first..end]),part)?;
+        }
+        assert_eq!(cache.len(),514);
+        assert_eq!(dev.read(&cache.k)?,key_values); assert_eq!(dev.read(&cache.v)?,value_values);
+        let queries=[511,512,513]; let t=queries.len(); let nt=cache.len();
+        let query_values:Vec<f32>=(0..t*Q*D).map(|i| {
+            let query=i/(Q*D); let head=i/D%Q;
+            match i%D {0=>(1+head%3) as f32/8.0,7=>-((1+query) as f32)/16.0,_=>0.0}
+        }).collect();
+        let sink_values:Vec<f32>=(0..Q).map(|h|(h%5) as f32/8.0-0.25).collect();
+        let q=dev.upload(&query_values); let pos=dev.positions(&queries);
+        let keys=dev.positions(&positions); let sinks=dev.upload(&sink_values);
+        let geometry=super::super::cache::Geometry::new(t,nt)?;
+        for window in [0,513] {
+            let mask=dev.empty(geometry.mask); let scores=dev.empty(geometry.scores);
+            let probs=dev.empty(geometry.scores); let heads=dev.empty(Q*t*D);
+            unsafe {
+                mask_kernel::launch_unchecked::<CudaRuntime>(&dev.client,
+                    CubeCount::new_1d(geometry.mask.div_ceil(32) as u32),CubeDim::new_1d(32),
+                    pos.arg(),keys.arg(),mask.arg(),t as u32,nt as u32,window,f32::NEG_INFINITY);
+                attention_kernel::launch_unchecked::<CudaRuntime>(&dev.client,
+                    CubeCount::new_1d((Q*t).div_ceil(32) as u32),CubeDim::new_1d(32),
+                    q.arg(),cache.k.arg(),cache.v.arg(),sinks.arg(),mask.arg(),scores.arg(),probs.arg(),heads.arg(),t as u32,nt as u32);
+            }
+            dev.sync()?;
+            let actual_mask=dev.read(&mask)?;
+            for (row,&query) in queries.iter().enumerate() { for (col,&key) in positions.iter().enumerate() {
+                let allowed=key<=query && (window==0 || query-key<window);
+                assert_eq!(actual_mask[row*nt+col],if allowed {0.0} else {f32::NEG_INFINITY});
+            }}
+            let mut expected=vec![0.0;Q*t*D];
+            for h in 0..Q { for (qi,&query) in queries.iter().enumerate() {
+                let mut logits=vec![f64::NEG_INFINITY;nt];
+                for (ki,&key) in positions.iter().enumerate() {
+                    if key<=query && (window==0 || query-key<window) {
+                        let dot:f64=[0,7].into_iter().map(|d|
+                            query_values[(qi*Q+h)*D+d] as f64*key_values[(ki*KV+h/8)*D+d] as f64).sum();
+                        logits[ki]=dot/(D as f64).sqrt();
+                    }
+                }
+                let max=logits.iter().copied().fold(sink_values[h] as f64,f64::max);
+                let exps:Vec<f64>=logits.iter().map(|&x|(x-max).exp()).collect();
+                let denom=exps.iter().sum::<f64>()+(sink_values[h] as f64-max).exp();
+                for d in 0..D {
+                    expected[(h*t+qi)*D+d]=exps.iter().enumerate().map(|(ki,&p)|
+                        p/denom*value_values[(ki*KV+h/8)*D+d] as f64).sum::<f64>() as f32;
+                }
+            }}
+            // Independent scalar synthetic witness, not a model-quality tolerance.
+            close(&dev.read(&heads)?,&expected,2e-5);
+        }
+        let row=dev.upload(&vec![2.0;KV*D]);
+        assert!(cache.append(&row,&row,&[514]).is_err()); assert_eq!(cache.len(),514);
+        cache.reset()?; assert_eq!(cache.len(),0);
+        cache.append(&row,&row,&[0])?; assert_eq!(cache.len(),1);
+        assert_eq!(&dev.read(&cache.k)?[..KV*D],&vec![2.0;KV*D]);
+        Ok(())
+    }
 
     #[test]
     #[ignore = "requires an exclusive GB10 GPU reservation"]
@@ -584,7 +713,7 @@ mod tests {
             for window in [0,513] {
                 let mask = dev.empty(t*t);
                 unsafe { mask_kernel::launch_unchecked::<CudaRuntime>(&dev.client,CubeCount::new_1d(1),CubeDim::new_1d(32),
-                    pos.arg(),mask.arg(),t as u32,window,f32::NEG_INFINITY); }
+                    pos.arg(),pos.arg(),mask.arg(),t as u32,t as u32,window,f32::NEG_INFINITY); }
                 let actual = dev.read(&mask)?;
                 let expected: Vec<_> = (0..t*t).map(|i| {
                     let distance = positions[i/t]-positions[i%t];
@@ -617,7 +746,7 @@ mod tests {
             let x: Vec<f32> = (0..ni*(t+1)).map(|i| (i as i32 % 17 - 8) as f32 / 16.0).collect();
             let w: Vec<f32> = (0..ni*no).map(|i| (i as i32 % 13 - 6) as f32 / 32.0).collect();
             let y = dev.upload(&vec![-123.0; no*(t+2)]);
-            dev.matvec(&dev.upload(&x),&dev.upload(&w),&y,ni,no,t,ni,no);
+            dev.matvec(&dev.upload(&x),&dev.upload(&w),&y,ni,no,t,ni,no)?;
             let mut expected = vec![-123.0; no*(t+2)];
             for token in 0..t { for row in 0..no {
                 expected[(token+1)*no+row] = (0..ni).map(|i| w[row*ni+i]*x[(token+1)*ni+i]).sum();
@@ -628,15 +757,15 @@ mod tests {
             let a = dev.upload(&x);
             let scales: Vec<f32> = (0..t).map(|i| (i+1) as f32).collect();
             let scale = dev.upload(&scales);
-            let scaled = dev.point(&a,&scale,5,1);
+            let scaled = dev.point(&a,&scale,5,1)?;
             let expected: Vec<f32> = x.iter().enumerate().map(|(i,&v)| v*scales[i/5]).collect();
             close(&dev.read(&scaled)?,&expected,0.0);
-            close(&dev.read(&dev.point(&scaled,&scale,5,4))?,&x,0.0);
+            close(&dev.read(&dev.point(&scaled,&scale,5,4)?)?,&x,0.0);
             let expected: Vec<f32> = x.chunks_exact(5).flat_map(|row| {
                 let inv = ((row.iter().map(|&v| (v as f64).powi(2)).sum::<f64>()/5.0 + 1e-6).sqrt().recip()) as f32;
                 row.iter().map(move |&v| v*inv)
             }).collect();
-            close(&dev.read(&dev.norm(&a,&[1.0;5]))?,&expected,1e-6);
+            close(&dev.read(&dev.norm(&a,&[1.0;5])?)?,&expected,1e-6);
         }
         Ok(())
     }
@@ -696,7 +825,7 @@ mod tests {
                 rope_ref[i] = x[i]*cos-x[i+D/2]*sin;
                 rope_ref[i+D/2] = x[i]*sin+x[i+D/2]*cos;
             }}}
-            close(&dev.read(&dev.rope(&dev.upload(&x),&pos,KV))?,&rope_ref,1e-6);
+            close(&dev.read(&dev.rope(&dev.upload(&x),&pos,KV)?)?,&rope_ref,1e-6);
             let q = dev.upload(&vec![0.0;Q*D*t]);
             let k = dev.upload(&vec![0.0;KV*D*t]);
             let values: Vec<f32> = (0..KV*D*t).map(|i|
@@ -710,9 +839,9 @@ mod tests {
             let joined = dev.empty(Q*t*D);
             unsafe {
                 mask_kernel::launch_unchecked::<CudaRuntime>(&dev.client,CubeCount::new_1d(1),CubeDim::new_1d(32),
-                    pos.arg(),mask.arg(),t as u32,513,f32::NEG_INFINITY);
+                    pos.arg(),pos.arg(),mask.arg(),t as u32,t as u32,513,f32::NEG_INFINITY);
                 attention_kernel::launch_unchecked::<CudaRuntime>(&dev.client,CubeCount::new_1d(t as u32),CubeDim::new_1d(32),
-                    q.arg(),k.arg(),v.arg(),sinks.arg(),mask.arg(),scores.arg(),probs.arg(),heads.arg(),t as u32);
+                    q.arg(),k.arg(),v.arg(),sinks.arg(),mask.arg(),scores.arg(),probs.arg(),heads.arg(),t as u32,t as u32);
                 join_kernel::launch_unchecked::<CudaRuntime>(&dev.client,
                     CubeCount::new_1d(joined.len.div_ceil(256) as u32),CubeDim::new_1d(256),heads.arg(),joined.arg(),t as u32);
             }

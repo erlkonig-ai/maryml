@@ -82,6 +82,10 @@ fn cuda_packed_dense_and_selected_experts_t1_t3() -> Result<()> {
             exact(trace_f32(&trace,"test_unscaled"),&raw);
             exact(&dev.read(&out)?,&scaled);
             assert_eq!(w.reads,vec![(format!("{suffix}.weight"),None)]);
+            let mut quiet=Trace::new(false);
+            let quiet_out=dev.dense(&mut w,&mut quiet,suffix,"test",&x,ni,no,t,ProjectionMode::PackedAll)?;
+            assert!(quiet.stages.is_empty());
+            exact(&dev.read(&quiet_out)?,&scaled);
         }
         let ids: Vec<i32> = (0..K*t).map(|slot| [255,0,17,255,1,0][(slot+slot/K)%K]).collect();
         for suffix in EXPERTS {
@@ -142,20 +146,20 @@ fn cuda_dense_parallel_swiglu_controls() -> Result<()> {
     // exceed the MoE adaptive threshold so a down-input normalization is visible.
     let up = dev.upload(&[4.0,-8.0,8192.0,-16384.0]);
     let gate = dev.upload(&[-4.0,2.0,4.0,8.0]);
-    let u = dev.point(&up,&dev.upload(&[-0.5]),4,1);
-    let g = dev.point(&gate,&dev.upload(&[0.75]),4,1);
-    let sw = dev.point(&g,&u,4,3);
+    let u = dev.point(&up,&dev.upload(&[-0.5]),4,1)?;
+    let g = dev.point(&gate,&dev.upload(&[0.75]),4,1)?;
+    let sw = dev.point(&g,&u,4,3)?;
     let actual = dev.read(&sw)?;
-    let swapped = dev.read(&dev.point(&u,&g,4,3))?;
-    let wrong = dev.point(&gate,&u,4,3);
-    let wrong = dev.read(&dev.point(&wrong,&dev.upload(&[0.75]),4,1))?;
+    let swapped = dev.read(&dev.point(&u,&g,4,3)?)?;
+    let wrong = dev.point(&gate,&u,4,3)?;
+    let wrong = dev.read(&dev.point(&wrong,&dev.upload(&[0.75]),4,1)?)?;
     assert!(actual.iter().zip(swapped).any(|(&a,b)|a.to_bits()!=b.to_bits()));
     assert!(actual.iter().zip(wrong).any(|(&a,b)|a.to_bits()!=b.to_bits()));
     assert!(actual.iter().any(|v|v.abs()>1024.0));
-    let zero = dev.point(&sw,&dev.upload(&[0.0]),4,1);
+    let zero = dev.point(&sw,&dev.upload(&[0.0]),4,1)?;
     assert!(dev.read(&zero)?.iter().all(|&v|v==0.0));
     let residual = dev.upload(&[1.0,-2.0,3.0,-4.0]);
-    exact(&dev.read(&dev.point(&residual,&zero,4,0))?,&[1.0,-2.0,3.0,-4.0]);
+    exact(&dev.read(&dev.point(&residual,&zero,4,0)?)?,&[1.0,-2.0,3.0,-4.0]);
     println!("dense controls: swapped gate/up and moving gate scale after SiLU differ; zero contribution preserves residual; activation exceeds1024");
     Ok(())
 }

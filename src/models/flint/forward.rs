@@ -1,6 +1,6 @@
-//! A bounded, empty-history diagnostic forward, not a generation/session API.
-//! Each block retains its existing readback fences and drops its trace before
-//! the next block. Only selected embeddings/experts and bounded head rows load.
+//! Shared 49-block composition for empty-history diagnostics and cached sessions.
+//! CPU residual handoff and bounded streamed weights are deliberate first-stage
+//! choices, not a resident-weight/performance claim.
 
 use anyhow::{Context, Result, ensure};
 use super::{math::{self, Trace, Values, H}, weights::{GgufWeights, ReadReceipt}};
@@ -12,6 +12,7 @@ pub const BLOCKS: usize = 49;
 
 #[derive(Clone, Copy, Debug)]
 pub enum Backend { Cpu, Cuda, PackedAll }
+pub(super) enum Head { All, Last, Skip }
 
 pub struct Output {
     pub embedding: Vec<f32>, pub residual: Vec<f32>, pub normalized: Vec<f32>,
@@ -47,12 +48,19 @@ fn insert_chunk(logits: &mut [f32], values: &[f32], vocab: usize, first: usize, 
 /// Observer borrows one completed block at a time. It must not launch work on
 /// weights while the trace is being examined. Runtime errors leave no KV state.
 pub fn run(w: &mut GgufWeights, ids: &[i32], positions: &[i32], backend: Backend,
-    mut observe: impl FnMut(usize,&Trace,&[ReadReceipt])->Result<()>) -> Result<Output> {
+    observe: impl FnMut(usize,&Trace,&[ReadReceipt])->Result<()>) -> Result<Output> {
+    run_core(w,ids,positions,backend,None,true,Head::All,observe)
+}
+
+pub(super) fn run_core(w:&mut GgufWeights,ids:&[i32],positions:&[i32],backend:Backend,
+    mut caches:Option<&mut [super::cache::LayerCache]>,trace:bool,head:Head,
+    mut observe:impl FnMut(usize,&Trace,&[ReadReceipt])->Result<()>)->Result<Output> {
     let t=ids.len();
     ensure!((1..=3).contains(&t) && positions.len()==t,"expected T1..3 token IDs and positions");
     ensure!(ids.iter().all(|&id|id>=0 && (id as usize)<VOCAB),"token ID outside vocabulary");
     ensure!(positions.iter().all(|&p|p>=0) && positions.windows(2).all(|p|p[0]<p[1]),"invalid positions");
     ensure!(matches!(backend,Backend::Cpu) || cfg!(feature="flint-cuda"),"CUDA feature required");
+    if let Some(c)=caches.as_ref() { ensure!(c.len()==BLOCKS,"expected all49 layer caches"); }
     ensure!(!w.file.index.tensors.iter().any(|info|
         info.name=="output.input_scale" || (info.name.starts_with("blk.") && info.name.ends_with(".bias"))),
         "unsupported input scale or block bias tensor");
@@ -68,23 +76,45 @@ pub fn run(w: &mut GgufWeights, ids: &[i32], positions: &[i32], backend: Backend
     for block in 0..BLOCKS {
         w.select_block(block)?;
         let config=w.config;
-        let trace=match backend {
-            Backend::Cpu => math::block(w,&residual,positions,config)?,
+        let cache=caches.as_deref_mut().map(|c|&mut c[block]);
+        let result=match backend {
+            Backend::Cpu => {
+                let cache=match cache {
+                    Some(super::cache::LayerCache::Cpu(c))=>Some(c),None=>None,
+                    #[cfg(feature="flint-cuda")] _=>anyhow::bail!("CPU/cache backend mismatch"),
+                };
+                math::block_core(w,&residual,positions,config,cache,trace)?
+            },
             #[cfg(feature="flint-cuda")]
             Backend::Cuda | Backend::PackedAll => {
                 use super::gpu::{self,ProjectionMode};
                 let mode=if matches!(backend,Backend::PackedAll) {ProjectionMode::PackedAll} else {ProjectionMode::Decoded};
-                gpu::block(w,&residual,positions,config,mode)?
+                let cache=match cache {
+                    Some(super::cache::LayerCache::Cuda(c))=>Some(c),None=>None,
+                    _=>anyhow::bail!("CUDA/cache backend mismatch"),
+                };
+                gpu::block_core(w,&residual,positions,config,mode,cache,trace)?
             },
             #[cfg(not(feature="flint-cuda"))]
             _ => unreachable!("feature checked before row reads"),
         };
-        residual=stage_f32(&trace,"l_out")?.to_vec();
+        residual=result.residual;
         ensure!(residual.len()==H*t && residual.iter().all(|v|v.is_finite()),"nonfinite/invalid residual at block {block}");
-        observe(block,&trace,&w.reads)?;
+        observe(block,&result.trace,&w.reads)?;
         w.reads.clear();
         // The full trace and its already-fenced GPU work are dropped here.
     }
+    let head_residual=match head { Head::All=>residual.as_slice(),Head::Last=>&residual[(t-1)*H..],Head::Skip=>&[] };
+    let (normalized,logits)=if head_residual.is_empty() { (Vec::new(),Vec::new()) }
+        else { output_head(w,head_residual,backend)? };
+    global_reads.extend(std::mem::take(&mut w.reads));
+    w.file.check_identity()?;
+    Ok(Output {embedding,residual,normalized,logits,global_reads})
+}
+
+fn output_head(w:&mut GgufWeights,residual:&[f32],backend:Backend)->Result<(Vec<f32>,Vec<f32>)> {
+    let t=residual.len()/H;
+    ensure!((1..=3).contains(&t) && residual.len()==t*H,"invalid head query length");
     let gain=f32_rows(w,"output_norm.weight",&[H])?;
     let scale=f32_rows(w,"output.scale",&[1])?[0];
     let mut logits=vec![0.0;VOCAB*t];
@@ -116,9 +146,7 @@ pub fn run(w: &mut GgufWeights, ids: &[i32], positions: &[i32], backend: Backend
         _ => unreachable!("feature checked before row reads"),
     }
     ensure!(normalized.iter().chain(&logits).all(|v|v.is_finite()),"nonfinite final norm/logits");
-    global_reads.extend(std::mem::take(&mut w.reads));
-    w.file.check_identity()?;
-    Ok(Output {embedding,residual,normalized,logits,global_reads})
+    Ok((normalized,logits))
 }
 
 #[cfg(test)]
