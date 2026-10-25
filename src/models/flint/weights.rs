@@ -1,10 +1,11 @@
-//! Only layer 2, one dense tensor or one routed expert at a time. GGUF scales
+//! One selected fixture block, one dense tensor or one routed expert at a time. GGUF scales
 //! remain separate, applied after matmul by the math layer. No full-model map.
 
 use std::path::Path;
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use crate::formats::gguf::{index::IndexedFile, nvfp4};
+use super::config::{BlockConfig, METADATA_KEYS};
 
 pub trait Weights {
     /// Expected GGML shape/type are mandatory; expert slices retain identity.
@@ -44,20 +45,26 @@ pub struct ReadReceipt {
 pub struct GgufWeights {
     pub file: IndexedFile,
     pub reads: Vec<ReadReceipt>,
+    pub config: BlockConfig,
 }
 
 impl GgufWeights {
     pub fn open(path: &Path) -> Result<Self> {
-        Ok(Self { file: IndexedFile::open(path)?, reads: Vec::new() })
+        Self::open_block(path, 2)
+    }
+    pub fn open_block(path: &Path, block: usize) -> Result<Self> {
+        let file = IndexedFile::open_with_metadata(path, METADATA_KEYS)?;
+        let config = BlockConfig::from_metadata(&file.index.metadata, block)?;
+        Ok(Self { file, reads: Vec::new(), config })
     }
     fn read_weight(&mut self, suffix: &str, dims: &[usize], ty: u32, expert: Option<usize>)
         -> Result<(Vec<u8>, usize, ReadReceipt)> {
         ensure!(!suffix.contains('.') || suffix.ends_with(".weight") || suffix.ends_with(".scale"), "invalid tensor suffix");
         let (first, rows, elements) = row_selection(dims, expert)?;
-        let name = format!("blk.2.{suffix}");
+        let name = format!("blk.{}.{suffix}", self.config.block);
         let info = self.file.index.tensor(&name)?.clone();
         ensure!(info.dims == dims.iter().map(|&d| d as u64).collect::<Vec<_>>() && info.ggml_type == ty,
-            "unexpected layer-2 shape/type: {name}");
+            "unexpected selected-block shape/type: {name}");
         let (start, raw) = self.file.read_rows(&name, first, rows)?;
         let end = start.checked_add(u64::try_from(raw.len())?).context("read receipt end overflow")?;
         let receipt = ReadReceipt { name, ggml_dims: info.dims, ggml_type: ty, expert,

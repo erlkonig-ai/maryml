@@ -87,7 +87,16 @@ pub struct Index {
     pub data_offset: u64,
     pub alignment: u64,
     pub tensors: Vec<TensorInfo>,
+    /// Only caller-selected semantics; unrelated metadata is skipped as before.
+    pub metadata: Vec<MetadataEntry>,
+    pub metadata_end: u64,
 }
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct MetadataEntry { pub key: String, pub gguf_type: u32, pub value: MetadataValue }
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub enum MetadataValue { U32(u32), F32(f32), Bool(bool), String(String), BoolArray(Vec<bool>) }
 
 struct Header<R> {
     reader: R,
@@ -157,10 +166,45 @@ impl<R: Read + Seek> Header<R> {
             _ => bail!("unknown GGUF metadata type {tag}"),
         }
     }
+
+    fn selected_value(&mut self, tag: u32) -> Result<MetadataValue> {
+        fn boolean(byte: u8) -> Result<bool> {
+            ensure!(byte <= 1, "invalid GGUF BOOL value");
+            Ok(byte != 0)
+        }
+        Ok(match tag {
+            4 => MetadataValue::U32(self.u32()?),
+            6 => MetadataValue::F32(f32::from_le_bytes(self.take()?)),
+            7 => MetadataValue::Bool(boolean(self.take::<1>()?[0])?),
+            8 => {
+                let size = self.u64()?;
+                ensure!(size <= 4096, "selected metadata string exceeds limit");
+                self.check(size)?;
+                let mut bytes = vec![0; usize::try_from(size)?];
+                self.reader.read_exact(&mut bytes)?;
+                MetadataValue::String(String::from_utf8(bytes).context("selected metadata is not UTF-8")?)
+            }
+            9 => {
+                ensure!(self.u32()? == 7, "selected metadata array must contain BOOL values");
+                let count = self.u64()?;
+                ensure!(count <= 4096, "selected metadata array exceeds limit");
+                self.check(count)?;
+                let mut values = Vec::with_capacity(usize::try_from(count)?);
+                for _ in 0..count { values.push(boolean(self.take::<1>()?[0])?); }
+                MetadataValue::BoolArray(values)
+            }
+            _ => bail!("unsupported selected GGUF metadata type {tag}"),
+        })
+    }
 }
 
 impl Index {
     pub fn read<R: Read + Seek>(reader: R, len: u64) -> Result<Self> {
+        Self::read_with_metadata(reader, len, &[])
+    }
+
+    pub fn read_with_metadata<R: Read + Seek>(reader: R, len: u64, keys: &[&str]) -> Result<Self> {
+        ensure!(keys.len() <= 64, "too many selected metadata keys");
         let mut h = Header { reader, len };
         ensure!(h.reader.stream_position()? == 0, "GGUF reader must start at byte zero");
         let magic = h.take::<4>()?;
@@ -173,6 +217,7 @@ impl Index {
         ensure!(tensors <= MAX_ENTRIES && metadata <= MAX_ENTRIES, "GGUF table exceeds bounded index limit");
         let mut alignment = 32u64;
         let mut alignment_seen = false;
+        let mut selected = Vec::<MetadataEntry>::new();
         for _ in 0..metadata {
             let key = h.string()?;
             let ty = h.u32()?;
@@ -181,10 +226,14 @@ impl Index {
                 alignment_seen = true;
                 alignment = u64::from(h.u32()?);
                 ensure!(alignment.is_power_of_two() && alignment <= MAX_HEADER, "invalid GGUF alignment");
+            } else if keys.contains(&key.as_str()) {
+                ensure!(!selected.iter().any(|entry| entry.key == key), "duplicate selected metadata key {key}");
+                selected.push(MetadataEntry { key, gguf_type: ty, value: h.selected_value(ty)? });
             } else {
                 h.value(ty)?;
             }
         }
+        let metadata_end = h.reader.stream_position()?;
         let mut infos = Vec::new();
         let mut names = HashSet::new(); // Ephemeral format validation, not retained collection state.
         for _ in 0..tensors {
@@ -227,7 +276,7 @@ impl Index {
             }
             if i > 0 { ensure!(ordered[i - 1].offset != info.offset, "duplicate tensor offset"); }
         }
-        Ok(Self { version, data_offset, alignment, tensors: infos })
+        Ok(Self { version, data_offset, alignment, tensors: infos, metadata: selected, metadata_end })
     }
 
     pub fn tensor(&self, name: &str) -> Result<&TensorInfo> {
@@ -243,12 +292,16 @@ pub struct IndexedFile {
 
 impl IndexedFile {
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_metadata(path, &[])
+    }
+
+    pub fn open_with_metadata(path: &Path, keys: &[&str]) -> Result<Self> {
         let before = path.symlink_metadata()?;
         ensure!(!before.file_type().is_symlink(), "GGUF source must not be a symlink");
         let file = File::open(path)?;
         let identity = FileIdentity::from_metadata(&file.metadata()?)?;
         ensure!(FileIdentity::from_metadata(&before)? == identity, "GGUF source changed while opening");
-        let index = Index::read(BufReader::new(file.try_clone()?), identity.bytes)?;
+        let index = Index::read_with_metadata(BufReader::new(file.try_clone()?), identity.bytes, keys)?;
         ensure!(FileIdentity::from_metadata(&file.metadata()?)? == identity, "GGUF source changed during indexing");
         Ok(Self { file, identity, index })
     }
@@ -329,3 +382,25 @@ mod tests {
         assert!(parse(&data).is_ok());
     }
 }
+    #[test]
+    fn selected_metadata_is_typed_bounded_and_unrelated_values_are_skipped() {
+        let mut bytes = b"GGUF".to_vec();
+        bytes.extend(3u32.to_le_bytes()); bytes.extend(0u64.to_le_bytes()); bytes.extend(3u64.to_le_bytes());
+        let entry = |dst: &mut Vec<u8>, key: &str, tag: u32| {
+            dst.extend((key.len() as u64).to_le_bytes()); dst.extend(key.as_bytes()); dst.extend(tag.to_le_bytes());
+        };
+        entry(&mut bytes,"architecture",8); bytes.extend(5u64.to_le_bytes()); bytes.extend(b"flint");
+        entry(&mut bytes,"unrelated",9); bytes.extend(10u32.to_le_bytes()); bytes.extend(2u64.to_le_bytes()); bytes.extend([0u8;16]);
+        entry(&mut bytes,"pattern",9); bytes.extend(7u32.to_le_bytes()); bytes.extend(3u64.to_le_bytes()); bytes.extend([0,1,0]);
+        let parse_selected = |data: &[u8]| Index::read_with_metadata(std::io::Cursor::new(data),data.len() as u64,&["architecture","pattern"]);
+        let result = parse_selected(&bytes).unwrap();
+        assert_eq!(result.metadata.len(),2);
+        assert_eq!(result.metadata[0].value,MetadataValue::String("flint".into()));
+        assert_eq!(result.metadata[1].value,MetadataValue::BoolArray(vec![false,true,false]));
+        assert_eq!(result.metadata_end,bytes.len() as u64);
+        for size in 0..bytes.len() { assert!(parse_selected(&bytes[..size]).is_err()); }
+        let mut bad = bytes.clone(); *bad.last_mut().unwrap() = 2;
+        assert!(parse_selected(&bad).is_err());
+        let n = bytes.len(); bytes[n-11..n-3].copy_from_slice(&4097u64.to_le_bytes());
+        assert!(parse_selected(&bytes).is_err());
+    }

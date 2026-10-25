@@ -1,4 +1,4 @@
-//! Bounded layer-2 CUDA arithmetic through Mary's existing CubeCL runtime.
+//! Bounded block-2/block-5 CUDA arithmetic through Mary's existing CubeCL runtime.
 //!
 //! Weights are decoded from stored GGUF NVFP4 (36 bytes / 64 values), then
 //! uploaded as F32. Explicit packed-K/all modes decode only attn_k or all ten
@@ -29,6 +29,7 @@ use cubecl::server::Handle;
 
 use super::math::{H, Stage, Trace, Values};
 use super::weights::Weights;
+use super::config::BlockConfig;
 
 mod packed;
 pub use packed::{KComparison, compare_k as compare_packed_k};
@@ -45,7 +46,7 @@ const SH: usize = 1024;
 type Client = cubecl::client::ComputeClient<CudaRuntime>;
 
 #[derive(Clone, Copy)]
-enum ProjectionMode { Decoded, PackedK, PackedAll }
+pub enum ProjectionMode { Decoded, PackedK, PackedAll }
 impl ProjectionMode {
     fn packed(self, suffix: &str) -> bool {
         match self { Self::Decoded => false, Self::PackedK => suffix == "attn_k", Self::PackedAll => true }
@@ -150,14 +151,14 @@ fn rope_kernel(x: &Array<f32>, positions: &Array<i32>, y: &mut Array<f32>, heads
 }
 
 #[cube(launch_unchecked)]
-fn mask_kernel(positions: &Array<i32>, mask: &mut Array<f32>, t: u32, negative_infinity: f32) {
+fn mask_kernel(positions: &Array<i32>, mask: &mut Array<f32>, t: u32, window: i32, negative_infinity: f32) {
     let i = ABSOLUTE_POS as u32;
     if i < t * t {
         let query = positions[(i / t) as usize];
         let key = positions[(i % t) as usize];
         let mut m = f32::new(0.0);
         // A scalar binding avoids CubeCL emitting the invalid CUDA literal -inf.
-        if key > query || query - key >= 513 { m = negative_infinity; }
+        if key > query || (window > 0 && query - key >= window) { m = negative_infinity; }
         mask[i as usize] = m;
     }
 }
@@ -411,22 +412,22 @@ impl Device {
 /// Exactly layer 2 for 1..=3 supplied residual rows, no KV history. Stage names
 /// and GGML fastest-first dimensions match the independent CPU trace.
 pub fn layer2(w: &mut impl Weights, input: &[f32], positions: &[i32]) -> Result<Trace> {
-    layer2_impl(w, input, positions, ProjectionMode::Decoded)
+    block(w, input, positions, BlockConfig::LAYER2, ProjectionMode::Decoded)
 }
 
 /// Only attn_k uses packed GGUF bytes; every other operation uses the accepted
 /// decoded-weight path. No tensor-core, activation-quantized or speed claim.
 pub fn layer2_packed_k(w: &mut impl Weights, input: &[f32], positions: &[i32]) -> Result<Trace> {
-    layer2_impl(w, input, positions, ProjectionMode::PackedK)
+    block(w, input, positions, BlockConfig::LAYER2, ProjectionMode::PackedK)
 }
 
 /// All ten type-40 projection families use packed bytes. F32 norms/scales and
 /// BF16 router storage are unchanged; no additional layers or runtime state.
 pub fn layer2_packed_all(w: &mut impl Weights, input: &[f32], positions: &[i32]) -> Result<Trace> {
-    layer2_impl(w, input, positions, ProjectionMode::PackedAll)
+    block(w, input, positions, BlockConfig::LAYER2, ProjectionMode::PackedAll)
 }
 
-fn layer2_impl(w: &mut impl Weights, input: &[f32], positions: &[i32], mode: ProjectionMode) -> Result<Trace> {
+pub fn block(w: &mut impl Weights, input: &[f32], positions: &[i32], config: BlockConfig, mode: ProjectionMode) -> Result<Trace> {
     let t = positions.len();
     ensure!((1..=3).contains(&t) && input.len() == H*t, "expected 1..=3 residual rows of width 2048");
     ensure!(positions.iter().all(|&p| p >= 0) && positions.windows(2).all(|p| p[0] < p[1]), "invalid positions");
@@ -446,10 +447,10 @@ fn layer2_impl(w: &mut impl Weights, input: &[f32], positions: &[i32], mode: Pro
     let kn = dev.norm(&k,&w.get("attn_k_norm.weight",&[D],0,None)?);
     dev.trace(&mut tr,"q_norm",[D,Q,t,1],&qn)?;
     dev.trace(&mut tr,"k_norm",[D,KV,t,1],&kn)?;
-    let q = dev.rope(&qn,&pos,Q);
-    let k = dev.rope(&kn,&pos,KV);
-    dev.trace(&mut tr,"q_rope",[D,Q,t,1],&q)?;
-    dev.trace(&mut tr,"k_rope",[D,KV,t,1],&k)?;
+    let q = if config.rope { dev.rope(&qn,&pos,Q) } else { qn };
+    let k = if config.rope { dev.rope(&kn,&pos,KV) } else { kn };
+    dev.trace(&mut tr,if config.rope { "q_rope" } else { "q_no_rope" },[D,Q,t,1],&q)?;
+    dev.trace(&mut tr,if config.rope { "k_rope" } else { "k_no_rope" },[D,KV,t,1],&k)?;
     let sinks = dev.upload(&w.get("attn_sinks.weight",&[Q],0,None)?);
     ensure!(sinks.len == Q, "attention sink shape differs");
     let scores = dev.empty(t*t*Q);
@@ -459,7 +460,7 @@ fn layer2_impl(w: &mut impl Weights, input: &[f32], positions: &[i32], mode: Pro
     let joined = dev.empty(Q*D*t);
     unsafe {
         mask_kernel::launch_unchecked::<CudaRuntime>(&dev.client, CubeCount::new_1d(1), CubeDim::new_1d(32),
-            pos.arg(),mask.arg(),t as u32,f32::NEG_INFINITY);
+            pos.arg(),mask.arg(),t as u32,config.sliding_window.unwrap_or(0),f32::NEG_INFINITY);
         attention_kernel::launch_unchecked::<CudaRuntime>(&dev.client,
             CubeCount::new_1d((Q*t).div_ceil(32) as u32), CubeDim::new_1d(32),
             q.arg(),k.arg(),v.arg(),sinks.arg(),mask.arg(),scores.arg(),probs.arg(),heads.arg(),t as u32);
@@ -530,6 +531,28 @@ fn layer2_impl(w: &mut impl Weights, input: &[f32], positions: &[i32], mode: Pro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires an exclusive GB10 GPU reservation"]
+    fn cuda_full_vs_sliding_mask_gapped_positions_t1_t3() -> Result<()> {
+        let dev = Device::new();
+        for positions in [vec![0],vec![0,512,513]] {
+            let t = positions.len(); let pos = dev.positions(&positions);
+            for window in [0,513] {
+                let mask = dev.empty(t*t);
+                unsafe { mask_kernel::launch_unchecked::<CudaRuntime>(&dev.client,CubeCount::new_1d(1),CubeDim::new_1d(32),
+                    pos.arg(),mask.arg(),t as u32,window,f32::NEG_INFINITY); }
+                let actual = dev.read(&mask)?;
+                let expected: Vec<_> = (0..t*t).map(|i| {
+                    let distance = positions[i/t]-positions[i%t];
+                    if distance < 0 || (window > 0 && distance >= window) { f32::NEG_INFINITY } else { 0.0 }
+                }).collect();
+                assert_eq!(actual.iter().map(|v|v.to_bits()).collect::<Vec<_>>(),expected.iter().map(|v|v.to_bits()).collect::<Vec<_>>());
+                if t == 3 { assert_eq!(actual[6],if window == 0 {0.0} else {f32::NEG_INFINITY}); }
+            }
+        }
+        Ok(())
+    }
 
     fn close(actual: &[f32], expected: &[f32], tolerance: f32) {
         assert_eq!(actual.len(), expected.len());
@@ -644,7 +667,7 @@ mod tests {
             let joined = dev.empty(Q*t*D);
             unsafe {
                 mask_kernel::launch_unchecked::<CudaRuntime>(&dev.client,CubeCount::new_1d(1),CubeDim::new_1d(32),
-                    pos.arg(),mask.arg(),t as u32,f32::NEG_INFINITY);
+                    pos.arg(),mask.arg(),t as u32,513,f32::NEG_INFINITY);
                 attention_kernel::launch_unchecked::<CudaRuntime>(&dev.client,CubeCount::new_1d(t as u32),CubeDim::new_1d(32),
                     q.arg(),k.arg(),v.arg(),sinks.arg(),mask.arg(),scores.arg(),probs.arg(),heads.arg(),t as u32);
                 join_kernel::launch_unchecked::<CudaRuntime>(&dev.client,

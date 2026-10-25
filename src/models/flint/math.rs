@@ -5,6 +5,7 @@
 
 use anyhow::{Result, ensure};
 use super::weights::Weights;
+use super::config::BlockConfig;
 
 pub const H: usize = 2048;
 const D: usize = 128;
@@ -97,6 +98,10 @@ fn down_scale(x: &[f32]) -> f32 {
 /// Exactly one layer, 1..=3 tokens, no KV history. All positions must be
 /// nonnegative and strictly increasing. Noncontiguous positions are supported.
 pub fn layer2(w: &mut impl Weights, input: &[f32], positions: &[i32]) -> Result<Trace> {
+    block(w, input, positions, BlockConfig::LAYER2)
+}
+
+pub fn block(w: &mut impl Weights, input: &[f32], positions: &[i32], config: BlockConfig) -> Result<Trace> {
     let t = positions.len();
     ensure!((1..=3).contains(&t) && input.len() == H*t, "expected 1..=3 residual rows of width 2048");
     ensure!(positions.iter().all(|&p| p >= 0) && positions.windows(2).all(|p| p[0] < p[1]), "invalid positions");
@@ -113,13 +118,15 @@ pub fn layer2(w: &mut impl Weights, input: &[f32], positions: &[i32]) -> Result<
     let qn = norm(&q,&w.get("attn_q_norm.weight", &[D],0,None)?);
     let kn = norm(&k,&w.get("attn_k_norm.weight", &[D],0,None)?);
     tr.f("q_norm",[D,Q,t,1],&qn); tr.f("k_norm",[D,KV,t,1],&kn);
-    let q = rope(&qn,Q,positions); let k = rope(&kn,KV,positions);
-    tr.f("q_rope",[D,Q,t,1],&q); tr.f("k_rope",[D,KV,t,1],&k);
+    let q = if config.rope { rope(&qn,Q,positions) } else { qn };
+    let k = if config.rope { rope(&kn,KV,positions) } else { kn };
+    tr.f(if config.rope { "q_rope" } else { "q_no_rope" },[D,Q,t,1],&q);
+    tr.f(if config.rope { "k_rope" } else { "k_no_rope" },[D,KV,t,1],&k);
     let sinks = w.get("attn_sinks.weight", &[Q],0,None)?;
     let mut scores = vec![0.0;t*t*Q]; let mut probs = scores.clone();
     let mut mask = vec![0.0;t*t]; let mut heads = vec![0.0;D*t*Q];
     for query in 0..t { for key in 0..t {
-        if positions[key] > positions[query] || positions[query] - positions[key] >= 513 { mask[query*t+key] = f32::NEG_INFINITY; }
+        if positions[key] > positions[query] || config.sliding_window.is_some_and(|window| positions[query] - positions[key] >= window) { mask[query*t+key] = f32::NEG_INFINITY; }
     }}
     for h in 0..Q { for query in 0..t {
         let base = (h*t+query)*t;

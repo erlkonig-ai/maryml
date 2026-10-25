@@ -1,4 +1,4 @@
-//! CPU or CUDA F32/math layer-2 diagnostics against retained reference outputs.
+//! CPU or CUDA F32/math block-2/block-5 diagnostics against reference outputs.
 //! Exit success means diagnostics completed with exact integer stage agreement,
 //! NOT floating-point numerical acceptance. CUDA uses the `flint-cuda` feature.
 
@@ -97,8 +97,15 @@ fn main() -> Result<()> {
     let packed_all = args.first().is_some_and(|p| p == Path::new("--cuda-packed-all"));
     let cuda = packed_k || packed_all || args.first().is_some_and(|p| p == Path::new("--cuda"));
     if cuda || args.first().is_some_and(|p| p == Path::new("--cpu")) { args.remove(0); }
+    let block = if args.first().is_some_and(|p| p == Path::new("--block")) {
+        ensure!(args.len() >= 2, "missing --block value");
+        let value = args[1].to_str().context("block is not UTF-8")?.parse::<usize>()?;
+        args.drain(..2);
+        value
+    } else { 2 };
+    ensure!(matches!(block, 2 | 5), "only block 2 or block 5 is implemented");
     ensure!(!cuda || cfg!(feature = "flint-cuda"), "--cuda requires the flint-cuda feature");
-    ensure!(args.len()==5,"usage: flint_layer2_gate [--cpu|--cuda|--cuda-packed-k|--cuda-packed-all] MODEL INPUT_F32 POSITIONS_I32 REFERENCE_DIR NEW_OUTPUT_DIR");
+    ensure!(args.len()==5,"usage: flint_layer2_gate [--cpu|--cuda|--cuda-packed-k|--cuda-packed-all] [--block 2|5] MODEL INPUT_F32 POSITIONS_I32 REFERENCE_DIR NEW_OUTPUT_DIR");
     let [model,input_path,pos_path,reference,out] = args.as_slice() else { unreachable!() };
     let input_bytes = read(input_path,math::H*3*4)?;
     let input = floats(&input_bytes)?;
@@ -108,15 +115,16 @@ fn main() -> Result<()> {
     let table_bytes = read(&reference.join("tensors.tsv"),1024*1024)?;
     let table = std::str::from_utf8(&table_bytes)?;
     fs::create_dir(out).context("output directory must not already exist")?;
-    let mut weights = GgufWeights::open(model)?;
+    let mut weights = GgufWeights::open_block(model, block)?;
+    let config = weights.config;
     let trace = if cuda {
         #[cfg(feature = "flint-cuda")]
-        { if packed_all { mary::models::flint::gpu::layer2_packed_all(&mut weights,&input,&positions)? }
-          else if packed_k { mary::models::flint::gpu::layer2_packed_k(&mut weights,&input,&positions)? }
-          else { mary::models::flint::gpu::layer2(&mut weights,&input,&positions)? } }
+        { use mary::models::flint::gpu::{self, ProjectionMode};
+          let mode = if packed_all { ProjectionMode::PackedAll } else if packed_k { ProjectionMode::PackedK } else { ProjectionMode::Decoded };
+          gpu::block(&mut weights,&input,&positions,config,mode)? }
         #[cfg(not(feature = "flint-cuda"))]
         { unreachable!("feature checked before file reads") }
-    } else { math::layer2(&mut weights,&input,&positions)? };
+    } else { math::block(&mut weights,&input,&positions,config)? };
     weights.file.check_identity()?;
     let mut comparisons = Vec::new();
     let mut exact_integer_stages = Vec::new();
@@ -162,12 +170,12 @@ fn main() -> Result<()> {
     }).collect();
     let selected_bytes: u64 = weights.reads.iter().map(|r|r.absolute_end-r.absolute_start).sum();
     let scope = if packed_all {
-        "layer 2 CubeCL CUDA F32 math; all ten type40 projection families read unchanged packed GGUF NVFP4 on GPU; F32 norms/scales and BF16 router storage unchanged; per-stage readbacks and CPU-controlled sparse expert loading; no tensor cores or activation quantization"
+        "metadata-bound isolated block CubeCL CUDA F32 math; all ten type40 projection families read unchanged packed GGUF NVFP4 on GPU; F32 norms/scales and BF16 router storage unchanged; per-stage readbacks and CPU-controlled sparse expert loading; no tensor cores or activation quantization"
     } else if packed_k {
-        "layer 2 CubeCL CUDA F32 math; only attn_k reads unchanged packed GGUF NVFP4 on GPU; other weights decoded; per-stage readbacks and CPU-controlled sparse loading; no tensor cores or activation quantization"
+        "metadata-bound isolated block CubeCL CUDA F32 math; only attn_k reads unchanged packed GGUF NVFP4 on GPU; other weights decoded; per-stage readbacks and CPU-controlled sparse loading; no tensor cores or activation quantization"
     } else if cuda {
-        "layer 2 CubeCL CUDA F32 decoded-weight math; per-stage readbacks and CPU-controlled sparse loading; no BF16 or activation quantization"
-    } else { "layer 2 CPU F32/math only; wider scalar dot/RMS reductions; no BF16 or activation quantization" };
+        "metadata-bound isolated block CubeCL CUDA F32 decoded-weight math; per-stage readbacks and CPU-controlled sparse loading; no BF16 or activation quantization"
+    } else { "metadata-bound isolated block CPU F32/math only; wider scalar dot/RMS reductions; no BF16 or activation quantization" };
     let arithmetic = if cuda {
         "F32 values and accumulation; matvec 32-lane strided/tree reduction; RMS 256-lane strided/tree reduction; serial F32 attention/router sums; GPU transcendentals; CUDA compiler may contract multiply-add; fixed kernels without autotune"
     } else { "F32 operation boundaries with f64 scalar dot/RMS and attention denominator/division reductions; CPU transcendentals" };
@@ -175,6 +183,7 @@ fn main() -> Result<()> {
         "acceptance":"diagnostics only: exact ordered integer stages required; floating errors reported without fitted tolerance or numerical acceptance claim",
         "exact_integer_stages":exact_integer_stages,"integer_stages_pass":integer_mismatches==0,
         "model_path":model,"model_identity":weights.file.identity,"whole_model_freshly_hashed":false,
+        "block_config":config,"gguf_metadata":weights.file.index.metadata,"metadata_end":weights.file.index.metadata_end,
         "input_path":input_path,"input_blake3":hash(&input_bytes),"positions_path":pos_path,"positions_blake3":hash(&pos_bytes),
         "reference_dir":reference,"reference_table_blake3":hash(&table_bytes),"positions":positions,
         "router_sixth_seventh_margins":trace.router_margins,"reference_router_sixth_seventh_margins":reference_margins,
