@@ -180,10 +180,24 @@ pub struct PileWeights {
 }
 impl PileWeights {
     pub fn open(path:&Path,root:Id)->Result<Self> {
+        Self::open_with_collection(path,root,None)
+    }
+    /// Select a descriptor independently from the model root. None retains
+    /// sole-name discovery; explicit selection never falls back to another
+    /// collection if its root is absent. All reads share this frozen observation.
+    pub fn open_with_collection(path:&Path,root:Id,
+        collection:Option<triblespace::core::collection::CollectionHandle>)->Result<Self> {
         // A read-only descriptor plus one frozen observation, not an append-
         // capable model helper. Another process still must not mutate its prefix.
         let store=crate::persist::read_model_pile_snapshot_read_only(path)?;
-        Self::from_snapshot(model_collection::snapshot_model_collection_in(&store)?,root)
+        let snapshot=match collection {
+            Some(handle)=>{
+                let collection=model_collection::open_model_collection(&store,handle)?;
+                model_collection::snapshot_model_collection_for(&store,collection)?
+            },
+            None=>model_collection::snapshot_model_collection_in(&store)?,
+        };
+        Self::from_snapshot(snapshot,root)
     }
     pub fn from_snapshot(snapshot:ModelPileSnapshot,root:Id)->Result<Self> {
         // Positive, typed membership joins. Unknown sibling modules/annotations
@@ -386,6 +400,39 @@ mod tests {
         let bytes=values.iter().flat_map(|v|v.to_le_bytes()).collect::<Vec<_>>();
         let weight=leaf_fragment(leaf::leaf_blob::<F32,1>([values.len() as u64],Bytes::from_source(bytes))?);
         Ok(entity! {attrs::kind:"post-matmul-scale",attrs::weight*:weight})
+    }
+
+    #[test]
+    fn explicit_collection_keeps_same_named_models_separate()->Result<()> {
+        use triblespace::core::collection::{AdmissionPolicy,CollectionPolicy};
+        let path=std::env::temp_dir().join(format!("mary-flint-collections-{}.pile",fucid().id));
+        std::fs::OpenOptions::new().write(true).create_new(true).open(&path)?;
+        let mut pile=Pile::open(&path).map_err(|e|anyhow::anyhow!("{e}"))?;
+        // Ephemeral fixture coordinates only, not a retained model catalogue.
+        let mut models=Vec::new();
+        for (key_byte,value) in [(41,1.0f32),(42,2.0f32)] {
+            let key=ed25519_dalek::SigningKey::from_bytes(&[key_byte;32]);
+            let policy=CollectionPolicy::new(AdmissionPolicy::direct(key.verifying_key()),AdmissionPolicy::direct(key.verifying_key()));
+            let collection=pile.collection(model_collection::mary_model_graph_name(),policy)?;
+            let weight=leaf_fragment(leaf::leaf_blob::<F32,1>([1],Bytes::from_source(value.to_le_bytes().to_vec()))?);
+            let parameters=entity! {attrs::kind:"probe",attrs::weight*:weight};
+            let fragment=model_fragment(parameters,&super::super::config::tests::fixture())?;
+            let root=fragment.root().context("fixture root")?;
+            model_collection::publish_model_fragment_into(&mut pile,&key,collection,fragment)?;
+            models.push((collection.handle(),root,value));
+        }
+        pile.close().map_err(|e|anyhow::anyhow!("{e}"))?;
+        assert!(PileWeights::open(&path,models[0].1).is_err()); // Name is ambiguous.
+        for &(handle,root,value) in &models {
+            let mut weights=PileWeights::open_with_collection(&path,root,Some(handle))?;
+            assert_eq!(model_collection::parse_collection_handle(&weights.collection())?,handle);
+            assert_eq!(weights.get("probe.weight",&[1],0,None)?,[value]);
+            assert_eq!(weights.support_members(),1);
+        }
+        assert!(PileWeights::open_with_collection(&path,models[1].1,Some(models[0].0)).is_err());
+        assert!(PileWeights::open_with_collection(&path,models[0].1,Some(models[1].0)).is_err());
+        std::fs::remove_file(path)?;
+        Ok(())
     }
 
     #[test]

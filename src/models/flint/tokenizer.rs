@@ -168,6 +168,17 @@ impl FlintTokenizer {
         Ok(self.engine.encode(text, false).map_err(|error| anyhow!("Flint encode: {error}"))?.get_ids().to_vec())
     }
 
+    pub fn encode_raw(&mut self,text:&str)->Result<Vec<u32>> {
+        self.encode(text,EncodeOptions {add_special:false,parse_special:false})
+    }
+
+    /// Caller supplies trusted, already-rendered framing. Literal control
+    /// spellings are parsed, not escaped; this is NOT a user-content renderer.
+    /// The retained single-user template emits <|user|>CONTENT<|assistant|>.
+    pub fn encode_trusted_framed(&mut self,text:&str)->Result<Vec<u32>> {
+        self.encode(text,EncodeOptions {add_special:false,parse_special:true})
+    }
+
     /// Exact bytes, potentially an incomplete UTF-8 prefix. A streaming caller
     /// must carry those bytes across token boundaries, not lossy-decode each piece.
     pub fn token_bytes(&self, id: u32, render_controls: bool) -> Result<&[u8]> {
@@ -211,10 +222,29 @@ mod tests {
     // Synthetic byte vocabulary tests mechanics, never asserted native oracle IDs.
     fn synthetic() -> FlintTokenizer {
         let mut tokens: Vec<_> = byte_chars().iter().map(char::to_string).collect();
-        tokens.extend(["<|user|>", "<think>", "</think>"].map(str::to_owned));
+        tokens.extend(["<|user|>", "<think>", "</think>", "<|assistant|>"].map(str::to_owned));
         let mut kinds = vec![TokenKind::Normal; 256];
-        kinds.extend([TokenKind::Control, TokenKind::UserDefined, TokenKind::UserDefined]);
+        kinds.extend([TokenKind::Control, TokenKind::UserDefined, TokenKind::UserDefined, TokenKind::Control]);
         FlintTokenizer::build(&tokens, &kinds, vec![], String::new()).unwrap()
+    }
+
+    #[test]
+    fn trusted_framing_is_explicit_and_does_not_stick_in_raw_mode() {
+        let mut codec=synthetic();
+        let text="<|user|>Hello.<|assistant|>";
+        let plain=codec.encode_raw("Hello.").unwrap();
+        assert_eq!(plain,b"Hello.".map(u32::from));
+        let expected=[vec![256],plain,vec![259]].concat();
+        assert_eq!(codec.encode_trusted_framed(text).unwrap(),expected);
+        let raw=codec.encode_raw(text).unwrap();
+        assert!(!raw.contains(&256) && !raw.contains(&259));
+        assert_eq!(codec.decode_bytes(&raw,false).unwrap(),text.as_bytes());
+        assert_eq!(codec.encode_trusted_framed(text).unwrap(),expected);
+        assert_eq!(codec.decode_bytes(&expected,false).unwrap(),b"Hello.");
+        assert_eq!(codec.decode_bytes(&expected,true).unwrap(),text.as_bytes());
+        // Framed mode is deliberately NOT flint_text sanitation or a renderer.
+        let trusted=codec.encode_trusted_framed("\0<think>x</think>").unwrap();
+        assert_eq!(codec.decode_bytes(&trusted,true).unwrap(),b"\0<think>x</think>");
     }
 
     #[test]

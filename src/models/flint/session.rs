@@ -1,4 +1,4 @@
-//! Bounded, single-sequence raw generation; no chat rendering or serving layer.
+//! Bounded, single-sequence ID generation; no chat rendering or serving layer.
 //! Every append uses the same block/forward core as empty-history diagnostics.
 //! Weights come from explicit GGUF or a frozen native pile. KV stays until reset.
 use std::{path::Path,time::Instant};
@@ -6,7 +6,7 @@ use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use crate::formats::gguf::index::{FileIdentity,MetadataValue};
 use super::{cache::{self,Admission,LayerCache,Limits},forward::{self,Backend,Head,VOCAB},
-    math::Trace,tokenizer::{FlintTokenizer,EncodeOptions,DECLARED_EOG_IDS},weights::{GgufWeights,ReadReceipt,HostPhase,ReceiptPolicy}};
+    math::Trace,tokenizer::{FlintTokenizer,DECLARED_EOG_IDS},weights::{GgufWeights,ReadReceipt,HostPhase,ReceiptPolicy}};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Options { pub backend:Backend, pub limits:Limits, pub trace:bool }
@@ -27,6 +27,12 @@ impl Default for Options {
 #[derive(Default)]
 struct Sequence { attended:usize, poisoned:bool }
 impl Sequence {
+    fn prompt_preflight(&self,ids:&[u32],capacity:usize)->Result<()> {
+        // A new prompt replaces attended history, but cannot silently recover a
+        // failed session. Validate the entire ID slice BEFORE reset/mutation.
+        ensure!(!self.poisoned,"session is poisoned; explicit successful reset required");
+        Self::default().preflight(ids,capacity)?; Ok(())
+    }
     fn preflight(&self,ids:&[u32],capacity:usize)->Result<usize> {
         ensure!(!self.poisoned,"session is poisoned; successful reset required");
         ensure!(!ids.is_empty(),"empty append/prompt has no next-token distribution");
@@ -73,8 +79,14 @@ impl FlintSession {
         Ok(Self {weights:forward::Source::Gguf(weights),codec,caches,sequence:Sequence::default(),options,admission})
     }
     pub fn open_pile(path:&Path,root:triblespace::prelude::Id,options:Options)->Result<Self> {
+        Self::open_pile_with_collection(path,root,None,options)
+    }
+    /// Descriptor selection and model root are independent coordinates. None
+    /// retains sole-name discovery for ordinary single-collection scratch piles.
+    pub fn open_pile_with_collection(path:&Path,root:triblespace::prelude::Id,
+        collection:Option<triblespace::core::collection::CollectionHandle>,options:Options)->Result<Self> {
         ensure!(matches!(options.backend,Backend::PackedAll) && cfg!(feature="flint-cuda"),"native pile requires CUDA PackedAll");
-        let weights=super::pile::PileWeights::open(path,root)?;
+        let weights=super::pile::PileWeights::open_with_collection(path,root,collection)?;
         let entries=weights.metadata()?;
         let context=entries.iter().find_map(|e|if e.key=="flint.context_length" {
             if let MetadataValue::U32(n)=&e.value {Some(*n as usize)} else {None}
@@ -94,7 +106,12 @@ impl FlintSession {
     pub fn is_poisoned(&self)->bool { self.sequence.poisoned }
     pub fn set_trace(&mut self,enabled:bool) { self.options.trace=enabled; }
     pub fn encode_raw(&mut self,text:&str)->Result<Vec<u32>> {
-        self.codec.encode(text,EncodeOptions {add_special:false,parse_special:false})
+        self.codec.encode_raw(text)
+    }
+    /// Only for already-rendered trusted framing. Parses literal controls; does
+    /// not render the retained template, sanitize user content, or insert BOS.
+    pub fn encode_trusted_framed(&mut self,text:&str)->Result<Vec<u32>> {
+        self.codec.encode_trusted_framed(text)
     }
     /// A failed CUDA fence leaves the session poisoned. Fatal device/context
     /// failures can require dropping/reconstructing it; reset is not GPU recovery.
@@ -146,14 +163,26 @@ impl FlintSession {
     /// Same accepted path, with clocks at completed prefill/cached-append boundaries.
     pub fn generate_raw_observed_timed(&mut self,prompt:&str,max_new:usize,
         observe:impl FnMut(usize,&[f32])->Result<()>)->Result<(Generation,GenerationTimings)> {
-        let mut timings=GenerationTimings::default();
         let start=Instant::now();
         let ids=self.encode_raw(prompt)?;
-        ensure!(!ids.is_empty(),"empty raw prompt; no implicit BOS");
-        ensure!(ids.len()<=self.capacity(),"prompt exceeds context capacity");
-        // An implicitly successful reset must not disguise a previously failed
-        // session: the caller must explicitly acknowledge it through reset().
-        ensure!(!self.is_poisoned(),"session is poisoned; explicit successful reset required");
+        let encode_seconds=start.elapsed().as_secs_f64();
+        let (generation,mut timings)=self.generate_ids_observed_timed(&ids,max_new,observe)?;
+        timings.encode_validate_seconds+=encode_seconds;
+        Ok((generation,timings))
+    }
+    /// Exact caller-supplied IDs, including any trusted framing controls. No
+    /// re-encoding, implicit BOS, filtering, or prompt-EOG removal. Validate all
+    /// IDs before reset, even for max_new=0; the latter performs no forward.
+    pub fn generate_ids(&mut self,ids:&[u32],max_new:usize)->Result<Generation> {
+        self.generate_ids_observed_timed(ids,max_new,|_,_|Ok(())).map(|(generation,_)|generation)
+    }
+    /// Shared raw/framed/ID generation loop. Encoding, if needed, belongs to the
+    /// caller; encode_validate_seconds here measures ID validation only.
+    pub fn generate_ids_observed_timed(&mut self,ids:&[u32],max_new:usize,
+        observe:impl FnMut(usize,&[f32])->Result<()>)->Result<(Generation,GenerationTimings)> {
+        let mut timings=GenerationTimings::default();
+        let start=Instant::now();
+        self.sequence.prompt_preflight(ids,self.capacity())?;
         timings.encode_validate_seconds=start.elapsed().as_secs_f64();
         let start=Instant::now();
         self.reset()?;
@@ -161,7 +190,7 @@ impl FlintSession {
         if max_new==0 { return Ok((Generation {ids:Vec::new(),bytes:Vec::new(),prompt_tokens:ids.len(),attended_tokens:0,stop:Stop::Budget},timings)); }
         let _=self.weights.take_host_phase();
         let start=Instant::now();
-        let logits=self.prefill(&ids)?;
+        let logits=self.prefill(ids)?;
         timings.prefill_seconds=start.elapsed().as_secs_f64();
         timings.prefill_host=self.weights.take_host_phase();
         let Self {weights,caches,sequence,options,codec,..}=self;
@@ -234,6 +263,22 @@ fn greedy(mut logits:Vec<f32>,prompt_tokens:usize,max_new:usize,capacity:usize,
 mod tests {
     use super::*;
     fn logits(id:u32)->Vec<f32> { let mut v=vec![0.0;VOCAB]; v[id as usize]=1.0; v }
+    #[test] fn explicit_prompt_ids_validate_before_reset() -> Result<()> {
+        let mut s=Sequence {attended:4,poisoned:false};
+        // Previous history does not consume the replacement prompt's capacity.
+        s.prompt_preflight(&[150003,9479,13,150004],4)?;
+        for bad in [&[][..],&[VOCAB as u32][..],&[u32::MAX][..],&[1,2,3,4,5][..]] {
+            assert!(s.prompt_preflight(bad,4).is_err());
+            assert_eq!(s.attended,4);assert!(!s.poisoned);
+        }
+        s.poisoned=true;
+        assert!(s.prompt_preflight(&[9479,13],4).is_err());
+        assert_eq!(s.attended,4);assert!(s.poisoned);
+        s.reset(||Ok(()))?;
+        s.prompt_preflight(&[150003,9479,13,150004],4)?;
+        assert_eq!(s.attended,0); // Prompt EOG/control IDs are not stripped.
+        Ok(())
+    }
     #[test] fn failed_append_poison_and_preflight() -> Result<()> {
         let mut s=Sequence::default();
         assert!(s.preflight(&[],3).is_err()); assert!(s.preflight(&[VOCAB as u32],3).is_err());
