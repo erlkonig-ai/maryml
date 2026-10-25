@@ -46,6 +46,18 @@ struct Args {
 fn save(path:&Path,bytes:&[u8])->Result<()> {
     OpenOptions::new().create_new(true).write(true).open(path)?.write_all(bytes)?; Ok(())
 }
+fn generation_failure(output:&Path,error:anyhow::Error,
+    phase:Option<mary::models::flint::native_setup::NativeSetupPhase>)->anyhow::Error {
+    // Profiling is best effort on a failed forward. A secondary serialization/
+    // filesystem error must never replace the original generation failure.
+    let report=serde_json::to_vec_pretty(&json!({
+        "error":format!("{error:#}"),"incomplete_phase":phase,
+        "scope":"partial failed phase only; not a complete successful profile; no retry"}))
+        .map_err(anyhow::Error::from)
+        .and_then(|bytes|save(&output.join("native-setup-failed-phase.json"),&bytes));
+    if let Err(report_error)=report {eprintln!("native setup failure report unavailable: {report_error:#}");}
+    error
+}
 fn main()->Result<()> {
     let process_start=Instant::now();
     let args=Args::parse();
@@ -94,12 +106,9 @@ fn main()->Result<()> {
     let (generation,generation_timings)=match observed {
         Ok(result)=>result,
         Err(error)=>{
-            if args.native_setup_timing {
-                save(&args.output.join("native-setup-failed-phase.json"),&serde_json::to_vec_pretty(&json!({
-                    "error":format!("{error:#}"),"incomplete_phase":session.take_native_setup_timing(),
-                    "scope":"partial failed phase only; not a complete successful profile; no retry"}))?)?;
-            }
-            return Err(error);
+            return Err(if args.native_setup_timing {
+                generation_failure(&args.output,error,session.take_native_setup_timing())
+            } else {error});
         },
     };
     let generation_seconds=start.elapsed().as_secs_f64();
@@ -140,6 +149,16 @@ fn main()->Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn failed_diagnostic_write_preserves_generation_error() {
+        let missing=std::env::temp_dir().join(format!("mary-flint-absent-{}",triblespace::prelude::fucid().id));
+        assert!(!missing.exists()); // Deliberately do not create this parent.
+        let error=anyhow::anyhow!("original generation failure").context("native forward");
+        let expected=format!("{error:#}");
+        let returned=generation_failure(&missing,error,None);
+        assert_eq!(format!("{returned:#}"),expected);
+        assert!(!missing.exists());
+    }
     #[test]
     fn raw_default_and_explicit_trusted_framing() {
         let raw=Args::try_parse_from(["flint_generate","model","prompt","out"]).unwrap();
