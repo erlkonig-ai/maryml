@@ -2,3 +2,5 @@
 pub mod ingress;
 pub mod mamba2;
 pub mod pile;
+#[cfg(feature = "nemotron-cuda")]
+pub mod fp8;
