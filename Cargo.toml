@@ -193,6 +193,7 @@ nvfp4-score-cuda = ["nvfp4-encode-cuda"]
 # Bounded Flint layer arithmetic on the existing raw CubeCL CUDA runtime.
 # Kept separate so the stored-weight/CPU diagnostics need no GPU dependency.
 flint-cuda = ["import", "dep:cubecl", "cubecl?/cuda"]
+nemotron-cuda = ["dep:cubecl", "cubecl?/cuda", "dep:burn-cubecl"]
 # Investigation-only: burn's REAL Cuda backend, for backend_matmul_probe.
 burn-cuda-bench = ["burn/cuda", "burn/autotune"]
 

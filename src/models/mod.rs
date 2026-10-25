@@ -5,6 +5,7 @@
 pub mod f5;
 
 pub mod qwen3_5;
+pub mod nemotron_h;
 
 #[cfg(feature = "breeze")]
 pub mod breeze;
