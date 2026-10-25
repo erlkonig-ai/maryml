@@ -193,7 +193,8 @@ fn globals() -> MatmulGlobalElems {
 fn capability(client: &ComputeClient<CudaRuntime>) -> Result<()> {
     let g = globals();
     let features = &client.properties().features;
-    if !features.type_usage(g.lhs).contains(TypeUsage::Conversion | TypeUsage::Buffer)
+    if !features.type_usage(g.lhs).contains(TypeUsage::Conversion)
+        || !features.type_usage(g.lhs).contains(TypeUsage::Buffer)
         || !features.matmul.mma.contains(&MmaConfig {
             a_type: g.lhs, b_type: g.rhs, cd_type: g.out, m: 16, n: 8, k: 32,
         })
