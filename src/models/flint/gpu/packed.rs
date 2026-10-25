@@ -223,7 +223,7 @@ mod tests {
     #[ignore = "requires an exclusive GB10 GPU reservation"]
     fn cuda_nvfp4_matvec_exact_t1_t3() -> Result<()> {
         let dev = Device::new();
-        for ni in [64, 128, 192] { for t in [1, 3] {
+        for ni in [64, 128, 192, 512, 1024, 2048, 4096] { for t in [1, 3] {
             let no = 9;
             let mut raw = Vec::new();
             for row in 0..no { for block in 0..ni / 64 {

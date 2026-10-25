@@ -94,10 +94,11 @@ fn main() -> Result<()> {
         { anyhow::bail!("--cuda-packed-k-probe requires the flint-cuda feature"); }
     }
     let packed_k = args.first().is_some_and(|p| p == Path::new("--cuda-packed-k"));
-    let cuda = packed_k || args.first().is_some_and(|p| p == Path::new("--cuda"));
+    let packed_all = args.first().is_some_and(|p| p == Path::new("--cuda-packed-all"));
+    let cuda = packed_k || packed_all || args.first().is_some_and(|p| p == Path::new("--cuda"));
     if cuda || args.first().is_some_and(|p| p == Path::new("--cpu")) { args.remove(0); }
     ensure!(!cuda || cfg!(feature = "flint-cuda"), "--cuda requires the flint-cuda feature");
-    ensure!(args.len()==5,"usage: flint_layer2_gate [--cpu|--cuda|--cuda-packed-k] MODEL INPUT_F32 POSITIONS_I32 REFERENCE_DIR NEW_OUTPUT_DIR");
+    ensure!(args.len()==5,"usage: flint_layer2_gate [--cpu|--cuda|--cuda-packed-k|--cuda-packed-all] MODEL INPUT_F32 POSITIONS_I32 REFERENCE_DIR NEW_OUTPUT_DIR");
     let [model,input_path,pos_path,reference,out] = args.as_slice() else { unreachable!() };
     let input_bytes = read(input_path,math::H*3*4)?;
     let input = floats(&input_bytes)?;
@@ -110,7 +111,8 @@ fn main() -> Result<()> {
     let mut weights = GgufWeights::open(model)?;
     let trace = if cuda {
         #[cfg(feature = "flint-cuda")]
-        { if packed_k { mary::models::flint::gpu::layer2_packed_k(&mut weights,&input,&positions)? }
+        { if packed_all { mary::models::flint::gpu::layer2_packed_all(&mut weights,&input,&positions)? }
+          else if packed_k { mary::models::flint::gpu::layer2_packed_k(&mut weights,&input,&positions)? }
           else { mary::models::flint::gpu::layer2(&mut weights,&input,&positions)? } }
         #[cfg(not(feature = "flint-cuda"))]
         { unreachable!("feature checked before file reads") }
@@ -159,7 +161,9 @@ fn main() -> Result<()> {
         let mut sorted = row.to_vec(); sorted.sort_by(|a,b|b.total_cmp(a)); sorted[5]-sorted[6]
     }).collect();
     let selected_bytes: u64 = weights.reads.iter().map(|r|r.absolute_end-r.absolute_start).sum();
-    let scope = if packed_k {
+    let scope = if packed_all {
+        "layer 2 CubeCL CUDA F32 math; all ten type40 projection families read unchanged packed GGUF NVFP4 on GPU; F32 norms/scales and BF16 router storage unchanged; per-stage readbacks and CPU-controlled sparse expert loading; no tensor cores or activation quantization"
+    } else if packed_k {
         "layer 2 CubeCL CUDA F32 math; only attn_k reads unchanged packed GGUF NVFP4 on GPU; other weights decoded; per-stage readbacks and CPU-controlled sparse loading; no tensor cores or activation quantization"
     } else if cuda {
         "layer 2 CubeCL CUDA F32 decoded-weight math; per-stage readbacks and CPU-controlled sparse loading; no BF16 or activation quantization"
@@ -167,7 +171,7 @@ fn main() -> Result<()> {
     let arithmetic = if cuda {
         "F32 values and accumulation; matvec 32-lane strided/tree reduction; RMS 256-lane strided/tree reduction; serial F32 attention/router sums; GPU transcendentals; CUDA compiler may contract multiply-add; fixed kernels without autotune"
     } else { "F32 operation boundaries with f64 scalar dot/RMS and attention denominator/division reductions; CPU transcendentals" };
-    let report = json!({"scope":scope,"arithmetic":arithmetic,"backend":if packed_k {"cuda-packed-k"} else if cuda {"cuda"} else {"cpu"},
+    let report = json!({"scope":scope,"arithmetic":arithmetic,"backend":if packed_all {"cuda-packed-all"} else if packed_k {"cuda-packed-k"} else if cuda {"cuda"} else {"cpu"},
         "acceptance":"diagnostics only: exact ordered integer stages required; floating errors reported without fitted tolerance or numerical acceptance claim",
         "exact_integer_stages":exact_integer_stages,"integer_stages_pass":integer_mismatches==0,
         "model_path":model,"model_identity":weights.file.identity,"whole_model_freshly_hashed":false,

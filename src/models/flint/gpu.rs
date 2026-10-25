@@ -1,8 +1,10 @@
 //! Bounded layer-2 CUDA arithmetic through Mary's existing CubeCL runtime.
 //!
 //! Weights are decoded from stored GGUF NVFP4 (36 bytes / 64 values), then
-//! uploaded as F32. The explicit packed-K mode decodes only attn_k inside its
-//! matvec, directly from unchanged GGUF bytes. Separate `.scale` values stay
+//! uploaded as F32. Explicit packed-K/all modes decode only attn_k or all ten
+//! type-40 projection families inside the same matvec, directly from unchanged
+//! GGUF bytes. Norms/sinks and the BF16 router keep their existing paths.
+//! Separate `.scale` values stay
 //! after the matmul in both modes. This
 //! does not use Mary's other FP4 packing, tensor cores, activation quantization,
 //! BF16, or llama.cpp's Q8_1/W4A4 expert-down dispatch.
@@ -30,6 +32,8 @@ use super::weights::Weights;
 
 mod packed;
 pub use packed::{KComparison, compare_k as compare_packed_k};
+#[cfg(test)]
+mod projection_tests;
 
 const D: usize = 128;
 const Q: usize = 32;
@@ -39,6 +43,17 @@ const K: usize = 6;
 const F: usize = 512;
 const SH: usize = 1024;
 type Client = cubecl::client::ComputeClient<CudaRuntime>;
+
+#[derive(Clone, Copy)]
+enum ProjectionMode { Decoded, PackedK, PackedAll }
+impl ProjectionMode {
+    fn packed(self, suffix: &str) -> bool {
+        match self { Self::Decoded => false, Self::PackedK => suffix == "attn_k", Self::PackedAll => true }
+    }
+}
+
+enum ProjectionStorage { Decoded(Buffer), Packed(packed::PackedBuffer) }
+struct Projection { ni: usize, no: usize, storage: ProjectionStorage }
 
 #[cube(launch_unchecked)]
 fn matvec_kernel(
@@ -337,40 +352,49 @@ impl Device {
         ); }
         y
     }
+    fn projection(&self, w: &mut impl Weights, suffix: &str, dims: &[usize],
+        expert: Option<usize>, mode: ProjectionMode) -> Result<Projection> {
+        ensure!(matches!(dims.len(), 2 | 3), "projection requires matrix/expert dimensions");
+        let name = format!("{suffix}.weight");
+        let storage = if mode.packed(suffix) {
+            let bytes = w.get_nvfp4(&name, dims, expert)?;
+            ProjectionStorage::Packed(self.upload_nvfp4(&bytes, dims[0], dims[1])?)
+        } else {
+            ProjectionStorage::Decoded(self.upload(&w.get(&name, dims, 40, expert)?))
+        };
+        Ok(Projection { ni: dims[0], no: dims[1], storage })
+    }
+    fn project(&self, weight: &Projection, x: &Buffer, y: &Buffer, t: usize,
+        input_offset: usize, output_offset: usize) -> Result<()> {
+        match &weight.storage {
+            ProjectionStorage::Decoded(w) => self.matvec(x, w, y, weight.ni, weight.no, t, input_offset, output_offset),
+            ProjectionStorage::Packed(w) => self.packed_matvec(x, w, y, t, input_offset, output_offset)?,
+        }
+        Ok(())
+    }
     fn dense(&self, w: &mut impl Weights, tr: &mut Trace, suffix: &str, label: &str,
-        x: &Buffer, ni: usize, no: usize, t: usize) -> Result<Buffer> {
-        let weight = self.upload(&w.get(&format!("{suffix}.weight"), &[ni, no], 40, None)?);
+        x: &Buffer, ni: usize, no: usize, t: usize, mode: ProjectionMode) -> Result<Buffer> {
+        let weight = self.projection(w, suffix, &[ni,no], None, mode)?;
         let scale = self.upload(&w.get(&format!("{suffix}.scale"), &[1], 0, None)?);
         let raw = self.empty(no * t);
-        self.matvec(x, &weight, &raw, ni, no, t, 0, 0);
+        self.project(&weight, x, &raw, t, 0, 0)?;
         self.trace(tr, &format!("{label}_unscaled"), [no,t,1,1], &raw)?;
         let out = self.point(&raw, &scale, raw.len, 1);
         self.trace(tr, label, [no,t,1,1], &out)?;
         Ok(out)
     }
-    fn dense_packed_k(&self, w: &mut impl Weights, tr: &mut Trace, x: &Buffer, t: usize) -> Result<Buffer> {
-        let bytes = w.get_nvfp4("attn_k.weight", &[H,KV*D], None)?;
-        let weight = self.upload_nvfp4(&bytes, H, KV*D)?;
-        let scale = self.upload(&w.get("attn_k.scale", &[1], 0, None)?);
-        let raw = self.empty(KV*D*t);
-        self.packed_matvec(x, &weight, &raw, t, 0, 0)?;
-        self.trace(tr, "k_proj_unscaled", [KV*D,t,1,1], &raw)?;
-        let out = self.point(&raw, &scale, raw.len, 1);
-        self.trace(tr, "k_proj", [KV*D,t,1,1], &out)?;
-        Ok(out)
-    }
     fn experts(&self, w: &mut impl Weights, tr: &mut Trace, suffix: &str, label: &str,
-        x: &Buffer, ni: usize, no: usize, t: usize, ids: &[i32], per_slot: bool) -> Result<Buffer> {
+        x: &Buffer, ni: usize, no: usize, t: usize, ids: &[i32], per_slot: bool, mode: ProjectionMode) -> Result<Buffer> {
         ensure!(ids.len() == K * t && ids.iter().all(|&i| (0..E as i32).contains(&i)), "invalid GPU expert IDs");
         let scales = w.get(&format!("{suffix}.scale"), &[E], 0, None)?;
         let raw = self.empty(no * K * t);
         let mut selected = Vec::with_capacity(ids.len());
-        // One decoded/uploaded expert matrix at a time. Synchronizing the
+        // One packed or decoded expert matrix at a time. Synchronizing the
         // completed slot retires its upload before loading the next one.
         for (slot, &id) in ids.iter().enumerate() {
-            let weight = self.upload(&w.get(&format!("{suffix}.weight"), &[ni,no,E], 40, Some(id as usize))?);
+            let weight = self.projection(w, suffix, &[ni,no,E], Some(id as usize), mode)?;
             let row = if per_slot { slot } else { slot / K };
-            self.matvec(x, &weight, &raw, ni, no, 1, row * ni, slot * no);
+            self.project(&weight, x, &raw, 1, row * ni, slot * no)?;
             cubecl::future::block_on(self.client.sync())
                 .map_err(|e| anyhow!("CUDA expert synchronization: {e:?}"))?;
             selected.push(scales[id as usize]);
@@ -387,16 +411,22 @@ impl Device {
 /// Exactly layer 2 for 1..=3 supplied residual rows, no KV history. Stage names
 /// and GGML fastest-first dimensions match the independent CPU trace.
 pub fn layer2(w: &mut impl Weights, input: &[f32], positions: &[i32]) -> Result<Trace> {
-    layer2_impl(w, input, positions, false)
+    layer2_impl(w, input, positions, ProjectionMode::Decoded)
 }
 
 /// Only attn_k uses packed GGUF bytes; every other operation uses the accepted
 /// decoded-weight path. No tensor-core, activation-quantized or speed claim.
 pub fn layer2_packed_k(w: &mut impl Weights, input: &[f32], positions: &[i32]) -> Result<Trace> {
-    layer2_impl(w, input, positions, true)
+    layer2_impl(w, input, positions, ProjectionMode::PackedK)
 }
 
-fn layer2_impl(w: &mut impl Weights, input: &[f32], positions: &[i32], packed_k: bool) -> Result<Trace> {
+/// All ten type-40 projection families use packed bytes. F32 norms/scales and
+/// BF16 router storage are unchanged; no additional layers or runtime state.
+pub fn layer2_packed_all(w: &mut impl Weights, input: &[f32], positions: &[i32]) -> Result<Trace> {
+    layer2_impl(w, input, positions, ProjectionMode::PackedAll)
+}
+
+fn layer2_impl(w: &mut impl Weights, input: &[f32], positions: &[i32], mode: ProjectionMode) -> Result<Trace> {
     let t = positions.len();
     ensure!((1..=3).contains(&t) && input.len() == H*t, "expected 1..=3 residual rows of width 2048");
     ensure!(positions.iter().all(|&p| p >= 0) && positions.windows(2).all(|p| p[0] < p[1]), "invalid positions");
@@ -409,10 +439,9 @@ fn layer2_impl(w: &mut impl Weights, input: &[f32], positions: &[i32], packed_k:
     tr.stages.push(Stage { name: "positions".into(), dims: [t,1,1,1], values: Values::I32(dev.read_ids(&pos)?) });
     let n = dev.norm(&input_gpu, &w.get("attn_norm.weight", &[H], 0, None)?);
     dev.trace(&mut tr, "attn_norm", [H,t,1,1], &n)?;
-    let q = dev.dense(w,&mut tr,"attn_q","q_proj",&n,H,Q*D,t)?;
-    let k = if packed_k { dev.dense_packed_k(w,&mut tr,&n,t)? }
-        else { dev.dense(w,&mut tr,"attn_k","k_proj",&n,H,KV*D,t)? };
-    let v = dev.dense(w,&mut tr,"attn_v","v_proj",&n,H,KV*D,t)?;
+    let q = dev.dense(w,&mut tr,"attn_q","q_proj",&n,H,Q*D,t,mode)?;
+    let k = dev.dense(w,&mut tr,"attn_k","k_proj",&n,H,KV*D,t,mode)?;
+    let v = dev.dense(w,&mut tr,"attn_v","v_proj",&n,H,KV*D,t,mode)?;
     let qn = dev.norm(&q,&w.get("attn_q_norm.weight",&[D],0,None)?);
     let kn = dev.norm(&k,&w.get("attn_k_norm.weight",&[D],0,None)?);
     dev.trace(&mut tr,"q_norm",[D,Q,t,1],&qn)?;
@@ -441,7 +470,7 @@ fn layer2_impl(w: &mut impl Weights, input: &[f32], positions: &[i32], packed_k:
     dev.trace(&mut tr,"attention_mask",[t,t,1,1],&mask)?;
     dev.trace(&mut tr,"attention_probs",[t,t,Q,1],&probs)?;
     dev.trace(&mut tr,"attention_heads",[D,t,Q,1],&heads)?;
-    let ao = dev.dense(w,&mut tr,"attn_output","attention_output",&joined,Q*D,H,t)?;
+    let ao = dev.dense(w,&mut tr,"attn_output","attention_output",&joined,Q*D,H,t,mode)?;
     let residual = dev.point(&input_gpu,&ao,H,0);
     dev.trace(&mut tr,"ffn_inp",[H,t,1,1],&residual)?;
     let n = dev.norm(&residual,&w.get("ffn_norm.weight",&[H],0,None)?);
@@ -467,8 +496,8 @@ fn layer2_impl(w: &mut impl Weights, input: &[f32], positions: &[i32], packed_k:
     dev.trace(&mut tr,"router_denominator",[1,t,1,1],&denoms)?;
     dev.trace(&mut tr,"router_weights",[1,K,t,1],&rw)?;
     tr.router_margins = dev.read(&margins)?;
-    let up = dev.experts(w,&mut tr,"ffn_up_exps","expert_up",&n,H,F,t,&ids,false)?;
-    let gate = dev.experts(w,&mut tr,"ffn_gate_exps","expert_gate",&n,H,F,t,&ids,false)?;
+    let up = dev.experts(w,&mut tr,"ffn_up_exps","expert_up",&n,H,F,t,&ids,false,mode)?;
+    let gate = dev.experts(w,&mut tr,"ffn_gate_exps","expert_gate",&n,H,F,t,&ids,false,mode)?;
     let sw = dev.point(&gate,&up,F,3);
     dev.trace(&mut tr,"expert_swiglu",[F,K,t,1],&sw)?;
     let scales = dev.empty(K*t);
@@ -477,7 +506,7 @@ fn layer2_impl(w: &mut impl Weights, input: &[f32], positions: &[i32], packed_k:
     dev.trace(&mut tr,"expert_down_scale",[1,K,t,1],&scales)?;
     let di = dev.point(&sw,&scales,F,4);
     dev.trace(&mut tr,"expert_down_input",[F,K,t,1],&di)?;
-    let before = dev.experts(w,&mut tr,"ffn_down_exps","expert_down_before_rescale",&di,F,H,t,&ids,true)?;
+    let before = dev.experts(w,&mut tr,"ffn_down_exps","expert_down_before_rescale",&di,F,H,t,&ids,true,mode)?;
     let down = dev.point(&before,&scales,H,1);
     dev.trace(&mut tr,"expert_down",[H,K,t,1],&down)?;
     let weighted = dev.point(&down,&rw,H,1);
@@ -486,11 +515,11 @@ fn layer2_impl(w: &mut impl Weights, input: &[f32], positions: &[i32], packed_k:
     unsafe { moe_sum_kernel::launch_unchecked::<CudaRuntime>(&dev.client,
         CubeCount::new_1d(moe.len.div_ceil(256) as u32),CubeDim::new_1d(256),weighted.arg(),moe.arg(),moe.len as u32); }
     dev.trace(&mut tr,"moe_out",[H,t,1,1],&moe)?;
-    let su = dev.dense(w,&mut tr,"ffn_up_shexp","shared_up",&n,H,SH,t)?;
-    let sg = dev.dense(w,&mut tr,"ffn_gate_shexp","shared_gate",&n,H,SH,t)?;
+    let su = dev.dense(w,&mut tr,"ffn_up_shexp","shared_up",&n,H,SH,t,mode)?;
+    let sg = dev.dense(w,&mut tr,"ffn_gate_shexp","shared_gate",&n,H,SH,t,mode)?;
     let ss = dev.point(&sg,&su,SH,3);
     dev.trace(&mut tr,"shared_swiglu",[SH,t,1,1],&ss)?;
-    let sd = dev.dense(w,&mut tr,"ffn_down_shexp","shared_down",&ss,SH,H,t)?;
+    let sd = dev.dense(w,&mut tr,"ffn_down_shexp","shared_down",&ss,SH,H,t,mode)?;
     let ffn = dev.point(&moe,&sd,H,0);
     dev.trace(&mut tr,"ffn_out",[H,t,1,1],&ffn)?;
     let out = dev.point(&ffn,&residual,H,0);
