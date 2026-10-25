@@ -1,0 +1,252 @@
+//! CPU or CUDA F32/math block-0/block-2/block-5 diagnostics against reference outputs.
+//! Exit success means diagnostics completed with exact integer stage agreement,
+//! NOT floating-point numerical acceptance. CUDA uses the `flint-cuda` feature.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use anyhow::{Context, Result, ensure};
+use mary::models::flint::{math::{self, Values}, weights::{GgufWeights,Weights,PackedWeight},pile::PileWeights};
+use mary::models::flint::config::FfnKind;
+use serde_json::{Value, json};
+
+enum Source { Gguf(GgufWeights), Native(PileWeights) }
+impl Source {
+    fn config(&self)->mary::models::flint::config::BlockConfig {
+        match self {Self::Gguf(w)=>w.config,Self::Native(w)=>w.config}
+    }
+    fn gguf(&self)->Option<&GgufWeights> { match self {Self::Gguf(w)=>Some(w),_=>None} }
+}
+impl Weights for Source {
+    fn get(&mut self,s:&str,d:&[usize],t:u32,e:Option<usize>)->Result<Vec<f32>> {
+        match self {Self::Gguf(w)=>w.get(s,d,t,e),Self::Native(w)=>w.get(s,d,t,e)}
+    }
+    fn get_nvfp4(&mut self,s:&str,d:&[usize],e:Option<usize>)->Result<Vec<u8>> {
+        match self {Self::Gguf(w)=>w.get_nvfp4(s,d,e),Self::Native(w)=>w.get_nvfp4(s,d,e)}
+    }
+    fn get_packed(&mut self,s:&str,d:&[usize],e:Option<usize>)->Result<PackedWeight> {
+        match self {Self::Gguf(w)=>w.get_packed(s,d,e),Self::Native(w)=>w.get_packed(s,d,e)}
+    }
+    fn packed_projection(&mut self,s:&str,d:&[usize],e:Option<usize>)->Result<(PackedWeight,Option<f32>)> {
+        match self {Self::Gguf(w)=>w.packed_projection(s,d,e),Self::Native(w)=>w.packed_projection(s,d,e)}
+    }
+    fn paired_scales(&self)->bool { matches!(self,Self::Native(_)) }
+}
+
+fn read(path: &Path, max: usize) -> Result<Vec<u8>> {
+    let meta = fs::symlink_metadata(path)?;
+    ensure!(meta.is_file() && meta.len() <= max as u64, "not a bounded regular file: {}",path.display());
+    let bytes = fs::read(path)?;
+    let after = fs::symlink_metadata(path)?;
+    ensure!(bytes.len() as u64 == meta.len() && after.len() == meta.len()
+        && after.modified()? == meta.modified()?, "source changed while reading: {}",path.display());
+    Ok(bytes)
+}
+fn floats(bytes: &[u8]) -> Result<Vec<f32>> {
+    ensure!(bytes.len()%4 == 0,"f32 length is not aligned");
+    Ok(bytes.chunks_exact(4).map(|c|f32::from_le_bytes(c.try_into().unwrap())).collect())
+}
+fn hash(bytes: &[u8]) -> String { blake3::hash(bytes).to_hex().to_string() }
+
+fn errors(actual: &[f32], expected: &[f32]) -> Result<Value> {
+    ensure!(actual.len() == expected.len(),"comparison length differs");
+    let mut max_abs = 0.0f64; let mut sum_diff = 0.0; let mut sum_ref = 0.0;
+    let mut max_ref = 0.0f64; let mut finite = 0usize; let mut bits = 0;
+    for (&a,&r) in actual.iter().zip(expected) {
+        bits += usize::from(a.to_bits() != r.to_bits());
+        if !a.is_finite() || !r.is_finite() {
+            ensure!(a == r && !a.is_nan(),"nonfinite mismatch");
+            continue;
+        }
+        let diff = (a as f64)-(r as f64);
+        max_abs = max_abs.max(diff.abs()); max_ref = max_ref.max((r as f64).abs());
+        sum_diff += diff*diff; sum_ref += (r as f64)*(r as f64); finite += 1;
+    }
+    let rmse = (sum_diff / finite.max(1) as f64).sqrt();
+    let ref_rms = (sum_ref / finite.max(1) as f64).sqrt();
+    Ok(json!({"elements":actual.len(),"finite_elements":finite,"bit_mismatches":bits,
+        "max_abs":max_abs,"rmse":rmse,"reference_rms":ref_rms,"reference_max_abs":max_ref,
+        "relative_rms_error":if ref_rms>0.0 {Some(rmse/ref_rms)} else {None},
+        "max_abs_over_reference_max":if max_ref>0.0 {Some(max_abs/max_ref)} else {None}}))
+}
+
+#[cfg(feature = "flint-cuda")]
+fn packed_k_probe(args: &[PathBuf]) -> Result<()> {
+    use mary::models::flint::{gpu, weights::Weights};
+    ensure!(args.len() == 3, "usage: flint_layer2_gate --cuda-packed-k-probe MODEL NORMALIZED_INPUT_F32 NEW_OUTPUT_DIR");
+    let [model, input_path, out] = args else { unreachable!() };
+    let input_bytes = read(input_path, math::H*3*4)?;
+    let input = floats(&input_bytes)?;
+    ensure!(input.len() % math::H == 0 && (1..=3).contains(&(input.len()/math::H))
+        && input.iter().all(|v| v.is_finite()), "invalid normalized probe input");
+    fs::create_dir(out).context("probe output directory must not already exist")?;
+    let mut weights = GgufWeights::open(model)?;
+    let raw = weights.get_nvfp4("attn_k.weight", &[math::H,512], None)?;
+    let scale = weights.get("attn_k.scale", &[1], 0, None)?[0];
+    let comparison = gpu::compare_packed_k(&raw, &input, scale)?;
+    weights.file.check_identity()?;
+    let unscaled = errors(&comparison.packed_unscaled, &comparison.decoded_unscaled)?;
+    let scaled = errors(&comparison.packed_scaled, &comparison.decoded_scaled)?;
+    let mut outputs = Vec::new();
+    for (name, values) in [
+        ("packed_unscaled", &comparison.packed_unscaled), ("decoded_unscaled", &comparison.decoded_unscaled),
+        ("packed_scaled", &comparison.packed_scaled), ("decoded_scaled", &comparison.decoded_scaled),
+    ] {
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        fs::write(out.join(format!("{name}.f32")), &bytes)?;
+        outputs.push(json!({"name":name,"elements":values.len(),"blake3":hash(&bytes)}));
+    }
+    let report = json!({
+        "backend":"cuda-packed-k-probe", "projection":"blk.2.attn_k.weight",
+        "scope":"unchanged packed bytes versus unchanged CPU decode uploaded to accepted F32 GPU matvec; standalone diagnostic allocates both representations",
+        "arithmetic":"same 32-lane F32 striding/tree; GPU decode uses exact dyadic operations; CUDA compiler may contract multiply-add; separate post-matmul scale",
+        "acceptance":"diagnostic errors, not a fitted float tolerance; exhaustive decode-bit test is separate",
+        "input_path":input_path,"input_blake3":hash(&input_bytes),"tokens":input.len()/math::H,
+        "model_identity":weights.file.identity,"whole_model_freshly_hashed":false,"reads":weights.reads,
+        "scale":scale,"scale_bits":scale.to_bits(),"unscaled":unscaled,"scaled":scaled,"outputs":outputs,
+    });
+    println!("{report}");
+    fs::write(out.join("report.json"), serde_json::to_vec_pretty(&report)?)?;
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    let mut args: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
+    if args.first().is_some_and(|p| p == Path::new("--cuda-packed-k-probe")) {
+        #[cfg(feature = "flint-cuda")]
+        { return packed_k_probe(&args[1..]); }
+        #[cfg(not(feature = "flint-cuda"))]
+        { anyhow::bail!("--cuda-packed-k-probe requires the flint-cuda feature"); }
+    }
+    let packed_k = args.first().is_some_and(|p| p == Path::new("--cuda-packed-k"));
+    let packed_all = args.first().is_some_and(|p| p == Path::new("--cuda-packed-all"));
+    let cuda = packed_k || packed_all || args.first().is_some_and(|p| p == Path::new("--cuda"));
+    if cuda || args.first().is_some_and(|p| p == Path::new("--cpu")) { args.remove(0); }
+    let typed_root=if args.first().is_some_and(|p|p==Path::new("--typed-pile")) {
+        ensure!(args.len()>=2,"missing --typed-pile root");
+        let root=triblespace::prelude::Id::from_hex(args[1].to_str().context("root is not UTF-8")?).context("invalid model root")?;
+        args.drain(..2); Some(root)
+    } else {None};
+    let block = if args.first().is_some_and(|p| p == Path::new("--block")) {
+        ensure!(args.len() >= 2, "missing --block value");
+        let value = args[1].to_str().context("block is not UTF-8")?.parse::<usize>()?;
+        args.drain(..2);
+        value
+    } else { 2 };
+    ensure!(matches!(block, 0 | 2 | 5), "only blocks 0, 2 and 5 are implemented");
+    ensure!(typed_root.is_none() || (block==0 && packed_all),"--typed-pile requires --cuda-packed-all --block0; no packed-to-F32 fallback");
+    ensure!(!cuda || cfg!(feature = "flint-cuda"), "--cuda requires the flint-cuda feature");
+    ensure!(args.len()==5,"usage: flint_layer2_gate [--cpu|--cuda|--cuda-packed-k|--cuda-packed-all] [--typed-pile ROOT] [--block 0|2|5] MODEL_OR_PILE INPUT_F32 POSITIONS_I32 REFERENCE_DIR NEW_OUTPUT_DIR");
+    let [model,input_path,pos_path,reference,out] = args.as_slice() else { unreachable!() };
+    let input_bytes = read(input_path,math::H*3*4)?;
+    let input = floats(&input_bytes)?;
+    let pos_bytes = read(pos_path,3*4)?;
+    ensure!(pos_bytes.len()%4==0,"unaligned positions");
+    let positions: Vec<i32> = pos_bytes.chunks_exact(4).map(|c|i32::from_le_bytes(c.try_into().unwrap())).collect();
+    let table_bytes = read(&reference.join("tensors.tsv"),1024*1024)?;
+    let table = std::str::from_utf8(&table_bytes)?;
+    fs::create_dir(out).context("output directory must not already exist")?;
+    let mut weights = match typed_root {
+        Some(root)=>Source::Native(PileWeights::open(model,root)?),
+        None=>Source::Gguf(GgufWeights::open_block(model,block)?),
+    };
+    let config = weights.config();
+    let trace = if cuda {
+        #[cfg(feature = "flint-cuda")]
+        { use mary::models::flint::gpu::{self, ProjectionMode};
+          let mode = if packed_all { ProjectionMode::PackedAll } else if packed_k { ProjectionMode::PackedK } else { ProjectionMode::Decoded };
+          gpu::block(&mut weights,&input,&positions,config,mode)? }
+        #[cfg(not(feature = "flint-cuda"))]
+        { unreachable!("feature checked before file reads") }
+    } else { math::block(&mut weights,&input,&positions,config)? };
+    if let Some(w)=weights.gguf() { w.file.check_identity()?; }
+    let mut comparisons = Vec::new();
+    let mut exact_integer_stages = Vec::new();
+    let mut integer_mismatches = 0usize;
+    let mut shape_text = String::from("name\ttype\tne0\tne1\tne2\tne3\tbytes\tblake3\n");
+    ensure!(table.lines().skip(1).count() == trace.stages.len(),"reference stage inventory differs");
+    for stage in &trace.stages {
+        let line = table.lines().skip(1).find(|s|s.split('\t').next()==Some(stage.name.as_str()))
+            .with_context(||format!("reference stage absent: {}",stage.name))?;
+        let cols: Vec<_> = line.split('\t').collect();
+        ensure!(cols.len()>=8,"invalid reference shape row");
+        let dims: Vec<usize> = cols[2..6].iter().map(|s|s.parse()).collect::<std::result::Result<_,_>>()?;
+        ensure!(dims==stage.dims,"shape differs: {}",stage.name);
+        let (ty,raw) = match &stage.values {
+            Values::F32(v) => ("f32",v.iter().flat_map(|v|v.to_le_bytes()).collect::<Vec<_>>()),
+            Values::I32(v) => ("i32",v.iter().flat_map(|v|v.to_le_bytes()).collect::<Vec<_>>()),
+        };
+        ensure!(ty==cols[1],"dtype differs: {}",stage.name);
+        let filename = format!("{}.{}",stage.name,ty);
+        let expected = read(&reference.join(&filename),1024*1024)?;
+        ensure!(expected.len()==raw.len() && expected.len()==cols[6].parse::<usize>()?,"byte length differs");
+        let metric = match &stage.values {
+            Values::F32(v) => errors(v,&floats(&expected)?)?,
+            Values::I32(v) => {
+                let mismatches = expected.chunks_exact(4).zip(raw.chunks_exact(4)).filter(|(a,b)|a!=b).count();
+                integer_mismatches += mismatches;
+                exact_integer_stages.push(json!({"stage":stage.name,"elements":v.len(),
+                    "mismatches":mismatches,"exact_ordered_match":mismatches==0}));
+                json!({"elements":v.len(),"integer_mismatches":mismatches})
+            },
+        };
+        println!("{} {}",stage.name,metric);
+        fs::write(out.join(filename),&raw)?;
+        shape_text.push_str(&format!("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",stage.name,ty,
+            dims[0],dims[1],dims[2],dims[3],raw.len(),hash(&raw)));
+        comparisons.push(json!({"stage":stage.name,"ggml_dims":dims,"type":ty,"metric":metric,
+            "actual_blake3":hash(&raw),"reference_blake3":hash(&expected),
+            "reference_manifest_digest_claim":cols[7]}));
+    }
+    let reference_margins = if config.ffn == FfnKind::Moe {
+        let ref_probs = floats(&read(&reference.join("router_probs.f32"),256*3*4)?)?;
+        Some(ref_probs.chunks_exact(256).map(|row|{
+            let mut sorted = row.to_vec(); sorted.sort_by(|a,b|b.total_cmp(a)); sorted[5]-sorted[6]
+        }).collect::<Vec<f32>>())
+    } else { None };
+    let gguf=weights.gguf();
+    let native=match &weights { Source::Native(w)=>Some(json!({"model_root":format!("{:X}",w.root),
+        "model_collection":w.collection(),"block":format!("{:X}",w.block),"config_node":format!("{:X}",w.config_node),
+        "support_members":w.support_members(),"weight_source":"frozen native pile reader; no GGUF access or F32 packed-weight fallback"})),_=>None };
+    let selected_bytes = gguf.map(|w|w.reads.iter().map(|r|r.absolute_end-r.absolute_start).sum::<u64>());
+    let scope = if typed_root.is_some() {
+        "typed pile block0 CubeCL CUDA F32; native Tensor NVFP4 planes decoded on GPU with the same32-lane matvec; separate post-scales, stage readbacks; no tensorcores/activation quantization"
+    } else if packed_all {
+        "metadata-bound isolated block CubeCL CUDA F32 math; every type40 projection in the selected dense or MoE branch reads unchanged packed GGUF NVFP4 on GPU; per-stage readbacks; no tensor cores or activation quantization"
+    } else if packed_k {
+        "metadata-bound isolated block CubeCL CUDA F32 math; only attn_k reads unchanged packed GGUF NVFP4 on GPU; other weights decoded; per-stage readbacks and CPU-controlled sparse loading; no tensor cores or activation quantization"
+    } else if cuda {
+        "metadata-bound isolated block CubeCL CUDA F32 decoded-weight math; per-stage readbacks and CPU-controlled sparse loading; no BF16 or activation quantization"
+    } else { "metadata-bound isolated block CPU F32/math only; wider scalar dot/RMS reductions; no BF16 or activation quantization" };
+    let arithmetic = if cuda {
+        "F32 values and accumulation; matvec 32-lane strided/tree reduction; RMS 256-lane strided/tree reduction; serial F32 attention/router sums; GPU transcendentals; CUDA compiler may contract multiply-add; fixed kernels without autotune"
+    } else { "F32 operation boundaries with f64 scalar dot/RMS and attention denominator/division reductions; CPU transcendentals" };
+    let report = json!({"scope":scope,"arithmetic":arithmetic,"backend":if typed_root.is_some() {"cuda-native-pile"} else if packed_all {"cuda-packed-all"} else if packed_k {"cuda-packed-k"} else if cuda {"cuda"} else {"cpu"},
+        "acceptance":"diagnostics only: exact ordered integer stages required; floating errors reported without fitted tolerance or numerical acceptance claim",
+        "exact_integer_stages":exact_integer_stages,"integer_stages_pass":integer_mismatches==0,
+        "model_path":gguf.map(|_|model),"pile_path":typed_root.map(|_|model),
+        "model_identity":gguf.map(|w|&w.file.identity),"whole_model_freshly_hashed":false,"native_source":native,
+        "block_config":config,"gguf_metadata":gguf.map(|w|&w.file.index.metadata),"metadata_end":gguf.map(|w|w.file.index.metadata_end),
+        "input_path":input_path,"input_blake3":hash(&input_bytes),"positions_path":pos_path,"positions_blake3":hash(&pos_bytes),
+        "reference_dir":reference,"reference_table_blake3":hash(&table_bytes),"positions":positions,
+        "projection_family_count":if config.ffn == FfnKind::Moe {10} else {7},
+        "ordinary_ffn_clamp":0.0,"clamp_source":"llama.cpp 1ddffe9: llama-model.cpp:1471 initializes zero; flint.cpp:3-18 has no override",
+        "router_sixth_seventh_margins":if config.ffn == FfnKind::Moe {Some(trace.router_margins)} else {None},"reference_router_sixth_seventh_margins":reference_margins,
+        "selected_payload_bytes_returned":selected_bytes,"read_accounting":"explicit row returns including repeats; excludes header/buffering/OS read-ahead",
+        "reads":gguf.map(|w|&w.reads),"comparisons":comparisons});
+    fs::write(out.join("tensors.tsv"),shape_text)?;
+    fs::write(out.join("report.json"),serde_json::to_vec_pretty(&report)?)?;
+    ensure!(integer_mismatches==0,"integer stage mismatch (including ordered expert IDs); diagnostics retained in {}",out.display());
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test] fn metrics_do_not_hide_nonfinite_or_zero_reference() {
+        assert!(errors(&[f32::NAN],&[0.0]).is_err());
+        assert!(errors(&[f32::INFINITY],&[0.0]).is_err());
+        assert!(errors(&[f32::NEG_INFINITY],&[f32::NEG_INFINITY]).is_ok());
+        let zero = errors(&[1.0],&[0.0]).unwrap();
+        assert_eq!(zero["max_abs"],1.0); assert!(zero["relative_rms_error"].is_null());
+    }
+}

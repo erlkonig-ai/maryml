@@ -23,6 +23,11 @@ use half::{bf16, f16};
 
 use gguf_rs_lib::prelude::GGUFTensorType;
 
+// Selective, checked import/parity path for modern GGML type tags. The existing
+// extract_tensors caller and its output semantics are deliberately unchanged.
+pub mod index;
+pub mod nvfp4;
+
 /// GGML super-block element count for the K-quant families (Q2_K..Q8_K).
 const QK_K: usize = 256;
 

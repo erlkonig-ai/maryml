@@ -190,6 +190,9 @@ nvfp4-cuda = ["dep:cubecl", "cubecl?/cuda"]
 # Direct native BF16 device rows to the canonical two-stage search encoding.
 nvfp4-encode-cuda = ["nvfp4-cuda", "dep:burn-cubecl", "dep:cubecl-cpp"]
 nvfp4-score-cuda = ["nvfp4-encode-cuda"]
+# Bounded Flint layer arithmetic on the existing raw CubeCL CUDA runtime.
+# Kept separate so the stored-weight/CPU diagnostics need no GPU dependency.
+flint-cuda = ["import", "dep:cubecl", "cubecl?/cuda"]
 # Investigation-only: burn's REAL Cuda backend, for backend_matmul_probe.
 burn-cuda-bench = ["burn/cuda", "burn/autotune"]
 
@@ -975,6 +978,31 @@ cubecl = { version = "0.10.0", default-features = false, features = ["std", "cud
 ciborium = "0.2"
 burn-ndarray = { version = "0.21.0", package = "maryml-burn-ndarray", path = "../burn-fork/crates/burn-ndarray" }
 
+# Selective stored-weight decoder gate; never loads or executes a full model.
+[[bin]]
+name = "flint_gguf_gate"
+required-features = ["import"]
+
+[[bin]]
+name = "flint_layer2_gate"
+required-features = ["import"]
+
+[[bin]]
+name = "flint_pile_import"
+required-features = ["import"]
+
+[[bin]]
+name = "flint_forward_gate"
+required-features = ["import"]
+
+[[bin]]
+name = "flint_generate"
+required-features = ["import", "tokenizer"]
+
+[[bin]]
+name = "flint_session_gate"
+required-features = ["import", "tokenizer"]
+
 # SOURCE-BUILD-ONLY: retain the tested network readiness repair.
 # Registry consumers intentionally use upstream netwatch without these fixes.
 # Root patches are not inherited; this source/registry difference is deliberate.
@@ -1280,3 +1308,7 @@ required-features = ["wemm-layer1-reset"]
 [[bin]]
 name = "wemm_behavior"
 required-features = ["wemm-prepared-gate"]
+
+[[bin]]
+name = "flint_tokenizer_gate"
+required-features = ["import", "tokenizer"]

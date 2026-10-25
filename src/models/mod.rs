@@ -12,6 +12,10 @@ pub mod breeze;
 #[cfg(feature = "step-audio2")]
 pub mod step_audio2;
 
+// Flint native Tensor pile ingress and bounded F32 CUDA generation.
+#[cfg(feature = "import")]
+pub mod flint;
+
 // Qwen2.5-VL text backbone (BiQwen2_5 / nomic-embed-multimodal-7b). Reuses
 // gemma's RoPE table, so it rides the `gemma` feature.
 #[cfg(feature = "gemma")]

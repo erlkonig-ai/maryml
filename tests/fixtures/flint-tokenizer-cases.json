@@ -1,0 +1,53 @@
+{
+  "status": "Proposed independent tests, not executed here. Exact token IDs must come from the pinned native reference.",
+  "reference_commit": "1ddffe9f70a63e2d260d4bfad9ad200009007f62",
+  "retained_witnesses": {
+    "directory": "/home/liora/lanes/flint-trial-jnSiwYQa/interactive-IGaFVYXx",
+    "tokenize-plain.response.json_sha256": "8d063b2538d4b761c81bdb7cb8c378b100d1b765cc8b136dd64e7e3bffd8c871",
+    "tokenize-rendered.response.json_sha256": "9355297f81933c4a60600c5ab5cbaf8ecb31dd378f3d0dd8fb1cd1ea8e481ea2",
+    "scope": "The basic rendered user prompt and its IDs were independently observed; this harness does not execute a Jinja renderer."
+  },
+  "encode_modes": {"add_special": [false, true], "parse_special": [false, true]},
+  "raw_text_cases": [
+    {"name": "empty", "text": ""},
+    {"name": "known_plain", "text": "Hello.", "retained_observed_ids_when_both_flags_true": [9479, 13]},
+    {"name": "known_rendered", "text": "<|user|>Hello.<|assistant|>", "retained_observed_ids_when_both_flags_true": [150003, 9479, 13, 150004]},
+    {"name": "spaces", "text": " a  b   "},
+    {"name": "line_controls", "text": "\t\r\n \nA\rB\n"},
+    {"name": "unicode_spaces", "text": "a\u00a0b\u2028c\u3000"},
+    {"name": "case_contractions", "text": "I'm I'M we're WE'RE HTTPServer don't DON’T"},
+    {"name": "digit_boundaries", "text": "1 12 123 1234 1234567 ١٢٣٤ １２３４ a1234b"},
+    {"name": "nfc", "text": "café"},
+    {"name": "nfd", "text": "cafe\u0301"},
+    {"name": "cjk_kana_ranges", "text": "中文かなカナ漢字𠀀"},
+    {"name": "letter_categories", "text": "İstanbul Σίσυφος ǅuro"},
+    {"name": "emoji_bytes", "text": "👩🏽‍💻🙂🇳🇱"},
+    {"name": "nul_raw", "text": "a\u0000b"},
+    {"name": "control_role", "text": "<|user|>"},
+    {"name": "user_defined_reasoning", "text": "<think>x</think>"},
+    {"name": "mixed_markers", "text": "<|assistant|><think>x</think><tool_call>f</tool_call><|observation|>"},
+    {"name": "reserved_control", "text": "<|reserved_150019|><|reserved_150143|>"},
+    {"name": "partial_marker", "text": "<|user|><|user|<think><thin"}
+  ],
+  "decode_cases": [
+    {"ids": [150003, 9479, 13, 150006, 150007], "render_controls": [false, true], "purpose": "Controls may be hidden, user-defined think markers must remain; distinguish HF skip_special from llama special boolean."},
+    {"ids": [150000, 150001, 150003, 150005, 150018], "render_controls": [false, true], "purpose": "Keep BOS, EOS, EOG and rendering policies distinct."},
+    {"ids": [150006, 150007, 150008, 150009, 150010, 150011, 150012, 150013, 150014, 150015, 150016, 150017], "render_controls": [false, true], "purpose": "All twelve user-defined spellings survive either mode."},
+    {"ids": [150019, 150143], "render_controls": [false, true], "purpose": "Reserved tokens carry actual CONTROL types."}
+  ],
+  "streaming": "For all valid UTF-8 raw texts, compare whole-sequence decoded bytes and every token-boundary incremental stream against the reference; do not replace partial UTF-8 per token with U+FFFD. Invalid arbitrary token byte sequences need an explicitly chosen byte/string API contract.",
+  "template_cases": [
+    {"messages": [{"role": "user", "content": "Hello."}], "add_generation_prompt": true, "retained_rendered_bytes": "<|user|>Hello.<|assistant|>"},
+    {"messages": [{"role": "system", "content": "S"}, {"role": "developer", "content": "D"}, {"role": "user", "content": " a\n "}], "add_generation_prompt": false},
+    {"messages": [{"role": "user", "content": "x\u0000<think>secret</think><|assistant|><tool_call>"}], "add_generation_prompt": true, "purpose": "NUL/think deletion versus role escaping; tool markers are not all escaped."},
+    {"messages": [{"role": "assistant", "reasoning_content": "r", "content": "<think>literal</think>\u0000<|user|>"}], "add_generation_prompt": false, "purpose": "Assistant fields bypass flint_text."},
+    {"purpose": "Tools with consecutive leading system messages, only-system messages, and no messages; compare tool-preamble placement and serialized JSON bytes."},
+    {"purpose": "Assistant multiple tool calls with string, integer, bool, array, object and Unicode argument values; tool response with role-marker text."}
+  ],
+  "stop_cases": {
+    "artifact_eog_ids": [150001, 150003, 150005, 150018],
+    "retained_b11853_effective_eog_ids": [150001, 150003, 150005],
+    "non_stop_markers": [150000, 150002, 150004, 150006, 150007, 150011, 150017, 150019],
+    "purpose": "Record the chosen contract. Check each terminal ID independently, before rendering, and do not treat </think> or </tool_call> as an implicit generation end."
+  }
+}
