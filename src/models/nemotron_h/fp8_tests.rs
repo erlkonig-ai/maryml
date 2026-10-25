@@ -16,6 +16,15 @@ fn geometry_scales_and_budgets_are_admitted_before_device_use() {
     assert!(working_bytes(0, [24, 128]).is_err());
     assert!(working_bytes(usize::MAX, [24, 128]).is_err());
     assert!(extent(&[u32::MAX as usize], 2).is_err());
+    // CUDA create_from_slice uses a 512-byte allocation with a trimmed tail
+    // for a 256-byte M=1,K=128 BF16 input. This is not a start-offset alias.
+    assert!(base_buffer_covers(512, 0, 256, 256));
+    assert!(base_buffer_covers(512, 0, 0, 512));
+    assert!(!base_buffer_covers(512, 0, 257, 256));
+    assert!(!base_buffer_covers(512, 0, 513, 256));
+    assert!(!base_buffer_covers(512, 0, u64::MAX, 256));
+    assert!(!base_buffer_covers(512, 1, 0, 256));
+    assert!(!base_buffer_covers(512, u64::MAX, 0, 256));
     assert_eq!(scale_product(0.5, 0.25).unwrap(), 0.125);
     for (a, w) in [
         (0.0, 1.0), (-0.0, 1.0), (-1.0, 1.0), (1.0, f32::NAN),
