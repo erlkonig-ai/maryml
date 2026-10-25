@@ -1,4 +1,4 @@
-//! Explicit fresh-pile ingress. Put/drop one typed leaf at a time; the returned
+//! Explicit-destination ingress. Put/drop one typed leaf at a time; the returned
 //! Fragment retains facts/handles, never the model's payloads. Existing Tensor
 //! encoding and core Pile content validation own the stored blob contract.
 use super::*;
@@ -106,9 +106,11 @@ fn metadata(pile:&mut Pile,entries:&[MetadataEntry],kind:&str)->Result<Fragment>
     Ok(fragment)
 }
 
-/// Caller supplies a new, explicitly selected scratch pile and already-admitted
-/// source descriptor. Publication happens once, after all leaves/config succeed.
-/// Partial orphan blobs on error stay in that scratch pile for diagnosis.
+/// Caller supplies an explicitly selected destination and already-admitted
+/// source observation. For an existing collection its writer must be admitted
+/// BEFORE calling this function. Publication happens once, after all leaves and
+/// config succeed. Partial orphan blobs on error remain in the destination;
+/// this append-only ingress does not roll back or create/select a collection.
 #[cfg(feature="tokenizer")]
 pub fn full(w:&mut GgufWeights,pile:&mut Pile,tokenizer:&[MetadataEntry])->Result<(Fragment,ImportSummary)> {
     use super::super::{math::{H,E,F,SH},forward::{VOCAB,BLOCKS}};

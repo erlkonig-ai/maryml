@@ -1,13 +1,14 @@
-//! Re-import a native Breeze or Voxtral model pile as one `nvfp4` root in an
-//! explicit model collection.
+//! Import into an explicit existing model collection: Flint GGUF -> native typed
+//! leaves on the host, or Breeze/Voxtral native piles -> device-gated NVFP4.
 //!
-//! The source is an existing native model pile, opened read-only; the
+//! Flint's source is GGUF, never opened as a pile. Other sources are existing
+//! native model piles, opened read-only. The
 //! destination is a pile holding the target collection's descriptor
 //! (`trible pile collection init <PILE> models ...`), named by its exact
 //! handle. The signer must be admitted by that descriptor's WRITE policy,
 //! which is checked before anything is written.
 //!
-//! What the `nvfp4` root holds: every linear projection the runtime used to
+//! For Breeze/Voxtral the `nvfp4` root holds: every linear projection the runtime used to
 //! quantize at load, stored as a `Tensor<NVFP4, 2>` leaf packed on the host by
 //! `nvfp4::pack_nearest` and gated byte for byte against the device quantizer
 //! on the same 16-bit values (Breeze: `Generator::export_projections`,
@@ -20,28 +21,26 @@
 //!     --pile <dest.pile> --key <signing.key> --collection blake3:HEX
 //!   models_import voxtral --source <voxtral.pile> --source-root HEX \
 //!     --tekken <tekken.json> --pile <dest.pile> --key <signing.key> --collection blake3:HEX
+//!   models_import flint --source <flint.gguf> \
+//!     --pile <existing.pile> --key <signing.key> --collection blake3:HEX
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
-use mary::format::attrs;
-use mary::leaf::Leaf;
 use mary::model_collection::{self, ModelCollection};
-use mary::nvfp4::StoredProjection;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
-use triblespace::core::metadata;
-use triblespace::core::repo::pile::{Pile, PileSnapshot};
+use triblespace::core::collection::CollectionHandle;
+use triblespace::core::repo::pile::Pile;
 use triblespace::core::signing_key_file;
 use triblespace::prelude::*;
 
 #[derive(Parser)]
 #[command(
-    about = "Re-import a native Breeze or Voxtral model pile as an nvfp4 root in a model collection"
+    about = "Import Flint GGUF or repack an enabled native model into an explicit existing collection"
 )]
 struct Args {
     #[command(subcommand)]
     model: Model,
-    /// Existing native model pile, read only.
+    /// Flint GGUF, or an existing native model pile for Breeze/Voxtral; read only.
     #[arg(long, global = true)]
     source: Option<PathBuf>,
     /// The source model root (32 hex): Breeze's native root, Voxtral's f16 root.
@@ -60,7 +59,11 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Model {
+    #[cfg(feature = "tokenizer")]
+    Flint,
+    #[cfg(feature = "breeze-cuda")]
     Breeze,
+    #[cfg(feature = "voxtral-cuda")]
     Voxtral {
         /// The checkpoint's tekken.json, gated piece for piece against the
         /// tokenizer the source pile already holds.
@@ -69,15 +72,37 @@ enum Model {
     },
 }
 
+impl Args {
+    fn check_source_kind(&self) -> Result<()> {
+        match &self.model {
+            #[cfg(feature = "tokenizer")]
+            Model::Flint => ensure!(self.source_root.is_none(), "Flint --source is GGUF; --source-root is not used"),
+            #[cfg(feature = "breeze-cuda")]
+            Model::Breeze => ensure!(self.source_root.is_some(), "--source-root is required"),
+            #[cfg(feature = "voxtral-cuda")]
+            Model::Voxtral { .. } => ensure!(self.source_root.is_some(), "--source-root is required"),
+        }
+        Ok(())
+    }
+}
+
+// Existing native-source repacking is absent from the host-only Flint build.
+#[cfg(any(feature = "breeze-cuda", feature = "voxtral-cuda"))]
+mod native {
+use super::*;
+use mary::{format::attrs, leaf::Leaf, nvfp4::StoredProjection};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use triblespace::core::{metadata, repo::pile::PileSnapshot};
+
 /// The source pile's one observation and the explicit root being converted.
-struct Source {
+pub(super) struct Source {
     facts: TribleSet,
     store: PileSnapshot,
     root: Id,
     models: model_collection::ModelPileSnapshot,
 }
 
-fn open_source(path: &Path, root: &str) -> Result<Source> {
+pub(super) fn open_source(path: &Path, root: &str) -> Result<Source> {
     let root = Id::from_hex(root).context("--source-root must be a 32-hex id")?;
     let store = mary::persist::read_model_pile_snapshot_read_only(path)?;
     let models = model_collection::snapshot_model_collection_in(&store)
@@ -97,7 +122,7 @@ fn open_source(path: &Path, root: &str) -> Result<Source> {
 /// `name -> leaf` for the tensor members of `root`. A member that is not a
 /// tensor (Breeze's main root lists its codec root as a member) is not one of
 /// its tensors and is left alone.
-fn tensors(
+pub(super) fn tensors(
     facts: &TribleSet,
     store: &impl BlobStoreGet,
     root: Id,
@@ -229,12 +254,13 @@ fn derivation(
     label(pile, fragment, root, "nvfp4-derivation", model_root)
 }
 
-fn breeze(
+#[cfg(feature = "breeze-cuda")]
+pub(super) fn breeze(
     args: &Args,
     source: &Source,
     source_path: &Path,
     pile: &mut Pile,
-) -> Result<(Fragment, serde_json::Value)> {
+) -> Result<(Id, Fragment, serde_json::Value)> {
     use mary::models::breeze::{
         REVISION, SOURCE,
         generator::Generator,
@@ -378,7 +404,7 @@ fn breeze(
     )?;
     let _ = args;
     Ok((
-        fragment,
+        model_root, fragment,
         serde_json::json!({
             "model": "breeze", "model_root": format!("{model_root:X}"), "codec_root": format!("{codec_root:X}"),
             "projections": stored.len(), "packed_bytes": packed, "dense_bytes": dense, "codec_bytes": codec_bytes,
@@ -387,12 +413,13 @@ fn breeze(
     ))
 }
 
-fn voxtral(
+#[cfg(feature = "voxtral-cuda")]
+pub(super) fn voxtral(
     tekken: &Path,
     source: &Source,
     source_path: &Path,
     pile: &mut Pile,
-) -> Result<(Fragment, serde_json::Value)> {
+) -> Result<(Id, Fragment, serde_json::Value)> {
     use mary::models::voxtral::{
         SOURCE, fast,
         tokenizer::{Tekken, TekkenSource},
@@ -463,7 +490,7 @@ fn voxtral(
         packed,
     )?;
     Ok((
-        fragment,
+        model_root, fragment,
         serde_json::json!({
             "model": "voxtral", "model_root": format!("{model_root:X}"), "projections": stored.len(),
             "replaced_tensors": dropped.len(), "packed_bytes": packed, "dense_bytes": dense,
@@ -472,66 +499,110 @@ fn voxtral(
     ))
 }
 
-fn main() -> Result<()> {
-    let args = Args::parse();
-    let need =
-        |v: &Option<PathBuf>, n: &str| v.clone().with_context(|| format!("--{n} is required"));
-    let source_path = need(&args.source, "source")?;
-    let dest = need(&args.pile, "pile")?;
-    let key =
-        signing_key_file::load_existing(&need(&args.key, "key")?).context("load signing key")?;
-    let handle = model_collection::parse_collection_handle(
-        args.collection
-            .as_deref()
-            .context("--collection is required")?,
-    )?;
-    let source = open_source(
-        &source_path,
-        args.source_root
-            .as_deref()
-            .context("--source-root is required")?,
-    )?;
+} // native
 
-    let started = Instant::now();
-    let size_before = std::fs::metadata(&dest)
-        .with_context(|| format!("{dest:?}"))?
-        .len();
+#[cfg(feature = "tokenizer")]
+fn flint(source_path: &Path, pile: &mut Pile) -> Result<(Id, Fragment, serde_json::Value)> {
+    use mary::formats::gguf::index::{SelectedMetadata, MetadataLimits};
+    use mary::models::flint::{weights::GgufWeights, tokenizer, pile::import};
+    let mut source = GgufWeights::open_block(source_path, 0)?;
+    let (identity, metadata) = SelectedMetadata::open(source_path, tokenizer::METADATA_KEYS, MetadataLimits::TOKENIZER)?;
+    ensure!(identity == source.file.identity, "tokenizer and weights are different source observations");
+    source.file.check_identity()?;
+    // full() validates all block configs and the actual tokenizer before its
+    // first leaf write; the destination writer has already been admitted.
+    let (fragment, summary) = import::full(&mut source, pile, &metadata.entries)?;
+    source.file.check_identity()?;
+    let root = fragment.root().context("Flint model root")?;
+    Ok((root, fragment, serde_json::json!({
+        "model": "flint", "source_identity": source.file.identity,
+        "source_gguf": source_path.file_name().map(|n| n.to_string_lossy().into_owned()),
+        "whole_model_freshly_hashed": false, "metadata_end": source.file.index.metadata_end,
+        "tokenizer_metadata_end": metadata.end, "import": summary,
+        "layout": "native BF16/F32/NVFP4 Tensor leaves; indexed rank2 experts; separate post-matmul scales",
+    })))
+}
+
+/// Existing destination transaction, factored so synthetic tests can verify
+/// that a refused writer never reaches the leaf-producing callback. Not a
+/// descriptor creator, transfer operation or alternative import framework.
+fn publish_into(dest: &Path, key: &ed25519_dalek::SigningKey, handle: CollectionHandle,
+    import: impl FnOnce(&mut Pile) -> Result<(Id, Fragment, serde_json::Value)>) -> Result<(Id, serde_json::Value)> {
+    ensure!(std::fs::metadata(dest).with_context(|| format!("existing destination {dest:?}"))?.is_file(),
+        "destination must be an existing pile file");
     let mut pile = Pile::open(&dest).map_err(|e| anyhow::anyhow!("open {dest:?}: {e:?}"))?;
-    let result = (|| -> Result<serde_json::Value> {
+    let result = (|| -> Result<(Id, serde_json::Value)> {
         pile.refresh().context("refresh destination")?;
         let collection: ModelCollection = {
             let snapshot = pile.snapshot().context("freeze destination")?;
             model_collection::open_model_collection(&snapshot, handle)?
         };
         // Before any weight is written: a refused signer must cost nothing.
-        model_collection::require_model_writer(&mut pile, &key, collection)?;
-        let (fragment, mut receipt) = match &args.model {
-            Model::Breeze => breeze(&args, &source, &source_path, &mut pile)?,
-            Model::Voxtral { tekken } => voxtral(tekken, &source, &source_path, &mut pile)?,
-        };
+        model_collection::require_model_writer(&mut pile, key, collection)?;
+        // The model's root is explicit: native fragments can export additional
+        // document/tokenizer roots without changing the model being published.
+        let (root, fragment, mut receipt) = import(&mut pile)?;
         let commit =
-            model_collection::publish_model_fragment_into(&mut pile, &key, collection, fragment)?;
+            model_collection::publish_model_fragment_into(&mut pile, key, collection, fragment)?;
+        receipt["model_root"] = serde_json::json!(format!("{root:X}"));
+        receipt["collection"] = serde_json::json!(handle.raw.iter().map(|b| format!("{b:02x}")).collect::<String>());
         receipt["commit"] = serde_json::json!(
             triblespace::core::collection::CollectionRecord::Commit(commit)
                 .fingerprint()
                 .to_string()
         );
-        Ok(receipt)
+        Ok((root, receipt))
     })();
     let close = pile
         .close()
         .map_err(|e| anyhow::anyhow!("close {dest:?}: {e:?}"));
-    let mut receipt = match (result, close) {
-        (Ok(receipt), Ok(())) => receipt,
-        (Err(error), _) | (Ok(_), Err(error)) => return Err(error),
-    };
+    match (result, close) {
+        (Ok(receipt), Ok(())) => Ok(receipt),
+        (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+    }
+}
 
-    // Read it back the way the runtime will: the collection by handle, the
-    // root by its labels.
+fn main() -> Result<()> {
+    let args = Args::parse();
+    args.check_source_kind()?;
+    let need =
+        |v: &Option<PathBuf>, n: &str| v.clone().with_context(|| format!("--{n} is required"));
+    let source_path = need(&args.source, "source")?;
+    let dest = need(&args.pile, "pile")?;
+    let key = signing_key_file::load_existing(&need(&args.key, "key")?).context("load signing key")?;
+    let handle = model_collection::parse_collection_handle(args.collection.as_deref().context("--collection is required")?)?;
+    let started = Instant::now();
+    let size_before = std::fs::metadata(&dest).with_context(|| format!("{dest:?}"))?.len();
+    let (model_root, mut receipt) = publish_into(&dest, &key, handle, |pile| match &args.model {
+        #[cfg(feature = "tokenizer")]
+        Model::Flint => flint(&source_path, pile),
+        #[cfg(feature = "breeze-cuda")]
+        Model::Breeze => {
+            let source = native::open_source(&source_path, args.source_root.as_deref().context("--source-root is required")?)?;
+            native::breeze(&args, &source, &source_path, pile)
+        },
+        #[cfg(feature = "voxtral-cuda")]
+        Model::Voxtral { tekken } => {
+            let source = native::open_source(&source_path, args.source_root.as_deref().context("--source-root is required")?)?;
+            native::voxtral(tekken, &source, &source_path, pile)
+        },
+    })?;
+
+    // Read it back the way the runtime will: the collection by handle, Flint's
+    // explicit root, or the existing native readers' model labels.
     let store = mary::persist::read_model_pile_snapshot_read_only(&dest)?;
     let collection = model_collection::open_model_collection(&store, handle)?;
     let models = model_collection::snapshot_model_collection_for(&store, collection)?;
     match &args.model {
+        #[cfg(feature = "tokenizer")]
+        Model::Flint => {
+            let mut weights = mary::models::flint::pile::PileWeights::from_snapshot(models, model_root)?;
+            for block in 0..49 { weights.select_block(block)?; }
+            weights.tokenizer()?;
+            receipt["readback"] = serde_json::json!("all49 block bindings and root-linked tokenizer in explicit frozen collection");
+            receipt["support_handles"] = serde_json::json!(weights.support_handles());
+        },
+        #[cfg(feature = "breeze-cuda")]
         Model::Breeze => {
             let ids = mary::models::breeze::load::Artifacts::select(
                 models.facts(),
@@ -539,7 +610,7 @@ fn main() -> Result<()> {
                 mary::persist::QUANTIZATION_NVFP4,
             )?;
             mary::models::breeze::load::Assets::from_frozen(models.facts(), models.store(), ids)?;
-            let index = tensors(models.facts(), models.store(), ids.model_root)?;
+            let index = native::tensors(models.facts(), models.store(), ids.model_root)?;
             receipt["readback_nvfp4_leaves"] = serde_json::json!(
                 index
                     .values()
@@ -548,6 +619,7 @@ fn main() -> Result<()> {
             );
             receipt["readback_tensors"] = serde_json::json!(index.len());
         }
+        #[cfg(feature = "voxtral-cuda")]
         Model::Voxtral { .. } => {
             let model = mary::models::voxtral::VoxtralNvfp4::from_snapshot(&models)?;
             mary::models::voxtral::tokenizer::Tekken::from_snapshot(&models)?;
@@ -559,4 +631,100 @@ fn main() -> Result<()> {
     receipt["seconds"] = serde_json::json!(started.elapsed().as_secs_f64());
     println!("{}", serde_json::to_string_pretty(&receipt)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mary::{format::attrs, leaf};
+    use triblespace::core::{metadata, collection::{AdmissionPolicy, CollectionPolicy},
+        blob::encodings::tensor::elements::F32};
+
+    // One-operation synthetic fixture; public deterministic key, no key file.
+    fn destination() -> Result<(PathBuf, ed25519_dalek::SigningKey, CollectionHandle, Id)> {
+        let path=std::env::temp_dir().join(format!("mary-models-import-{}.pile",fucid().id));
+        std::fs::OpenOptions::new().write(true).create_new(true).open(&path)?;
+        let mut pile=Pile::open(&path).map_err(|e|anyhow::anyhow!("{e}"))?;
+        let key=ed25519_dalek::SigningKey::from_bytes(&[71;32]);
+        let policy=CollectionPolicy::new(AdmissionPolicy::direct(key.verifying_key()),AdmissionPolicy::direct(key.verifying_key()));
+        let collection=pile.collection("models",policy)?;
+        let existing=entity! {metadata::name:"unrelated existing model"};
+        let root=existing.root().context("fixture root")?;
+        model_collection::publish_model_fragment_into(&mut pile,&key,collection,existing)?;
+        pile.close().map_err(|e|anyhow::anyhow!("{e}"))?;
+        Ok((path,key,collection.handle(),root))
+    }
+
+    #[cfg(feature="tokenizer")]
+    #[test]
+    fn flint_cli_uses_gguf_without_source_root() -> Result<()> {
+        let args=Args::try_parse_from(["models_import","flint","--source","input.gguf",
+            "--pile","existing.pile","--key","existing.key","--collection",&"ab".repeat(32)])?;
+        args.check_source_kind()?;
+        assert!(args.source_root.is_none());
+        assert_eq!(args.source.as_deref(),Some(Path::new("input.gguf")));
+        let wrong=Args::try_parse_from(["models_import","flint","--source-root","0123456789abcdef0123456789abcdef"])?;
+        assert!(wrong.check_source_kind().is_err());
+        #[cfg(not(feature="breeze-cuda"))]
+        assert!(Args::try_parse_from(["models_import","breeze"]).is_err());
+        #[cfg(not(feature="voxtral-cuda"))]
+        assert!(Args::try_parse_from(["models_import","voxtral","--tekken","tekken.json"]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn refused_writer_never_reaches_leaf_writes_and_missing_pile_is_not_created() -> Result<()> {
+        let (path,key,handle,_)=destination()?;
+        let before=std::fs::metadata(&path)?.len();
+        let outsider=ed25519_dalek::SigningKey::from_bytes(&[72;32]);
+        let mut called=false;
+        let error=publish_into(&path,&outsider,handle,|_| {called=true;anyhow::bail!("unreachable leaf writes")}).unwrap_err();
+        assert!(!called);assert!(error.to_string().contains("not admitted"),"{error:#}");
+        assert_eq!(std::fs::metadata(&path)?.len(),before);
+        let absent=path.with_extension("absent");
+        assert!(publish_into(&absent,&key,handle,|_|panic!("missing destination reached importer")).is_err());
+        assert!(!absent.exists());
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn admitted_publication_reopens_explicit_collection_and_preserves_existing_facts() -> Result<()> {
+        let (path,key,handle,existing)=destination()?;
+        let (root,receipt)=publish_into(&path,&key,handle,|pile| {
+            let blob=leaf::leaf_blob::<F32,1>([1],anybytes::Bytes::from_source(1.25f32.to_le_bytes().to_vec()))?;
+            let weight=pile.put(blob)?;
+            let leaf=entity! {leaf::leaf::<F32,1>():weight};
+            let mut fragment=entity! {attrs::member*:leaf,metadata::name:"typed import fixture"};
+            let root=fragment.root().context("typed fixture root")?;
+            fragment+=entity! {metadata::name:"another exported document root"};
+            Ok((root,fragment,serde_json::json!({})))
+        })?;
+        assert_eq!(receipt["model_root"],format!("{root:X}"));
+        let store=mary::persist::read_model_pile_snapshot_read_only(&path)?;
+        let collection=model_collection::open_model_collection(&store,handle)?;
+        let models=model_collection::snapshot_model_collection_for(&store,collection)?;
+        assert!(exists!(pattern!(models.facts(),[{existing @ metadata::name:"unrelated existing model"}])));
+        let weight=find!(w:Id,pattern!(models.facts(),[{root @ attrs::member:?w}])).next().context("typed leaf missing")?;
+        let leaf=leaf::resolve(models.facts(),models.store(),weight)?.context("typed leaf unreadable")?;
+        assert_eq!(&leaf.payload()[..],1.25f32.to_le_bytes());
+        assert_eq!(models.support().collection().handle(),handle);
+        drop(leaf);drop(models);drop(store);
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[cfg(feature="tokenizer")]
+    #[test]
+    fn invalid_gguf_ingress_does_not_publish_or_write_leaves() -> Result<()> {
+        use std::io::Write;
+        let (path,key,handle,_)=destination()?;
+        let source=path.with_extension("gguf");
+        std::fs::OpenOptions::new().write(true).create_new(true).open(&source)?.write_all(b"not a GGUF")?;
+        let before=std::fs::metadata(&path)?.len();
+        assert!(publish_into(&path,&key,handle,|pile|flint(&source,pile)).is_err());
+        assert_eq!(std::fs::metadata(&path)?.len(),before);
+        std::fs::remove_file(source)?;std::fs::remove_file(path)?;
+        Ok(())
+    }
 }
