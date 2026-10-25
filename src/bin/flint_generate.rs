@@ -4,7 +4,7 @@ use std::{fs::{self,OpenOptions},io::Write,path::{Path,PathBuf},time::Instant};
 use anyhow::{Context,Result,ensure};
 use clap::{Parser,ValueEnum};
 use serde_json::json;
-use mary::models::flint::{cache::Limits,forward::Backend,session::{FlintSession,Options,NativeHead,greedy_id},weights::ReceiptPolicy};
+use mary::models::flint::{cache::Limits,forward::Backend,session::{FlintSession,Options,NativeHead,NativeFixed,greedy_id},weights::ReceiptPolicy};
 
 #[derive(Clone,Copy,ValueEnum)]
 enum Mode { Cpu,Cuda,PackedAll }
@@ -34,6 +34,10 @@ struct Args {
     #[arg(long,value_enum,default_value="resident")] native_head:HeadMode,
     /// Immutable head buffers only, excluding workspace/runtime/host overhead.
     #[arg(long,default_value_t=192)] max_head_mib:usize,
+    /// Native non-routed block parameters only; routed experts remain streamed.
+    #[arg(long,value_enum,default_value="resident")] native_fixed:HeadMode,
+    /// Logical fixed GPU buffers, separate from head/KV/runtime/transient memory.
+    #[arg(long,default_value_t=1024)] max_fixed_mib:usize,
     #[arg(long)] trace:bool,
     /// Native block setup API wall spans, not CPU-only or device transfer time.
     #[arg(long,requires="typed_pile")] native_setup_timing:bool,
@@ -72,7 +76,9 @@ fn main()->Result<()> {
         limits:Limits {capacity:args.capacity,max_cache_bytes:args.max_cache_mib.checked_mul(1<<20).context("KV MiB overflow")?,
             max_attention_bytes:args.max_attention_mib.checked_mul(1<<20).context("attention MiB overflow")?},trace:args.trace,
         native_head:match args.native_head {HeadMode::Streamed=>NativeHead::Streamed,
-            HeadMode::Resident=>NativeHead::Resident {max_bytes:args.max_head_mib.checked_mul(1<<20).context("head MiB overflow")?}}};
+            HeadMode::Resident=>NativeHead::Resident {max_bytes:args.max_head_mib.checked_mul(1<<20).context("head MiB overflow")?}},
+        native_fixed:match args.native_fixed {HeadMode::Streamed=>NativeFixed::Streamed,
+            HeadMode::Resident=>NativeFixed::Resident {max_bytes:args.max_fixed_mib.checked_mul(1<<20).context("fixed MiB overflow")?}}};
     fs::create_dir(&args.output).context("output directory must be new")?;
     let process_setup_seconds=process_start.elapsed().as_secs_f64();
     let start=Instant::now();
@@ -137,6 +143,9 @@ fn main()->Result<()> {
         "head_admission":session.head_admission(),"max_head_mib":args.max_head_mib,
         "head_admission_scope":"immutable native GPU head buffers only; not total GPU/runtime/workspace/host memory",
         "head_initialization":"resident native head validation/upload is included in model_init_seconds; immutable buffers survive reset; GGUF stays streamed",
+        "native_fixed_mode":if session.fixed_admission().is_some(){"Resident"}else{"Streamed"},
+        "fixed_admission":session.fixed_admission(),"max_fixed_mib":args.max_fixed_mib,
+        "fixed_initialization":"resident native fixed-block lookup/validation/upload is in model_init_seconds, before timing is enabled; logical budget excludes host preparation/runtime/workspace. Immutable buffers survive reset; experts and GGUF stay streamed. Resident fixed setup calls are absent by construction, not an unclassified profiler gap.",
         "prompt_ids":ids,"prompt_bytes_blake3":blake3::hash(&raw).to_hex().to_string(),"choices":choices,"saved_logits":args.save_logits,
         "generation_bytes_blake3":blake3::hash(&generation.bytes).to_hex().to_string(),"result":generation,
         "accounting":"attended_tokens excludes the final emitted token when no subsequent prediction is requested; EOG is neither emitted nor fed back"});
@@ -169,6 +178,9 @@ mod tests {
         assert!(matches!(raw.native_head,HeadMode::Resident));assert_eq!(raw.max_head_mib,192);
         let streamed=Args::try_parse_from(["flint_generate","pile","prompt","out","--native-head","streamed"]).unwrap();
         assert!(matches!(streamed.native_head,HeadMode::Streamed));
+        assert!(matches!(raw.native_fixed,HeadMode::Resident));assert_eq!(raw.max_fixed_mib,1024);
+        let fixed=Args::try_parse_from(["flint_generate","pile","prompt","out","--native-fixed","streamed"]).unwrap();
+        assert!(matches!(fixed.native_fixed,HeadMode::Streamed));
         assert!(!raw.native_setup_timing);
         assert!(Args::try_parse_from(["flint_generate","model","prompt","out","--native-setup-timing"]).is_err());
         assert!(Args::try_parse_from(["flint_generate","pile","prompt","out","--typed-pile",

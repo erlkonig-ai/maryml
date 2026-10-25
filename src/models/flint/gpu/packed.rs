@@ -183,7 +183,7 @@ impl Device {
     }
 }
 
-fn native_geometry(view:&TensorView,ni:usize,no:usize)->Result<(usize,u32)> {
+pub(super) fn native_geometry(view:&TensorView,ni:usize,no:usize)->Result<(usize,u32)> {
     let gguf_bytes=packed_bytes(ni,no)?;
     let elements=ni.checked_mul(no).context("native matrix element overflow")?;
     ensure!(elements<=u32::MAX as usize,"native matrix index exceeds u32");

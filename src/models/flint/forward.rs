@@ -1,6 +1,7 @@
 //! Shared 49-block composition for empty-history diagnostics and cached sessions.
 //! CPU residual handoff and bounded streamed weights are deliberate first-stage
-//! choices. Sessions may retain only the native output head on the device.
+//! choices. Native sessions may retain the immutable head and non-routed block
+//! operands on the device; selected routed expert matrices stay streamed.
 
 use anyhow::{Context, Result, ensure};
 use std::time::Instant;
@@ -14,6 +15,42 @@ pub const BLOCKS: usize = 49;
 #[derive(Clone, Copy, Debug)]
 pub enum Backend { Cpu, Cuda, PackedAll }
 pub(super) enum Head { All, Last, Skip }
+
+/// Actual selected immutable fixed-block GPU bytes, separate from head/KV.
+/// Excludes mapped host views, temporary F32 preparation, allocator padding,
+/// activations, runtime and workspace. Never a total device-memory guarantee.
+#[derive(Clone,Copy,Debug,serde::Serialize,PartialEq,Eq)]
+pub struct FixedAdmission { pub blocks:usize, pub gpu_bytes:usize }
+impl FixedAdmission {
+    pub(super) fn checked(blocks:usize,gpu_bytes:usize,max_bytes:usize)->Result<Self> {
+        ensure!(blocks>0 && blocks<=BLOCKS && gpu_bytes>0,"invalid fixed block admission");
+        ensure!(gpu_bytes<=max_bytes,"fixed-block admission: {gpu_bytes} > {max_bytes} bytes");
+        Ok(Self {blocks,gpu_bytes})
+    }
+}
+
+/// Concrete execution buffers only; their source reader remains in the session.
+pub(super) enum FixedWeights {
+    Streamed,
+    #[cfg(feature="flint-cuda")]
+    Resident(super::gpu::ResidentFixed),
+}
+impl FixedWeights {
+    pub fn resident(w:&mut PileWeights,max_bytes:usize)->Result<Self> {
+        #[cfg(feature="flint-cuda")]
+        {Ok(Self::Resident(super::gpu::PreparedFixed::new(w,max_bytes)?.upload()?))}
+        #[cfg(not(feature="flint-cuda"))]
+        {let _=(w,max_bytes);anyhow::bail!("resident native fixed blocks require flint-cuda")}
+    }
+    pub fn admission(&self)->Option<FixedAdmission> {match self {
+        Self::Streamed=>None,
+        #[cfg(feature="flint-cuda")] Self::Resident(fixed)=>Some(fixed.admission()),
+    }}
+    pub fn fence(&self)->Result<()> {match self {
+        Self::Streamed=>Ok(()),
+        #[cfg(feature="flint-cuda")] Self::Resident(fixed)=>fixed.fence(),
+    }}
+}
 
 /// Logical immutable output-head GPU bytes only, separate from KV/attention.
 /// Allocator padding, runtime, query scratch and host mappings need headroom.
@@ -177,12 +214,12 @@ pub(super) fn insert_chunk(logits: &mut [f32], values: &[f32], vocab: usize, fir
 /// weights while the trace is being examined. Runtime errors leave no KV state.
 pub fn run(w: &mut Source, ids: &[i32], positions: &[i32], backend: Backend,
     observe: impl FnMut(usize,&Trace,&[ReadReceipt])->Result<()>) -> Result<Output> {
-    run_core(w,ids,positions,backend,None,true,Head::All,&HeadWeights::Streamed,observe)
+    run_core(w,ids,positions,backend,None,true,Head::All,&HeadWeights::Streamed,&FixedWeights::Streamed,observe)
 }
 
 pub(super) fn run_core(w:&mut Source,ids:&[i32],positions:&[i32],backend:Backend,
     mut caches:Option<&mut [super::cache::LayerCache]>,trace:bool,head:Head,
-    head_weights:&HeadWeights,
+    head_weights:&HeadWeights,fixed_weights:&FixedWeights,
     mut observe:impl FnMut(usize,&Trace,&[ReadReceipt])->Result<()>)->Result<Output> {
     let t=ids.len();
     ensure!((1..=3).contains(&t) && positions.len()==t,"expected T1..3 token IDs and positions");
@@ -192,6 +229,7 @@ pub(super) fn run_core(w:&mut Source,ids:&[i32],positions:&[i32],backend:Backend
     if let Some(c)=caches.as_ref() { ensure!(c.len()==BLOCKS,"expected all49 layer caches"); }
     ensure!(!matches!(w,Source::Native(_)) || matches!(backend,Backend::PackedAll),"native pile requires PackedAll");
     ensure!(head_weights.admission().is_none() || matches!(w,Source::Native(_)),"resident head requires its native source");
+    ensure!(fixed_weights.admission().is_none() || matches!(w,Source::Native(_)),"resident fixed blocks require their native source");
     if let Source::Gguf(w)=w { ensure!(!w.file.index.tensors.iter().any(|info|
         info.name=="output.input_scale" || (info.name.starts_with("blk.") && info.name.ends_with(".bias"))),
         "unsupported input scale or block bias tensor"); }
@@ -221,7 +259,10 @@ pub(super) fn run_core(w:&mut Source,ids:&[i32],positions:&[i32],backend:Backend
                     Some(super::cache::LayerCache::Cuda(c))=>Some(c),None=>None,
                     _=>anyhow::bail!("CUDA/cache backend mismatch"),
                 };
-                gpu::block_core(w,&residual,positions,config,mode,cache,trace)?
+                let fixed=match fixed_weights {
+                    FixedWeights::Streamed=>None,FixedWeights::Resident(f)=>Some(f.block(block)?),
+                };
+                gpu::block_core(w,&residual,positions,config,mode,cache,trace,fixed)?
             },
             #[cfg(not(feature="flint-cuda"))]
             _ => unreachable!("feature checked before row reads"),
@@ -302,6 +343,14 @@ fn output_head(w:&mut GgufWeights,residual:&[f32],backend:Backend)->Result<(Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test] fn resident_fixed_separate_budget_boundaries() -> Result<()> {
+        let a=FixedAdmission::checked(BLOCKS,828_450_616,1<<30)?;
+        assert_eq!(FixedAdmission::checked(BLOCKS,a.gpu_bytes,a.gpu_bytes)?,a);
+        assert!(FixedAdmission::checked(BLOCKS,a.gpu_bytes,a.gpu_bytes-1).is_err());
+        for blocks in [0,BLOCKS+1,usize::MAX] {assert!(FixedAdmission::checked(blocks,1,usize::MAX).is_err());}
+        assert!(FixedAdmission::checked(BLOCKS,0,usize::MAX).is_err());
+        Ok(())
+    }
     #[test] fn resident_head_checked_logical_admission() -> Result<()> {
         let a=HeadAdmission::native(192<<20)?;
         assert_eq!(a,HeadAdmission {rows:VOCAB,chunks:19,gpu_bytes:172_974_160});

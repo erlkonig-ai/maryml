@@ -33,6 +33,9 @@ use super::weights::{Weights, PackedWeight};
 use super::config::{BlockConfig, FfnKind};
 
 mod packed;
+mod fixed;
+pub(super) use fixed::{FixedBlock,PreparedFixed,ResidentFixed};
+use fixed::{FixedProjection,FixedFfn,FixedBranch};
 pub use packed::{KComparison, compare_k as compare_packed_k};
 #[cfg(test)]
 mod projection_tests;
@@ -312,7 +315,8 @@ impl Device {
         }
         buffer
     }
-    fn norm_parameter(&self,w:&mut impl Weights,x:&Buffer,suffix:&str,dims:&[usize])->Result<Buffer> {
+    fn norm_parameter(&self,w:&mut impl Weights,x:&Buffer,suffix:&str,dims:&[usize],resident:Option<&Buffer>)->Result<Buffer> {
+        if let Some(gain)=resident {return self.norm_borrowed(x,gain);}
         let values=w.get(suffix,dims,0,None)?;
         assert!(!values.is_empty());assert_eq!(x.len%values.len(),0);
         let gain=self.weight_upload(w,&values,false);
@@ -426,12 +430,26 @@ impl Device {
         let (weight,paired) = self.projection(w, suffix, &[ni,no], None, mode)?;
         let scale_value=match paired {Some(v)=>v,None=>w.get(&format!("{suffix}.scale"), &[1], 0, None)?[0]};
         let scale = self.weight_upload(w,&[scale_value],false);
+        self.dense_borrowed(tr,label,x,&weight,&scale,t)
+    }
+    fn dense_borrowed(&self,tr:&mut Trace,label:&str,x:&Buffer,weight:&Projection,scale:&Buffer,t:usize)->Result<Buffer> {
+        let no=weight.no;
         let raw = self.empty(no * t);
-        self.project(&weight, x, &raw, t, 0, 0)?;
+        self.project(weight, x, &raw, t, 0, 0)?;
         self.trace(tr, &format!("{label}_unscaled"), [no,t,1,1], &raw)?;
-        let out = self.point(&raw, &scale, raw.len, 1)?;
+        let out = self.point(&raw, scale, raw.len, 1)?;
         self.trace(tr, label, [no,t,1,1], &out)?;
         Ok(out)
+    }
+    fn dense_parameter(&self,w:&mut impl Weights,tr:&mut Trace,suffix:&str,label:&str,
+        x:&Buffer,ni:usize,no:usize,t:usize,mode:ProjectionMode,resident:Option<&FixedProjection>)->Result<Buffer> {
+        match resident {
+            Some(p)=>{
+                ensure!(p.weight.ni==ni && p.weight.no==no,"resident fixed projection dimensions differ");
+                self.dense_borrowed(tr,label,x,&p.weight,&p.scale,t)
+            },
+            None=>self.dense(w,tr,suffix,label,x,ni,no,t,mode),
+        }
     }
     fn experts(&self, w: &mut impl Weights, tr: &mut Trace, suffix: &str, label: &str,
         x: &Buffer, ni: usize, no: usize, t: usize, ids: &[i32], per_slot: bool, mode: ProjectionMode) -> Result<Buffer> {
@@ -459,14 +477,14 @@ impl Device {
         Ok(out)
     }
     fn dense_ffn(&self, w: &mut impl Weights, tr: &mut Trace, n: &Buffer,
-        hidden: usize, width: usize, t: usize, mode: ProjectionMode) -> Result<Buffer> {
-        let up = self.dense(w,tr,"ffn_up","dense_up",n,hidden,width,t,mode)?;
-        let gate = self.dense(w,tr,"ffn_gate","dense_gate",n,hidden,width,t,mode)?;
+        hidden: usize, width: usize, t: usize, mode: ProjectionMode,resident:Option<&FixedFfn>) -> Result<Buffer> {
+        let up = self.dense_parameter(w,tr,"ffn_up","dense_up",n,hidden,width,t,mode,resident.map(|f|&f.up))?;
+        let gate = self.dense_parameter(w,tr,"ffn_gate","dense_gate",n,hidden,width,t,mode,resident.map(|f|&f.gate))?;
         // Clamp=0 follows the exact pinned common loader plus Flint loader.
         let sw = self.point(&gate,&up,width,3)?;
         self.trace(tr,"dense_swiglu",[width,t,1,1],&sw)?;
         self.trace(tr,"dense_down_input",[width,t,1,1],&sw)?;
-        self.dense(w,tr,"ffn_down","dense_down",&sw,width,hidden,t,mode)
+        self.dense_parameter(w,tr,"ffn_down","dense_down",&sw,width,hidden,t,mode,resident.map(|f|&f.down))
     }
 }
 
@@ -516,28 +534,31 @@ pub fn layer2_packed_all(w: &mut impl Weights, input: &[f32], positions: &[i32])
 }
 
 pub fn block(w: &mut impl Weights, input: &[f32], positions: &[i32], config: BlockConfig, mode: ProjectionMode) -> Result<Trace> {
-    Ok(block_core(w,input,positions,config,mode,None,true)?.trace)
+    Ok(block_core(w,input,positions,config,mode,None,true,None)?.trace)
 }
 pub(super) fn block_core(w:&mut impl Weights,input:&[f32],positions:&[i32],config:BlockConfig,
-    mode:ProjectionMode,mut cache:Option<&mut KvCache>,trace:bool)->Result<super::math::BlockOutput> {
+    mode:ProjectionMode,mut cache:Option<&mut KvCache>,trace:bool,fixed:Option<&FixedBlock>)->Result<super::math::BlockOutput> {
     let t = positions.len();
     ensure!((1..=3).contains(&t) && input.len() == H*t, "expected 1..=3 residual rows of width 2048");
     ensure!(positions.iter().all(|&p| p >= 0) && positions.windows(2).all(|p| p[0] < p[1]), "invalid positions");
     ensure!(input.iter().all(|v| v.is_finite()), "non-finite residual input");
     ensure!(config.sliding_window.is_none_or(|w|w>0),"sliding window must be positive");
+    if let Some(f)=fixed {
+        ensure!(matches!(mode,ProjectionMode::PackedAll) && f.config==config,"resident fixed configuration differs");
+    }
     let dev = match cache.as_ref() { Some(c)=>Device {client:c.dev.client.clone()},None=>Device::new() };
     let mut tr = Trace::new(trace);
     let input_gpu = dev.upload(input);
     let pos = dev.positions(positions);
     dev.trace(&mut tr, "input", [H,t,1,1], &input_gpu)?;
     if trace { tr.stages.push(Stage { name: "positions".into(), dims: [t,1,1,1], values: Values::I32(positions.to_vec()) }); }
-    let n = dev.norm_parameter(w,&input_gpu,"attn_norm.weight",&[H])?;
+    let n = dev.norm_parameter(w,&input_gpu,"attn_norm.weight",&[H],fixed.map(|f|&f.attn_norm))?;
     dev.trace(&mut tr, "attn_norm", [H,t,1,1], &n)?;
-    let q = dev.dense(w,&mut tr,"attn_q","q_proj",&n,H,Q*D,t,mode)?;
-    let k = dev.dense(w,&mut tr,"attn_k","k_proj",&n,H,KV*D,t,mode)?;
-    let v = dev.dense(w,&mut tr,"attn_v","v_proj",&n,H,KV*D,t,mode)?;
-    let qn = dev.norm_parameter(w,&q,"attn_q_norm.weight",&[D])?;
-    let kn = dev.norm_parameter(w,&k,"attn_k_norm.weight",&[D])?;
+    let q = dev.dense_parameter(w,&mut tr,"attn_q","q_proj",&n,H,Q*D,t,mode,fixed.map(|f|&f.q))?;
+    let k = dev.dense_parameter(w,&mut tr,"attn_k","k_proj",&n,H,KV*D,t,mode,fixed.map(|f|&f.k))?;
+    let v = dev.dense_parameter(w,&mut tr,"attn_v","v_proj",&n,H,KV*D,t,mode,fixed.map(|f|&f.v))?;
+    let qn = dev.norm_parameter(w,&q,"attn_q_norm.weight",&[D],fixed.map(|f|&f.q_norm))?;
+    let kn = dev.norm_parameter(w,&k,"attn_k_norm.weight",&[D],fixed.map(|f|&f.k_norm))?;
     dev.trace(&mut tr,"q_norm",[D,Q,t,1],&qn)?;
     dev.trace(&mut tr,"k_norm",[D,KV,t,1],&kn)?;
     let q = if config.rope { dev.rope(&qn,&pos,Q)? } else { qn };
@@ -550,9 +571,11 @@ pub(super) fn block_core(w:&mut impl Weights,input:&[f32],positions:&[i32],confi
     let nt=key_positions.len();
     let key_pos=dev.positions(key_positions);
     let geometry=super::cache::Geometry::new(t,nt)?;
-    let sink_values=w.get("attn_sinks.weight",&[Q],0,None)?;
-    let sinks = dev.weight_upload(w,&sink_values,false);
-    drop(sink_values);
+    let streamed_sinks;
+    let sinks=if let Some(f)=fixed {&f.sinks} else {
+        let values=w.get("attn_sinks.weight",&[Q],0,None)?;
+        streamed_sinks=dev.weight_upload(w,&values,false);&streamed_sinks
+    };
     ensure!(sinks.len == Q, "attention sink shape differs");
     let scores = dev.empty(geometry.scores);
     let probs = dev.empty(geometry.scores);
@@ -573,19 +596,28 @@ pub(super) fn block_core(w:&mut impl Weights,input:&[f32],positions:&[i32],confi
     dev.trace(&mut tr,"attention_mask",[nt,t,1,1],&mask)?;
     dev.trace(&mut tr,"attention_probs",[nt,t,Q,1],&probs)?;
     dev.trace(&mut tr,"attention_heads",[D,t,Q,1],&heads)?;
-    let ao = dev.dense(w,&mut tr,"attn_output","attention_output",&joined,Q*D,H,t,mode)?;
+    let ao = dev.dense_parameter(w,&mut tr,"attn_output","attention_output",&joined,Q*D,H,t,mode,fixed.map(|f|&f.o))?;
     let residual = dev.point(&input_gpu,&ao,H,0)?;
     dev.trace(&mut tr,"ffn_inp",[H,t,1,1],&residual)?;
-    let n = dev.norm_parameter(w,&residual,"ffn_norm.weight",&[H])?;
+    let n = dev.norm_parameter(w,&residual,"ffn_norm.weight",&[H],fixed.map(|f|&f.ffn_norm))?;
     dev.trace(&mut tr,"ffn_norm",[H,t,1,1],&n)?;
     let ffn = if let FfnKind::Dense { width } = config.ffn {
-        dev.dense_ffn(w,&mut tr,&n,H,width,t,mode)?
+        let dense=match fixed.map(|f|&f.ffn) {
+            Some(FixedBranch::Dense(d))=>Some(d),None=>None,_=>anyhow::bail!("resident dense branch differs"),
+        };
+        dev.dense_ffn(w,&mut tr,&n,H,width,t,mode,dense)?
     } else {
-        let router_values=w.get("ffn_gate_inp.weight",&[H,E],30,None)?;
-        let router = dev.weight_upload(w,&router_values,false);
-        drop(router_values);
+        let streamed_router;
+        let (router,shared)=match fixed.map(|f|&f.ffn) {
+            Some(FixedBranch::Moe {router,shared})=>(router,Some(shared)),
+            None=>{
+                let values=w.get("ffn_gate_inp.weight",&[H,E],30,None)?;
+                streamed_router=dev.weight_upload(w,&values,false);(&streamed_router,None)
+            },
+            _=>anyhow::bail!("resident MoE branch differs"),
+        };
         let logits = dev.empty(E*t);
-        dev.matvec(&n,&router,&logits,H,E,t,0,0)?;
+        dev.matvec(&n,router,&logits,H,E,t,0,0)?;
         let prob = dev.point(&logits,&logits,E,2)?;
         dev.trace(&mut tr,"router_logits",[E,t,1,1],&logits)?;
         dev.trace(&mut tr,"router_probs",[E,t,1,1],&prob)?;
@@ -625,11 +657,11 @@ pub(super) fn block_core(w:&mut impl Weights,input:&[f32],positions:&[i32],confi
             CubeCount::new_1d(moe.len.div_ceil(256) as u32),CubeDim::new_1d(256),weighted.arg(),moe.arg(),moe.len as u32); }
         dev.sync()?;
         dev.trace(&mut tr,"moe_out",[H,t,1,1],&moe)?;
-        let su = dev.dense(w,&mut tr,"ffn_up_shexp","shared_up",&n,H,SH,t,mode)?;
-        let sg = dev.dense(w,&mut tr,"ffn_gate_shexp","shared_gate",&n,H,SH,t,mode)?;
+        let su = dev.dense_parameter(w,&mut tr,"ffn_up_shexp","shared_up",&n,H,SH,t,mode,shared.map(|f|&f.up))?;
+        let sg = dev.dense_parameter(w,&mut tr,"ffn_gate_shexp","shared_gate",&n,H,SH,t,mode,shared.map(|f|&f.gate))?;
         let ss = dev.point(&sg,&su,SH,3)?;
         dev.trace(&mut tr,"shared_swiglu",[SH,t,1,1],&ss)?;
-        let sd = dev.dense(w,&mut tr,"ffn_down_shexp","shared_down",&ss,SH,H,t,mode)?;
+        let sd = dev.dense_parameter(w,&mut tr,"ffn_down_shexp","shared_down",&ss,SH,H,t,mode,shared.map(|f|&f.down))?;
         dev.point(&moe,&sd,H,0)?
     };
     dev.trace(&mut tr,"ffn_out",[H,t,1,1],&ffn)?;
