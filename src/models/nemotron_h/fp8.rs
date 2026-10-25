@@ -268,3 +268,7 @@ fn launch_mma(
 #[cfg(test)]
 #[path = "fp8_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "fp8_dense_tests.rs"]
+mod dense_tests;
