@@ -109,12 +109,12 @@ impl Projection {
             }
             stride *= dim; // extent() proved this product above.
         }
-        // Reject offsets before size_in_used(), whose upstream subtraction is
-        // unchecked. This first wrapper admits ordinary device allocations only.
-        if input.handle.offset_start.unwrap_or(0) != 0 || input.handle.offset_end.unwrap_or(0) != 0
-            || input.handle.size() < (input_len * 2) as u64
-        {
-            return Err("FP8 input requires an unoffset buffer with enough BF16 bytes".into());
+        // CUDA allocations round up to 512 bytes and trim the unused tail.
+        // Keep the aligned base; validate the tail before upstream's unchecked
+        // size_in_used() subtraction. Arbitrary start-offset aliases stay out.
+        if !base_buffer_covers(input.handle.size(), input.handle.offset_start.unwrap_or(0),
+            input.handle.offset_end.unwrap_or(0), (input_len * 2) as u64) {
+            return Err("FP8 input requires an aligned base buffer covering its BF16 bytes".into());
         }
         if self.working_bytes(rows)? > max_working_bytes {
             return Err("FP8 projection exceeds logical working-byte budget".into());
@@ -147,6 +147,10 @@ impl Projection {
         Ok(CubeTensor::new_contiguous(client.clone(), self.device.clone(),
             [dims[0], dims[1], n].into(), output, DType::BF16))
     }
+}
+
+fn base_buffer_covers(size: u64, start: u64, end: u64, required: u64) -> bool {
+    start == 0 && size.checked_sub(end).is_some_and(|used| used >= required)
 }
 
 fn extent(dims: &[usize], element_bytes: usize) -> Result<usize> {
