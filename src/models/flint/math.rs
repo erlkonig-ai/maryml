@@ -267,6 +267,7 @@ mod tests {
             assert!(dense_ffn(&mut w,&mut Trace::default(),&x,2,3,t)?.iter().all(|&v|v==0.0));
         }
         Ok(())
+    }
     #[test] fn norm_rope_and_swiglu() {
         assert_eq!(norm(&[0.0;4],&[1.0;4]),[0.0;4]);
         let x: Vec<f32> = (0..D).map(|i|i as f32).collect();
