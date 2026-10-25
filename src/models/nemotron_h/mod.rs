@@ -6,3 +6,5 @@ pub mod pile;
 pub mod fp8;
 #[cfg(feature = "nemotron-cuda")]
 pub mod attention;
+#[cfg(feature = "nemotron-cuda")]
+pub mod moe;

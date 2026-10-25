@@ -70,10 +70,20 @@ pub mod inkling {
     #[cfg(feature = "nemotron-cuda")]
     #[path = "fp4quant.rs"]
     pub mod fp4quant;
-    // Existing flash device tests compare their packed reader with this codec.
-    #[cfg(all(test, feature = "nemotron-cuda"))]
+    // Unchanged helpers reused by Nemotron's BF16/packed MoE paths. The codec
+    // is also referenced by fp4gemm's host helpers, not only device tests.
+    #[cfg(feature = "nemotron-cuda")]
     #[path = "nvfp4.rs"]
     pub mod nvfp4;
+    #[cfg(feature = "nemotron-cuda")]
+    #[path = "bf16gemm.rs"]
+    pub mod bf16gemm;
+    #[cfg(feature = "nemotron-cuda")]
+    #[path = "fp4gemm.rs"]
+    pub mod fp4gemm;
+    #[cfg(feature = "nemotron-cuda")]
+    #[path = "moegroup.rs"]
+    pub mod moegroup;
     #[path = "cache_pile.rs"]
     pub mod cache_pile;
     #[path = "spectree.rs"]
