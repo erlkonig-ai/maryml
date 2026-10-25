@@ -1,5 +1,6 @@
-//! GGUF type-40 bytes decoded inside an ordinary F32 matvec. Not Mary's typed
-//! FP4 planes, not tensor cores, and not activation quantization. No repacking.
+//! Explicit GGUF type-40 or native Tensor planes inside one ordinary F32 matvec.
+//! No tensor cores or activation quantization. Native payload global must be1;
+//! projection scales remain separate post-matmul operations in either layout.
 //! Decode has its own bitwise test, independent of accumulation diagnostics.
 
 use anyhow::{Context, Result, ensure};
@@ -9,6 +10,7 @@ use cubecl::server::Handle;
 
 use super::{Buffer, Device, H, KV, D};
 use crate::formats::gguf::nvfp4;
+use triblespace::core::blob::encodings::tensor::TensorView;
 
 #[cube]
 fn decode_value(raw: &Array<u8>, row_bytes: u32, row: u32, i: u32) -> f32 {
@@ -46,10 +48,39 @@ fn decode_value(raw: &Array<u8>, row_bytes: u32, row: u32, i: u32) -> f32 {
     value * scale
 }
 
+#[cube]
+fn decode_native_value(raw:&Array<u8>,codes:u32,index:u32)->f32 {
+    let byte=u32::cast_from(raw[(index/2) as usize]);
+    let code=if index%2==0 {byte&15} else {byte>>4};
+    let scale_byte=u32::cast_from(raw[(codes+index/16) as usize]);
+    // Host admission requires positive finite E4M3 (0..=126), global exactly1.
+    let exponent=(scale_byte>>3)&15;
+    let mantissa=scale_byte&7;
+    let mut scale=f32::new(0.0);
+    if exponent==0 { scale=mantissa as f32*0.001953125; }
+    else {
+        let mut power=f32::new(0.0009765625);
+        let mut step=u32::new(0);
+        while step<exponent { power*=2.0; step+=1; }
+        scale=(8+mantissa) as f32*power;
+    }
+    let magnitude=code&7;
+    let mut value=f32::new(0.0);
+    if magnitude==1 { value=0.5; }
+    if magnitude>=2 {
+        let mut power=f32::new(0.5); let mut step=u32::new(1);
+        while step<magnitude/2 { power*=2.0; step+=1; }
+        value=(2+(magnitude&1)) as f32*power;
+    }
+    // Unlike GGUF, native code8 really is negative zero.
+    if code>=8 { value=-value; }
+    value*scale
+}
+
 #[cube(launch_unchecked)]
 fn packed_matvec_kernel(
     x: &Array<f32>, raw: &Array<u8>, y: &mut Array<f32>,
-    ni: u32, no: u32, batch: u32, row_bytes: u32,
+    ni: u32, no: u32, batch: u32, row_bytes: u32, native_codes:u32,
     input_offset: u32, output_offset: u32,
 ) {
     // Same striding, accumulator and tree as the accepted decoded matvec.
@@ -61,7 +92,8 @@ fn packed_matvec_kernel(
         let wr = row % no;
         let mut i = lane;
         while i < ni {
-            let weight = decode_value(raw, row_bytes, wr, i);
+            let weight = if native_codes==0 { decode_value(raw, row_bytes, wr, i) }
+                else { decode_native_value(raw,native_codes,wr*ni+i) };
             acc += weight * x[(input_offset + token * ni + i) as usize];
             i += 32;
         }
@@ -83,7 +115,7 @@ fn packed_matvec_kernel(
 }
 
 // Separate from the four-byte Buffer: logical length and allocation are bytes.
-pub(super) struct PackedBuffer { handle: Handle, bytes: usize, ni: usize, no: usize }
+pub(super) struct PackedBuffer { handle: Handle, bytes: usize, ni: usize, no: usize, native_codes:u32 }
 
 fn packed_bytes(ni: usize, no: usize) -> Result<usize> {
     ensure!(ni > 0 && ni % nvfp4::ELEMENTS == 0 && no > 0, "invalid packed matrix geometry");
@@ -112,20 +144,40 @@ fn launch_geometry(ni: usize, no: usize, bytes: usize, batch: usize,
 impl Device {
     pub(super) fn upload_nvfp4(&self, raw: &[u8], ni: usize, no: usize) -> Result<PackedBuffer> {
         ensure!(raw.len() == packed_bytes(ni, no)?, "packed upload byte length mismatch");
-        Ok(PackedBuffer { handle: self.client.create_from_slice(raw), bytes: raw.len(), ni, no })
+        Ok(PackedBuffer { handle: self.client.create_from_slice(raw), bytes: raw.len(), ni, no, native_codes:0 })
+    }
+    pub(super) fn upload_native_nvfp4(&self,view:&TensorView,ni:usize,no:usize)->Result<PackedBuffer> {
+        let (bytes,codes)=native_geometry(view,ni,no)?;
+        Ok(PackedBuffer {handle:self.client.create_from_slice(view.payload()),bytes,ni,no,native_codes:codes})
     }
     pub(super) fn packed_matvec(&self, x: &Buffer, w: &PackedBuffer, y: &Buffer,
         batch: usize, input_offset: usize, output_offset: usize) -> Result<()> {
-        launch_geometry(w.ni, w.no, w.bytes, batch, x.len, y.len, input_offset, output_offset)?;
+        // Native adds only the4-byte intrinsic global; the code/scale plane
+        // total is exactly the GGUF byte count. Geometry is otherwise identical.
+        let layout_bytes=if w.native_codes==0 {w.bytes} else {w.bytes-4};
+        launch_geometry(w.ni, w.no, layout_bytes, batch, x.len, y.len, input_offset, output_offset)?;
         let row_bytes = (w.ni / nvfp4::ELEMENTS) * nvfp4::BYTES; // checked above
         unsafe { packed_matvec_kernel::launch_unchecked::<CudaRuntime>(
             &self.client, CubeCount::new_1d((w.no * batch).div_ceil(8) as u32), CubeDim::new_1d(256),
             x.arg(), ArrayArg::from_raw_parts(w.handle.clone(), w.bytes), y.arg(),
-            w.ni as u32, w.no as u32, batch as u32, row_bytes as u32,
+            w.ni as u32, w.no as u32, batch as u32, row_bytes as u32,w.native_codes,
             input_offset as u32, output_offset as u32,
         ); }
         Ok(())
     }
+}
+
+fn native_geometry(view:&TensorView,ni:usize,no:usize)->Result<(usize,u32)> {
+    let gguf_bytes=packed_bytes(ni,no)?;
+    let elements=ni.checked_mul(no).context("native matrix element overflow")?;
+    ensure!(elements<=u32::MAX as usize,"native matrix index exceeds u32");
+    ensure!(view.dims()==[no as u64,ni as u64],"native matrix logical dimensions differ");
+    let bytes=gguf_bytes.checked_add(4).context("native byte count overflow")?;
+    ensure!(bytes<=u32::MAX as usize && view.payload().len()==bytes,"native payload byte length differs");
+    let (_,scales,global)=crate::nvfp4::split_payload(view.payload(),elements)?;
+    ensure!(global.to_bits()==1.0f32.to_bits(),"native Flint import requires intrinsic global1; keep post-matmul scale separate");
+    ensure!(scales.iter().all(|&b|b<=0x7e),"native Flint import requires positive finite E4M3 scale bytes");
+    Ok((bytes,(elements/2) as u32))
 }
 
 /// A standalone comparison deliberately uploads a decoded reference matrix.
@@ -168,8 +220,72 @@ fn decode_probe_kernel(raw: &Array<u8>, out: &mut Array<f32>, elements: u32, row
 }
 
 #[cfg(test)]
+#[cube(launch_unchecked)]
+fn native_decode_probe_kernel(raw:&Array<u8>,out:&mut Array<f32>,elements:u32) {
+    let i=ABSOLUTE_POS as u32;
+    if i<elements { out[i as usize]=decode_native_value(raw,elements/2,i); }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    fn native_view(raw:&[u8],ni:usize,no:usize)->Result<TensorView> {
+        crate::leaf::read_leaf(nvfp4::typed::to_tensor(raw,[no as u64,ni as u64])?)
+    }
+
+    #[test]
+    fn native_geometry_admits_only_the_imported_arithmetic_domain()->Result<()> {
+        use triblespace::core::blob::encodings::tensor::elements::NVFP4;
+        let mut raw=[0x21;36]; raw[..4].fill(0x38);
+        let view=native_view(&raw,64,1)?;
+        assert_eq!(native_geometry(&view,64,1)?,(40,32));
+        assert!(native_geometry(&view,128,1).is_err());
+        for (offset,byte) in [(32,0x80),(32,0x7f),(39,0x40)] {
+            let mut payload=view.payload().to_vec(); payload[offset]=byte;
+            let bad=crate::leaf::read_leaf(crate::leaf::leaf_blob::<NVFP4,2>([1,64],anybytes::Bytes::from_source(payload))?)?;
+            assert!(native_geometry(&bad,64,1).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an exclusive GB10 GPU reservation"]
+    fn cuda_native_nvfp4_decode_all_admitted_scale_code_bits()->Result<()> {
+        let mut raw=Vec::new();
+        for scale in 0..255u8 {
+            raw.extend([scale;4]);
+            for group in 0..4u8 { for j in 0..8u8 {
+                raw.push(((j+group*3)%16)|(((j+8+group*3)%16)<<4));
+            }}
+        }
+        let elements=255*64;
+        let expected=nvfp4::decode(&raw,elements)?;
+        let dev=Device::new();
+        let packed=dev.upload_native_nvfp4(&native_view(&raw,elements,1)?,elements,1)?;
+        let out=dev.empty(elements);
+        unsafe { native_decode_probe_kernel::launch_unchecked::<CudaRuntime>(
+            &dev.client,CubeCount::new_1d(elements.div_ceil(256) as u32),CubeDim::new_1d(256),
+            ArrayArg::from_raw_parts(packed.handle.clone(),packed.bytes),out.arg(),elements as u32);
+        }
+        for (i,(&a,&e)) in dev.read(&out)?.iter().zip(&expected).enumerate() {
+            assert_eq!(a.to_bits(),e.to_bits(),"native decode coordinate{i}");
+        }
+        // Converter canonicalizes GGUF code8 to native0; also exercise native8
+        // directly, so this decoder cannot silently inherit GGUF's +zero rule.
+        use triblespace::core::blob::encodings::tensor::elements::NVFP4;
+        let mut payload=vec![0x88;32]; payload.extend([0,0x38,0,0x38]);
+        payload.extend(1.0f32.to_le_bytes());
+        let view=crate::leaf::read_leaf(crate::leaf::leaf_blob::<NVFP4,2>([1,64],anybytes::Bytes::from_source(payload))?)?;
+        let packed=dev.upload_native_nvfp4(&view,64,1)?;
+        let out=dev.empty(64);
+        unsafe { native_decode_probe_kernel::launch_unchecked::<CudaRuntime>(
+            &dev.client,CubeCount::new_1d(1),CubeDim::new_1d(256),
+            ArrayArg::from_raw_parts(packed.handle.clone(),packed.bytes),out.arg(),64u32);
+        }
+        for a in dev.read(&out)? { assert_eq!(a.to_bits(),(-0.0f32).to_bits()); }
+        Ok(())
+    }
 
     #[test]
     fn packed_geometry_rejects_invalid_before_launch() {
@@ -242,10 +358,13 @@ mod tests {
             let input: Vec<f32> = (0..ni * (t + 1)).map(|i| (i as i32 % 19 - 9) as f32 / 16.0).collect();
             let x = dev.upload(&input);
             let packed = dev.upload_nvfp4(&raw, ni, no)?;
+            let native = dev.upload_native_nvfp4(&native_view(&raw,ni,no)?,ni,no)?;
             let a = dev.upload(&vec![-123.0; no * (t + 2)]);
             let b = dev.upload(&vec![-123.0; no * (t + 2)]);
+            let c = dev.upload(&vec![-123.0; no * (t + 2)]);
             dev.packed_matvec(&x, &packed, &a, t, ni, no)?;
             dev.matvec(&x, &dev.upload(&decoded), &b, ni, no, t, ni, no)?;
+            dev.packed_matvec(&x,&native,&c,t,ni,no)?;
             let mut expected = vec![-123.0; no * (t + 2)];
             for token in 0..t { for row in 0..no {
                 expected[(token + 1) * no + row] = (0..ni).map(|i|
@@ -253,6 +372,8 @@ mod tests {
             }}
             let actual = dev.read(&a)?;
             let reference = dev.read(&b)?;
+            let native_actual=dev.read(&c)?;
+            for (&a,&b) in native_actual.iter().zip(&reference) { assert_eq!(a.to_bits(),b.to_bits(),"native/decoded ni={ni} T={t}"); }
             for (i, ((&a, &b), &e)) in actual.iter().zip(&reference).zip(&expected).enumerate() {
                 assert!(a.is_finite());
                 assert_eq!(a.to_bits(), b.to_bits(), "packed/decoded ni={ni} T={t} index={i}");

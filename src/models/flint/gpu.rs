@@ -3,10 +3,12 @@
 //! Weights are decoded from stored GGUF NVFP4 (36 bytes / 64 values), then
 //! uploaded as F32. Explicit packed-K/all modes decode only attn_k or all
 //! type-40 projection families inside the same matvec, directly from unchanged
-//! GGUF bytes. Norms/sinks and the BF16 router keep their existing paths.
+//! GGUF bytes. A typed pile source supplies native Tensor planes explicitly;
+//! their positive finite block scales/global1 are admitted before upload.
+//! Norms/sinks and the BF16 router keep their existing paths.
 //! Separate `.scale` values stay
 //! after the matmul in both modes. This
-//! does not use Mary's other FP4 packing, tensor cores, activation quantization,
+//! does not use tensor cores, activation quantization,
 //! BF16, or llama.cpp's Q8_1/W4A4 expert-down dispatch.
 //!
 //! All layer arithmetic, including top-six selection, runs on the GPU. This is
@@ -27,7 +29,7 @@ use cubecl::prelude::*;
 use cubecl::server::Handle;
 
 use super::math::{H, Stage, Trace, Values};
-use super::weights::Weights;
+use super::weights::{Weights, PackedWeight};
 use super::config::{BlockConfig, FfnKind};
 
 mod packed;
@@ -369,8 +371,11 @@ impl Device {
         ensure!(matches!(dims.len(), 2 | 3), "projection requires matrix/expert dimensions");
         let name = format!("{suffix}.weight");
         let storage = if mode.packed(suffix) {
-            let bytes = w.get_nvfp4(&name, dims, expert)?;
-            ProjectionStorage::Packed(self.upload_nvfp4(&bytes, dims[0], dims[1])?)
+            let packed = match w.get_packed(&name, dims, expert)? {
+                PackedWeight::Gguf(bytes) => self.upload_nvfp4(&bytes, dims[0], dims[1])?,
+                PackedWeight::Native(view) => self.upload_native_nvfp4(&view, dims[0], dims[1])?,
+            };
+            ProjectionStorage::Packed(packed)
         } else {
             ProjectionStorage::Decoded(self.upload(&w.get(&name, dims, 40, expert)?))
         };

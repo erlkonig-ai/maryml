@@ -12,7 +12,7 @@ use std::path::Path;
 use std::time::{Instant,UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail, ensure};
-use serde::Serialize;
+use serde::{Serialize, Deserialize};
 
 const MAX_HEADER: u64 = 128 * 1024 * 1024;
 const MAX_ENTRIES: u64 = 1_000_000;
@@ -92,10 +92,10 @@ pub struct Index {
     pub metadata_end: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MetadataEntry { pub key: String, pub gguf_type: u32, pub value: MetadataValue }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum MetadataValue {
     U32(u32), F32(f32), Bool(bool), String(String), BoolArray(Vec<bool>),
     I32Array(Vec<i32>), StringArray(Vec<String>),

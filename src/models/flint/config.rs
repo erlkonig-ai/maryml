@@ -77,11 +77,11 @@ impl BlockConfig {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use MetadataValue::*;
 
-    fn fixture() -> Vec<MetadataEntry> {
+    pub(crate) fn fixture() -> Vec<MetadataEntry> {
         let mut entries = vec![MetadataEntry { key: "general.architecture".into(), gguf_type: 8, value: String("flint".into()) }];
         for (key, value) in [
             ("block_count",49), ("context_length",262144), ("embedding_length",2048), ("feed_forward_length",6144),

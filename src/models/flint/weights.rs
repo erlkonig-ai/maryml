@@ -7,15 +7,25 @@ use serde::Serialize;
 use crate::formats::gguf::{index::{IndexedFile,RowReadTimings}, nvfp4};
 use super::config::{BlockConfig, METADATA_KEYS};
 
+/// Storage is explicit: GGUF's interleaved blocks are not native Tensor planes.
+/// A native view owns its mapped bytes; it is never flattened to F32 here.
+pub enum PackedWeight {
+    Gguf(Vec<u8>),
+    Native(triblespace::core::blob::encodings::tensor::TensorView),
+}
+
 pub trait Weights {
     /// Expected GGML shape/type are mandatory; expert slices retain identity.
     fn get(&mut self, suffix: &str, dims: &[usize], ty: u32, expert: Option<usize>) -> Result<Vec<f32>>;
     /// Unchanged GGUF type-40 blocks, with the same bounded selection/receipt.
     /// Separate `.scale` tensors are deliberately not included.
     fn get_nvfp4(&mut self, suffix: &str, dims: &[usize], expert: Option<usize>) -> Result<Vec<u8>>;
+    fn get_packed(&mut self, suffix: &str, dims: &[usize], expert: Option<usize>) -> Result<PackedWeight> {
+        Ok(PackedWeight::Gguf(self.get_nvfp4(suffix,dims,expert)?))
+    }
 }
 
-fn row_selection(dims: &[usize], expert: Option<usize>) -> Result<(u64, u64, usize)> {
+pub(super) fn row_selection(dims: &[usize], expert: Option<usize>) -> Result<(u64, u64, usize)> {
     ensure!(!dims.is_empty() && dims.iter().all(|&d| d > 0), "empty weight geometry");
     let (first, rows) = if let Some(e) = expert {
         ensure!(dims.len() == 3 && e < dims[2], "invalid expert slice");
@@ -147,7 +157,7 @@ impl GgufWeights {
         self.host.api.record(api_start,raw.len(),raw.len());
         Ok(raw)
     }
-    fn read_weight(&mut self, suffix: &str, dims: &[usize], ty: u32, expert: Option<usize>)
+    pub(super) fn read_weight(&mut self, suffix: &str, dims: &[usize], ty: u32, expert: Option<usize>)
         -> Result<(Vec<u8>, usize, Option<ReadReceipt>)> {
         ensure!(!suffix.contains('.') || suffix.ends_with(".weight") || suffix.ends_with(".scale"), "invalid tensor suffix");
         let (first, rows, elements) = row_selection(dims, expert)?;

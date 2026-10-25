@@ -5,6 +5,7 @@
 pub mod math;
 pub mod weights;
 pub mod config;
+pub mod pile;
 pub mod forward;
 pub mod cache;
 #[cfg(feature = "tokenizer")]

@@ -5,9 +5,28 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, ensure};
-use mary::models::flint::{math::{self, Values}, weights::GgufWeights};
+use mary::models::flint::{math::{self, Values}, weights::{GgufWeights,Weights,PackedWeight},pile::PileWeights};
 use mary::models::flint::config::FfnKind;
 use serde_json::{Value, json};
+
+enum Source { Gguf(GgufWeights), Native(PileWeights) }
+impl Source {
+    fn config(&self)->mary::models::flint::config::BlockConfig {
+        match self {Self::Gguf(w)=>w.config,Self::Native(w)=>w.config}
+    }
+    fn gguf(&self)->Option<&GgufWeights> { match self {Self::Gguf(w)=>Some(w),_=>None} }
+}
+impl Weights for Source {
+    fn get(&mut self,s:&str,d:&[usize],t:u32,e:Option<usize>)->Result<Vec<f32>> {
+        match self {Self::Gguf(w)=>w.get(s,d,t,e),Self::Native(w)=>w.get(s,d,t,e)}
+    }
+    fn get_nvfp4(&mut self,s:&str,d:&[usize],e:Option<usize>)->Result<Vec<u8>> {
+        match self {Self::Gguf(w)=>w.get_nvfp4(s,d,e),Self::Native(w)=>w.get_nvfp4(s,d,e)}
+    }
+    fn get_packed(&mut self,s:&str,d:&[usize],e:Option<usize>)->Result<PackedWeight> {
+        match self {Self::Gguf(w)=>w.get_packed(s,d,e),Self::Native(w)=>w.get_packed(s,d,e)}
+    }
+}
 
 fn read(path: &Path, max: usize) -> Result<Vec<u8>> {
     let meta = fs::symlink_metadata(path)?;
@@ -98,6 +117,11 @@ fn main() -> Result<()> {
     let packed_all = args.first().is_some_and(|p| p == Path::new("--cuda-packed-all"));
     let cuda = packed_k || packed_all || args.first().is_some_and(|p| p == Path::new("--cuda"));
     if cuda || args.first().is_some_and(|p| p == Path::new("--cpu")) { args.remove(0); }
+    let typed_root=if args.first().is_some_and(|p|p==Path::new("--typed-pile")) {
+        ensure!(args.len()>=2,"missing --typed-pile root");
+        let root=triblespace::prelude::Id::from_hex(args[1].to_str().context("root is not UTF-8")?).context("invalid model root")?;
+        args.drain(..2); Some(root)
+    } else {None};
     let block = if args.first().is_some_and(|p| p == Path::new("--block")) {
         ensure!(args.len() >= 2, "missing --block value");
         let value = args[1].to_str().context("block is not UTF-8")?.parse::<usize>()?;
@@ -105,8 +129,9 @@ fn main() -> Result<()> {
         value
     } else { 2 };
     ensure!(matches!(block, 0 | 2 | 5), "only blocks 0, 2 and 5 are implemented");
+    ensure!(typed_root.is_none() || (block==0 && packed_all),"--typed-pile requires --cuda-packed-all --block0; no packed-to-F32 fallback");
     ensure!(!cuda || cfg!(feature = "flint-cuda"), "--cuda requires the flint-cuda feature");
-    ensure!(args.len()==5,"usage: flint_layer2_gate [--cpu|--cuda|--cuda-packed-k|--cuda-packed-all] [--block 0|2|5] MODEL INPUT_F32 POSITIONS_I32 REFERENCE_DIR NEW_OUTPUT_DIR");
+    ensure!(args.len()==5,"usage: flint_layer2_gate [--cpu|--cuda|--cuda-packed-k|--cuda-packed-all] [--typed-pile ROOT] [--block 0|2|5] MODEL_OR_PILE INPUT_F32 POSITIONS_I32 REFERENCE_DIR NEW_OUTPUT_DIR");
     let [model,input_path,pos_path,reference,out] = args.as_slice() else { unreachable!() };
     let input_bytes = read(input_path,math::H*3*4)?;
     let input = floats(&input_bytes)?;
@@ -116,8 +141,11 @@ fn main() -> Result<()> {
     let table_bytes = read(&reference.join("tensors.tsv"),1024*1024)?;
     let table = std::str::from_utf8(&table_bytes)?;
     fs::create_dir(out).context("output directory must not already exist")?;
-    let mut weights = GgufWeights::open_block(model, block)?;
-    let config = weights.config;
+    let mut weights = match typed_root {
+        Some(root)=>Source::Native(PileWeights::open(model,root)?),
+        None=>Source::Gguf(GgufWeights::open_block(model,block)?),
+    };
+    let config = weights.config();
     let trace = if cuda {
         #[cfg(feature = "flint-cuda")]
         { use mary::models::flint::gpu::{self, ProjectionMode};
@@ -126,7 +154,7 @@ fn main() -> Result<()> {
         #[cfg(not(feature = "flint-cuda"))]
         { unreachable!("feature checked before file reads") }
     } else { math::block(&mut weights,&input,&positions,config)? };
-    weights.file.check_identity()?;
+    if let Some(w)=weights.gguf() { w.file.check_identity()?; }
     let mut comparisons = Vec::new();
     let mut exact_integer_stages = Vec::new();
     let mut integer_mismatches = 0usize;
@@ -171,8 +199,14 @@ fn main() -> Result<()> {
             let mut sorted = row.to_vec(); sorted.sort_by(|a,b|b.total_cmp(a)); sorted[5]-sorted[6]
         }).collect::<Vec<f32>>())
     } else { None };
-    let selected_bytes: u64 = weights.reads.iter().map(|r|r.absolute_end-r.absolute_start).sum();
-    let scope = if packed_all {
+    let gguf=weights.gguf();
+    let native=match &weights { Source::Native(w)=>Some(json!({"model_root":format!("{:X}",w.root),
+        "model_collection":w.collection(),"block":format!("{:X}",w.block),"config_node":format!("{:X}",w.config_node),
+        "support_members":w.support_members(),"weight_source":"frozen native pile reader; no GGUF access or F32 packed-weight fallback"})),_=>None };
+    let selected_bytes = gguf.map(|w|w.reads.iter().map(|r|r.absolute_end-r.absolute_start).sum::<u64>());
+    let scope = if typed_root.is_some() {
+        "typed pile block0 CubeCL CUDA F32; native Tensor NVFP4 planes decoded on GPU with the same32-lane matvec; separate post-scales, stage readbacks; no tensorcores/activation quantization"
+    } else if packed_all {
         "metadata-bound isolated block CubeCL CUDA F32 math; every type40 projection in the selected dense or MoE branch reads unchanged packed GGUF NVFP4 on GPU; per-stage readbacks; no tensor cores or activation quantization"
     } else if packed_k {
         "metadata-bound isolated block CubeCL CUDA F32 math; only attn_k reads unchanged packed GGUF NVFP4 on GPU; other weights decoded; per-stage readbacks and CPU-controlled sparse loading; no tensor cores or activation quantization"
@@ -182,18 +216,19 @@ fn main() -> Result<()> {
     let arithmetic = if cuda {
         "F32 values and accumulation; matvec 32-lane strided/tree reduction; RMS 256-lane strided/tree reduction; serial F32 attention/router sums; GPU transcendentals; CUDA compiler may contract multiply-add; fixed kernels without autotune"
     } else { "F32 operation boundaries with f64 scalar dot/RMS and attention denominator/division reductions; CPU transcendentals" };
-    let report = json!({"scope":scope,"arithmetic":arithmetic,"backend":if packed_all {"cuda-packed-all"} else if packed_k {"cuda-packed-k"} else if cuda {"cuda"} else {"cpu"},
+    let report = json!({"scope":scope,"arithmetic":arithmetic,"backend":if typed_root.is_some() {"cuda-native-pile"} else if packed_all {"cuda-packed-all"} else if packed_k {"cuda-packed-k"} else if cuda {"cuda"} else {"cpu"},
         "acceptance":"diagnostics only: exact ordered integer stages required; floating errors reported without fitted tolerance or numerical acceptance claim",
         "exact_integer_stages":exact_integer_stages,"integer_stages_pass":integer_mismatches==0,
-        "model_path":model,"model_identity":weights.file.identity,"whole_model_freshly_hashed":false,
-        "block_config":config,"gguf_metadata":weights.file.index.metadata,"metadata_end":weights.file.index.metadata_end,
+        "model_path":gguf.map(|_|model),"pile_path":typed_root.map(|_|model),
+        "model_identity":gguf.map(|w|&w.file.identity),"whole_model_freshly_hashed":false,"native_source":native,
+        "block_config":config,"gguf_metadata":gguf.map(|w|&w.file.index.metadata),"metadata_end":gguf.map(|w|w.file.index.metadata_end),
         "input_path":input_path,"input_blake3":hash(&input_bytes),"positions_path":pos_path,"positions_blake3":hash(&pos_bytes),
         "reference_dir":reference,"reference_table_blake3":hash(&table_bytes),"positions":positions,
         "projection_family_count":if config.ffn == FfnKind::Moe {10} else {7},
         "ordinary_ffn_clamp":0.0,"clamp_source":"llama.cpp 1ddffe9: llama-model.cpp:1471 initializes zero; flint.cpp:3-18 has no override",
         "router_sixth_seventh_margins":if config.ffn == FfnKind::Moe {Some(trace.router_margins)} else {None},"reference_router_sixth_seventh_margins":reference_margins,
         "selected_payload_bytes_returned":selected_bytes,"read_accounting":"explicit row returns including repeats; excludes header/buffering/OS read-ahead",
-        "reads":weights.reads,"comparisons":comparisons});
+        "reads":gguf.map(|w|&w.reads),"comparisons":comparisons});
     fs::write(out.join("tensors.tsv"),shape_text)?;
     fs::write(out.join("report.json"),serde_json::to_vec_pretty(&report)?)?;
     ensure!(integer_mismatches==0,"integer stage mismatch (including ordered expert IDs); diagnostics retained in {}",out.display());
