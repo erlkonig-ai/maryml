@@ -367,7 +367,7 @@ mod tests {
         let weights=PileWeights::open(&path,root)?;
         // Native text facts must carry resolvable UTF8 bytes, not merely hashes
         // that happen to satisfy a known string query.
-        for attribute in [attrs::kind,attrs::source,attrs::quantization,metadata::name] {
+        for attribute in [&*attrs::kind,&*attrs::source,&*attrs::quantization,&*metadata::name] {
             for handle in find!(h:Inline<inlineencodings::Handle<blobencodings::UTF8String>>,
                 pattern!(weights.snapshot.facts(),[{_?entity @ attribute:?h}])) {
                 let text:anybytes::View<str>=weights.snapshot.store().get(handle)
