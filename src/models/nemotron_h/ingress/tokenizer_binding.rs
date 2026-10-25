@@ -15,6 +15,9 @@ use triblespace::{core::metadata, prelude::*};
 pub const BINDING: &str = "nemotron-h-tokenizer";
 pub const BASE: &str = "tokenizer-base";
 pub const ADDED: &str = "added-token";
+pub const PRE_TOKENIZER: &str = "pre-tokenizer-sequence";
+const SPLIT: &str = "split-regex-isolated";
+const BYTE_LEVEL: &str = "byte-level-pretokenizer";
 
 pub fn validate(bytes: &[u8]) -> Result<()> {
     let value: Value = serde_json::from_slice(bytes)?;
@@ -22,6 +25,50 @@ pub fn validate(bytes: &[u8]) -> Result<()> {
         value["model"]["type"] == "BPE",
         "unsupported tokenizer model"
     );
+    for field in ["byte_fallback", "fuse_unk"] {
+        ensure!(value["model"][field] == false, "unsupported BPE {field}");
+    }
+    for field in ["dropout", "continuing_subword_prefix", "end_of_word_suffix"] {
+        ensure!(value["model"][field].is_null(), "unsupported BPE {field}");
+    }
+    ensure!(
+        value["normalizer"].is_null(),
+        "unsupported tokenizer normalizer"
+    );
+    ensure!(
+        value["decoder"]["type"] == "ByteLevel",
+        "unsupported tokenizer decoder"
+    );
+    for field in ["add_prefix_space", "trim_offsets", "use_regex"] {
+        ensure!(
+            value["decoder"][field].is_boolean(),
+            "missing decoder {field}"
+        );
+    }
+    ensure!(
+        value["pre_tokenizer"]["type"] == "Sequence",
+        "unsupported pre-tokenizer root"
+    );
+    let children = value["pre_tokenizer"]["pretokenizers"]
+        .as_array()
+        .context("missing pre-tokenizers")?;
+    ensure!(!children.is_empty(), "empty pre-tokenizer sequence");
+    for child in children {
+        match child["type"].as_str() {
+            Some("Split") => ensure!(
+                child["pattern"]["Regex"].is_string()
+                    && child["behavior"] == "Isolated"
+                    && child["invert"] == false,
+                "unsupported Split: requires Regex, Isolated, invert=false"
+            ),
+            Some("ByteLevel") => {
+                for field in ["add_prefix_space", "trim_offsets", "use_regex"] {
+                    ensure!(child[field].is_boolean(), "missing ByteLevel {field}");
+                }
+            }
+            _ => anyhow::bail!("unsupported pre-tokenizer child"),
+        }
+    }
     ensure!(
         value["padding"].is_null() && value["truncation"].is_null(),
         "unsupported tokenizer padding/truncation"
@@ -64,9 +111,39 @@ pub fn save(bytes: &[u8], source: &str, blobs: &mut impl BlobStorePut) -> Result
     let mut value: Value = serde_json::from_slice(bytes)?;
     let added = value["added_tokens"].take();
     value["added_tokens"] = serde_json::json!([]);
+    // Generic Sequence nodes annotate shared child IDs with indexes. Never
+    // send this sequence through that writer: opposite orders would share a
+    // root and merge conflicting indexes. Each native child's order is core.
+    let pre_tokenizer = value["pre_tokenizer"].take();
     let base = tokenizer::save_tokenizer_json(&serde_json::to_vec(&value)?, BINDING, blobs)
         .map_err(|e| anyhow::anyhow!("save base tokenizer: {e}"))?;
     let mut members = entity! { attrs::kind: BASE, attrs::member*: base };
+    let mut children = Fragment::empty();
+    for (index, child) in pre_tokenizer["pretokenizers"]
+        .as_array()
+        .expect("validated sequence")
+        .iter()
+        .enumerate()
+    {
+        if child["type"] == "Split" {
+            children += entity! { attrs::kind: SPLIT, attrs::index: index as u64,
+            tok::pattern: child["pattern"]["Regex"].as_str().expect("validated regex") };
+        } else {
+            let mut flags = Vec::new();
+            if child["add_prefix_space"] == true {
+                flags.push(flag::ADD_PREFIX_SPACE);
+            }
+            if child["trim_offsets"] == true {
+                flags.push(flag::TRIM_OFFSETS);
+            }
+            if child["use_regex"] == true {
+                flags.push(flag::USE_REGEX);
+            }
+            children += entity! { attrs::kind: BYTE_LEVEL, attrs::index: index as u64,
+            metadata::tag*: flags };
+        }
+    }
+    members += entity! { attrs::kind: PRE_TOKENIZER, attrs::member*: children };
     for (index, token) in added
         .as_array()
         .expect("validated added_tokens")
@@ -102,12 +179,20 @@ pub fn bases(facts: &TribleSet, binding: Id) -> impl Iterator<Item = Id> + '_ {
     ]))
 }
 
+pub fn pre_tokenizers(facts: &TribleSet, binding: Id) -> impl Iterator<Item = Id> + '_ {
+    find!(sequence: Id, pattern!(facts, [
+        { binding @ attrs::kind: BINDING, attrs::member: ?sequence },
+        { ?sequence @ attrs::kind: PRE_TOKENIZER }
+    ]))
+}
+
 #[cfg(feature = "tokenizer")]
 pub fn rebuild(
     facts: &TribleSet,
     blobs: &impl BlobStoreGet,
     binding: Id,
     base: Id,
+    pre_tokenizer: Id,
 ) -> Result<tokenizers::Tokenizer> {
     ensure!(
         exists!(pattern!(facts, [
@@ -118,6 +203,49 @@ pub fn rebuild(
     );
     let mut tokenizer = tokenizer::build_tokenizer_with_added(facts, blobs, base, false)
         .map_err(|e| anyhow::anyhow!("rebuild tokenizer base: {e}"))?;
+    ensure!(
+        exists!(pattern!(facts, [
+            { binding @ attrs::member: pre_tokenizer },
+            { pre_tokenizer @ attrs::kind: PRE_TOKENIZER }
+        ])),
+        "pre-tokenizer is not a member of this binding"
+    );
+    use tokenizers::pre_tokenizers as p;
+    // Query only supported node shapes, at the constructor that consumes them.
+    // Alternative facts remain alternatives; no singleton/cardinality policy.
+    let mut ordered: Vec<(u64, Id, tokenizers::PreTokenizerWrapper)> = Vec::new();
+    for (index, node, pattern) in find!((index: u64, node: Id, pattern: Inline<inlineencodings::Handle<blobencodings::UTF8String>>), pattern!(facts, [
+        { pre_tokenizer @ attrs::member: ?node },
+        { ?node @ attrs::kind: SPLIT, attrs::index: ?index, tok::pattern: ?pattern }
+    ])) {
+        let pattern: anybytes::View<str> = blobs
+            .get(pattern)
+            .map_err(|e| anyhow::anyhow!("read Split regex: {e}"))?;
+        let split = p::split::Split::new(
+            p::split::SplitPattern::Regex(pattern.to_string()),
+            tokenizers::SplitDelimiterBehavior::Isolated,
+            false,
+        )
+        .map_err(|e| anyhow::anyhow!("build Split pre-tokenizer: {e}"))?;
+        ordered.push((index, node, split.into()));
+    }
+    for (index, node) in find!((index: u64, node: Id), pattern!(facts, [
+        { pre_tokenizer @ attrs::member: ?node },
+        { ?node @ attrs::kind: BYTE_LEVEL, attrs::index: ?index }
+    ])) {
+        let prefix = exists!(pattern!(facts, [{ node @ metadata::tag: flag::ADD_PREFIX_SPACE }]));
+        let trim = exists!(pattern!(facts, [{ node @ metadata::tag: flag::TRIM_OFFSETS }]));
+        let regex = exists!(pattern!(facts, [{ node @ metadata::tag: flag::USE_REGEX }]));
+        ordered.push((
+            index,
+            node,
+            p::byte_level::ByteLevel::new(prefix, trim, regex).into(),
+        ));
+    }
+    ordered.sort_by_key(|(index, node, _)| (*index, *node));
+    tokenizer.with_pre_tokenizer(Some(p::sequence::Sequence::new(
+        ordered.into_iter().map(|(_, _, node)| node).collect(),
+    )));
     let mut added = find!((order: u64, node: Id, piece: Inline<inlineencodings::Handle<blobencodings::UTF8String>>, id: u64), pattern!(facts, [
         { binding @ attrs::member: ?node },
         { ?node @ attrs::kind: ADDED, attrs::index: ?order, tok::piece: ?piece, tok::token_id: ?id }
