@@ -35,6 +35,8 @@ struct Args {
     /// Immutable head buffers only, excluding workspace/runtime/host overhead.
     #[arg(long,default_value_t=192)] max_head_mib:usize,
     #[arg(long)] trace:bool,
+    /// Native block setup API wall spans, not CPU-only or device transfer time.
+    #[arg(long,requires="typed_pile")] native_setup_timing:bool,
     /// Saves each last-row vocabulary distribution for independent prefix replay.
     #[arg(long)] save_logits:bool,
     /// Selected-weight provenance is unused by this raw generator. Collect is
@@ -69,6 +71,7 @@ fn main()->Result<()> {
     } else {FlintSession::open_with_receipts(&args.model,options,match args.weight_receipts {
         Receipts::Collect=>ReceiptPolicy::Collect,Receipts::None=>ReceiptPolicy::None})?};
     let model_init_seconds=start.elapsed().as_secs_f64();
+    if args.native_setup_timing {session.enable_native_setup_timing()?;}
     let start=Instant::now();
     let ids=match args.prompt_mode {
         PromptMode::Raw=>session.encode_raw(prompt)?,
@@ -78,7 +81,7 @@ fn main()->Result<()> {
     let mut choices=Vec::new();
     let mut observer_seconds=0.0;
     let start=Instant::now();
-    let (generation,generation_timings)=session.generate_ids_observed_timed(&ids,args.max_new,|attended,logits| {
+    let observed=session.generate_ids_observed_timed(&ids,args.max_new,|attended,logits| {
         let start=Instant::now();
         let id=greedy_id(logits)? as usize;
         let second=logits.iter().enumerate().filter(|&(i,_)|i!=id).map(|(_,v)|*v).fold(f32::NEG_INFINITY,f32::max);
@@ -87,7 +90,18 @@ fn main()->Result<()> {
         choices.push(json!({"attended":attended,"argmax":id,"logit":logits[id],"top1_minus_top2":logits[id]-second,
             "logits_blake3":blake3::hash(&bytes).to_hex().to_string()}));
         observer_seconds+=start.elapsed().as_secs_f64(); Ok(())
-    })?;
+    });
+    let (generation,generation_timings)=match observed {
+        Ok(result)=>result,
+        Err(error)=>{
+            if args.native_setup_timing {
+                save(&args.output.join("native-setup-failed-phase.json"),&serde_json::to_vec_pretty(&json!({
+                    "error":format!("{error:#}"),"incomplete_phase":session.take_native_setup_timing(),
+                    "scope":"partial failed phase only; not a complete successful profile; no retry"}))?)?;
+            }
+            return Err(error);
+        },
+    };
     let generation_seconds=start.elapsed().as_secs_f64();
     ensure!(session.attended_len()==generation.attended_tokens,"generation/cache accounting differs");
     let start=Instant::now();
@@ -106,7 +120,8 @@ fn main()->Result<()> {
         "backend":format!("{:?}",options.backend),"model_identity":session.identity(),"whole_model_hashed":false,
         "source":session.source_identity(),"pile_path":args.typed_pile.as_ref().map(|_|&args.model),
         "model_path":if args.typed_pile.is_none(){Some(&args.model)}else{None},
-        "native_host_timings":"GGUF-specific host counters are absent for native pile, not fabricated zeros",
+        "native_host_timings":"GGUF-specific host counters remain absent for native pile. Opt-in native_setup fields measure disjoint fixed/routed block lookup-materialization, geometry and upload API wall time; exclude embedding/block selection/head init/activation uploads. Remainder includes unclassified host/runtime/device/waits, not CPU-only. Logical payload bytes are not physical IO/transfer traffic; lookup output bytes are F32 temporaries, not mapped views. Calls count attempts; failed lookup bytes are unknown/zero. Phase wall contains all subspans, never add both.",
+        "native_setup_timing":args.native_setup_timing,
         "weight_receipts":session.receipt_policy(),
         "capacity":session.capacity(),"cache_admission_bytes":session.admission().cache_bytes,
         "attention_admission_bytes":session.admission().attention_bytes,"trace":args.trace,
@@ -135,6 +150,10 @@ mod tests {
         assert!(matches!(raw.native_head,HeadMode::Resident));assert_eq!(raw.max_head_mib,192);
         let streamed=Args::try_parse_from(["flint_generate","pile","prompt","out","--native-head","streamed"]).unwrap();
         assert!(matches!(streamed.native_head,HeadMode::Streamed));
+        assert!(!raw.native_setup_timing);
+        assert!(Args::try_parse_from(["flint_generate","model","prompt","out","--native-setup-timing"]).is_err());
+        assert!(Args::try_parse_from(["flint_generate","pile","prompt","out","--typed-pile",
+            "0123456789abcdef0123456789abcdef","--native-setup-timing"]).unwrap().native_setup_timing);
     }
     #[test]
     fn descriptor_requires_native_root_and_is_not_a_root_alias() {

@@ -25,6 +25,8 @@ pub struct GenerationTimings {
     pub encode_validate_seconds:f64, pub reset_seconds:f64, pub prefill_seconds:f64,
     pub decode_seconds:Vec<f64>, pub greedy_host_observer_seconds:f64,
     pub prefill_host:Option<HostPhase>, pub decode_host:Vec<Option<HostPhase>>,
+    pub prefill_native:Option<super::native_setup::NativeSetupPhase>,
+    pub decode_native:Vec<Option<super::native_setup::NativeSetupPhase>>,
 }
 impl Default for Options {
     fn default()->Self { Self {backend:Backend::PackedAll,limits:Limits::default(),trace:false,native_head:NativeHead::default()} }
@@ -119,6 +121,13 @@ impl FlintSession {
     pub fn attended_len(&self)->usize { self.sequence.attended }
     pub fn is_poisoned(&self)->bool { self.sequence.poisoned }
     pub fn set_trace(&mut self,enabled:bool) { self.options.trace=enabled; }
+    /// Explicit diagnostic after initialization; excludes resident-head upload.
+    /// Native-only API wall counters. No change to fences or weight validation.
+    pub fn enable_native_setup_timing(&mut self)->Result<()> {self.weights.enable_native_setup()}
+    /// Drain once per phase; useful for retaining an incomplete failed phase.
+    pub fn take_native_setup_timing(&mut self)->Option<super::native_setup::NativeSetupPhase> {
+        self.weights.take_native_setup()
+    }
     pub fn encode_raw(&mut self,text:&str)->Result<Vec<u32>> {
         self.codec.encode_raw(text)
     }
@@ -204,10 +213,12 @@ impl FlintSession {
         timings.reset_seconds=start.elapsed().as_secs_f64();
         if max_new==0 { return Ok((Generation {ids:Vec::new(),bytes:Vec::new(),prompt_tokens:ids.len(),attended_tokens:0,stop:Stop::Budget},timings)); }
         let _=self.weights.take_host_phase();
+        let _=self.weights.take_native_setup();
         let start=Instant::now();
         let logits=self.prefill(ids)?;
         timings.prefill_seconds=start.elapsed().as_secs_f64();
         timings.prefill_host=self.weights.take_host_phase();
+        timings.prefill_native=self.weights.take_native_setup();
         let Self {weights,caches,sequence,options,codec,head_weights,..}=self;
         let start=Instant::now();
         let generation=greedy(logits,ids.len(),max_new,options.limits.capacity,
@@ -215,7 +226,8 @@ impl FlintSession {
                 let start=Instant::now();
                 let logits=append_parts(weights,caches,sequence,*options,head_weights,&[id],Head::Last,|_,_,_|Ok(()))?;
                 timings.decode_seconds.push(start.elapsed().as_secs_f64());
-                timings.decode_host.push(weights.take_host_phase()); Ok(logits)
+                timings.decode_host.push(weights.take_host_phase());
+                timings.decode_native.push(weights.take_native_setup()); Ok(logits)
             },|id| Ok(codec.token_bytes(id,false)?.to_vec()),observe)?;
         timings.greedy_host_observer_seconds=start.elapsed().as_secs_f64()-timings.decode_seconds.iter().sum::<f64>();
         Ok((generation,timings))

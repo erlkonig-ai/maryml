@@ -7,6 +7,8 @@ use anyhow::{Context, Result, ensure};
 use cubecl::cuda::CudaRuntime;
 use cubecl::prelude::*;
 use cubecl::server::Handle;
+use std::time::Instant;
+use super::super::weights::Work;
 
 use super::{Buffer, Device, H, KV, D};
 use crate::formats::gguf::nvfp4;
@@ -147,8 +149,22 @@ impl Device {
         Ok(PackedBuffer { handle: self.client.create_from_slice(raw), bytes: raw.len(), ni, no, native_codes:0 })
     }
     pub(super) fn upload_native_nvfp4(&self,view:&TensorView,ni:usize,no:usize)->Result<PackedBuffer> {
-        let (bytes,codes)=native_geometry(view,ni,no)?;
-        Ok(PackedBuffer {handle:self.client.create_from_slice(view.payload()),bytes,ni,no,native_codes:codes})
+        self.upload_native_nvfp4_observed(view,ni,no,None)
+    }
+    pub(super) fn upload_native_nvfp4_observed(&self,view:&TensorView,ni:usize,no:usize,
+        mut timing:Option<(&mut Work,&mut Work)>)->Result<PackedBuffer> {
+        let start=timing.as_ref().map(|_|Instant::now());
+        let layout=native_geometry(view,ni,no);
+        if let (Some(start),Some((geometry,_)))=(start,timing.as_mut()) {
+            geometry.record(start,view.payload().len(),0);
+        }
+        let (bytes,codes)=layout?;
+        let start=timing.as_ref().map(|_|Instant::now());
+        let handle=self.client.create_from_slice(view.payload());
+        if let (Some(start),Some((_,upload)))=(start,timing.as_mut()) {
+            upload.record(start,bytes,bytes);
+        }
+        Ok(PackedBuffer {handle,bytes,ni,no,native_codes:codes})
     }
     pub(super) fn packed_matvec(&self, x: &Buffer, w: &PackedBuffer, y: &Buffer,
         batch: usize, input_offset: usize, output_offset: usize) -> Result<()> {
@@ -246,6 +262,25 @@ mod tests {
             let bad=crate::leaf::read_leaf(crate::leaf::leaf_blob::<NVFP4,2>([1,64],anybytes::Bytes::from_source(payload))?)?;
             assert!(native_geometry(&bad,64,1).is_err());
         }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an exclusive GB10 GPU reservation"]
+    fn cuda_native_setup_upload_spans_and_refusal()->Result<()> {
+        let dev=Device::new();
+        let mut raw=[0x11;36];raw[..4].fill(0x38);
+        let view=native_view(&raw,64,1)?;
+        let mut geometry=Work::default();let mut upload=Work::default();
+        let packed=dev.upload_native_nvfp4_observed(&view,64,1,Some((&mut geometry,&mut upload)))?;
+        assert_eq!((geometry.calls,geometry.input_bytes,geometry.output_bytes),(1,40,0));
+        assert_eq!((upload.calls,upload.input_bytes,upload.output_bytes),(1,40,40));
+        let x=dev.upload(&[1.0;64]);let y=dev.empty(1);
+        dev.packed_matvec(&x,&packed,&y,1,0,0)?;
+        assert_eq!(dev.read(&y)?,[32.0]); // Existing dyadic math, no timing tolerance.
+        let mut bad_geometry=Work::default();let mut bad_upload=Work::default();
+        assert!(dev.upload_native_nvfp4_observed(&view,128,1,Some((&mut bad_geometry,&mut bad_upload))).is_err());
+        assert_eq!(bad_geometry.calls,1);assert_eq!(bad_upload.calls,0);
         Ok(())
     }
 

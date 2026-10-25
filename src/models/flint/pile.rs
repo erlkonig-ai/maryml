@@ -16,7 +16,7 @@
 //! Text fields use current native UTF8String handles: entity string arguments
 //! retain their blobs; query string literals constrain those content handles.
 
-use std::path::Path;
+use std::{path::Path,time::Instant};
 use anyhow::{Context,Result,ensure};
 use anybytes::Bytes;
 use serde::Serialize;
@@ -177,6 +177,7 @@ fn model_fragment(parameters:Fragment,entries:&[MetadataEntry])->Result<Fragment
 pub struct PileWeights {
     snapshot:ModelPileSnapshot,
     pub root:Id, pub block:Id, pub config_node:Id, pub config:BlockConfig,
+    setup:Option<super::native_setup::NativeSetupPhase>,
 }
 impl PileWeights {
     pub fn open(path:&Path,root:Id)->Result<Self> {
@@ -215,7 +216,11 @@ impl PileWeights {
             }
         }
         let (block,config_node)=selected.context("root has no supported metadata-bound block0 binding")?;
-        Ok(Self {snapshot,root,block,config_node,config:BLOCK0})
+        Ok(Self {snapshot,root,block,config_node,config:BLOCK0,setup:None})
+    }
+    pub(super) fn enable_setup(&mut self) {self.setup=Some(Default::default());}
+    pub(super) fn take_setup(&mut self)->Option<super::native_setup::NativeSetupPhase> {
+        self.setup.as_mut().map(std::mem::take)
     }
     pub fn collection(&self)->String {
         use triblespace::core::inline::encodings::hash::{Hash,Blake3};
@@ -265,7 +270,8 @@ impl PileWeights {
     /// One joined weight/postscale choice in this frozen snapshot. Consumers
     /// select both native planes when materializing bounded row chunks.
     pub(super) fn output_projection(&self)->Result<(TensorView,f32)> {
-        self.projection_at(self.root,"output",&[super::math::H,super::forward::VOCAB],None)
+        let (view,scale,_)=self.projection_at(self.root,"output",&[super::math::H,super::forward::VOCAB],None)?;
+        Ok((view,scale))
     }
 
     /// Diagnostic only; runtime get/get_packed do not hash per-weight bytes.
@@ -312,7 +318,7 @@ impl PileWeights {
         checked_view(blob,dims)
     }
 
-    fn projection_at(&self,parent:Id,kind:&str,dims:&[usize],expert:Option<usize>)->Result<(TensorView,f32)> {
+    fn projection_at(&self,parent:Id,kind:&str,dims:&[usize],expert:Option<usize>)->Result<(TensorView,f32,usize)> {
         row_selection(dims,expert)?;
         ensure!(matches!(dims.len(),2|3),"invalid projection request");
         // Both arms project the SAME typed tuple. The expert child and scale
@@ -341,13 +347,16 @@ impl PileWeights {
         let scale:Blob<Tensor<F32,1>>=self.snapshot.store().get(pair.1).map_err(|e|anyhow::anyhow!("{e}"))?;
         let weight=checked_view(weight,&dims[..2])?;
         let scales=checked_view(scale,&[expert.map(|_|dims[2]).unwrap_or(1)])?;
+        let scale_bytes=scales.payload().len();
         let scales=small_floats(scales.payload(),0)?;
-        Ok((weight,scales[expert.unwrap_or(0)]))
+        Ok((weight,scales[expert.unwrap_or(0)],scale_bytes))
     }
 }
 
 impl Weights for PileWeights {
     fn get(&mut self,suffix:&str,dims:&[usize],ty:u32,expert:Option<usize>)->Result<Vec<f32>> {
+        let start=self.setup.as_ref().map(|_|Instant::now());
+        let result:Result<(Vec<f32>,usize)>=(|| {
         let view=match (ty,dims.len()) {
             (0,1)=>self.typed::<F32,1>(suffix,dims,expert)?,
             (0,2)=>self.typed::<F32,2>(suffix,dims,expert)?,
@@ -356,7 +365,14 @@ impl Weights for PileWeights {
             _=>anyhow::bail!("typed block witness refuses packed-to-F32/unsupported dtype or rank"),
         };
         ensure!(view.payload().len()<=MAX_READ as usize,"small typed parameter exceeds bound");
-        small_floats(view.payload(),ty)
+        let bytes=view.payload().len();
+        Ok((small_floats(view.payload(),ty)?,bytes))
+        })();
+        if let (Some(start),Some(phase))=(start,self.setup.as_mut()) {
+            let (input,output)=result.as_ref().map(|(values,bytes):&(Vec<f32>,usize)|(*bytes,values.len()*4)).unwrap_or((0,0));
+            phase.class(expert.is_some()).lookup_materialize.record(start,input,output);
+        }
+        result.map(|(values,_)|values)
     }
     fn get_nvfp4(&mut self,_:&str,_:&[usize],_:Option<usize>)->Result<Vec<u8>> {
         anyhow::bail!("native planes are not GGUF blocks; use get_packed")
@@ -365,11 +381,24 @@ impl Weights for PileWeights {
         Ok(PackedWeight::Native(self.typed::<NVFP4,2>(suffix,dims,expert)?))
     }
     fn packed_projection(&mut self,suffix:&str,dims:&[usize],expert:Option<usize>)->Result<(PackedWeight,Option<f32>)> {
-        let (view,scale)=self.projection_at(self.block,suffix,dims,expert)?;
+        let start=self.setup.as_ref().map(|_|Instant::now());
+        let result:Result<(TensorView,f32,usize)>=(|| {
+        let (view,scale,scale_bytes)=self.projection_at(self.block,suffix,dims,expert)?;
         ensure!(view.payload().len()<=MAX_READ as usize+4,"selected native matrix exceeds bound");
-        Ok((PackedWeight::Native(view),Some(scale)))
+        Ok((view,scale,scale_bytes))
+        })();
+        if let (Some(start),Some(phase))=(start,self.setup.as_mut()) {
+            let (input,output)=result.as_ref().map(|(view,_,bytes):&(TensorView,f32,usize)|
+                (view.payload().len()+bytes,*bytes)).unwrap_or((0,0));
+            phase.class(expert.is_some()).lookup_materialize.record(start,input,output);
+        }
+        result.map(|(view,scale,_)|(PackedWeight::Native(view),Some(scale)))
     }
     fn paired_scales(&self)->bool {true}
+    fn native_setup_enabled(&self)->bool {self.setup.is_some()}
+    fn record_native_upload(&mut self,routed:bool,geometry:super::weights::Work,upload:super::weights::Work) {
+        if let Some(phase)=self.setup.as_mut() {phase.class(routed).add_upload(geometry,upload);}
+    }
 }
 
 #[cfg(test)]
@@ -488,6 +517,10 @@ mod tests {
         let post=scale_fixture(&[9.0])?;
         params+=entity! {attrs::kind:"incomplete",attrs::member*:post};
         with_snapshot(model_fragment(params,&super::super::config::tests::fixture())?,|mut weights| {
+            assert!(!weights.native_setup_enabled());
+            weights.record_native_upload(false,Default::default(),Default::default());
+            assert!(weights.take_setup().is_none());
+            weights.enable_setup();
             let (PackedWeight::Native(view),Some(scale))=weights.packed_projection("native-projection-kind-longer-than-32-bytes",&[64,1],None)?
                 else {panic!("native pair missing")};
             let code=view.payload()[0];
@@ -495,8 +528,17 @@ mod tests {
             let (PackedWeight::Native(view),Some(scale))=weights.packed_projection("experts",&[64,1,2],Some(1))?
                 else {panic!("native expert pair missing")};
             assert!((view.payload()[0]==0x33 && scale==6.0)||(view.payload()[0]==0x44 && scale==7.0));
+            let phase=weights.take_setup().unwrap();
+            assert_eq!((phase.fixed.lookup_materialize.calls,phase.routed.lookup_materialize.calls),(1,1));
+            // 40-byte native payload; FULL scale vectors are materialized (4/8B).
+            assert_eq!((phase.fixed.lookup_materialize.input_bytes,phase.fixed.lookup_materialize.output_bytes),(44,4));
+            assert_eq!((phase.routed.lookup_materialize.input_bytes,phase.routed.lookup_materialize.output_bytes),(48,8));
+            assert_eq!(weights.take_setup().unwrap().selected_seconds(),0.0);
             assert!(weights.packed_projection("experts",&[64,1,2],Some(2)).is_err());
             assert!(weights.packed_projection("incomplete",&[64,1],None).is_err());
+            let failed=weights.take_setup().unwrap();
+            assert_eq!((failed.fixed.lookup_materialize.calls,failed.routed.lookup_materialize.calls),(1,1));
+            assert_eq!((failed.fixed.lookup_materialize.input_bytes,failed.routed.lookup_materialize.input_bytes),(0,0));
             Ok(())
         })
     }
@@ -572,6 +614,14 @@ mod tests {
         assert_eq!(weights.get("probe.weight",&[2,2],30,None)?.iter().map(|v|v.to_bits()).collect::<Vec<_>>(),
             [0x80000000,0x3f800000,0x40000000,0xc0000000]);
         assert_eq!(weights.get("probe.scale",&[1],0,None)?,[0.75]);
+        assert!(weights.take_setup().is_none());
+        weights.enable_setup();
+        assert_eq!(weights.get("probe.weight",&[2,2],30,None)?.len(),4);
+        assert_eq!(weights.get("probe.scale",&[1],0,None)?,[0.75]);
+        let phase=weights.take_setup().unwrap();
+        assert_eq!(phase.fixed.lookup_materialize.calls,2);
+        assert_eq!((phase.fixed.lookup_materialize.input_bytes,phase.fixed.lookup_materialize.output_bytes),(12,20));
+        assert_eq!(phase.routed.lookup_materialize.calls,0);
         assert!(weights.get("probe.weight",&[2,2],0,None).is_err());
         assert!(weights.get("probe.weight",&[4,1],30,None).is_err());
         assert!(weights.get("probe.weight",&[2,2,256],30,Some(0)).is_err());

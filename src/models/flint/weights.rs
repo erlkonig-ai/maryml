@@ -30,6 +30,9 @@ pub trait Weights {
         Ok((self.get_packed(&format!("{suffix}.weight"),dims,expert)?,None))
     }
     fn paired_scales(&self)->bool { false }
+    /// Native-only diagnostic hooks; GGUF counters retain their own meanings.
+    fn native_setup_enabled(&self)->bool {false}
+    fn record_native_upload(&mut self,_routed:bool,_geometry:Work,_upload:Work) {}
 }
 
 pub(super) fn row_selection(dims: &[usize], expert: Option<usize>) -> Result<(u64, u64, usize)> {

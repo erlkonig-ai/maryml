@@ -301,6 +301,23 @@ impl Device {
     fn upload(&self, x: &[f32]) -> Buffer {
         Buffer { handle: self.client.create_from_slice(f32::as_bytes(x)), len: x.len() }
     }
+    // Only explicitly identified immutable parameters use this counter. Never
+    // count activation/KV/position uploads as fixed weight traffic.
+    fn weight_upload(&self,w:&mut impl Weights,x:&[f32],routed:bool)->Buffer {
+        let start=w.native_setup_enabled().then(std::time::Instant::now);
+        let buffer=self.upload(x);
+        if let Some(start)=start {
+            let mut upload=super::weights::Work::default();upload.record(start,x.len()*4,x.len()*4);
+            w.record_native_upload(routed,Default::default(),upload);
+        }
+        buffer
+    }
+    fn norm_parameter(&self,w:&mut impl Weights,x:&Buffer,suffix:&str,dims:&[usize])->Result<Buffer> {
+        let values=w.get(suffix,dims,0,None)?;
+        assert!(!values.is_empty());assert_eq!(x.len%values.len(),0);
+        let gain=self.weight_upload(w,&values,false);
+        self.norm_borrowed(x,&gain)
+    }
     fn positions(&self, x: &[i32]) -> Buffer {
         Buffer { handle: self.client.create_from_slice(i32::as_bytes(x)), len: x.len() }
     }
@@ -381,7 +398,14 @@ impl Device {
             post_scale=scale;
             let packed = match weight {
                 PackedWeight::Gguf(bytes) => self.upload_nvfp4(&bytes, dims[0], dims[1])?,
-                PackedWeight::Native(view) => self.upload_native_nvfp4(&view, dims[0], dims[1])?,
+                PackedWeight::Native(view) => {
+                    if w.native_setup_enabled() {
+                        let mut geometry=super::weights::Work::default();let mut upload=super::weights::Work::default();
+                        let result=self.upload_native_nvfp4_observed(&view,dims[0],dims[1],Some((&mut geometry,&mut upload)));
+                        w.record_native_upload(expert.is_some(),geometry,upload);
+                        result?
+                    } else {self.upload_native_nvfp4(&view,dims[0],dims[1])?}
+                },
             };
             ProjectionStorage::Packed(packed)
         } else {
@@ -400,8 +424,8 @@ impl Device {
     fn dense(&self, w: &mut impl Weights, tr: &mut Trace, suffix: &str, label: &str,
         x: &Buffer, ni: usize, no: usize, t: usize, mode: ProjectionMode) -> Result<Buffer> {
         let (weight,paired) = self.projection(w, suffix, &[ni,no], None, mode)?;
-        let scale = self.upload(&[match paired {Some(v)=>v,
-            None=>w.get(&format!("{suffix}.scale"), &[1], 0, None)?[0]}]);
+        let scale_value=match paired {Some(v)=>v,None=>w.get(&format!("{suffix}.scale"), &[1], 0, None)?[0]};
+        let scale = self.weight_upload(w,&[scale_value],false);
         let raw = self.empty(no * t);
         self.project(&weight, x, &raw, t, 0, 0)?;
         self.trace(tr, &format!("{label}_unscaled"), [no,t,1,1], &raw)?;
@@ -427,7 +451,7 @@ impl Device {
             selected.push(match paired {Some(v)=>v,None=>*scales.get(id as usize)
                 .context("paired native expert scale missing")?});
         }
-        let scale = self.upload(&selected);
+        let scale = self.weight_upload(w,&selected,true);
         let out = self.point(&raw, &scale, no, 1)?;
         self.trace(tr, &format!("{label}_unscaled"), [no,K,t,1], &raw)?;
         self.trace(tr, &format!("{label}_selected_scale"), [1,K,t,1], &scale)?;
@@ -507,13 +531,13 @@ pub(super) fn block_core(w:&mut impl Weights,input:&[f32],positions:&[i32],confi
     let pos = dev.positions(positions);
     dev.trace(&mut tr, "input", [H,t,1,1], &input_gpu)?;
     if trace { tr.stages.push(Stage { name: "positions".into(), dims: [t,1,1,1], values: Values::I32(positions.to_vec()) }); }
-    let n = dev.norm(&input_gpu, &w.get("attn_norm.weight", &[H], 0, None)?)?;
+    let n = dev.norm_parameter(w,&input_gpu,"attn_norm.weight",&[H])?;
     dev.trace(&mut tr, "attn_norm", [H,t,1,1], &n)?;
     let q = dev.dense(w,&mut tr,"attn_q","q_proj",&n,H,Q*D,t,mode)?;
     let k = dev.dense(w,&mut tr,"attn_k","k_proj",&n,H,KV*D,t,mode)?;
     let v = dev.dense(w,&mut tr,"attn_v","v_proj",&n,H,KV*D,t,mode)?;
-    let qn = dev.norm(&q,&w.get("attn_q_norm.weight",&[D],0,None)?)?;
-    let kn = dev.norm(&k,&w.get("attn_k_norm.weight",&[D],0,None)?)?;
+    let qn = dev.norm_parameter(w,&q,"attn_q_norm.weight",&[D])?;
+    let kn = dev.norm_parameter(w,&k,"attn_k_norm.weight",&[D])?;
     dev.trace(&mut tr,"q_norm",[D,Q,t,1],&qn)?;
     dev.trace(&mut tr,"k_norm",[D,KV,t,1],&kn)?;
     let q = if config.rope { dev.rope(&qn,&pos,Q)? } else { qn };
@@ -526,7 +550,9 @@ pub(super) fn block_core(w:&mut impl Weights,input:&[f32],positions:&[i32],confi
     let nt=key_positions.len();
     let key_pos=dev.positions(key_positions);
     let geometry=super::cache::Geometry::new(t,nt)?;
-    let sinks = dev.upload(&w.get("attn_sinks.weight",&[Q],0,None)?);
+    let sink_values=w.get("attn_sinks.weight",&[Q],0,None)?;
+    let sinks = dev.weight_upload(w,&sink_values,false);
+    drop(sink_values);
     ensure!(sinks.len == Q, "attention sink shape differs");
     let scores = dev.empty(geometry.scores);
     let probs = dev.empty(geometry.scores);
@@ -550,12 +576,14 @@ pub(super) fn block_core(w:&mut impl Weights,input:&[f32],positions:&[i32],confi
     let ao = dev.dense(w,&mut tr,"attn_output","attention_output",&joined,Q*D,H,t,mode)?;
     let residual = dev.point(&input_gpu,&ao,H,0)?;
     dev.trace(&mut tr,"ffn_inp",[H,t,1,1],&residual)?;
-    let n = dev.norm(&residual,&w.get("ffn_norm.weight",&[H],0,None)?)?;
+    let n = dev.norm_parameter(w,&residual,"ffn_norm.weight",&[H])?;
     dev.trace(&mut tr,"ffn_norm",[H,t,1,1],&n)?;
     let ffn = if let FfnKind::Dense { width } = config.ffn {
         dev.dense_ffn(w,&mut tr,&n,H,width,t,mode)?
     } else {
-        let router = dev.upload(&w.get("ffn_gate_inp.weight",&[H,E],30,None)?);
+        let router_values=w.get("ffn_gate_inp.weight",&[H,E],30,None)?;
+        let router = dev.weight_upload(w,&router_values,false);
+        drop(router_values);
         let logits = dev.empty(E*t);
         dev.matvec(&n,&router,&logits,H,E,t,0,0)?;
         let prob = dev.point(&logits,&logits,E,2)?;

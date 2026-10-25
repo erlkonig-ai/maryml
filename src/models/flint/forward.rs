@@ -87,6 +87,13 @@ impl Source {
     pub fn take_host_phase(&mut self)->Option<HostPhase> {
         match self {Self::Gguf(w)=>Some(w.take_host_phase()),Self::Native(_)=>None}
     }
+    pub(super) fn enable_native_setup(&mut self)->Result<()> {
+        match self {Self::Native(w)=>{w.enable_setup();Ok(())},
+            Self::Gguf(_)=>anyhow::bail!("native setup timing requires a native pile")}
+    }
+    pub(super) fn take_native_setup(&mut self)->Option<super::native_setup::NativeSetupPhase> {
+        match self {Self::Native(w)=>w.take_setup(),Self::Gguf(_)=>None}
+    }
     pub fn reads(&self)->&[ReadReceipt] {match self {Self::Gguf(w)=>&w.reads,Self::Native(_)=>&[]}}
     pub fn take_reads(&mut self)->Vec<ReadReceipt> {
         match self {Self::Gguf(w)=>std::mem::take(&mut w.reads),Self::Native(_)=>Vec::new()}
@@ -125,6 +132,12 @@ impl Weights for Source {
         match self {Self::Gguf(w)=>w.packed_projection(s,d,e),Self::Native(w)=>w.packed_projection(s,d,e)}
     }
     fn paired_scales(&self)->bool {matches!(self,Self::Native(_))}
+    fn native_setup_enabled(&self)->bool {
+        match self {Self::Native(w)=>w.native_setup_enabled(),Self::Gguf(_)=>false}
+    }
+    fn record_native_upload(&mut self,routed:bool,geometry:super::weights::Work,upload:super::weights::Work) {
+        if let Self::Native(w)=self {w.record_native_upload(routed,geometry,upload);}
+    }
 }
 
 pub struct Output {
