@@ -1001,6 +1001,10 @@ name = "flint_generate"
 required-features = ["import", "tokenizer"]
 
 [[bin]]
+name = "nemotron_generate_smoke"
+required-features = ["nemotron-cuda", "import", "tokenizer"]
+
+[[bin]]
 name = "flint_head_repeat"
 required-features = ["flint-cuda", "tokenizer"]
 
