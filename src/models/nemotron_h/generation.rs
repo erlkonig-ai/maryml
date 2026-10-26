@@ -36,6 +36,26 @@ pub enum LimitCause {
     Context,
 }
 
+/// A valid rendered prompt and checked generation reserve exceed context.
+/// `preflight()` preserves this type inside its `anyhow::Error`: callers may
+/// downcast to distinguish insufficient capacity from malformed input/render
+/// failures. Arithmetic overflow is a separate error, NOT this rejection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PromptCapacityExceeded {
+    pub required_tokens: usize,
+    pub capacity: usize,
+}
+impl std::fmt::Display for PromptCapacityExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "prompt plus generation reserve ({}) exceeds session capacity ({})",
+            self.required_tokens, self.capacity
+        )
+    }
+}
+impl std::error::Error for PromptCapacityExceeded {}
+
 /// Immutable, descriptive admission facts, not a transferable execution permit.
 /// No History is retained. Replacement re-renders/revalidates its own proposal.
 #[derive(Clone, Debug)]
@@ -146,6 +166,9 @@ impl<S: BlobStoreGet> Generator<S> {
     /// This optional strict reservation is conservative, not turn()'s behavior:
     /// turn() still accepts a fitting prompt and reports later context limits.
     /// No runtime reset, append, cache mutation or retained host History.
+    /// Only a valid prompt with a non-overflowing sum may return the downcastable
+    /// `PromptCapacityExceeded`; propagate all other errors rather than treating
+    /// them as a capacity miss. An invalid oversized prompt is still invalid.
     pub fn preflight(&self, history: &History, options: TurnOptions) -> Result<PromptAdmission> {
         admit_prompt(
             &self.session,
@@ -258,6 +281,10 @@ fn validate_prompt(runtime: &impl Runtime, ids: &[u32]) -> Result<()> {
         !ids.is_empty() && ids.len() <= runtime.context_capacity(),
         "empty prompt or prompt exceeds session capacity"
     );
+    validate_prompt_ids(runtime, ids)
+}
+
+fn validate_prompt_ids(runtime: &impl Runtime, ids: &[u32]) -> Result<()> {
     ensure!(
         ids.iter()
             .all(|&id| (id as usize) < runtime.vocabulary_size()),
@@ -271,16 +298,23 @@ fn admit_prompt(
     prompt: RenderedPrompt,
     requested_new_tokens: usize,
 ) -> Result<PromptAdmission> {
-    validate_prompt(runtime, &prompt.token_ids)?;
+    // Capacity must not hide malformed data: scan the complete prompt's IDs
+    // even when its length already exceeds context. turn() keeps its existing
+    // validation behavior; this strict preflight supplies the typed rejection.
+    ensure!(!prompt.token_ids.is_empty(), "empty prompt");
+    validate_prompt_ids(runtime, &prompt.token_ids)?;
     let reserved_attended_tokens = prompt
         .token_ids
         .len()
         .checked_add(requested_new_tokens)
         .context("prompt plus generation reserve overflows usize")?;
-    ensure!(
-        reserved_attended_tokens <= runtime.context_capacity(),
-        "prompt plus generation reserve exceeds session capacity"
-    );
+    if reserved_attended_tokens > runtime.context_capacity() {
+        return Err(PromptCapacityExceeded {
+            required_tokens: reserved_attended_tokens,
+            capacity: runtime.context_capacity(),
+        }
+        .into());
+    }
     Ok(PromptAdmission {
         prompt,
         requested_new_tokens,

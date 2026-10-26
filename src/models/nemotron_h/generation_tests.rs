@@ -417,6 +417,84 @@ fn rendered(ids: &[u32]) -> RenderedPrompt {
     }
 }
 
+// Drive's fits boundary: only the explicit capacity rejection becomes false.
+fn capacity_fits(admission: Result<PromptAdmission>) -> Result<bool> {
+    match admission {
+        Ok(_) => Ok(true),
+        Err(error) if error.downcast_ref::<PromptCapacityExceeded>().is_some() => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+#[test]
+fn generation_preflight_capacity_rejection_is_typed_and_nonmutating() {
+    for status in [Status::Ready, Status::Poisoned] {
+        let mut s = Script::new(&[5, 6]);
+        s.capacity = 4;
+        s.committed = vec![9];
+        s.logits = row(5);
+        s.status = status;
+        assert!(capacity_fits(admit_prompt(&s, rendered(&[1, 3]), 2)).unwrap());
+        assert!(capacity_fits(admit_prompt(&s, rendered(&[1, 3, 4, 5]), 0)).unwrap());
+        for (ids, budget) in [(vec![1, 3], 3), (vec![1; 5], 0)] {
+            let error = admit_prompt(&s, rendered(&ids), budget)
+                .unwrap_err()
+                .context("caller admission context");
+            assert_eq!(
+                error.downcast_ref::<PromptCapacityExceeded>(),
+                Some(&PromptCapacityExceeded {
+                    required_tokens: 5,
+                    capacity: 4,
+                })
+            );
+            assert!(!capacity_fits(Err(error)).unwrap());
+        }
+        assert_eq!(s.committed, [9]);
+        assert_eq!(s.logits, row(5));
+        assert_eq!(s.predictions, VecDeque::from([5, 6]));
+        assert_eq!(s.status, status);
+        assert!(s.appends.is_empty() && s.resets == 0);
+    }
+}
+
+#[test]
+fn generation_preflight_invalid_even_oversized_is_not_capacity_rejection() {
+    let mut s = Script::new(&[5]);
+    s.capacity = 4;
+    s.committed = vec![9];
+    s.logits = row(5);
+    let mut oversized_invalid = vec![1; MAX_CHUNK + 1];
+    oversized_invalid[MAX_CHUNK] = 99;
+    for ids in [Vec::new(), vec![99], oversized_invalid] {
+        let error = capacity_fits(admit_prompt(&s, rendered(&ids), 8)).unwrap_err();
+        assert!(error.downcast_ref::<PromptCapacityExceeded>().is_none());
+    }
+    // Public preflight returns render errors before admission. The scripted
+    // boundary must propagate that ordinary error, not guess from its text.
+    let render_error = Err(anyhow::anyhow!("scripted render failure")).context("render");
+    assert!(capacity_fits(render_error).is_err());
+    assert_eq!(s.committed, [9]);
+    assert_eq!(s.logits, row(5));
+    assert_eq!(s.predictions, VecDeque::from([5]));
+    assert_eq!(s.status, Status::Ready);
+    assert!(s.appends.is_empty() && s.resets == 0);
+}
+
+#[test]
+fn generation_preflight_checked_overflow_is_not_capacity_rejection() {
+    let mut s = Script::new(&[5]);
+    s.capacity = usize::MAX;
+    s.committed = vec![9];
+    s.logits = row(5);
+    let error = capacity_fits(admit_prompt(&s, rendered(&[1]), usize::MAX)).unwrap_err();
+    assert!(error.downcast_ref::<PromptCapacityExceeded>().is_none());
+    assert_eq!(s.committed, [9]);
+    assert_eq!(s.logits, row(5));
+    assert_eq!(s.predictions, VecDeque::from([5]));
+    assert_eq!(s.status, Status::Ready);
+    assert!(s.appends.is_empty() && s.resets == 0);
+}
+
 #[test]
 fn generation_preflight_reserves_every_emission_without_mutating() {
     let mut s = Script::new(&[]);
