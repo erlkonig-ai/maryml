@@ -3295,6 +3295,7 @@ dependencies = [
  "sha2",
  "symphonia",
  "tokenizers",
+ "tracing",
  "triblespace",
  "wgpu",
  "zip",
