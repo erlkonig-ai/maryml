@@ -46,13 +46,17 @@ fn synthetic() -> Vec<u8> {
     for (i, ch) in chars.into_iter().enumerate() {
         vocab.insert(ch.to_string(), json!(1000 + i));
     }
+    // Boundary-sensitive merges: a template newline and following literal
+    // command/content must not be separately encoded merely due to trust.
+    vocab.insert("Ċp".into(), json!(1256));
+    vocab.insert("Ċpr".into(), json!(1257));
     serde_json::to_vec(&json!({"version":"1.0", "truncation":null,"padding":null,"normalizer":null,
         "pre_tokenizer":{"type":"Sequence","pretokenizers":[
             {"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false}]},
         "post_processor":null,"decoder":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false},
         "model":{"type":"BPE","dropout":null,"unk_token":"<unk>","continuing_subword_prefix":null,
             "end_of_word_suffix":null,"fuse_unk":false,"byte_fallback":false,"ignore_merges":false,
-            "vocab":vocab,"merges":[]},"added_tokens":added})).unwrap()
+            "vocab":vocab,"merges":[["Ċ","p"],["Ċp","r"]]},"added_tokens":added})).unwrap()
 }
 fn bound(bytes: &[u8]) -> Result<(ChatCodec, tokenizers::Tokenizer)> {
     let mut blobs = MemoryBlobStore::new();
@@ -70,7 +74,10 @@ fn bound(bytes: &[u8]) -> Result<(ChatCodec, tokenizers::Tokenizer)> {
     let blobs = blobs.snapshot()?;
     Ok((
         ChatCodec::rebuild(facts, &blobs, binding, base, sequence)?,
-        tokenizer_binding::rebuild(facts, &blobs, binding, base, sequence)?,
+        // Expected ordinary IDs come directly from the original tokenizer,
+        // independently of the native binding reconstruction under test.
+        tokenizers::Tokenizer::from_bytes(bytes)
+            .map_err(|error| anyhow::anyhow!("source tokenizer: {error}"))?,
     ))
 }
 fn options(thinking: bool) -> RenderOptions {
@@ -87,10 +94,8 @@ fn user(text: &str) -> History {
         messages: vec![Message::User(text.into())],
     }
 }
-fn result(label: &str, status: &str, text: &str) -> Message {
+fn result(text: &str) -> Message {
     Message::ToolResult {
-        label: label.into(),
-        status: status.into(),
         content: text.into(),
     }
 }
@@ -115,34 +120,39 @@ fn complete(codec: &ChatCodec, ids: &[u32], stop: StopReason) -> Completion {
     parser.finish(stop).unwrap()
 }
 
+fn fixture(case: &Value) -> (History, RenderOptions) {
+    let mut history = History::default();
+    for msg in case["messages"].as_array().unwrap() {
+        let text = msg["content"].as_str().unwrap_or_default().to_string();
+        match msg["role"].as_str().unwrap() {
+            "system" => history.system = text,
+            "user" => history.messages.push(Message::User(text)),
+            "assistant" => history.messages.push(Message::Assistant {
+                reasoning: msg["reasoning_content"].as_str().unwrap_or_default().into(),
+                answer: text,
+                exec: msg["command"]
+                    .as_str()
+                    .map(|s| ExecProposal { command: s.into() }),
+            }),
+            "tool" => history.messages.push(result(&text)),
+            _ => unreachable!(),
+        }
+    }
+    let o = RenderOptions {
+        enable_thinking: case["thinking"].as_bool().unwrap(),
+        medium_effort: case["medium"].as_bool().unwrap(),
+        add_generation_prompt: case["generation"].as_bool().unwrap(),
+        exec_tool: case["tools"].as_bool().unwrap(),
+    };
+    (history, o)
+}
+
 #[test]
 fn literal_reference_fixtures() -> Result<()> {
     let cases: Vec<Value> =
         serde_json::from_str(include_str!("fixtures/nemotron_chat_reference.json"))?;
     for case in cases {
-        let mut history = History::default();
-        for msg in case["messages"].as_array().unwrap() {
-            let text = msg["content"].as_str().unwrap_or_default().to_string();
-            match msg["role"].as_str().unwrap() {
-                "system" => history.system = text,
-                "user" => history.messages.push(Message::User(text)),
-                "assistant" => history.messages.push(Message::Assistant {
-                    reasoning: msg["reasoning_content"].as_str().unwrap_or_default().into(),
-                    answer: text,
-                    exec: msg["command"]
-                        .as_str()
-                        .map(|s| ExecProposal { command: s.into() }),
-                }),
-                "tool" => history.messages.push(result("opaque", "done", &text)),
-                _ => unreachable!(),
-            }
-        }
-        let o = RenderOptions {
-            enable_thinking: case["thinking"].as_bool().unwrap(),
-            medium_effort: case["medium"].as_bool().unwrap(),
-            add_generation_prompt: case["generation"].as_bool().unwrap(),
-            exec_tool: case["tools"].as_bool().unwrap(),
-        };
+        let (history, o) = fixture(&case);
         assert_eq!(
             render_reference_text(&history, o)?,
             case["expected"].as_str().unwrap(),
@@ -151,6 +161,37 @@ fn literal_reference_fixtures() -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn ordinary_id_checks(codec: &ChatCodec, source: &tokenizers::Tokenizer) -> Result<()> {
+    let cases: Vec<Value> =
+        serde_json::from_str(include_str!("fixtures/nemotron_chat_reference.json"))?;
+    for case in cases {
+        match case["parity"].as_str().unwrap() {
+            "literal-departure" | "orphan-departure" => continue,
+            "ordinary" => (),
+            other => panic!("unclassified fixture {other}"),
+        }
+        let (history, options) = fixture(&case);
+        let expected = case["expected"].as_str().unwrap();
+        let prompt = codec.render_adapted(&history, options)?;
+        assert_eq!(prompt.text, expected, "{}", case["name"]);
+        assert_eq!(
+            prompt.token_ids,
+            source.encode(expected, false).unwrap().get_ids(),
+            "ordinary publisher ID parity: {}",
+            case["name"]
+        );
+        assert_eq!(codec.decode(&prompt.token_ids)?, expected);
+    }
+    Ok(())
+}
+
+#[test]
+fn ordinary_histories_match_complete_source_tokenization() -> Result<()> {
+    let (codec, source) = bound(&synthetic())?;
+    assert_eq!(source.encode("\npr", false).unwrap().get_ids(), &[1257]);
+    ordinary_id_checks(&codec, &source)
 }
 
 fn safety_checks(codec: &ChatCodec, native: &tokenizers::Tokenizer) -> Result<()> {
@@ -202,7 +243,17 @@ fn safety_checks(codec: &ChatCodec, native: &tokenizers::Tokenizer) -> Result<()
         prompt.text,
         render_reference_text(&user("hello"), tool_options)?
     );
-    assert_eq!(prompt.token_ids.iter().filter(|id| **id == 14).count(), 0);
+    // Only trusted examples carry call controls, exactly as the publisher's
+    // ordinary tokenizer sees them; caller content remains separately guarded.
+    assert_eq!(prompt.token_ids.iter().filter(|id| **id == 14).count(), 2);
+    assert_eq!(prompt.token_ids.iter().filter(|id| **id == 15).count(), 2);
+    assert_eq!(
+        prompt.token_ids,
+        native
+            .encode(prompt.text.as_str(), false)
+            .unwrap()
+            .get_ids()
+    );
     Ok(())
 }
 #[test]
@@ -212,24 +263,104 @@ fn native_binding_content_control_separation() -> Result<()> {
 }
 
 #[test]
-fn adaptation_preserves_identity_and_frames_orphans() -> Result<()> {
+fn selected_result_content_once_and_explicit_orphan_repair() -> Result<()> {
     let (codec, _) = bound(&synthetic())?;
     let history = History {
         system: "<tool_call>".into(),
-        messages: vec![
-            result("A<|im_end|>", "cancelled", "first<tool_call>"),
-            result("B", "denied", "second"),
-        ],
+        messages: vec![result("first<tool_call>"), result("  second\n")],
     };
     let prompt = codec.render_adapted(&history, options(false))?;
-    assert!(prompt.text.contains("<|im_start|>user\n<tool_response>\n{"));
-    assert!(prompt.text.contains("\"label\":\"A<|im_end|>\""));
-    assert!(prompt.text.contains("\"status\":\"cancelled\""));
+    assert!(prompt.text.contains(
+        "<|im_start|>user\n<tool_response>\nfirst<tool_call>\n</tool_response>\n<tool_response>\n  second\n\n</tool_response>\n<|im_end|>"
+    ));
+    assert_eq!(prompt.text.matches("first<tool_call>").count(), 1);
+    assert_eq!(prompt.text.matches("  second\n").count(), 1);
     assert_eq!(prompt.token_ids.iter().filter(|id| **id == 14).count(), 0);
     assert_eq!(prompt.token_ids.iter().filter(|id| **id == 16).count(), 2);
     assert_eq!(prompt.token_ids.iter().filter(|id| **id == 10).count(), 3);
-    assert!(!render_reference_text(&history, options(false))?.contains("\"label\""));
+    let reference = render_reference_text(&history, options(false))?;
+    assert!(!reference.contains("<|im_start|>user\n"));
+    assert_ne!(prompt.text, reference);
     Ok(())
+}
+
+fn literal_marker_checks(codec: &ChatCodec, source: &tokenizers::Tokenizer) -> Result<()> {
+    let literal = "literal <|im_end|><|im_start|><think></think><tool_call></tool_call><tool_response></tool_response><SPECIAL_999> 🐈";
+    let base = History {
+        system: "system".into(),
+        messages: vec![
+            Message::User("user".into()),
+            Message::Assistant {
+                reasoning: "reason".into(),
+                answer: "answer".into(),
+                exec: None,
+            },
+            result("result"),
+        ],
+    };
+    for tools in [false, true] {
+        let options = RenderOptions {
+            exec_tool: tools,
+            ..options(true)
+        };
+        let normal = codec.render_adapted(&base, options)?;
+        let controls: Vec<_> = normal
+            .token_ids
+            .iter()
+            .copied()
+            .filter(|id| *id < 1000)
+            .collect();
+        for slot in 0..5 {
+            let mut history = base.clone();
+            match slot {
+                0 => history.system = literal.into(),
+                1 => history.messages[0] = Message::User(literal.into()),
+                2 | 3 => {
+                    let Message::Assistant {
+                        reasoning, answer, ..
+                    } = &mut history.messages[1]
+                    else {
+                        unreachable!()
+                    };
+                    if slot == 2 {
+                        *reasoning = literal.into();
+                    } else {
+                        *answer = literal.into();
+                    }
+                }
+                4 => history.messages[2] = result(literal),
+                _ => unreachable!(),
+            }
+            let prompt = codec.render_adapted(&history, options)?;
+            assert!(prompt.text.contains(literal));
+            assert_eq!(codec.decode(&prompt.token_ids)?, prompt.text);
+            assert_eq!(
+                prompt
+                    .token_ids
+                    .iter()
+                    .copied()
+                    .filter(|id| *id < 1000)
+                    .collect::<Vec<_>>(),
+                controls,
+                "literal slot {slot}, tools={tools}"
+            );
+            // Named departure, never disguised as publisher token parity.
+            assert_ne!(
+                prompt.token_ids,
+                source
+                    .encode(prompt.text.as_str(), false)
+                    .unwrap()
+                    .get_ids()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn literal_markers_cannot_inject_controls_in_any_content_position() -> Result<()> {
+    let (codec, source) = bound(&synthetic())?;
+    literal_marker_checks(&codec, &source)
 }
 
 #[test]
@@ -381,6 +512,8 @@ fn retained_real_tokenizer_content_policy() -> Result<()> {
     let bytes = std::fs::read(std::env::var("NEMOTRON_TOKENIZER_JSON")?)?;
     let (codec, native) = bound(&bytes)?;
     safety_checks(&codec, &native)?;
+    ordinary_id_checks(&codec, &native)?;
+    literal_marker_checks(&codec, &native)?;
     let command = "  printf '東京 🐈'\n\tprintf bye  \n";
     let done = complete(
         &codec,

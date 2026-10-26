@@ -20,10 +20,8 @@ pub enum Message {
         answer: String,
         exec: Option<ExecProposal>,
     },
-    /// Opaque labels supplied by the authority adapter, not invented IDs.
+    /// Selected model-visible text. Result identity/status remain host-side.
     ToolResult {
-        label: String,
-        status: String,
         content: String,
     },
 }
@@ -90,6 +88,22 @@ fn content(parts: &mut Vec<Part>, text: impl Into<String>) {
 fn control(parts: &mut Vec<Part>, id: u32) {
     parts.push(Part::Control(id));
 }
+/// Only static publisher grammar takes this path, never caller content.
+/// Splitting at added-token markers preserves the tokenizer's own boundaries;
+/// all other text still coalesces before BPE, including across trust boundaries.
+fn trusted_template(parts: &mut Vec<Part>, mut text: &'static str) {
+    while let Some((offset, id, marker)) = MARKERS
+        .iter()
+        .enumerate()
+        .filter_map(|(id, marker)| text.find(*marker).map(|offset| (offset, id, marker)))
+        .min_by_key(|(offset, _, _)| *offset)
+    {
+        content(parts, &text[..offset]);
+        control(parts, id as u32);
+        text = &text[offset + marker.len()..];
+    }
+    content(parts, text);
+}
 fn open(parts: &mut Vec<Part>, role: &str) {
     control(parts, 10);
     content(parts, format!("{role}\n"));
@@ -133,14 +147,7 @@ fn render_parts(history: &History, options: RenderOptions, adapted: bool) -> Res
                     .len()
                     .saturating_add(answer.len())
                     .saturating_add(exec.as_ref().map_or(0, |e| e.command.len())),
-                Message::ToolResult {
-                    label,
-                    status,
-                    content,
-                } => label
-                    .len()
-                    .saturating_add(status.len())
-                    .saturating_add(content.len()),
+                Message::ToolResult { content } => content.len(),
             })
             .context("history size overflow")?;
     }
@@ -156,8 +163,9 @@ fn render_parts(history: &History, options: RenderOptions, adapted: bool) -> Res
             content(&mut parts, "\n\n");
         }
         content(&mut parts, EXEC_SCHEMA);
-        // The example is instructional text, not an actual tool-call frame.
-        content(&mut parts, TOOL_INSTRUCTIONS);
+        // Publisher examples retain their published token representation even
+        // though they occur inside system instructions, not an actual call.
+        trusted_template(&mut parts, TOOL_INSTRUCTIONS);
     }
     close(&mut parts);
     let last_user = history
@@ -200,11 +208,7 @@ fn render_parts(history: &History, options: RenderOptions, adapted: bool) -> Res
                 }
                 close(&mut parts);
             }
-            Message::ToolResult {
-                label,
-                status,
-                content: text,
-            } => {
+            Message::ToolResult { content: text } => {
                 let preceding_tool =
                     i > 0 && matches!(history.messages[i - 1], Message::ToolResult { .. });
                 if !preceding_tool && (adapted || i > 0) {
@@ -212,18 +216,7 @@ fn render_parts(history: &History, options: RenderOptions, adapted: bool) -> Res
                 }
                 control(&mut parts, 16);
                 content(&mut parts, "\n");
-                if adapted {
-                    // JSON here is a CONTENT envelope for result identity, not
-                    // the model's XML-like exec proposal grammar.
-                    content(
-                        &mut parts,
-                        serde_json::to_string(&serde_json::json!({
-                            "label": label, "status": status, "content": text,
-                        }))?,
-                    );
-                } else {
-                    content(&mut parts, text);
-                }
+                content(&mut parts, text);
                 content(&mut parts, "\n");
                 control(&mut parts, 17);
                 content(&mut parts, "\n");
@@ -259,10 +252,10 @@ fn rendered_text(parts: &[Part]) -> String {
     text
 }
 
-/// Literal reference text only, never safe-to-feed tokenization. Tool result
-/// labels/status are dropped and a leading orphan retains the upstream missing
-/// opener. Use `render_adapted` for actual prompts. Embedded assistant marker
-/// strings are treated as typed content, not upstream's implicit reasoning.
+/// Literal reference text only, never safe-to-feed tokenization. A leading
+/// orphan retains the upstream missing opener. Use `render_adapted` for actual
+/// prompts. Embedded assistant marker strings are treated as typed content,
+/// not upstream's implicit reasoning.
 pub fn render_reference_text(history: &History, options: RenderOptions) -> Result<String> {
     Ok(rendered_text(&render_parts(history, options, false)?))
 }
@@ -387,9 +380,11 @@ impl ChatCodec {
         Ok(ids)
     }
 
-    /// Named adaptation: frames orphan results and preserves opaque labels and
-    /// statuses in content envelopes. All content (including prior assistant
-    /// text and tool documentation examples) uses the marker-safe policy.
+    /// Ordinary supported histories retain publisher text AND token IDs.
+    /// Named departures: frame leading orphan results and encode literal marker
+    /// spellings as marker-safe content, including prior assistant text. Static
+    /// template grammar keeps its observed control IDs. Result content is not
+    /// wrapped; identity/status belong to the host, not this model transcript.
     pub fn render_adapted(
         &self,
         history: &History,

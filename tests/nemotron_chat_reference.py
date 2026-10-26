@@ -1,20 +1,26 @@
 """Check shared literal fixtures against the pinned HF template, CPU/offline.
 
 Usage: python tests/nemotron_chat_reference.py /path/to/chat_template.jinja
-Requires the already-installed Transformers Jinja environment; installs nothing.
-This is reference text evidence, not the content-safe production tokenizer.
+Requires already-installed Jinja2; installs nothing. This pinned template uses
+standard Jinja syntax and JSON serialization, not Transformers-only extensions.
+This checks the published interface, not training examples or model behavior.
+Rust's ordinary_id_checks independently compares complete prompt IDs with the
+original tokenizer bytes; literal/orphan departures are explicitly classified.
 """
 import hashlib
 import json
 from pathlib import Path
 import sys
-from transformers.utils.chat_template_utils import _compile_jinja_template
+from jinja2.sandbox import ImmutableSandboxedEnvironment
 
 template = Path(sys.argv[1]).read_bytes()
 assert hashlib.sha256(template).hexdigest() == "1369e90b19976f99ce2070eb21ade8fcb4af640f008e14e82af5c5e89a9cc816"
-render = _compile_jinja_template(template.decode()).render
+environment = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True)
+environment.filters["tojson"] = lambda value: json.dumps(value, ensure_ascii=False)
+render = environment.from_string(template.decode()).render
 cases = json.loads(Path(__file__).with_name("fixtures").joinpath("nemotron_chat_reference.json").read_text())
 for case in cases:
+    assert case["parity"] in {"ordinary", "literal-departure", "orphan-departure"}
     messages = case["messages"]
     for message in messages:
         if "command" in message:
