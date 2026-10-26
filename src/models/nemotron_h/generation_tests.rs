@@ -408,3 +408,112 @@ fn generation_nonfinite_row_is_not_silently_masked_by_sampler() {
     assert!(out.emitted_ids.is_empty());
     assert!(s.appends.is_empty() && s.resets == 0);
 }
+
+// Admission scripts bypass rendering; the public methods use the actual codec.
+fn rendered(ids: &[u32]) -> RenderedPrompt {
+    RenderedPrompt {
+        text: "scripted complete prompt".into(),
+        token_ids: ids.to_vec(),
+    }
+}
+
+#[test]
+fn generation_preflight_reserves_every_emission_without_mutating() {
+    let mut s = Script::new(&[]);
+    s.capacity = 4;
+    s.committed = vec![9];
+    s.status = Status::Poisoned;
+    let admission = admit_prompt(&s, rendered(&[1, 3]), 2).unwrap();
+    assert_eq!(admission.prompt().token_ids, [1, 3]);
+    assert_eq!(admission.prompt().text, "scripted complete prompt");
+    assert_eq!(admission.requested_new_tokens(), 2);
+    assert_eq!(admission.reserved_attended_tokens(), 4);
+    assert_eq!(admission.capacity(), 4);
+    assert!(admit_prompt(&s, rendered(&[1, 3]), 3).is_err());
+    let zero = admit_prompt(&s, rendered(&[1, 3, 4, 5]), 0).unwrap();
+    assert_eq!(zero.reserved_attended_tokens(), 4);
+    assert_eq!(zero.requested_new_tokens(), 0);
+    assert_eq!(s.committed, [9]);
+    assert_eq!(s.status, Status::Poisoned);
+    assert!(s.appends.is_empty() && s.resets == 0);
+}
+
+#[test]
+fn generation_replacement_rejects_full_prompt_and_render_failure_before_reset() {
+    let mut invalid = vec![1; MAX_CHUNK + 1];
+    invalid[MAX_CHUNK] = 99;
+    for ids in [Vec::new(), invalid, vec![1; 301]] {
+        let mut s = Script::new(&[]);
+        s.committed = vec![9];
+        let admission = admit_prompt(&s, rendered(&ids), 1);
+        assert!(matches!(
+            replace_admitted(&mut s, admission),
+            ReplacementOutcome::RejectedUnchanged { .. }
+        ));
+        assert_eq!(s.committed, [9]);
+        assert_eq!(s.status, Status::Ready);
+        assert!(s.appends.is_empty() && s.resets == 0);
+    }
+    let mut s = Script::new(&[]);
+    s.committed = vec![9];
+    let outcome = replace_admitted(&mut s, Err(anyhow::anyhow!("scripted render failure")));
+    assert!(
+        matches!(outcome, ReplacementOutcome::RejectedUnchanged { error } if error.contains("render failure"))
+    );
+    assert_eq!(s.committed, [9]);
+    assert!(s.appends.is_empty() && s.resets == 0);
+}
+
+#[test]
+fn generation_replacement_rejects_reserve_and_overflow_before_reset() {
+    for budget in [300, usize::MAX] {
+        let mut s = Script::new(&[]);
+        s.committed = vec![9];
+        let admission = admit_prompt(&s, rendered(&[1]), budget);
+        let outcome = replace_admitted(&mut s, admission);
+        let ReplacementOutcome::RejectedUnchanged { error } = outcome else {
+            panic!("must reject")
+        };
+        assert!(error.contains(if budget == usize::MAX {
+            "overflows"
+        } else {
+            "exceeds"
+        }));
+        assert_eq!(s.committed, [9]);
+        assert_eq!(s.status, Status::Ready);
+        assert!(s.appends.is_empty() && s.resets == 0);
+    }
+}
+
+#[test]
+fn generation_replacement_success_is_empty_ready_not_prefilled() {
+    let mut s = Script::new(&[]);
+    s.committed = vec![1]; // Even an exact old prefix is deliberately reset.
+    s.logits = row(5);
+    let admission = admit_prompt(&s, rendered(&[1]), 0);
+    let ReplacementOutcome::ReadyForAssignment { admission } = replace_admitted(&mut s, admission)
+    else {
+        panic!("reset must succeed")
+    };
+    assert_eq!(admission.prompt().token_ids, [1]);
+    assert_eq!(s.resets, 1);
+    assert!(s.committed.is_empty() && s.logits.is_empty() && s.appends.is_empty());
+    assert_eq!(s.status, Status::Ready);
+}
+
+#[test]
+fn generation_replacement_reset_failure_is_terminal_not_rejected_unchanged() {
+    let mut s = Script::new(&[]);
+    s.committed = vec![9];
+    s.fail_reset = true;
+    let admission = admit_prompt(&s, rendered(&[1]), 2);
+    let outcome = replace_admitted(&mut s, admission);
+    assert!(matches!(outcome, ReplacementOutcome::ResetFailedTerminal {
+            error, session_status: Status::Poisoned, committed_tokens: 1
+        } if error.contains("reset failure")));
+    assert_eq!(s.status, Status::Poisoned);
+    assert_eq!(s.resets, 1);
+    assert!(s.appends.is_empty());
+    // Retained count is diagnostic; the outcome makes no rollback assertion.
+    assert_eq!(s.committed, [9]);
+}

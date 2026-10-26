@@ -11,7 +11,8 @@
 
 use super::{
     chat::{
-        ChatCodec, Completion, History, OutputParser, PartialOutput, RenderOptions, StopReason,
+        ChatCodec, Completion, History, OutputParser, PartialOutput, RenderOptions, RenderedPrompt,
+        StopReason,
     },
     session::{MAX_CHUNK, Session, Status},
 };
@@ -33,6 +34,50 @@ pub struct TurnOptions {
 pub enum LimitCause {
     TokenBudget,
     Context,
+}
+
+/// Immutable, descriptive admission facts, not a transferable execution permit.
+/// No History is retained. Replacement re-renders/revalidates its own proposal.
+#[derive(Clone, Debug)]
+pub struct PromptAdmission {
+    prompt: RenderedPrompt,
+    requested_new_tokens: usize,
+    reserved_attended_tokens: usize,
+    capacity: usize,
+}
+impl PromptAdmission {
+    pub fn prompt(&self) -> &RenderedPrompt {
+        &self.prompt
+    }
+    pub fn requested_new_tokens(&self) -> usize {
+        self.requested_new_tokens
+    }
+    /// Conservative bound: prompt length + EVERY requested emission, including
+    /// final/EOS tokens that turn() normally does not append. No subtraction or
+    /// implicit max(1); zero emission reserve is zero. Checked for usize overflow.
+    pub fn reserved_attended_tokens(&self) -> usize {
+        self.reserved_attended_tokens
+    }
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum ReplacementOutcome {
+    /// No reset/append occurred; the caller must not assign the proposed History.
+    RejectedUnchanged { error: String },
+    /// Reset failed. Caller MUST retire/stop this backend session, not retry old
+    /// history. No rollback/drain or reusable prefix claim; status/count remain
+    /// actual diagnostic observations (the native Session poisons on failure).
+    ResetFailedTerminal {
+        error: String,
+        session_status: Status,
+        committed_tokens: usize,
+    },
+    /// Reset succeeded: Ready with empty attended prefix, NOT prefilled. The
+    /// caller may now assign its host History; this owner never stores that copy.
+    ReadyForAssignment { admission: PromptAdmission },
 }
 
 #[derive(Clone, Debug)]
@@ -84,6 +129,45 @@ impl<S: BlobStoreGet> Generator<S> {
         &self.session
     }
 
+    fn render_prompt(&self, history: &History, options: TurnOptions) -> Result<RenderedPrompt> {
+        self.codec.render_adapted(
+            history,
+            RenderOptions {
+                enable_thinking: options.enable_thinking,
+                medium_effort: false,
+                add_generation_prompt: true,
+                exec_tool: options.exec_tool,
+            },
+        )
+    }
+
+    /// Render the COMPLETE proposed history with the real codec, validate all
+    /// IDs and capacity, then require prompt_len + max_new_tokens <= capacity.
+    /// This optional strict reservation is conservative, not turn()'s behavior:
+    /// turn() still accepts a fitting prompt and reports later context limits.
+    /// No runtime reset, append, cache mutation or retained host History.
+    pub fn preflight(&self, history: &History, options: TurnOptions) -> Result<PromptAdmission> {
+        admit_prompt(
+            &self.session,
+            self.render_prompt(history, options).context("render")?,
+            options.max_new_tokens,
+        )
+    }
+
+    /// Validate the same COMPLETE proposal and conservative generation reserve
+    /// BEFORE attempting reset, even for zero budget or an already-matching
+    /// prefix. Success permits host-history assignment, not immediate sampling;
+    /// a later turn must prefill it. Failure after reset is NOT rollback/drain.
+    /// Inspect session() for actual diagnostic count/status after any outcome.
+    pub fn prepare_history_replacement(
+        &mut self,
+        history: &History,
+        options: TurnOptions,
+    ) -> ReplacementOutcome {
+        let admission = self.preflight(history, options);
+        replace_admitted(&mut self.session, admission)
+    }
+
     /// A turn always returns its partial/result, even on render, reset, runtime
     /// or decoding error. Panics/fatal process failures are not caught here.
     /// Validate the whole rendered prompt BEFORE resetting/appending; rejection
@@ -96,15 +180,7 @@ impl<S: BlobStoreGet> Generator<S> {
         options: TurnOptions,
         mut cancelled: impl FnMut() -> bool,
     ) -> TurnOutput {
-        let prompt = match self.codec.render_adapted(
-            history,
-            RenderOptions {
-                enable_thinking: options.enable_thinking,
-                medium_effort: false,
-                add_generation_prompt: true,
-                exec_tool: options.exec_tool,
-            },
-        ) {
+        let prompt = match self.render_prompt(history, options) {
             Ok(prompt) => prompt,
             Err(error) => return rejected(&self.session, format!("render: {error:#}")),
         };
@@ -177,6 +253,64 @@ impl Decoder for OutputParser<'_> {
     }
 }
 
+fn validate_prompt(runtime: &impl Runtime, ids: &[u32]) -> Result<()> {
+    ensure!(
+        !ids.is_empty() && ids.len() <= runtime.context_capacity(),
+        "empty prompt or prompt exceeds session capacity"
+    );
+    ensure!(
+        ids.iter()
+            .all(|&id| (id as usize) < runtime.vocabulary_size()),
+        "prompt ID outside session vocabulary"
+    );
+    Ok(())
+}
+
+fn admit_prompt(
+    runtime: &impl Runtime,
+    prompt: RenderedPrompt,
+    requested_new_tokens: usize,
+) -> Result<PromptAdmission> {
+    validate_prompt(runtime, &prompt.token_ids)?;
+    let reserved_attended_tokens = prompt
+        .token_ids
+        .len()
+        .checked_add(requested_new_tokens)
+        .context("prompt plus generation reserve overflows usize")?;
+    ensure!(
+        reserved_attended_tokens <= runtime.context_capacity(),
+        "prompt plus generation reserve exceeds session capacity"
+    );
+    Ok(PromptAdmission {
+        prompt,
+        requested_new_tokens,
+        reserved_attended_tokens,
+        capacity: runtime.context_capacity(),
+    })
+}
+
+fn replace_admitted(
+    runtime: &mut impl Runtime,
+    admission: Result<PromptAdmission>,
+) -> ReplacementOutcome {
+    let admission = match admission {
+        Ok(value) => value,
+        Err(error) => {
+            return ReplacementOutcome::RejectedUnchanged {
+                error: format!("{error:#}"),
+            };
+        }
+    };
+    match runtime.reset() {
+        Ok(()) => ReplacementOutcome::ReadyForAssignment { admission },
+        Err(error) => ReplacementOutcome::ResetFailedTerminal {
+            error: format!("{error:#}"),
+            session_status: runtime.status(),
+            committed_tokens: runtime.committed_ids().len(),
+        },
+    }
+}
+
 fn rejected(runtime: &impl Runtime, error: String) -> TurnOutput {
     TurnOutput {
         emitted_ids: Vec::new(),
@@ -205,16 +339,7 @@ fn run_turn(
     let mut decoded_complete = true;
     let run = (|| -> Result<(StopReason, Option<LimitCause>)> {
         // All prompt IDs, not just the first chunk, before ANY mutation.
-        ensure!(
-            !prompt.is_empty() && prompt.len() <= runtime.context_capacity(),
-            "empty prompt or prompt exceeds session capacity"
-        );
-        ensure!(
-            prompt
-                .iter()
-                .all(|&id| (id as usize) < runtime.vocabulary_size()),
-            "prompt ID outside session vocabulary"
-        );
+        validate_prompt(runtime, prompt)?;
         if max_new == 0 {
             return Ok((StopReason::Budget, Some(LimitCause::TokenBudget)));
         }
