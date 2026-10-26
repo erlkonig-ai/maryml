@@ -164,7 +164,10 @@ fn generation_timing_counts_include_failed_attempts_without_state_changes() {
     use tracing::{Event, Metadata, Subscriber, field::Visit, span::{Attributes, Id, Record}};
 
     #[derive(Clone, Default)]
-    struct Capture(Arc<Mutex<Vec<Vec<(String, String)>>>>);
+    struct Capture {
+        events: Arc<Mutex<Vec<Vec<(String, String)>>>>,
+        spans: Arc<Mutex<Vec<Vec<(String, String)>>>>,
+    }
     #[derive(Default)]
     struct Fields(Vec<(String, String)>);
     impl Visit for Fields {
@@ -174,7 +177,14 @@ fn generation_timing_counts_include_failed_attempts_without_state_changes() {
     }
     impl Subscriber for Capture {
         fn enabled(&self, meta: &Metadata<'_>) -> bool { meta.target() == "mary.nemotron.timing" }
-        fn new_span(&self, _: &Attributes<'_>) -> Id { Id::from_u64(1) }
+        fn new_span(&self, attrs: &Attributes<'_>) -> Id {
+            assert_eq!(attrs.metadata().name(), "native_append");
+            let mut fields = Fields::default();
+            attrs.record(&mut fields);
+            let mut spans = self.spans.lock().unwrap();
+            spans.push(fields.0);
+            Id::from_u64(spans.len() as u64)
+        }
         fn record(&self, _: &Id, _: &Record<'_>) {}
         fn record_follows_from(&self, _: &Id, _: &Id) {}
         fn enter(&self, _: &Id) {}
@@ -182,7 +192,7 @@ fn generation_timing_counts_include_failed_attempts_without_state_changes() {
         fn event(&self, event: &Event<'_>) {
             let mut fields = Fields::default();
             event.record(&mut fields);
-            self.0.lock().unwrap().push(fields.0);
+            self.events.lock().unwrap().push(fields.0);
         }
     }
 
@@ -206,7 +216,25 @@ fn generation_timing_counts_include_failed_attempts_without_state_changes() {
         assert_eq!(observed.session_status, baseline.session_status);
         assert_eq!(on.appends, off.appends);
         assert_eq!(on.resets, off.resets);
-        let events = capture.0.lock().unwrap();
+        let spans = capture.spans.lock().unwrap();
+        assert_eq!(spans.len(), 2, "one span per actual append attempt");
+        for (span, role, before, tokens) in [
+            (
+                &spans[0], "\"prompt\"", if reuse { "2" } else { "0" },
+                if reuse { "1" } else { "3" },
+            ),
+            (&spans[1], "\"generated\"", "3", "1"),
+        ] {
+            let field = |name: &str| {
+                span.iter().find(|(key, _)| key == name).unwrap().1.as_str()
+            };
+            assert_eq!(field("role"), role);
+            assert_eq!(field("committed_before"), before);
+            assert_eq!(field("attempted_tokens"), tokens);
+        }
+        // With prefix reuse both chunks have T=1, but retain distinct roles.
+        // The failed generated append still owns its correctly labelled span.
+        let events = capture.events.lock().unwrap();
         assert_eq!(events.len(), 1, "one aggregate, not per-token events");
         let field = |name: &str| events[0].iter().find(|(key, _)| key == name).unwrap().1.clone();
         assert_eq!(field("phase"), "\"generation\"");

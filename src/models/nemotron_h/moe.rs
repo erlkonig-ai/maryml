@@ -13,6 +13,8 @@
 //! An outer hybrid owner must also discard/reset attention AND Mamba history;
 //! resetting this stateless mixer alone cannot undo another layer's effects.
 
+#[cfg(feature = "nemotron-timing")]
+use super::host_timing::{self, Phase, Timings};
 use crate::{
     models::inkling::{bf16gemm, moegroup},
     nn::{nvfp4_gemm::calibrated_scale, nvfp4_gemv::Nvfp4},
@@ -433,10 +435,48 @@ impl<P: ExpertProvider> Moe<P> {
         x: &CudaTensor,
         observe: &mut impl FnMut(&str, &CudaTensor) -> Result<()>,
     ) -> Result<Output> {
+        self.forward_inner(
+            x,
+            observe,
+            #[cfg(feature = "nemotron-timing")]
+            None,
+        )
+    }
+
+    #[cfg(feature = "nemotron-timing")]
+    pub(super) fn forward_timed(&mut self, x: &CudaTensor, timing: &mut Timings) -> Result<Output> {
+        self.forward_inner(x, &mut |_, _| Ok(()), Some(timing))
+    }
+
+    fn forward_inner(
+        &mut self,
+        x: &CudaTensor,
+        observe: &mut impl FnMut(&str, &CudaTensor) -> Result<()>,
+        #[cfg(feature = "nemotron-timing")] mut timing: Option<&mut Timings>,
+    ) -> Result<Output> {
         let (t, working) = self.preflight(x)?;
         self.poisoned = true;
-        let result = self.run(x, t, working, observe);
+        #[cfg(feature = "nemotron-timing")]
+        let started = host_timing::clock(timing.as_deref());
+        let result = self.run(
+            x,
+            t,
+            working,
+            observe,
+            #[cfg(feature = "nemotron-timing")]
+            timing.as_deref_mut(),
+        );
+        #[cfg(feature = "nemotron-timing")]
+        let fence_started = host_timing::clock(timing.as_deref());
         let completion = fence(&self.client);
+        #[cfg(feature = "nemotron-timing")]
+        host_timing::record(
+            timing.as_deref_mut(),
+            Phase::MixerFence,
+            fence_started,
+            0,
+            completion.is_ok(),
+        );
         if completion.is_ok() {
             self.pending_expert = None;
         }
@@ -444,6 +484,8 @@ impl<P: ExpertProvider> Moe<P> {
         if result.is_ok() {
             self.poisoned = false;
         }
+        #[cfg(feature = "nemotron-timing")]
+        host_timing::record(timing, Phase::Mixer, started, 0, result.is_ok());
         result
     }
 
@@ -453,6 +495,7 @@ impl<P: ExpertProvider> Moe<P> {
         t: usize,
         working: usize,
         observe: &mut impl FnMut(&str, &CudaTensor) -> Result<()>,
+        #[cfg(feature = "nemotron-timing")] mut timing: Option<&mut Timings>,
     ) -> Result<Output> {
         let logits = self.linear(x, &self.router, HIDDEN, EXPERTS);
         let route = self.client.empty(t * ROUTE_WIDTH * 4);
@@ -486,61 +529,142 @@ impl<P: ExpertProvider> Moe<P> {
             if rows.is_empty() {
                 continue;
             }
-            if self.provider.source() != self.source {
-                return Err("MoE selected expert/source binding mismatch".into());
-            }
-            self.pending_expert = Some(self.provider.with_expert(index, |pair| {
-                if pair.index != index {
-                    return Err("MoE selected expert index mismatch".into());
-                }
-                validate_packed(&pair.up, INTERMEDIATE, LATENT)?;
-                validate_packed(&pair.down, LATENT, INTERMEDIATE)?;
-                Ok((
-                    PackedWeight::upload(&pair.up, INTERMEDIATE, LATENT, &self.device)?,
-                    PackedWeight::upload(&pair.down, LATENT, INTERMEDIATE, &self.device)?,
-                ))
-            })?);
-            let (up, down) = self.pending_expert.as_ref().expect("installed before dispatch");
-            let result = (|| {
-                let idx: Vec<i32> = rows.iter().map(|&(token, _)| token as i32).collect();
-                let idx = self.client.create_from_slice(i32::as_bytes(&idx));
-                let gathered = moegroup::gather_grouped_bf16_from_bf16(
-                    &self.client,
-                    &latent.handle,
-                    &idx,
-                    t,
-                    rows.len(),
-                    LATENT,
-                );
-                let gathered = self.tensor(gathered, rows.len(), LATENT, DType::BF16);
-                let high = up.project(&gathered)?;
-                let active = self.relu2(&high);
-                let low = down.project(&active)?;
-                observe(&format!("expert{index}_input"), &gathered)?;
-                observe(&format!("expert{index}_up"), &high)?;
-                observe(&format!("expert{index}_relu2"), &active)?;
-                observe(&format!("expert{index}_down"), &low)?;
-                let len = rows.len() * LATENT;
-                unsafe {
-                    copy_kernel::launch_unchecked::<CudaRuntime>(
+            #[cfg(feature = "nemotron-timing")]
+            let selected_started = host_timing::clock(timing.as_deref());
+            // This immediate closure only collects Result returns for timing;
+            // the existing per-expert and final fences remain on the same paths.
+            let selected_result = (|| -> Result<()> {
+                #[cfg(feature = "nemotron-timing")]
+                let mut lookup = host_timing::Lookup::start(timing.as_deref());
+                let pair = (|| {
+                    if self.provider.source() != self.source {
+                        return Err("MoE selected expert/source binding mismatch".into());
+                    }
+                    self.provider.with_expert(index, |pair| {
+                        #[cfg(feature = "nemotron-timing")]
+                        lookup.entered(timing.as_deref_mut());
+                        #[cfg(feature = "nemotron-timing")]
+                        let started = host_timing::clock(timing.as_deref());
+                        let validation = (|| {
+                            if pair.index != index {
+                                return Err("MoE selected expert index mismatch".into());
+                            }
+                            validate_packed(&pair.up, INTERMEDIATE, LATENT)?;
+                            validate_packed(&pair.down, LATENT, INTERMEDIATE)
+                        })();
+                        #[cfg(feature = "nemotron-timing")]
+                        host_timing::record(
+                            timing.as_deref_mut(),
+                            Phase::Validate,
+                            started,
+                            0,
+                            validation.is_ok(),
+                        );
+                        validation?;
+                        #[cfg(feature = "nemotron-timing")]
+                        let started = host_timing::clock(timing.as_deref());
+                        let up = PackedWeight::upload(&pair.up, INTERMEDIATE, LATENT, &self.device);
+                        #[cfg(feature = "nemotron-timing")]
+                        host_timing::record(
+                            timing.as_deref_mut(),
+                            Phase::Upload,
+                            started,
+                            pair.up.payload.len() - 4,
+                            up.is_ok(),
+                        );
+                        let up = up?;
+                        #[cfg(feature = "nemotron-timing")]
+                        let started = host_timing::clock(timing.as_deref());
+                        let down =
+                            PackedWeight::upload(&pair.down, LATENT, INTERMEDIATE, &self.device);
+                        #[cfg(feature = "nemotron-timing")]
+                        host_timing::record(
+                            timing.as_deref_mut(),
+                            Phase::Upload,
+                            started,
+                            pair.down.payload.len() - 4,
+                            down.is_ok(),
+                        );
+                        Ok((up, down?))
+                    })
+                })();
+                #[cfg(feature = "nemotron-timing")]
+                lookup.returned(timing.as_deref_mut());
+                self.pending_expert = Some(pair?);
+                let (up, down) = self
+                    .pending_expert
+                    .as_ref()
+                    .expect("installed before dispatch");
+                #[cfg(feature = "nemotron-timing")]
+                let enqueue_started = host_timing::clock(timing.as_deref());
+                let result = (|| {
+                    let idx: Vec<i32> = rows.iter().map(|&(token, _)| token as i32).collect();
+                    let idx = self.client.create_from_slice(i32::as_bytes(&idx));
+                    let gathered = moegroup::gather_grouped_bf16_from_bf16(
                         &self.client,
-                        CubeCount::new_1d(len.div_ceil(THREADS as usize) as u32),
-                        CubeDim::new_1d(THREADS),
-                        ArrayArg::from_raw_parts(low.handle.clone(), len),
-                        ArrayArg::from_raw_parts(selected.clone(), t * TOP_K * LATENT),
-                        len,
-                        schedule.offsets[index] * LATENT,
+                        &latent.handle,
+                        &idx,
+                        t,
+                        rows.len(),
+                        LATENT,
                     );
+                    let gathered = self.tensor(gathered, rows.len(), LATENT, DType::BF16);
+                    let high = up.project(&gathered)?;
+                    let active = self.relu2(&high);
+                    let low = down.project(&active)?;
+                    observe(&format!("expert{index}_input"), &gathered)?;
+                    observe(&format!("expert{index}_up"), &high)?;
+                    observe(&format!("expert{index}_relu2"), &active)?;
+                    observe(&format!("expert{index}_down"), &low)?;
+                    let len = rows.len() * LATENT;
+                    unsafe {
+                        copy_kernel::launch_unchecked::<CudaRuntime>(
+                            &self.client,
+                            CubeCount::new_1d(len.div_ceil(THREADS as usize) as u32),
+                            CubeDim::new_1d(THREADS),
+                            ArrayArg::from_raw_parts(low.handle.clone(), len),
+                            ArrayArg::from_raw_parts(selected.clone(), t * TOP_K * LATENT),
+                            len,
+                            schedule.offsets[index] * LATENT,
+                        );
+                    }
+                    Ok(())
+                })();
+                #[cfg(feature = "nemotron-timing")]
+                host_timing::record(
+                    timing.as_deref_mut(),
+                    Phase::Enqueue,
+                    enqueue_started,
+                    0,
+                    result.is_ok(),
+                );
+                // Keep both weight owners alive until their queued work completes,
+                // including setup/observer failures after the first projection.
+                #[cfg(feature = "nemotron-timing")]
+                let fence_started = host_timing::clock(timing.as_deref());
+                let completion = fence(&self.client);
+                #[cfg(feature = "nemotron-timing")]
+                host_timing::record(
+                    timing.as_deref_mut(),
+                    Phase::ExpertFence,
+                    fence_started,
+                    0,
+                    completion.is_ok(),
+                );
+                if completion.is_ok() {
+                    self.pending_expert = None;
                 }
-                Ok(())
+                finish(result, completion)
             })();
-            // Keep both weight owners alive until their queued work completes,
-            // including setup/observer failures after the first projection.
-            let completion = fence(&self.client);
-            if completion.is_ok() {
-                self.pending_expert = None;
-            }
-            finish(result, completion)?;
+            #[cfg(feature = "nemotron-timing")]
+            host_timing::record(
+                timing.as_deref_mut(),
+                Phase::Selected,
+                selected_started,
+                0,
+                selected_result.is_ok(),
+            );
+            selected_result?;
         }
         let weights = self
             .client

@@ -3,6 +3,8 @@ pub mod chat;
 pub mod ingress;
 pub mod mamba2;
 pub mod pile;
+#[cfg(feature = "nemotron-timing")]
+mod host_timing;
 #[cfg(feature = "nemotron-cuda")]
 pub mod fp8;
 #[cfg(feature = "nemotron-cuda")]

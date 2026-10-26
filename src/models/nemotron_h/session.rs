@@ -397,7 +397,19 @@ impl<S: BlobStoreGet> Session<S> {
         self.preflight(ids)?;
         // Poison BEFORE dispatch: even unwinding cannot expose a Ready prefix.
         self.status = Status::Poisoned;
-        let result = self.run(ids);
+        #[cfg(feature = "nemotron-timing")]
+        let mut timing = super::host_timing::start();
+        let result = self.run(
+            ids,
+            #[cfg(feature = "nemotron-timing")]
+            timing.as_mut().map(|(_, timing)| timing),
+        );
+        #[cfg(feature = "nemotron-timing")]
+        if let Some((started, timing)) = timing {
+            timing.emit(
+                started.elapsed(), ids.len(), self.committed.len(), result.is_ok(),
+            );
+        }
         match result {
             Ok(logits) => {
                 for layer in &mut self.layers {
@@ -417,7 +429,11 @@ impl<S: BlobStoreGet> Session<S> {
             }
         }
     }
-    fn run(&mut self, ids: &[u32]) -> Result<Vec<f32>> {
+    fn run(
+        &mut self,
+        ids: &[u32],
+        #[cfg(feature = "nemotron-timing")] mut timing: Option<&mut super::host_timing::Timings>,
+    ) -> Result<Vec<f32>> {
         let t = ids.len();
         let h = self.client.create_from_slice(u32::as_bytes(ids));
         self.pending.push(CudaTensor::new_contiguous(
@@ -445,7 +461,16 @@ impl<S: BlobStoreGet> Session<S> {
             self.pending.push(norm.clone());
             let y = match &mut layer.mixer {
                 Mixer::Attention(a) => a.enqueue(&norm, self.committed.len())?.values,
-                Mixer::Moe(m) => m.forward(&norm)?.values,
+                Mixer::Moe(m) => {
+                    #[cfg(feature = "nemotron-timing")]
+                    let result = match timing.as_deref_mut() {
+                        Some(timing) => m.forward_timed(&norm, timing),
+                        None => m.forward(&norm),
+                    };
+                    #[cfg(not(feature = "nemotron-timing"))]
+                    let result = m.forward(&norm);
+                    result?.values
+                }
                 Mixer::Mamba(m) => {
                     let projected = m.input.project(&norm, self.limits.max_chunk_bytes)?;
                     self.pending.push(projected.clone());
