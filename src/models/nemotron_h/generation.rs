@@ -203,7 +203,18 @@ impl<S: BlobStoreGet> Generator<S> {
         options: TurnOptions,
         mut cancelled: impl FnMut() -> bool,
     ) -> TurnOutput {
-        let prompt = match self.render_prompt(history, options) {
+        #[cfg(feature = "nemotron-timing")]
+        let render_started = tracing::enabled!(target: "mary.nemotron.timing", tracing::Level::INFO)
+            .then(std::time::Instant::now);
+        let rendered = self.render_prompt(history, options);
+        #[cfg(feature = "nemotron-timing")]
+        if let Some(started) = render_started {
+            tracing::info!(target: "mary.nemotron.timing", phase = "render",
+                wall_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                ok = rendered.is_ok(),
+                prompt_tokens = rendered.as_ref().map_or(0, |p| p.token_ids.len()));
+        }
+        let prompt = match rendered {
             Ok(prompt) => prompt,
             Err(error) => return rejected(&self.session, format!("render: {error:#}")),
         };
@@ -368,6 +379,8 @@ fn run_turn(
     cancelled: &mut impl FnMut() -> bool,
     mut decoder: impl Decoder,
 ) -> TurnOutput {
+    #[cfg(feature = "nemotron-timing")]
+    let mut timing = TurnTiming::start(runtime.committed_ids().len());
     let mut emitted = Vec::new();
     let mut partial = PartialOutput::default();
     let mut decoded_complete = true;
@@ -383,17 +396,33 @@ fn run_turn(
         let reuse =
             runtime.status() == Status::Ready && prompt.starts_with(runtime.committed_ids());
         if !reuse {
-            runtime.reset().context("reset before prefix replacement")?;
+            #[cfg(feature = "nemotron-timing")]
+            let started = timing.as_ref().map(|_| std::time::Instant::now());
+            let reset = runtime.reset();
+            #[cfg(feature = "nemotron-timing")]
+            if let (Some(timing), Some(started)) = (&mut timing, started) {
+                timing.reset.record(started.elapsed(), 0, reset.is_ok());
+            }
+            reset.context("reset before prefix replacement")?;
         }
         let mut from = runtime.committed_ids().len();
+        #[cfg(feature = "nemotron-timing")]
+        if let Some(timing) = &mut timing {
+            timing.reused_tokens = from;
+        }
         while from < prompt.len() {
             if cancelled() {
                 return Ok((StopReason::Cancelled, None));
             }
             let end = from.saturating_add(MAX_CHUNK).min(prompt.len());
-            runtime
-                .append(&prompt[from..end])
-                .context("prompt append")?;
+            #[cfg(feature = "nemotron-timing")]
+            let started = timing.as_ref().map(|_| std::time::Instant::now());
+            let append = runtime.append(&prompt[from..end]);
+            #[cfg(feature = "nemotron-timing")]
+            if let (Some(timing), Some(started)) = (&mut timing, started) {
+                timing.prompt.record(started.elapsed(), end - from, append.is_ok());
+            }
+            append.context("prompt append")?;
             from = end;
             if cancelled() {
                 return Ok((StopReason::Cancelled, None));
@@ -440,7 +469,14 @@ fn run_turn(
             }
             // Only request a successor when another emission is allowed. A
             // failed append retains the emitted ID and Session's actual status.
-            runtime.append(&[id]).context("generated-token append")?;
+            #[cfg(feature = "nemotron-timing")]
+            let started = timing.as_ref().map(|_| std::time::Instant::now());
+            let append = runtime.append(&[id]);
+            #[cfg(feature = "nemotron-timing")]
+            if let (Some(timing), Some(started)) = (&mut timing, started) {
+                timing.generated.record(started.elapsed(), 1, append.is_ok());
+            }
+            append.context("generated-token append")?;
         }
     })();
     let (stop, mut limit) = match run {
@@ -487,6 +523,11 @@ fn run_turn(
     if !matches!(completion.stop, StopReason::Budget) {
         limit = None;
     }
+    #[cfg(feature = "nemotron-timing")]
+    if let Some(timing) = timing {
+        timing.emit(prompt.len(), emitted.len(), runtime.committed_ids().len(),
+            matches!(completion.stop, StopReason::Error(_)));
+    }
     TurnOutput {
         emitted_ids: emitted,
         completion,
@@ -494,6 +535,72 @@ fn run_turn(
         limit,
         committed_tokens: runtime.committed_ids().len(),
         session_status: runtime.status(),
+    }
+}
+
+// Ephemeral counters for this one call, not another trace/history model. Timers
+// wrap the existing synchronous returns, including their fences, reads, uploads
+// and possible first-use compilation. They are NOT GPU execution durations.
+// No feature or no interested subscriber => no Instant reads, no extra fences.
+#[cfg(feature = "nemotron-timing")]
+#[derive(Default)]
+struct CallTiming {
+    wall_ns: u64,
+    calls: usize,
+    completed_calls: usize,
+    attempted_tokens: usize,
+    completed_tokens: usize,
+}
+
+#[cfg(feature = "nemotron-timing")]
+impl CallTiming {
+    fn record(&mut self, elapsed: std::time::Duration, tokens: usize, ok: bool) {
+        self.wall_ns = self.wall_ns.saturating_add(elapsed.as_nanos().min(u64::MAX as u128) as u64);
+        self.calls = self.calls.saturating_add(1);
+        self.attempted_tokens = self.attempted_tokens.saturating_add(tokens);
+        if ok {
+            self.completed_calls = self.completed_calls.saturating_add(1);
+            self.completed_tokens = self.completed_tokens.saturating_add(tokens);
+        }
+    }
+}
+
+#[cfg(feature = "nemotron-timing")]
+struct TurnTiming {
+    started: std::time::Instant,
+    committed_before: usize,
+    reused_tokens: usize,
+    reset: CallTiming,
+    prompt: CallTiming,
+    generated: CallTiming,
+}
+
+#[cfg(feature = "nemotron-timing")]
+impl TurnTiming {
+    fn start(committed_before: usize) -> Option<Self> {
+        tracing::enabled!(target: "mary.nemotron.timing", tracing::Level::INFO).then(|| Self {
+            started: std::time::Instant::now(), committed_before, reused_tokens: 0,
+            reset: CallTiming::default(), prompt: CallTiming::default(),
+            generated: CallTiming::default(),
+        })
+    }
+
+    fn emit(self, prompt_tokens: usize, emitted_tokens: usize, attended_tokens: usize, error: bool) {
+        tracing::info!(target: "mary.nemotron.timing", phase = "generation",
+            wall_ns = self.started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+            committed_before = self.committed_before, reused_tokens = self.reused_tokens,
+            prompt_tokens, emitted_tokens, attended_tokens, error,
+            reset_ns = self.reset.wall_ns, reset_calls = self.reset.calls,
+            reset_completed = self.reset.completed_calls,
+            prompt_append_ns = self.prompt.wall_ns, prompt_append_calls = self.prompt.calls,
+            prompt_append_completed = self.prompt.completed_calls,
+            prompt_attempted_tokens = self.prompt.attempted_tokens,
+            prompt_attended_tokens = self.prompt.completed_tokens,
+            generated_append_ns = self.generated.wall_ns,
+            generated_append_calls = self.generated.calls,
+            generated_append_completed = self.generated.completed_calls,
+            generated_attempted_tokens = self.generated.attempted_tokens,
+            generated_attended_tokens = self.generated.completed_tokens);
     }
 }
 

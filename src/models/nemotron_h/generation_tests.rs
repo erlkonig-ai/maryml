@@ -155,6 +155,77 @@ fn errored(out: &TurnOutput, needle: &str) {
     assert!(out.completion.proposal.is_none());
 }
 
+// Observe the actual production loop event without a subscriber dependency or
+// a CPU model. These remain scripted state/control-flow witnesses, not kernels.
+#[cfg(feature = "nemotron-timing")]
+#[test]
+fn generation_timing_counts_include_failed_attempts_without_state_changes() {
+    use std::sync::{Arc, Mutex};
+    use tracing::{Event, Metadata, Subscriber, field::Visit, span::{Attributes, Id, Record}};
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<Vec<(String, String)>>>>);
+    #[derive(Default)]
+    struct Fields(Vec<(String, String)>);
+    impl Visit for Fields {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.push((field.name().into(), format!("{value:?}")));
+        }
+    }
+    impl Subscriber for Capture {
+        fn enabled(&self, meta: &Metadata<'_>) -> bool { meta.target() == "mary.nemotron.timing" }
+        fn new_span(&self, _: &Attributes<'_>) -> Id { Id::from_u64(1) }
+        fn record(&self, _: &Id, _: &Record<'_>) {}
+        fn record_follows_from(&self, _: &Id, _: &Id) {}
+        fn enter(&self, _: &Id) {}
+        fn exit(&self, _: &Id) {}
+        fn event(&self, event: &Event<'_>) {
+            let mut fields = Fields::default();
+            event.record(&mut fields);
+            self.0.lock().unwrap().push(fields.0);
+        }
+    }
+
+    for (fail, reuse) in [(false, false), (true, false), (false, true)] {
+        let make = || {
+            let mut script = Script::new(&[5, 11]);
+            script.committed = if reuse { vec![1, 3] } else { vec![9] };
+            script.fail_append = fail.then_some(2);
+            script
+        };
+        let mut off = make();
+        let baseline = tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(),
+            || run(&mut off, &[1, 3, 4], 2, DecodeScript::default()));
+        let mut on = make();
+        let capture = Capture::default();
+        let observed = tracing::subscriber::with_default(capture.clone(),
+            || run(&mut on, &[1, 3, 4], 2, DecodeScript::default()));
+        assert_eq!(observed.emitted_ids, baseline.emitted_ids);
+        assert_eq!(observed.completion.stop, baseline.completion.stop);
+        assert_eq!(observed.committed_tokens, baseline.committed_tokens);
+        assert_eq!(observed.session_status, baseline.session_status);
+        assert_eq!(on.appends, off.appends);
+        assert_eq!(on.resets, off.resets);
+        let events = capture.0.lock().unwrap();
+        assert_eq!(events.len(), 1, "one aggregate, not per-token events");
+        let field = |name: &str| events[0].iter().find(|(key, _)| key == name).unwrap().1.clone();
+        assert_eq!(field("phase"), "\"generation\"");
+        for (name, value) in [("reset_calls", if reuse { "0" } else { "1" }),
+            ("reset_completed", if reuse { "0" } else { "1" }),
+            ("committed_before", if reuse { "2" } else { "1" }),
+            ("reused_tokens", if reuse { "2" } else { "0" }), ("prompt_tokens", "3"),
+            ("prompt_append_calls", "1"), ("prompt_attended_tokens", if reuse { "1" } else { "3" }),
+            ("generated_append_calls", "1"), ("generated_attempted_tokens", "1")] {
+            assert_eq!(field(name), value, "{name}");
+        }
+        assert_eq!(field("generated_attended_tokens"), if fail { "0" } else { "1" });
+        assert_eq!(field("emitted_tokens"), if fail { "1" } else { "2" });
+        assert_eq!(field("attended_tokens"), if fail { "3" } else { "4" });
+        // The synthetic error message and emitted/raw text never enter timing.
+        assert!(!format!("{events:?}").contains("scripted"));
+    }
+}
+
 #[test]
 fn generation_eos_is_retained_at_budget_boundary_not_attended() {
     for eos in [2, 11] {
