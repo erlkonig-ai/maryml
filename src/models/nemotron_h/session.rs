@@ -268,8 +268,9 @@ impl<S: BlobStoreGet> Session<S> {
     /// No publication, download or default collection selection. Layer IDs are
     /// explicit opaque choices in ordered config positions. Multiple matches
     /// remain legal. Fixed FP8/aux operands choose the first typed tuple and
-    /// hold its values. NVFP4 uses the minimum opaque joined tuple (and expert
-    /// ID at each requested index), stable on repeated queries of this snapshot.
+    /// hold its values. NVFP4 uses the minimum opaque joined tuple, including
+    /// complete typed expert pairs at each requested index, stable on repeated
+    /// queries of this snapshot.
     /// No full expert catalog is retained.
     pub fn from_snapshot(
         snapshot: Arc<ModelSnapshot<S>>,

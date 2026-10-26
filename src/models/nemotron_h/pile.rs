@@ -137,6 +137,35 @@ pub fn nvfp4_minimum<S: BlobStoreGet>(
     }))
 }
 
+/// Select only complete typed expert pairs at the requested index. A bare or
+/// unsupported expert alternative is a negative match, not a reason to reject
+/// another usable pair. Once a tuple matches, unavailable/invalid blobs remain
+/// errors. One joined tuple is read; no expert-bank catalogue is materialized.
+pub fn nvfp4_expert_minimum<S: BlobStoreGet>(
+    snapshot: &ModelSnapshot<S>, layer: Id, index: u64,
+) -> Option<Result<(Id, Nvfp4Projection, Nvfp4Projection)>> {
+    find!((expert: Id,
+    up: Id, uw: Inline<inlineencodings::Handle<Tensor<NVFP4, 2>>>, ui: Inline<inlineencodings::Handle<Tensor<F32, 0>>>,
+    down: Id, dw: Inline<inlineencodings::Handle<Tensor<NVFP4, 2>>>, di: Inline<inlineencodings::Handle<Tensor<F32, 0>>>),
+    pattern!(snapshot.facts(), [
+        { layer @ attrs::member: ?expert },
+        { ?expert @ attrs::kind: EXPERT, attrs::index: index, attrs::member: ?up, attrs::member: ?down },
+        { ?up @ attrs::kind: "moe.up_proj", attrs::weight: _?up_weight, attrs::member: _?up_input },
+        { _?up_weight @ leaf::leaf::<NVFP4, 2>(): ?uw },
+        { _?up_input @ attrs::kind: INPUT_SCALE, attrs::weight: _?ui_leaf },
+        { _?ui_leaf @ leaf::leaf::<F32, 0>(): ?ui },
+        { ?down @ attrs::kind: "moe.down_proj", attrs::weight: _?down_weight, attrs::member: _?down_input },
+        { _?down_weight @ leaf::leaf::<NVFP4, 2>(): ?dw },
+        { _?down_input @ attrs::kind: INPUT_SCALE, attrs::weight: _?di_leaf },
+        { _?di_leaf @ leaf::leaf::<F32, 0>(): ?di }
+    ]))
+    .min()
+    .map(|(expert, up, uw, ui, down, dw, di)| Ok((expert,
+        Nvfp4Projection { operation: up, weight: read(snapshot.store(), uw)?, input_scale: read(snapshot.store(), ui)? },
+        Nvfp4Projection { operation: down, weight: read(snapshot.store(), dw)?, input_scale: read(snapshot.store(), di)? },
+    )))
+}
+
 pub fn fp8<'a, S: BlobStoreGet>(
     snapshot: &'a ModelSnapshot<S>,
     parent: Id,

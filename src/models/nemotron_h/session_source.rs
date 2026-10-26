@@ -20,15 +20,14 @@ impl<S: BlobStoreGet> moe::ExpertProvider for NativeExperts<S> {
         index: usize,
         use_pair: impl FnOnce(moe::ExpertPair<'_>) -> Result<T>,
     ) -> Result<T> {
-        // Minimum opaque expert ID / operation tuple in this observation.
-        // Deterministic repeated choice without retaining a lookup catalogue.
-        // No closed-world cardinality check, synthesized lookup ID, all-expert
-        // scan or cache.
-        let expert = pile::experts(&self.snapshot, self.source.layer, index as u64)
-            .min()
-            .ok_or_else(|| format!("missing native expert {index}"))?;
-        let up = packed(&self.snapshot, expert, "moe.up_proj", [2688, 1024])?;
-        let down = packed(&self.snapshot, expert, "moe.down_proj", [1024, 2688])?;
+        // Choose only among complete typed expert/up/down/scale tuples. Missing
+        // typed facts are negative matches; a selected missing blob is an error.
+        let (_, up, down) =
+            pile::nvfp4_expert_minimum(&self.snapshot, self.source.layer, index as u64)
+                .ok_or_else(|| format!("missing complete native expert {index}"))?
+                .map_err(|e| e.to_string())?;
+        shape(&up.weight, &[2688, 1024], "moe.up_proj")?;
+        shape(&down.weight, &[1024, 2688], "moe.down_proj")?;
         use_pair(moe::ExpertPair {
             index,
             up: packed_op(&up)?,

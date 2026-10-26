@@ -19,7 +19,7 @@ use triblespace::core::{
 };
 
 fn configuration() -> Value {
-    json!({
+    serde_json::from_str(r#"{
         "model_type":"nemotron_h","layers_block_type":["mamba","attention","moe"],
         "hidden_size":4096,"vocab_size":32,"max_position_embeddings":8,"layer_norm_epsilon":0.00001,
         "residual_in_fp32":false,"rescale_prenorm_residual":true,"tie_word_embeddings":false,
@@ -33,7 +33,7 @@ fn configuration() -> Value {
         "moe_shared_expert_intermediate_size":5376,"moe_shared_expert_overlap":false,
         "n_routed_experts":512,"n_shared_experts":1,"num_experts_per_tok":22,"norm_topk_prob":true,
         "routed_scaling_factor":5.0,"n_group":1,"topk_group":1
-    })
+    }"#).unwrap()
 }
 fn config() -> TextConfig {
     serde_json::from_value(configuration()).unwrap()
@@ -87,6 +87,91 @@ fn session_host_config_rejects_unsupported_policies() {
     assert!(validate_config(&c, limits()).is_err());
     assert!(inject(Some(Fault::Reset), Fault::Reset).is_err());
     assert!(inject(Some(Fault::AfterCommit(1)), Fault::AfterLayer(1)).is_ok());
+}
+
+#[test]
+fn session_host_complete_typed_expert_survives_merged_alternatives() {
+    let mut repo = MemoryRepo::default();
+    let key = SigningKey::generate(&mut rand::rngs::OsRng);
+    let policy = CollectionPolicy::new(
+        AdmissionPolicy::direct(key.verifying_key()),
+        AdmissionPolicy::direct(key.verifying_key()),
+    );
+    let collection: model_collection::ModelCollection = repo
+        .collection("merged-expert-alternatives", policy)
+        .unwrap();
+    let mut ids = [genid(), genid(), genid()];
+    ids.sort_by_key(|id| **id);
+    let layer = genid();
+    let up = packed(&mut repo, "moe.up_proj", 2688, 1024);
+    let down = packed(&mut repo, "moe.down_proj", 1024, 2688);
+    let up_id = up.root().unwrap();
+    let down_id = down.root().unwrap();
+    let complete = up + down;
+    let good =
+        entity! {&ids[2] @ attrs::kind:pile::EXPERT,attrs::index:7u64,attrs::member*:complete};
+    let good = entity! {&layer @ attrs::member*:good};
+    repo.commit(collection, &key, good).unwrap();
+    // Later independent facts add smaller same-index alternatives: one bare,
+    // one with the right semantic roles but unsupported BF16 weight encoding.
+    let bare = entity! {&ids[0] @ attrs::kind:pile::EXPERT,attrs::index:7u64};
+    let unsupported = operation::<BF16, 2>(&mut repo, "moe.up_proj", [1, 1], bf(1.0, 1))
+        + operation::<BF16, 2>(&mut repo, "moe.down_proj", [1, 1], bf(1.0, 1));
+    let unsupported =
+        entity! {&ids[1] @ attrs::kind:pile::EXPERT,attrs::index:7u64,attrs::member*:unsupported};
+    let alternatives = bare + unsupported;
+    repo.commit(
+        collection,
+        &key,
+        entity! {&layer @ attrs::member*:alternatives},
+    )
+    .unwrap();
+    let snapshot =
+        model_collection::snapshot_model_collection_for(&repo.snapshot().unwrap(), collection)
+            .unwrap();
+    assert_eq!(pile::experts(&snapshot, *layer, 7).min(), Some(*ids[0]));
+    let (expert, up, down) = pile::nvfp4_expert_minimum(&snapshot, *layer, 7)
+        .unwrap()
+        .unwrap();
+    assert_eq!(expert, *ids[2]);
+    assert_eq!((up.operation, down.operation), (up_id, down_id));
+    assert_eq!(up.weight.dims(), &[2688, 1024]);
+    assert_eq!(down.weight.dims(), &[1024, 2688]);
+    assert!(pile::nvfp4_expert_minimum(&snapshot, *layer, 8).is_none());
+
+    // A fully typed selected tuple whose blob is absent must still report an
+    // error. It must not silently fall through to a different observation.
+    let missing = leaf::leaf_blob::<NVFP4, 2>(
+        [8, 16],
+        Bytes::from_source({
+            let mut data = vec![0u8; 64];
+            data.extend(vec![0x38; 8]);
+            data.extend(1.0f32.to_le_bytes());
+            data
+        }),
+    )
+    .unwrap();
+    let w = entity! {leaf::leaf::<NVFP4,2>():missing.get_handle()};
+    let scale = operation::<F32, 0>(
+        &mut repo,
+        native::INPUT_SCALE,
+        [],
+        1.0f32.to_le_bytes().to_vec(),
+    );
+    let bad_up = entity! {attrs::kind:"moe.up_proj",attrs::weight*:w,attrs::member*:scale};
+    let bad_down = packed(&mut repo, "moe.down_proj", 8, 16);
+    let pair = bad_up + bad_down;
+    let expert = entity! {attrs::kind:pile::EXPERT,attrs::index:8u64,attrs::member*:pair};
+    repo.commit(collection, &key, entity! {&layer @ attrs::member*:expert})
+        .unwrap();
+    let snapshot =
+        model_collection::snapshot_model_collection_for(&repo.snapshot().unwrap(), collection)
+            .unwrap();
+    assert!(
+        pile::nvfp4_expert_minimum(&snapshot, *layer, 8)
+            .unwrap()
+            .is_err()
+    );
 }
 
 fn tensor<T: TensorElement, const R: usize>(
