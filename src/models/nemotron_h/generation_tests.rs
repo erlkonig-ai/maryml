@@ -90,6 +90,8 @@ struct DecodeScript {
     ids: Vec<u32>,
     fail_push: Option<usize>,
     fail_finish: bool,
+    protocol_push: Option<usize>,
+    protocol_finish: bool,
     cancel_on_push: Option<Rc<Cell<bool>>>,
 }
 impl DecodeScript {
@@ -101,6 +103,10 @@ impl DecodeScript {
                 .map(u32::to_string)
                 .collect::<Vec<_>>()
                 .join(","),
+            protocol_error: self
+                .protocol_push
+                .filter(|&at| self.ids.len() >= at)
+                .map(|_| "scripted malformed push".into()),
             ..PartialOutput::default()
         }
     }
@@ -119,10 +125,14 @@ impl Decoder for DecodeScript {
     }
     fn finish(self, stop: StopReason) -> Result<Completion> {
         ensure!(!self.fail_finish, "scripted finish failure");
+        let mut partial = self.partial();
+        if self.protocol_finish {
+            partial.protocol_error = Some("scripted malformed finish".into());
+        }
         // Deliberately offer on every stop to check the owner's unconditional
         // suppression. This is not OutputParser grammar behavior.
         Ok(Completion {
-            partial: self.partial(),
+            partial,
             stop,
             proposal: Some(ExecProposal {
                 command: "mock, never executed".into(),
@@ -313,6 +323,62 @@ fn generation_finish_failure_does_not_mask_runtime_failure() {
     assert_eq!(out.emitted_ids, [5]);
     assert_eq!(out.completion.partial.raw_text, "5");
     assert!(!out.decoded_complete);
+}
+
+#[test]
+fn generation_push_protocol_error_retains_newest_decoded_partial() {
+    let mut s = Script::new(&[5, 6]);
+    let decoder = DecodeScript {
+        protocol_push: Some(2),
+        ..Default::default()
+    };
+    let out = run(&mut s, &[1], 3, decoder);
+    errored(&out, "malformed push");
+    assert_eq!(out.emitted_ids, [5, 6]);
+    assert_eq!(out.completion.partial.raw_text, "5,6");
+    assert_eq!(
+        out.completion.partial.protocol_error.as_deref(),
+        Some("scripted malformed push")
+    );
+    assert!(out.decoded_complete);
+    assert_eq!(s.committed, [1, 5]);
+}
+
+#[test]
+fn generation_finish_protocol_error_keeps_decoded_eos_and_suppresses_proposal() {
+    let mut s = Script::new(&[2]);
+    let decoder = DecodeScript {
+        protocol_finish: true,
+        ..Default::default()
+    };
+    let out = run(&mut s, &[1], 1, decoder);
+    errored(&out, "malformed finish");
+    assert_eq!(out.emitted_ids, [2]);
+    assert_eq!(out.completion.partial.raw_text, "2");
+    assert_eq!(
+        out.completion.partial.protocol_error.as_deref(),
+        Some("scripted malformed finish")
+    );
+    assert!(out.decoded_complete && out.limit.is_none());
+    assert_eq!(s.committed, [1]);
+}
+
+#[test]
+fn generation_finish_protocol_error_preserves_original_runtime_failure() {
+    let mut s = Script::new(&[5]);
+    s.fail_append = Some(2);
+    let decoder = DecodeScript {
+        protocol_finish: true,
+        ..Default::default()
+    };
+    let out = run(&mut s, &[1], 3, decoder);
+    errored(&out, "append failure");
+    errored(&out, "malformed finish");
+    assert_eq!(out.emitted_ids, [5]);
+    assert_eq!(out.completion.partial.raw_text, "5");
+    assert!(out.completion.partial.protocol_error.is_some());
+    assert!(out.decoded_complete);
+    assert_eq!(out.session_status, Status::Poisoned);
 }
 
 #[test]

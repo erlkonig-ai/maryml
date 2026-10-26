@@ -11,3 +11,5 @@ pub mod attention;
 pub mod moe;
 #[cfg(feature = "nemotron-cuda")]
 pub mod session;
+#[cfg(all(feature = "nemotron-cuda", feature = "tokenizer"))]
+pub mod generation;

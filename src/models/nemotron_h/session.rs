@@ -290,6 +290,12 @@ impl<S: BlobStoreGet> Session<S> {
     pub fn status(&self) -> Status {
         self.status
     }
+    pub fn capacity(&self) -> usize {
+        self.limits.capacity
+    }
+    pub fn vocab_size(&self) -> usize {
+        self.config.vocab_size
+    }
     /// While poisoned these IDs are diagnostic metadata, NOT a reusable cache.
     pub fn committed_ids(&self) -> &[u32] {
         &self.committed

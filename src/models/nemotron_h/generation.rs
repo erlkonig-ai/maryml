@@ -6,9 +6,8 @@
 //! is cooperative at completed chunk boundaries, never a GPU interrupt/drain.
 //! No executor, sampling policy switch, history truncation or implicit token mask.
 //!
-//! Integration requires `session::{capacity, vocab_size}` read-only getters
-//! and a module declaration gated by BOTH nemotron-cuda and tokenizer. This
-//! source-only leaf deliberately does not modify those author-owned files.
+//! Available with BOTH nemotron-cuda and tokenizer. Runtime failures preserve
+//! the Session's actual state; a failed synchronization is not a drainage claim.
 
 use super::{
     chat::{
@@ -44,6 +43,8 @@ pub struct TurnOutput {
     /// The returned partial covers all emitted IDs. This does NOT promise
     /// lossless UTF-8 display: the codec can display an incomplete byte sequence
     /// as U+FFFD. A decoder error keeps the last valid partial and sets false.
+    /// Successfully decoded malformed protocol stays complete, with its error
+    /// in the partial and an Error stop; no proposal is returned.
     pub decoded_complete: bool,
     /// Budget distinguishes the requested emission bound from context exhaustion.
     pub limit: Option<LimitCause>,
@@ -169,18 +170,10 @@ impl Decoder for OutputParser<'_> {
             OutputParser::push(self, &[id]),
             "parser emission bound exceeded"
         );
-        let partial = self.snapshot()?;
-        if let Some(error) = &partial.protocol_error {
-            anyhow::bail!("output protocol: {error}");
-        }
-        Ok(partial)
+        self.snapshot()
     }
     fn finish(self, stop: StopReason) -> Result<Completion> {
-        let completion = OutputParser::finish(self, stop)?;
-        if let Some(error) = &completion.partial.protocol_error {
-            anyhow::bail!("output protocol: {error}");
-        }
-        Ok(completion)
+        OutputParser::finish(self, stop)
     }
 }
 
@@ -270,6 +263,9 @@ fn run_turn(
                     return Err(error.context("decode emission"));
                 }
             };
+            if let Some(error) = &partial.protocol_error {
+                anyhow::bail!("output protocol: {error}");
+            }
             // EOS at the last emission slot is EOS, not Budget. No EOS feedback.
             if matches!(id, 2 | 11) {
                 return Ok((StopReason::Eos { id }, None));
@@ -299,7 +295,21 @@ fn run_turn(
     };
     let mut completion = if decoded_complete {
         match decoder.finish(stop.clone()) {
-            Ok(value) => value,
+            Ok(mut value) => {
+                if let Some(error) = &value.partial.protocol_error {
+                    // Grammar failure is NOT text-decoding failure. Preserve
+                    // this newest partial and any original runtime error.
+                    let message = match &stop {
+                        StopReason::Error(original) => {
+                            format!("{original}; output protocol: {error}")
+                        }
+                        _ => format!("output protocol: {error}"),
+                    };
+                    value.stop = StopReason::Error(message);
+                    value.proposal = None;
+                }
+                value
+            }
             Err(error) => {
                 decoded_complete = false;
                 let message = match stop {
