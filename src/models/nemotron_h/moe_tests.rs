@@ -437,12 +437,12 @@ impl ExpertProvider for TestProvider {
     fn source(&self) -> SourceBinding {
         self.binding
     }
-    fn expert(&self, index: usize) -> Result<ExpertPair<'_>> {
+    fn with_expert<T>(&self, index: usize, use_pair: impl FnOnce(ExpertPair<'_>) -> Result<T>) -> Result<T> {
         self.calls.set(self.calls.get() + 1);
         if self.fail.get() == Some(index) {
             return Err("injected expert lookup failure".into());
         }
-        Ok(ExpertPair {
+        use_pair(ExpertPair {
             index,
             up: PackedOperation {
                 operation: self.operations[index][0],

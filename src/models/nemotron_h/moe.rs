@@ -77,7 +77,13 @@ pub struct ExpertPair<'a> {
 /// No provider replacement or runtime source rebinding is exposed by Moe.
 pub trait ExpertProvider {
     fn source(&self) -> SourceBinding;
-    fn expert(&self, index: usize) -> Result<ExpertPair<'_>>;
+    /// The selected views need only live for this callback. A native provider
+    /// can query one immutable snapshot here without retaining an expert bank.
+    fn with_expert<T>(
+        &self,
+        index: usize,
+        use_pair: impl FnOnce(ExpertPair<'_>) -> Result<T>,
+    ) -> Result<T>;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -150,6 +156,9 @@ pub struct Moe<P> {
     // errors conservatively require that same explicit acknowledgement even
     // when the attempted final fence succeeded. Cross-layer commit is external.
     poisoned: bool,
+    // Installed BEFORE projection dispatch. A failed sync is not a drain;
+    // retain these operands until a subsequent successful completion/reset.
+    pending_expert: Option<(PackedWeight, PackedWeight)>,
 }
 
 fn bytes(dims: &[usize], width: usize) -> Result<usize> {
@@ -171,7 +180,7 @@ fn packed_bytes(n: usize, k: usize) -> Result<usize> {
         .and_then(|v| v.checked_add(4))
         .ok_or("MoE packed length overflow".into())
 }
-fn admission(limits: Limits) -> Result<Admission> {
+pub(super) fn admission(limits: Limits) -> Result<Admission> {
     let fixed_bytes = bytes(&[EXPERTS, HIDDEN], 2)?
         + bytes(&[EXPERTS], 4)?
         + 2 * bytes(&[HIDDEN, LATENT], 2)?
@@ -218,7 +227,7 @@ fn validate_fixed(w: &FixedOperands<'_>) -> Result<()> {
     validate_packed(&w.shared_down, HIDDEN, SHARED)
 }
 
-fn working_bytes(t: usize) -> Result<usize> {
+pub(super) fn working_bytes(t: usize) -> Result<usize> {
     if !(1..=MAX_CHUNK).contains(&t) {
         return Err("MoE requires B1/T1..256".into());
     }
@@ -308,6 +317,7 @@ impl<P: ExpertProvider> Moe<P> {
             limits,
             admission,
             poisoned: false,
+            pending_expert: None,
         })
     }
     pub fn source(&self) -> SourceBinding {
@@ -331,6 +341,7 @@ impl<P: ExpertProvider> Moe<P> {
     pub fn reset(&mut self) -> Result<()> {
         self.poisoned = true;
         fence(&self.client)?;
+        self.pending_expert = None;
         self.poisoned = false;
         Ok(())
     }
@@ -411,7 +422,7 @@ impl<P: ExpertProvider> Moe<P> {
 
     /// Fully fenced mixer output. Input is immutable. Preflight refusals leave
     /// this owner usable; any later error keeps it poisoned until reset. The
-    /// outer hybrid still owns common attended-count/state commit and rollback.
+    /// outer hybrid owns common attended-count publication, not GPU rollback.
     pub fn forward(&mut self, x: &CudaTensor) -> Result<Output> {
         self.forward_observed(x, &mut |_, _| Ok(()))
     }
@@ -425,7 +436,11 @@ impl<P: ExpertProvider> Moe<P> {
         let (t, working) = self.preflight(x)?;
         self.poisoned = true;
         let result = self.run(x, t, working, observe);
-        let result = finish(result, fence(&self.client));
+        let completion = fence(&self.client);
+        if completion.is_ok() {
+            self.pending_expert = None;
+        }
+        let result = finish(result, completion);
         if result.is_ok() {
             self.poisoned = false;
         }
@@ -433,7 +448,7 @@ impl<P: ExpertProvider> Moe<P> {
     }
 
     fn run(
-        &self,
+        &mut self,
         x: &CudaTensor,
         t: usize,
         working: usize,
@@ -471,14 +486,21 @@ impl<P: ExpertProvider> Moe<P> {
             if rows.is_empty() {
                 continue;
             }
-            let pair = self.provider.expert(index)?;
-            if pair.index != index || self.provider.source() != self.source {
+            if self.provider.source() != self.source {
                 return Err("MoE selected expert/source binding mismatch".into());
             }
-            validate_packed(&pair.up, INTERMEDIATE, LATENT)?;
-            validate_packed(&pair.down, LATENT, INTERMEDIATE)?;
-            let up = PackedWeight::upload(&pair.up, INTERMEDIATE, LATENT, &self.device)?;
-            let down = PackedWeight::upload(&pair.down, LATENT, INTERMEDIATE, &self.device)?;
+            self.pending_expert = Some(self.provider.with_expert(index, |pair| {
+                if pair.index != index {
+                    return Err("MoE selected expert index mismatch".into());
+                }
+                validate_packed(&pair.up, INTERMEDIATE, LATENT)?;
+                validate_packed(&pair.down, LATENT, INTERMEDIATE)?;
+                Ok((
+                    PackedWeight::upload(&pair.up, INTERMEDIATE, LATENT, &self.device)?,
+                    PackedWeight::upload(&pair.down, LATENT, INTERMEDIATE, &self.device)?,
+                ))
+            })?);
+            let (up, down) = self.pending_expert.as_ref().expect("installed before dispatch");
             let result = (|| {
                 let idx: Vec<i32> = rows.iter().map(|&(token, _)| token as i32).collect();
                 let idx = self.client.create_from_slice(i32::as_bytes(&idx));
@@ -514,7 +536,11 @@ impl<P: ExpertProvider> Moe<P> {
             })();
             // Keep both weight owners alive until their queued work completes,
             // including setup/observer failures after the first projection.
-            finish(result, fence(&self.client))?;
+            let completion = fence(&self.client);
+            if completion.is_ok() {
+                self.pending_expert = None;
+            }
+            finish(result, completion)?;
         }
         let weights = self
             .client

@@ -115,6 +115,28 @@ pub fn nvfp4<'a, S: BlobStoreGet>(
     })
 }
 
+/// A named reader policy for repeated on-demand execution: the least opaque
+/// (operation, weight handle, input-scale handle) tuple in this observation.
+/// Select BEFORE loading payloads. This is not validation of ID derivation,
+/// a singleton constraint or a claim that one alternative is more authoritative.
+pub fn nvfp4_minimum<S: BlobStoreGet>(
+    snapshot: &ModelSnapshot<S>, parent: Id, kind: &str,
+) -> Option<Result<Nvfp4Projection>> {
+    find!((op: Id, w: Inline<inlineencodings::Handle<Tensor<NVFP4, 2>>>,
+    input: Inline<inlineencodings::Handle<Tensor<F32, 0>>>),
+    pattern!(snapshot.facts(), [
+        { parent @ attrs::member: ?op },
+        { ?op @ attrs::kind: kind, attrs::weight: _?weight, attrs::member: _?input },
+        { _?weight @ leaf::leaf::<NVFP4, 2>(): ?w },
+        { _?input @ attrs::kind: INPUT_SCALE, attrs::weight: _?input_leaf },
+        { _?input_leaf @ leaf::leaf::<F32, 0>(): ?input }
+    ]))
+    .min()
+    .map(|(operation, w, input)| Ok(Nvfp4Projection {
+        operation, weight: read(snapshot.store(), w)?, input_scale: read(snapshot.store(), input)?,
+    }))
+}
+
 pub fn fp8<'a, S: BlobStoreGet>(
     snapshot: &'a ModelSnapshot<S>,
     parent: Id,
@@ -149,10 +171,20 @@ pub fn auxiliary<'a, T: TensorElement, const R: usize, S: BlobStoreGet>(
     parent: Id,
     kind: &'a str,
 ) -> impl Iterator<Item = Result<TensorView>> + 'a {
-    find!(w: Inline<inlineencodings::Handle<Tensor<T, R>>>, pattern!(snapshot.facts(), [
-        { parent @ attrs::member: _?op },
-        { _?op @ attrs::kind: kind, attrs::weight: _?leaf },
+    auxiliary_operations::<T, R, S>(snapshot, parent, kind)
+        .map(|selected| selected.map(|(_, view)| view))
+}
+
+/// Same typed alternatives, retaining the selected opaque operation identity.
+pub fn auxiliary_operations<'a, T: TensorElement, const R: usize, S: BlobStoreGet>(
+    snapshot: &'a ModelSnapshot<S>,
+    parent: Id,
+    kind: &'a str,
+) -> impl Iterator<Item = Result<(Id, TensorView)>> + 'a {
+    find!((op: Id, w: Inline<inlineencodings::Handle<Tensor<T, R>>>), pattern!(snapshot.facts(), [
+        { parent @ attrs::member: ?op },
+        { ?op @ attrs::kind: kind, attrs::weight: _?leaf },
         { _?leaf @ leaf::leaf::<T, R>(): ?w }
     ]))
-    .map(move |w| read(snapshot.store(), w))
+    .map(move |(op, w)| Ok((op, read(snapshot.store(), w)?)))
 }

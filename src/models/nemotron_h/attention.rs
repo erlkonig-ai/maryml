@@ -158,7 +158,7 @@ fn checked_elements(dims: &[usize], bytes: usize) -> Result<usize> {
     Ok(n)
 }
 
-fn admission(limits: Limits) -> Result<Admission> {
+pub(super) fn admission(limits: Limits) -> Result<Admission> {
     if limits.capacity == 0 || limits.capacity > limits.context_limit {
         return Err("attention capacity must be positive and within explicit context limit".into());
     }
@@ -256,6 +256,9 @@ fn validate_operations(operations: &[Operation<'_>; 4]) -> Result<()> {
 }
 
 impl Attention {
+    pub(super) fn planned_working_bytes(start: usize, tokens: usize, limits: Limits) -> Result<usize> {
+        Ok(plan(start, tokens, limits)?.working_bytes)
+    }
     /// Upload each operation once onto ONE client/device and reserve KV once.
     /// All host geometry, scale and aggregate resident checks precede device
     /// allocation. Source finite-value semantics remain the loader's contract;
