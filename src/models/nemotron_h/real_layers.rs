@@ -121,7 +121,7 @@ fn import_actual_components() -> AnyResult<()> {
         native_pile::auxiliary::<BF16,1,_>(&snapshot,layer,"norm").next().context("reopened norm")??;
     }
     json_write(&out.join("import.json"),&json!({"root":format!("{root:X}"),
-        "collection":format!("{:X}",collection.handle()),"support":snapshot.support().len(),
+        "collection":collection.handle().raw.iter().map(|b|format!("{b:02x}")).collect::<String>(),"support":snapshot.support().len(),
         "kind":"component fixture, NOT a complete model","records":records,
         "source_revision":"da5b2650a835292c678994a1fa3fb653250fb508",
         "source_bytes":145366832,"pile_bytes":fs::metadata(path)?.len(),
@@ -134,24 +134,24 @@ fn import_actual_components() -> AnyResult<()> {
 fn outer_norm(x:&Array<bf16>,gain:&Array<bf16>,out:&mut Array<bf16>) {
     let row=CUBE_POS_X as usize;
     let lane=UNIT_POS_X as usize;
-    let mut sums=SharedMemory::<f32>::new(64);
+    let mut sums=SharedMemory::<f32>::new(64usize);
     let mut sum=0.0f32;
-    for j in 0..64 {
-        let v=f32::cast_from(x[row*4096+lane+j*64]);
+    for j in 0usize..64usize {
+        let v=f32::cast_from(x[row*4096usize+lane+j*64usize]);
         sum+=v*v;
     }
     sums[lane]=sum;
     sync_cube();
     let mut step=32usize;
-    while step>0 {
+    while step>0usize {
         if lane<step { sums[lane]+=sums[lane+step]; }
-        sync_cube(); step/=2;
+        sync_cube(); step/=2usize;
     }
-    let inverse=1.0f32/(sums[0]/4096.0f32+0.00001f32).sqrt();
-    for j in 0..64 {
-        let col=lane+j*64;
-        let rounded=bf16::cast_from(f32::cast_from(x[row*4096+col])*inverse);
-        out[row*4096+col]=bf16::cast_from(f32::cast_from(rounded)*f32::cast_from(gain[col]));
+    let inverse=1.0f32/(sums[0usize]/4096.0f32+0.00001f32).sqrt();
+    for j in 0usize..64usize {
+        let col=lane+j*64usize;
+        let rounded=bf16::cast_from(f32::cast_from(x[row*4096usize+col])*inverse);
+        out[row*4096usize+col]=bf16::cast_from(f32::cast_from(rounded)*f32::cast_from(gain[col]));
     }
 }
 #[cube(launch_unchecked)]
@@ -268,7 +268,7 @@ fn actual_components_gpu() -> AnyResult<()> {
     let imported:Value=serde_json::from_slice(&fs::read(pile_dir.join("import.json"))?)?;
     let root=Id::from_hex(imported["root"].as_str().unwrap()).unwrap();
     let collection=model_collection::parse_collection_handle(imported["collection"].as_str().unwrap())?;
-    let mut pile=Pile::new(triblespace::core::repo::pile::PileFile::open_read_only(pile_dir.join("components.pile"))?);
+    let mut pile=Pile::new(triblespace::core::repo::pile::PileFile::open_read_only(&pile_dir.join("components.pile"))?);
     pile.refresh()?; let store=pile.snapshot()?;
     let collection=model_collection::open_model_collection(&store,collection)?;
     let snapshot=model_collection::snapshot_model_collection_for(&store,collection)?;
