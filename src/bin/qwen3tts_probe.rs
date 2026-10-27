@@ -73,7 +73,7 @@ fn run<B: Backend>(f16: bool) {
     let (tight, loose) = if f16 { (0.999, 0.999) } else { (0.9999, 0.999) };
 
     // 1. tokenizer
-    let tok = TextTokenizer::load(Path::new(WEIGHTS));
+    let tok = TextTokenizer::load(Path::new(WEIGHTS)).expect("checkpoint tokenizer");
     let (tests, tshape) = golden("tokenizer_tests");
     let strings = [
         "<|im_start|>assistant\nIf you can hear this clearly, the port worked: the same reference voice, synthesized end to end by the new engine in real time.<|im_end|>\n<|im_start|>assistant\n",

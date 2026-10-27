@@ -11,8 +11,9 @@
 //! `--ref`/`--ref-text` clone any 24 kHz mono clip, default is `ref_voice.wav`.
 //!
 //! Weights come ONLY from the durable qwen3tts pile (both checkpoints, written
-//! by `qwen3tts_persist`); `QWEN3TTS_PILE` overrides the default path. The
-//! tokenizer files are the committed `assets/qwen3tts/`.
+//! by `qwen3tts_persist`); `QWEN3TTS_PILE` overrides the default path. So
+//! does the text tokenizer: the `vocab.json` and `merges.txt` documents the
+//! importer names on the base roots.
 
 use burn::prelude::*;
 use mary::models::f5::wav;
@@ -65,9 +66,8 @@ fn run<B: Backend>(args: &Args) {
     let codec_dev = mary::nn::backend::WgpuDevice::default();
     let codec = CodecDecoder::<BFused>::load(&loader, &codec_dev);
     let encoder = CodecEncoder::load(&loader);
-    let tok = TextTokenizer::load(
-        &std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/qwen3tts"),
-    );
+    let tok = TextTokenizer::from_model_pile(&pile)
+        .unwrap_or_else(|e| panic!("tokenizer from qwen3tts pile {}: {e:?}", pile.display()));
     eprintln!("weights loaded in {:.1}s", t0.elapsed().as_secs_f64());
 
     // clone prompt, fully in-process (CPU codec encoder + GPU x-vector)

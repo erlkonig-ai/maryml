@@ -2,7 +2,8 @@
 //!
 //! The result is ordinary model roots in one append-only pile:
 //!
-//! - the variant's exact base checkpoint;
+//! - the variant's exact base checkpoint, with the checkpoint's `vocab.json`
+//!   and `merges.txt` named on it as text documents (the voice's tokenizer);
 //! - the exact codec checkpoint shared by both Qwen sizes;
 //! - on macOS, the variant's filtered f16 talker tensors;
 //! - on macOS, the variant's versioned, pre-folded f16 talker tensors.
@@ -77,6 +78,8 @@ mod imp {
             &base_source,
             mary::persist::QUANTIZATION_NATIVE,
         )?;
+        eprintln!("[qwen3tts] naming the text tokenizer documents on the base root");
+        attach_tokenizer(pile, signing_key, model_dir, base_root)?;
 
         eprintln!(
             "[qwen3tts] importing shared exact codec {}",
@@ -106,6 +109,43 @@ mod imp {
                  codec={codec_root}; {exact_count} exact tensors"
             );
         }
+        Ok(())
+    }
+
+    /// Name the checkpoint's `vocab.json` and `merges.txt` on the exact base
+    /// root as text documents, the way Breeze names its `tokenizer.json`, so
+    /// the voice reads its tokenizer from the pile and nothing from a build tree.
+    fn attach_tokenizer(
+        pile: &mut Pile,
+        signing_key: &ed25519_dalek::SigningKey,
+        model_dir: &Path,
+        base_root: triblespace::prelude::Id,
+    ) -> anyhow::Result<()> {
+        use anyhow::Context;
+        use mary::models::qwen3tts::tokenizer::{MERGES, TextTokenizer, VOCAB};
+        use triblespace::core::metadata;
+        use triblespace::prelude::blobencodings::UTF8String;
+        use triblespace::prelude::*;
+        let read = |name: &str| {
+            std::fs::read_to_string(model_dir.join(name))
+                .with_context(|| format!("read checkpoint {name}"))
+        };
+        let (vocab, merges) = (read(VOCAB)?, read(MERGES)?);
+        // Documents that do not build the tokenizer are refused before naming.
+        TextTokenizer::from_documents(&vocab, &merges)?;
+        let mut fragment = Fragment::empty();
+        for (name, text) in [(VOCAB, vocab), (MERGES, merges)] {
+            let text = pile.put::<UTF8String, _>(text)?;
+            let document = entity! { _ @ mary::dataset::text: text };
+            let asset = document.root().context("document root absent")?;
+            fragment += document;
+            fragment += entity! { ExclusiveId::force_ref(&asset) @
+                metadata::name: name,
+                mary::format::attrs::model_root: base_root,
+            };
+        }
+        mary::model_collection::publish_model_fragment(pile, signing_key, fragment)
+            .map_err(|error| anyhow::anyhow!("publish tokenizer documents: {error}"))?;
         Ok(())
     }
 

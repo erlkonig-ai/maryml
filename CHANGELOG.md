@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- The Qwen3-TTS text tokenizer is read from the model pile, not the build
+  tree. `qwen3tts_persist` names the checkpoint's `vocab.json` and
+  `merges.txt` on the exact base root as `dataset::text` documents (the
+  convention Breeze uses for `tokenizer.json`), and
+  `Qwen3TtsWeights::from_snapshot` builds the BPE from them
+  (`Qwen3TtsWeights::tokenizer`, `TextTokenizer::from_root` and
+  `from_documents`). The committed `assets/qwen3tts/` copies are gone, so a
+  deployed voice no longer panics in its speak thread when its build lane is
+  cleaned. A Qwen3-TTS pile written before this refuses selection, naming the
+  remedy, until `qwen3tts_persist <checkpoint> <pile> <key>` is rerun on it.
+  On a scratch pile that already held the documents, a rerun appended zero
+  bytes.
 - Breeze and Voxtral load from a model collection the caller names, as one
   `nvfp4` root each: `BreezeResident::load` / `Synthesizer::spawn_breeze` and
   `hear::Ears::load` take a frozen `ModelSnapshot` instead of a pile path and

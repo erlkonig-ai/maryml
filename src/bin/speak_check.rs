@@ -60,8 +60,7 @@ fn main() -> anyhow::Result<()> {
 
     if let Some(s) = &tok_check {
         use mary::models::qwen3tts::tokenizer::TextTokenizer;
-        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/qwen3tts");
-        let ids = TextTokenizer::load(&dir).encode(s);
+        let ids = TextTokenizer::from_model_pile(Path::new(pile))?.encode(s);
         eprintln!("tok ({} ids): {:?}", ids.len(), ids);
     }
 
@@ -91,9 +90,7 @@ fn main() -> anyhow::Result<()> {
         let spk_enc = SpeakerEncoder::<B>::load(&loader, &dev);
         let _codec = CodecDecoder::<B>::load(&loader, &dev);
         drop(loader);
-        let tok = TextTokenizer::load(
-            &std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/qwen3tts"),
-        );
+        let tok = TextTokenizer::from_model_pile(Path::new(pile))?;
         let (samples, _sr) = wav::read_pcm16_mono(Path::new(ref_wav));
         let spk_embedding = spk_enc.forward(SpeakerMel::<B>::new(&dev).forward(&samples, &dev));
         let (rc, rcs) = npy::load_npy(Path::new(ref_codes))?;

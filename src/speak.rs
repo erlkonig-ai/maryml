@@ -46,8 +46,9 @@
 //! Long text is split into sentence-sized passes (same splitter as `say`;
 //! each pass stays far below the 2048-frame generation cap and re-clones the
 //! same reference so the voice stays consistent); a short silence gap is
-//! emitted between passes. The Qwen2 BPE builds from the tokenizer files
-//! committed under `<mary>/assets/qwen3tts/`.
+//! emitted between passes. The Qwen2 BPE builds from the checkpoint's
+//! `vocab.json` and `merges.txt`, which the importer stores as text documents
+//! named on the exact base root, so the voice reads nothing from its build tree.
 //!
 //! With `breeze-cuda`, `Synthesizer::spawn_breeze` adds an explicitly selected
 //! native Breeze resident using the same request/completion transport. It
@@ -179,12 +180,15 @@ impl Qwen3TtsVariant {
 /// exact roots and needs just the first two. Only the compact leaf indexes remain resident —
 /// each leaf holds its bytes as a view over the pile's mapping and keeps that
 /// mapping alive, so no reader is retained. No Repository ancestry or
-/// sibling-file naming participates in runtime selection.
+/// sibling-file naming participates in runtime selection. The text tokenizer
+/// comes from the same snapshot: the base root's `vocab.json` and `merges.txt`
+/// documents.
 pub struct Qwen3TtsWeights {
     variant: Qwen3TtsVariant,
     exact: HashMap<String, Leaf>,
     talker_f16: HashMap<String, Leaf>,
     folded_f16: HashMap<String, Leaf>,
+    text: TextTokenizer,
 }
 
 impl Qwen3TtsWeights {
@@ -233,12 +237,17 @@ impl Qwen3TtsWeights {
         let base_source = variant.base_source();
         let talker_source = variant.talker_f16_source();
         let folded_source = variant.folded_f16_source();
-        let mut exact = select(
+        let base_root = crate::selection::select_model_root_acquiring(
             snapshot.facts(),
             snapshot.store(),
-            &base_source,
-            crate::persist::QUANTIZATION_NATIVE,
+            ModelSelector::Source {
+                source: &base_source,
+                quantization: crate::persist::QUANTIZATION_NATIVE,
+            },
         )?;
+        let mut exact =
+            crate::selection::index_keymap_for_root(snapshot.facts(), snapshot.store(), base_root)?;
+        let text = TextTokenizer::from_root(snapshot.facts(), snapshot.store(), base_root)?;
         let codec = select(
             snapshot.facts(),
             snapshot.store(),
@@ -292,11 +301,17 @@ impl Qwen3TtsWeights {
             exact,
             talker_f16,
             folded_f16,
+            text,
         })
     }
 
     pub const fn variant(&self) -> Qwen3TtsVariant {
         self.variant
+    }
+
+    /// The Qwen2 BPE read from the base root's documents.
+    pub fn tokenizer(&self) -> &TextTokenizer {
+        &self.text
     }
 
     pub fn counts(&self) -> (usize, usize, usize) {
@@ -1313,6 +1328,7 @@ fn spawn_impl<B: EngineBackend>(
 
                 let t_load = Instant::now();
                 let folded_talker = weights.folded_talker::<B>()?;
+                let tok = weights.tokenizer().clone();
                 let loader = weights.into_loader();
                 let talker = folded_talker.unwrap_or_else(|| Talker::load(&loader, &dev));
                 let mut predictor = CodePredictor::load(&loader);
@@ -1332,9 +1348,6 @@ fn spawn_impl<B: EngineBackend>(
                 }
                 let predictor = predictor;
                 let spk_enc = SpeakerEncoder::<B>::load(&loader, &dev);
-                let tok = TextTokenizer::load(
-                    &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/qwen3tts"),
-                );
                 eprintln!("[timing] weight load (pile): {:.2}s", t_load.elapsed().as_secs_f32());
 
                 // ── reference kit → clone prompt ──
@@ -1731,16 +1744,44 @@ mod tests {
         (2, 0, 0)
     };
 
+    /// Name the two tokenizer documents on the fragment's model root, as the
+    /// importer does: a tiny but valid Qwen2 BPE of three tokens and one merge.
+    fn attach_tokenizer(fragment: &mut Fragment) {
+        use crate::models::qwen3tts::tokenizer::{MERGES, VOCAB};
+        use triblespace::core::metadata;
+        let (root,) = find!((root: Id), pattern!(fragment.facts(), [{ ?root @
+            attrs::quantization: _?quantization,
+            attrs::member: _?member,
+        }]))
+        .next()
+        .expect("fragment holds a model root");
+        for (name, text) in [
+            (VOCAB, r#"{"a": 0, "b": 1, "ab": 2}"#),
+            (MERGES, "#version: 0.2\na b\n"),
+        ] {
+            let text = fragment.put::<UTF8String, _>(text.to_owned());
+            let document = entity! { _ @ crate::dataset::text: text };
+            let asset = document.root().expect("document root");
+            *fragment += document;
+            *fragment += entity! { ExclusiveId::force_ref(&asset) @
+                metadata::name: name,
+                attrs::model_root: root,
+            };
+        }
+    }
+
     fn cohort(variant: Qwen3TtsVariant, form: crate::leaf::Form) -> [Fragment; 4] {
+        let mut base = component_fragment(
+            &variant.component_source(BASE),
+            crate::persist::QUANTIZATION_NATIVE,
+            "base.weight",
+            1.0,
+            false,
+            form,
+        );
+        attach_tokenizer(&mut base);
         [
-            component_fragment(
-                &variant.component_source(BASE),
-                crate::persist::QUANTIZATION_NATIVE,
-                "base.weight",
-                1.0,
-                false,
-                form,
-            ),
+            base,
             component_fragment(
                 CODEC_SOURCE,
                 crate::persist::QUANTIZATION_NATIVE,
@@ -1845,6 +1886,8 @@ mod tests {
         assert_eq!(weights.counts(), SELECTED);
         assert!(weights.exact.contains_key("base.weight"));
         assert!(weights.exact.contains_key("codec.weight"));
+        // The tokenizer is the fixture's: "a" and "b" merge into token 2.
+        assert_eq!(weights.tokenizer().encode("ab"), vec![2]);
 
         // The owned view stays frozen, while a fresh widened view fails closed
         // when a second root claims the codec coordinate.
@@ -1869,6 +1912,36 @@ mod tests {
         assert!(
             error.to_string().contains("ambiguous model root"),
             "unexpected ambiguity diagnostic: {error:#}"
+        );
+    }
+
+    /// A base root without its tokenizer documents fails at selection, with
+    /// the remedy, instead of in the speak thread.
+    #[test]
+    fn qwen3tts_base_root_without_tokenizer_documents_fails_at_selection() {
+        let file = TestPile::new();
+        let variant = Qwen3TtsVariant::Base1_7B;
+        let [_, codec, talker, folded] = cohort(variant, crate::leaf::Form::Typed);
+        let bare_base = component_fragment(
+            &variant.component_source(BASE),
+            crate::persist::QUANTIZATION_NATIVE,
+            "base.weight",
+            1.0,
+            false,
+            crate::leaf::Form::Typed,
+        );
+        publish(file.path(), [bare_base, codec, talker, folded]);
+
+        let snapshot = crate::model_collection::load_model_collection_local_latest(file.path())
+            .expect("freeze native Qwen3-TTS snapshot");
+        let error = Qwen3TtsWeights::from_snapshot(snapshot, variant)
+            .err()
+            .expect("a base root without tokenizer documents must not select");
+        assert!(
+            error
+                .to_string()
+                .contains("no vocab.json and merges.txt documents"),
+            "unexpected diagnostic: {error:#}"
         );
     }
 }

@@ -11,8 +11,9 @@
 //!     [--pcm] [text…]
 //!
 //! Weights come ONLY from the durable qwen3tts pile (written by
-//! `qwen3tts_persist`); `QWEN3TTS_PILE` overrides the default path. The
-//! tokenizer files are the committed `assets/qwen3tts/`.
+//! `qwen3tts_persist`); `QWEN3TTS_PILE` overrides the default path. So does
+//! the text tokenizer: the `vocab.json` and `merges.txt` documents the
+//! importer names on the base roots.
 //!
 //! stderr reports TTFA (time to first audio), per-chunk deadline margins
 //! against a playback clock that starts at first-chunk-ready, and the
@@ -82,9 +83,8 @@ fn run<B: Backend>(args: &Args) {
     let predictor = CodePredictor::load(&loader);
     let spk_enc = SpeakerEncoder::<B>::load(&loader, &dev);
     let encoder = CodecEncoder::load(&loader);
-    let tok = TextTokenizer::load(
-        &std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/qwen3tts"),
-    );
+    let tok = TextTokenizer::from_model_pile(&pile)
+        .unwrap_or_else(|e| panic!("tokenizer from qwen3tts pile {}: {e:?}", pile.display()));
     eprintln!("weights loaded in {:.1}s", t0.elapsed().as_secs_f64());
 
     // clone prompt, fully in-process (CPU codec encoder + GPU x-vector)
