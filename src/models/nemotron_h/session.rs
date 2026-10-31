@@ -58,6 +58,25 @@ pub struct Limits {
     /// host staging, allocator/JIT overhead or a whole-device reservation.
     pub max_chunk_bytes: usize,
 }
+
+/// CPU-only logical admission for a cold prompt. These payload totals exclude
+/// host preparation/staging, allocator reservation, runtime and JIT overhead;
+/// they are neither a physical peak estimate nor a whole-device reservation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Admission {
+    /// Immutable weights/KV plus one committed state per Mamba layer.
+    pub base_resident_bytes: usize,
+    pub expert_cache_pairs_per_moe: usize,
+    pub expert_cache_bytes: usize,
+    pub resident_bytes: usize,
+    pub first_chunk_tokens: usize,
+    pub first_chunk_bytes: usize,
+    pub max_prompt_chunk_bytes: usize,
+    /// Exact largest logical chunk within capacity, independent of this
+    /// prompt. Informational: only the actual prompt chunks are admitted.
+    /// Future appends still enforce max_chunk_bytes before dispatch.
+    pub max_capacity_chunk_bytes: usize,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
     Ready,
@@ -285,6 +304,114 @@ fn expert_cache_pairs(resident: usize, limit: usize, moe_layers: usize) -> Resul
     Ok(pairs)
 }
 
+/// Validate the native configuration and the cold prompt's resident/chunk
+/// budgets without opening a store, creating a CUDA client or allocating device
+/// memory. The caller separately admits any response reserve against capacity.
+/// This does not validate source payloads or establish physical readiness.
+pub fn admission(config: &TextConfig, limits: Limits, prompt_tokens: usize) -> Result<Admission> {
+    validate_config(config, limits)?;
+    if prompt_tokens == 0 || prompt_tokens > limits.capacity {
+        return Err("empty prompt or prompt exceeds session capacity".into());
+    }
+    let base_resident_bytes = resident_bytes(config, limits)?;
+    let moe_layers = config.layers_block_type.iter()
+        .filter(|kind| matches!(kind, LayerKind::Moe)).count();
+    let expert_cache_pairs_per_moe = expert_cache_pairs(
+        base_resident_bytes, limits.max_resident_bytes, moe_layers,
+    )?;
+    let expert_cache_bytes = moe::expert_device_bytes()?.checked_mul(moe_layers)
+        .and_then(|n| n.checked_mul(expert_cache_pairs_per_moe))
+        .ok_or("session expert cache byte sum overflow")?;
+    let resident_bytes = add(base_resident_bytes, expert_cache_bytes)?;
+    let first_chunk_tokens = prompt_tokens.min(MAX_CHUNK);
+    let first_chunk_bytes = planned_chunk_bytes(config, limits, 0, first_chunk_tokens)?;
+    let mut max_prompt_chunk_bytes = first_chunk_bytes;
+    // Generator uses MAX_CHUNK, with only the last chunk possibly partial.
+    // For fixed width, only attention's split count depends on start, and it
+    // is monotone. The last full chunk and the remainder cover every maximum.
+    let remainder = prompt_tokens % MAX_CHUNK;
+    let full_end = prompt_tokens - remainder;
+    if full_end > 0 {
+        max_prompt_chunk_bytes = max_prompt_chunk_bytes.max(planned_chunk_bytes(
+            config, limits, full_end - MAX_CHUNK, MAX_CHUNK,
+        )?);
+    }
+    if remainder > 0 {
+        max_prompt_chunk_bytes = max_prompt_chunk_bytes.max(planned_chunk_bytes(
+            config, limits, full_end, remainder,
+        )?);
+    }
+    // Report all possible future widths without rejecting a prompt because
+    // an unrelated larger chunk would exceed the caller's working budget.
+    let unbounded_chunk = Limits { max_chunk_bytes: usize::MAX, ..limits };
+    let max_capacity_chunk_bytes = (1..=limits.capacity.min(MAX_CHUNK))
+        .try_fold(0usize, |maximum, tokens| -> Result<usize> {
+            Ok(maximum.max(planned_chunk_bytes(
+                config, unbounded_chunk, limits.capacity - tokens, tokens,
+            )?))
+        })?;
+    Ok(Admission {
+        base_resident_bytes, expert_cache_pairs_per_moe, expert_cache_bytes, resident_bytes,
+        first_chunk_tokens, first_chunk_bytes, max_prompt_chunk_bytes, max_capacity_chunk_bytes,
+    })
+}
+
+/// The shared logical planner for admission and live appends. Config is already
+/// validated by admission/source::load. The loader checks actual head [V,H],
+/// Mamba input [projected,H]/output [H,inner] and each fixed attention/MoE shape
+/// before constructing a Session, so these are the uploaded operand extents.
+fn planned_chunk_bytes(c: &TextConfig, l: Limits, start: usize, t: usize) -> Result<usize> {
+    if !(1..=MAX_CHUNK).contains(&t)
+        || start.checked_add(t).filter(|&end| end <= l.capacity).is_none()
+    {
+        return Err("empty/oversized chunk or capacity exhausted".into());
+    }
+    // IDs, embedding, final norm and final-row copy; each layer's norm,
+    // mixer output and residual are retained until whole-chunk completion.
+    let mut total = add(bytes(&[t], 4)?, bytes(&[t, H], 4)?)?;
+    total = add(total, bytes(&[H], 2)?)?;
+    total = add(total, super::fp8::working_bytes(1, [c.vocab_size, H])?)?;
+    let mut expert_peak = 0;
+    for kind in &c.layers_block_type {
+        total = add(total, bytes(&[t, H], 6)?)?;
+        total = add(
+            total,
+            match kind {
+                LayerKind::Attention => attention::Attention::planned_working_bytes(
+                    start, t, attention_limits(c, l),
+                )?,
+                LayerKind::Moe => {
+                    expert_peak = expert_peak.max(moe::admission(moe_limits(l))?.expert_bytes);
+                    moe::working_bytes(t)?
+                }
+                LayerKind::Mamba => {
+                    let m = mamba_config(c);
+                    let e = m.extents(1, t)?;
+                    let g = m.layout()?;
+                    let mut n = add(
+                        super::fp8::working_bytes(t, [g.projected, H])?,
+                        super::fp8::working_bytes(t, [H, g.inner])?,
+                    )?;
+                    for v in [
+                        bytes(&[e.output], 6)?,
+                        bytes(&[t, g.conv_channels], 2)?,
+                        bytes(&[e.conv], 2)?,
+                        bytes(&[e.recurrent], 4)?,
+                    ] {
+                        n = add(n, v)?;
+                    }
+                    n
+                }
+            },
+        )?;
+    }
+    total = add(total, expert_peak)?;
+    if total > l.max_chunk_bytes {
+        return Err("session aggregate chunk budget exceeded".into());
+    }
+    Ok(total)
+}
+
 impl<S: BlobStoreGet> Session<S> {
     /// No publication, download or default collection selection. Layer IDs are
     /// explicit opaque choices in ordered config positions. Multiple matches
@@ -332,48 +459,7 @@ impl<S: BlobStoreGet> Session<S> {
         self.status == Status::Ready && rendered_ids.starts_with(&self.committed)
     }
     fn chunk_bytes(&self, t: usize) -> Result<usize> {
-        // IDs, embedding, final norm and final-row copy; each layer's norm,
-        // mixer output and residual are retained until whole-chunk completion.
-        let mut total = add(bytes(&[t], 4)?, bytes(&[t, H], 4)?)?;
-        total = add(total, bytes(&[H], 2)?)?;
-        total = add(total, self.head.working_bytes(1)?)?;
-        let mut expert_peak = 0;
-        for layer in &self.layers {
-            total = add(total, bytes(&[t, H], 6)?)?;
-            total = add(
-                total,
-                match &layer.mixer {
-                    Mixer::Attention(_) => attention::Attention::planned_working_bytes(
-                        self.committed.len(),
-                        t,
-                        attention_limits(&self.config, self.limits),
-                    )?,
-                    Mixer::Moe(m) => {
-                        expert_peak = expert_peak.max(m.admission().expert_bytes);
-                        moe::working_bytes(t)?
-                    }
-                    Mixer::Mamba(m) => {
-                        let e = m.config.extents(1, t)?;
-                        let g = m.config.layout()?;
-                        let mut n = add(m.input.working_bytes(t)?, m.output.working_bytes(t)?)?;
-                        for v in [
-                            bytes(&[e.output], 6)?,
-                            bytes(&[t, g.conv_channels], 2)?,
-                            bytes(&[e.conv], 2)?,
-                            bytes(&[e.recurrent], 4)?,
-                        ] {
-                            n = add(n, v)?;
-                        }
-                        n
-                    }
-                },
-            )?;
-        }
-        total = add(total, expert_peak)?;
-        if total > self.limits.max_chunk_bytes {
-            return Err("session aggregate chunk budget exceeded".into());
-        }
-        Ok(total)
+        planned_chunk_bytes(&self.config, self.limits, self.committed.len(), t)
     }
     fn preflight(&self, ids: &[u32]) -> Result<()> {
         if self.status != Status::Ready {

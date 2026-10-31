@@ -46,6 +46,25 @@ fn limits() -> Limits {
     }
 }
 
+fn full_config(capacity: usize) -> TextConfig {
+    let mut c = config();
+    c.layers_block_type = vec![LayerKind::Mamba; 40];
+    c.layers_block_type.extend(vec![LayerKind::Moe; 40]);
+    c.layers_block_type.extend(vec![LayerKind::Attention; 8]);
+    c.vocab_size = 131072;
+    c.max_position_embeddings = capacity;
+    c.mamba_num_heads = 128;
+    c.ssm_state_size = 128;
+    c.n_groups = 8;
+    c.conv_kernel = 4;
+    c.expand = 2;
+    c
+}
+
+fn full_limits(capacity: usize) -> Limits {
+    Limits { capacity, max_resident_bytes: 12 << 30, max_chunk_bytes: 6 << 30 }
+}
+
 #[test]
 fn session_host_geometry_and_aggregate_admission() {
     let c = config();
@@ -88,17 +107,7 @@ fn session_host_expert_cache_budget_boundaries_and_overflow() {
 
 #[test]
 fn session_host_expert_cache_full_geometry_uses_caller_resident_limit() {
-    let mut c = config();
-    c.layers_block_type = vec![LayerKind::Mamba; 40];
-    c.layers_block_type.extend(vec![LayerKind::Moe; 40]);
-    c.layers_block_type.extend(vec![LayerKind::Attention; 8]);
-    c.vocab_size = 131072;
-    c.max_position_embeddings = 2048;
-    c.mamba_num_heads = 128;
-    c.ssm_state_size = 128;
-    c.n_groups = 8;
-    c.conv_kernel = 4;
-    c.expand = 2;
+    let c = full_config(2048);
     let mut l = Limits { capacity: 2048, max_resident_bytes: 8 << 30, max_chunk_bytes: 6 << 30 };
     validate_config(&c, l).unwrap();
     let base = resident_bytes(&c, l).unwrap();
@@ -111,6 +120,105 @@ fn session_host_expert_cache_full_geometry_uses_caller_resident_limit() {
     assert_eq!(resident, 12_761_157_952);
     assert!(resident <= l.max_resident_bytes);
     assert!(resident + 40 * moe::expert_device_bytes().unwrap() > l.max_resident_bytes);
+}
+
+#[test]
+fn session_host_admission_full_geometry_matches_existing_accounting() {
+    // Arithmetic witnesses from the pre-extraction formulas, not a device
+    // measurement or an assertion about allocator/host/runtime overhead.
+    let a = admission(&full_config(2048), full_limits(2048), 88).unwrap();
+    assert_eq!(a.base_resident_bytes, 8_302_088_512);
+    assert_eq!(a.expert_cache_pairs_per_moe, 36);
+    assert_eq!(a.expert_cache_bytes, 4_459_069_440);
+    assert_eq!(a.resident_bytes, 12_761_157_952);
+    assert_eq!(a.first_chunk_tokens, 88);
+    assert_eq!(a.first_chunk_bytes, 1_809_020_264);
+    assert_eq!(a.max_prompt_chunk_bytes, 1_809_020_264);
+    assert_eq!(a.max_capacity_chunk_bytes, 4_992_726_024);
+
+    let a = admission(&full_config(262144), full_limits(262144), 513).unwrap();
+    assert_eq!(a.base_resident_bytes, 10_432_794_944);
+    assert_eq!(a.expert_cache_pairs_per_moe, 19);
+    assert_eq!(a.resident_bytes, 12_786_192_704);
+    assert_eq!(a.first_chunk_tokens, MAX_CHUNK);
+    assert_eq!(a.first_chunk_bytes, 4_924_568_584);
+    assert_eq!(a.max_prompt_chunk_bytes, 4_992_726_024);
+    assert_eq!(a.max_capacity_chunk_bytes, 4_992_726_024);
+}
+
+#[test]
+fn session_host_admission_partial_last_chunk_and_attention_split_boundaries() {
+    let c = full_config(2048);
+    let l = full_limits(2048);
+    // A late 255-token remainder can be larger than the first 256-token
+    // chunk because its attention split count has grown from two to four.
+    for (tokens, expected) in [
+        (1, 217_940_364),
+        (255, 4_907_653_764),
+        (256, 4_924_568_584),
+        (257, 4_924_568_584),
+        (300, 4_924_568_584),
+        (511, 4_975_544_964),
+        (512, 4_992_726_024),
+        (513, 4_992_726_024),
+    ] {
+        assert_eq!(admission(&c, l, tokens).unwrap().max_prompt_chunk_bytes, expected);
+    }
+    // Max-capacity accounting considers decode too, at its latest start.
+    assert_eq!(planned_chunk_bytes(&c, l, 2047, 1).unwrap(), 219_937_164);
+    let short = admission(&full_config(1), full_limits(1), 1).unwrap();
+    assert_eq!(short.max_capacity_chunk_bytes, short.first_chunk_bytes);
+}
+
+#[test]
+fn session_host_admission_budget_boundaries_precede_any_session() {
+    let c = full_config(2048);
+    let mut l = full_limits(2048);
+    let base = 8_302_088_512;
+    l.max_resident_bytes = base;
+    let exact = admission(&c, l, 256).unwrap();
+    assert_eq!(exact.expert_cache_pairs_per_moe, 0);
+    assert_eq!(exact.expert_cache_bytes, 0);
+    assert_eq!(exact.resident_bytes, base);
+    l.max_resident_bytes -= 1;
+    assert!(admission(&c, l, 256).is_err());
+    l = full_limits(2048);
+    l.max_chunk_bytes = 4_924_568_584;
+    let first = admission(&c, l, 256).unwrap();
+    assert_eq!(first.first_chunk_bytes, l.max_chunk_bytes);
+    assert!(first.max_capacity_chunk_bytes > l.max_chunk_bytes);
+    assert!(admission(&c, l, 300).is_ok());
+    // The first chunk fits, but the required late partial chunk does not.
+    assert!(admission(&c, l, 511).is_err());
+    l.max_chunk_bytes -= 1;
+    assert!(admission(&c, l, 256).is_err());
+    assert!(admission(&full_config(1048576), full_limits(1048576), 1).is_err());
+}
+
+#[test]
+fn session_host_admission_rejects_config_capacity_and_overflow() {
+    let c = config();
+    let l = limits();
+    assert!(admission(&c, l, 0).is_err());
+    assert!(admission(&c, l, l.capacity + 1).is_err());
+    assert!(admission(&c, l, usize::MAX).is_err());
+    for capacity in [0, 9, usize::MAX] {
+        assert!(admission(&c, Limits { capacity, ..l }, 1).is_err());
+    }
+    for field in ["hidden_size", "num_attention_heads", "moe_latent_size"] {
+        let mut value = configuration();
+        value[field] = json!(1);
+        let wrong: TextConfig = serde_json::from_value(value).unwrap();
+        assert!(admission(&wrong, l, 1).is_err());
+    }
+    let mut wrong = c.clone();
+    wrong.mamba_head_dim = usize::MAX;
+    assert!(admission(&wrong, l, 1).is_err());
+    wrong = c.clone();
+    wrong.vocab_size = usize::MAX - 7; // Divisible by eight, but extent overflows.
+    assert!(admission(&wrong, l, 1).is_err());
+    assert!(planned_chunk_bytes(&c, l, usize::MAX, 1).is_err());
+    assert!(planned_chunk_bytes(&c, l, 0, MAX_CHUNK + 1).is_err());
 }
 
 #[test]

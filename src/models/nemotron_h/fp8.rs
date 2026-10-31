@@ -185,7 +185,7 @@ fn scale_product(input: f32, weight: f32) -> Result<f32> {
     Ok(alpha)
 }
 
-fn working_bytes(rows: usize, [n, k]: [usize; 2]) -> Result<usize> {
+pub(super) fn working_bytes(rows: usize, [n, k]: [usize; 2]) -> Result<usize> {
     weight_elements([n, k])?;
     let input = extent(&[rows, k], 2)?;
     let output = extent(&[rows, n], 4)?;
