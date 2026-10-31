@@ -24,6 +24,8 @@ use triblespace::core::blob::{
     },
 };
 use triblespace::prelude::*;
+#[cfg(feature = "nemotron-timing")]
+use super::host_timing::{LookupPhase, LookupTimings};
 
 pub const LAYER: &str = "nemotron-h-layer";
 pub const EXPERT: &str = "nemotron-h-expert";
@@ -144,7 +146,16 @@ pub fn nvfp4_minimum<S: BlobStoreGet>(
 pub fn nvfp4_expert_minimum<S: BlobStoreGet>(
     snapshot: &ModelSnapshot<S>, layer: Id, index: u64,
 ) -> Option<Result<(Id, Nvfp4Projection, Nvfp4Projection)>> {
-    find!((expert: Id,
+    nvfp4_expert_minimum_observed(snapshot, layer, index, #[cfg(feature = "nemotron-timing")] None)
+}
+
+pub(super) fn nvfp4_expert_minimum_observed<S: BlobStoreGet>(
+    snapshot: &ModelSnapshot<S>, layer: Id, index: u64,
+    #[cfg(feature = "nemotron-timing")] mut timing: Option<&mut LookupTimings>,
+) -> Option<Result<(Id, Nvfp4Projection, Nvfp4Projection)>> {
+    #[cfg(feature = "nemotron-timing")]
+    let started = LookupTimings::clock(timing.as_deref());
+    let query = find!((expert: Id,
     up: Id, uw: Inline<inlineencodings::Handle<Tensor<NVFP4, 2>>>, ui: Inline<inlineencodings::Handle<Tensor<F32, 0>>>,
     down: Id, dw: Inline<inlineencodings::Handle<Tensor<NVFP4, 2>>>, di: Inline<inlineencodings::Handle<Tensor<F32, 0>>>),
     pattern!(snapshot.facts(), [
@@ -158,12 +169,41 @@ pub fn nvfp4_expert_minimum<S: BlobStoreGet>(
         { _?down_weight @ leaf::leaf::<NVFP4, 2>(): ?dw },
         { _?down_input @ attrs::kind: INPUT_SCALE, attrs::weight: _?di_leaf },
         { _?di_leaf @ leaf::leaf::<F32, 0>(): ?di }
-    ]))
-    .min()
-    .map(|(expert, up, uw, ui, down, dw, di)| Ok((expert,
-        Nvfp4Projection { operation: up, weight: read(snapshot.store(), uw)?, input_scale: read(snapshot.store(), ui)? },
-        Nvfp4Projection { operation: down, weight: read(snapshot.store(), dw)?, input_scale: read(snapshot.store(), di)? },
+    ]));
+    #[cfg(feature = "nemotron-timing")]
+    LookupTimings::record(timing.as_deref_mut(), LookupPhase::Construction, started, true);
+    #[cfg(feature = "nemotron-timing")]
+    let started = LookupTimings::clock(timing.as_deref());
+    // Preserve the same lazy drain and minimum policy. No per-row inspection,
+    // candidate collection or extra enumeration is introduced for diagnostics.
+    let selected = query.min();
+    #[cfg(feature = "nemotron-timing")]
+    LookupTimings::record(timing.as_deref_mut(), LookupPhase::Enumeration, started, true);
+    selected.map(|(expert, up, uw, ui, down, dw, di)| Ok((expert,
+        Nvfp4Projection { operation: up,
+            weight: read_expert(snapshot.store(), uw, #[cfg(feature = "nemotron-timing")] timing.as_deref_mut())?,
+            input_scale: read_expert(snapshot.store(), ui, #[cfg(feature = "nemotron-timing")] timing.as_deref_mut())?,
+        },
+        Nvfp4Projection { operation: down,
+            weight: read_expert(snapshot.store(), dw, #[cfg(feature = "nemotron-timing")] timing.as_deref_mut())?,
+            input_scale: read_expert(snapshot.store(), di, #[cfg(feature = "nemotron-timing")] timing.as_deref_mut())?,
+        },
     )))
+}
+
+/// One synchronous host read/header/typed-view return, including any existing
+/// store validation. This is neither a device upload nor isolated hash timing.
+fn read_expert<T: TensorElement, const R: usize>(
+    store: &impl BlobStoreGet,
+    handle: Inline<inlineencodings::Handle<Tensor<T, R>>>,
+    #[cfg(feature = "nemotron-timing")] timing: Option<&mut LookupTimings>,
+) -> Result<TensorView> {
+    #[cfg(feature = "nemotron-timing")]
+    let started = LookupTimings::clock(timing.as_deref());
+    let result = read(store, handle);
+    #[cfg(feature = "nemotron-timing")]
+    LookupTimings::record(timing, LookupPhase::NativeRead, started, result.is_ok());
+    result
 }
 
 pub fn fp8<'a, S: BlobStoreGet>(

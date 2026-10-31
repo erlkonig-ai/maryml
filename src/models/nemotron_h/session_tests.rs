@@ -289,6 +289,26 @@ fn session_host_complete_typed_expert_survives_merged_alternatives() {
     assert_eq!(up.weight.dims(), &[2688, 1024]);
     assert_eq!(down.weight.dims(), &[1024, 2688]);
     assert!(pile::nvfp4_expert_minimum(&snapshot, *layer, 8).is_none());
+    #[cfg(feature = "nemotron-timing")]
+    {
+        let mut detail = moe::LookupTimings::default();
+        let (observed_expert, observed_up, observed_down) =
+            pile::nvfp4_expert_minimum_observed(&snapshot, *layer, 7, Some(&mut detail))
+                .unwrap().unwrap();
+        assert_eq!(observed_expert, expert);
+        for (observed, original) in [(&observed_up, &up), (&observed_down, &down)] {
+            assert_eq!(observed.operation, original.operation);
+            assert_eq!(observed.weight.dims(), original.weight.dims());
+            assert_eq!(&observed.weight.payload()[..], &original.weight.payload()[..]);
+            assert_eq!(&observed.input_scale.payload()[..], &original.input_scale.payload()[..]);
+        }
+        assert_eq!(detail.counts(), [(1, 1), (1, 1), (4, 4)]);
+        let mut missing = moe::LookupTimings::default();
+        assert!(pile::nvfp4_expert_minimum_observed(
+            &snapshot, *layer, 8, Some(&mut missing),
+        ).is_none());
+        assert_eq!(missing.counts(), [(1, 1), (1, 1), (0, 0)]);
+    }
 
     // A fully typed selected tuple whose blob is absent must still report an
     // error. It must not silently fall through to a different observation.
@@ -323,6 +343,17 @@ fn session_host_complete_typed_expert_survives_merged_alternatives() {
             .unwrap()
             .is_err()
     );
+    #[cfg(feature = "nemotron-timing")]
+    {
+        let mut detail = moe::LookupTimings::default();
+        let observed = pile::nvfp4_expert_minimum_observed(
+            &snapshot, *layer, 8, Some(&mut detail),
+        ).unwrap().err().unwrap();
+        let original = pile::nvfp4_expert_minimum(&snapshot, *layer, 8)
+            .unwrap().err().unwrap();
+        assert_eq!(observed.to_string(), original.to_string());
+        assert_eq!(detail.counts(), [(1, 1), (1, 1), (1, 0)]);
+    }
 }
 
 fn tensor<T: TensorElement, const R: usize>(

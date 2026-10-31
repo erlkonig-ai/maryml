@@ -96,6 +96,22 @@ fn stage(
     })
 }
 
+#[cfg(feature = "nemotron-timing")]
+#[test]
+fn moe_host_default_timed_provider_preserves_callback_and_error() {
+    let provider = Provider::new();
+    let mut detail = super::super::LookupTimings::default();
+    let result: Result<()> = provider.with_expert_timed(7, |pair| {
+        assert_eq!(pair.index, 7);
+        assert_eq!(pair.up.operation, provider.operations[0]);
+        assert_eq!(pair.down.operation, provider.operations[1]);
+        Err("callback failed".into())
+    }, &mut detail);
+    assert_eq!(result.unwrap_err(), "callback failed");
+    assert_eq!(provider.queries.get(), 1);
+    assert_eq!(detail.counts(), [(0, 0); 3]);
+}
+
 #[test]
 fn moe_host_cache_hit_skips_query_validation_and_upload() {
     let provider = Provider::new();

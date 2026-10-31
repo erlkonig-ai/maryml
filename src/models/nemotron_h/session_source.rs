@@ -20,12 +20,33 @@ impl<S: BlobStoreGet> moe::ExpertProvider for NativeExperts<S> {
         index: usize,
         use_pair: impl FnOnce(moe::ExpertPair<'_>) -> Result<T>,
     ) -> Result<T> {
+        self.with_expert_detail(index, use_pair, #[cfg(feature = "nemotron-timing")] None)
+    }
+
+    #[cfg(feature = "nemotron-timing")]
+    fn with_expert_timed<T>(
+        &self,
+        index: usize,
+        use_pair: impl FnOnce(moe::ExpertPair<'_>) -> Result<T>,
+        timing: &mut moe::LookupTimings,
+    ) -> Result<T> {
+        self.with_expert_detail(index, use_pair, Some(timing))
+    }
+}
+impl<S: BlobStoreGet> NativeExperts<S> {
+    fn with_expert_detail<T>(
+        &self,
+        index: usize,
+        use_pair: impl FnOnce(moe::ExpertPair<'_>) -> Result<T>,
+        #[cfg(feature = "nemotron-timing")] timing: Option<&mut moe::LookupTimings>,
+    ) -> Result<T> {
         // Choose only among complete typed expert/up/down/scale tuples. Missing
         // typed facts are negative matches; a selected missing blob is an error.
-        let (_, up, down) =
-            pile::nvfp4_expert_minimum(&self.snapshot, self.source.layer, index as u64)
-                .ok_or_else(|| format!("missing complete native expert {index}"))?
-                .map_err(|e| e.to_string())?;
+        let (_, up, down) = pile::nvfp4_expert_minimum_observed(
+            &self.snapshot, self.source.layer, index as u64,
+            #[cfg(feature = "nemotron-timing")] timing,
+        ).ok_or_else(|| format!("missing complete native expert {index}"))?
+            .map_err(|e| e.to_string())?;
         shape(&up.weight, &[2688, 1024], "moe.up_proj")?;
         shape(&down.weight, &[1024, 2688], "moe.down_proj")?;
         use_pair(moe::ExpertPair {

@@ -17,6 +17,8 @@
 
 #[cfg(feature = "nemotron-timing")]
 use super::host_timing::{self, Phase, Timings};
+#[cfg(feature = "nemotron-timing")]
+pub use super::host_timing::LookupTimings;
 use crate::{
     models::inkling::{bf16gemm, moegroup},
     nn::{nvfp4_gemm::calibrated_scale, nvfp4_gemv::Nvfp4},
@@ -91,6 +93,18 @@ pub trait ExpertProvider {
         index: usize,
         use_pair: impl FnOnce(ExpertPair<'_>) -> Result<T>,
     ) -> Result<T>;
+
+    /// Optional nested host-return timing. The default preserves standalone
+    /// providers and leaves detail unavailable; it does not invent zero cost.
+    #[cfg(feature = "nemotron-timing")]
+    fn with_expert_timed<T>(
+        &self,
+        index: usize,
+        use_pair: impl FnOnce(ExpertPair<'_>) -> Result<T>,
+        _timing: &mut LookupTimings,
+    ) -> Result<T> {
+        self.with_expert(index, use_pair)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -251,7 +265,9 @@ fn load_expert<P: ExpertProvider, W>(
 ) -> Result<(W, W)> {
     #[cfg(feature = "nemotron-timing")]
     let mut lookup = host_timing::Lookup::start(timing.as_deref());
-    let result = provider.with_expert(index, |pair| {
+    #[cfg(feature = "nemotron-timing")]
+    let detailed = timing.is_some();
+    let use_pair = |pair: ExpertPair<'_>| {
         #[cfg(feature = "nemotron-timing")]
         lookup.entered(timing.as_deref_mut());
         #[cfg(feature = "nemotron-timing")]
@@ -284,9 +300,23 @@ fn load_expert<P: ExpertProvider, W>(
             pair.down.payload.len() - 4, down.is_ok(),
         );
         Ok((up, down?))
-    });
+    };
+    #[cfg(feature = "nemotron-timing")]
+    let (result, detail) = if detailed {
+        let mut detail = LookupTimings::default();
+        let result = provider.with_expert_timed(index, use_pair, &mut detail);
+        (result, Some(detail))
+    } else {
+        (provider.with_expert(index, use_pair), None)
+    };
+    #[cfg(not(feature = "nemotron-timing"))]
+    let result = provider.with_expert(index, use_pair);
     #[cfg(feature = "nemotron-timing")]
     lookup.returned(timing.as_deref_mut());
+    #[cfg(feature = "nemotron-timing")]
+    if let (Some(timing), Some(detail)) = (timing, detail) {
+        timing.merge_lookup(detail);
+    }
     result
 }
 
