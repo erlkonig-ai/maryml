@@ -49,7 +49,9 @@ pub struct Source {
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
     pub capacity: usize,
-    /// Fixed weights/KV plus one committed Mamba state per Mamba layer.
+    /// Fixed weights/KV, one committed Mamba state per Mamba layer, and routed
+    /// expert planes. Remaining room sets a uniform per-MoE cache quota (0..512).
+    /// Logical payload bytes, not allocator reservation or host staging.
     pub max_resident_bytes: usize,
     /// Sum of fresh logical allocations for one chunk, including staged state,
     /// retained outer outputs and one transient expert pair. NOT physical peak,
@@ -264,6 +266,25 @@ fn resident_bytes(c: &TextConfig, l: Limits) -> Result<usize> {
     Ok(total)
 }
 
+/// Reserve the full uniform cache quota before any fixed upload. A miss still
+/// has one extra pending pair in chunk_bytes, including when the cache is full.
+fn expert_cache_pairs(resident: usize, limit: usize, moe_layers: usize) -> Result<usize> {
+    let remaining = limit.checked_sub(resident)
+        .ok_or("session aggregate resident budget exceeded")?;
+    if moe_layers == 0 {
+        return Ok(0);
+    }
+    let one_per_layer = moe::expert_device_bytes()?.checked_mul(moe_layers)
+        .ok_or("session expert cache byte sum overflow")?;
+    let pairs = (remaining / one_per_layer).min(moe::EXPERTS);
+    let cached = one_per_layer.checked_mul(pairs)
+        .ok_or("session expert cache byte sum overflow")?;
+    if add(resident, cached)? > limit {
+        return Err("session aggregate cached resident budget exceeded".into());
+    }
+    Ok(pairs)
+}
+
 impl<S: BlobStoreGet> Session<S> {
     /// No publication, download or default collection selection. Layer IDs are
     /// explicit opaque choices in ordered config positions. Multiple matches
@@ -271,7 +292,8 @@ impl<S: BlobStoreGet> Session<S> {
     /// hold its values. NVFP4 uses the minimum opaque joined tuple, including
     /// complete typed expert pairs at each requested index, stable on repeated
     /// queries of this snapshot.
-    /// No full expert catalog is retained.
+    /// Only on-demand immutable device operands are cached; no expert catalog
+    /// or source payloads are retained beside the frozen snapshot.
     pub fn from_snapshot(
         snapshot: Arc<ModelSnapshot<S>>,
         source: Source,

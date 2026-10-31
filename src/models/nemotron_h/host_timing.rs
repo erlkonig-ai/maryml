@@ -58,6 +58,9 @@ pub(super) struct Timings {
     enqueue: Work,
     expert_fence: Work,
     mixer_fence: Work,
+    cache_hits: u64,
+    cache_misses: u64,
+    cache_evictions: u64,
 }
 
 /// Only the actual append entry decides opt-in; inner loops never query env/logging.
@@ -98,6 +101,16 @@ impl Lookup {
 }
 
 impl Timings {
+    // Attempts, including failed miss materialization; not GPU durations.
+    pub(super) fn cache_access(&mut self, hit: bool) {
+        let count = if hit { &mut self.cache_hits } else { &mut self.cache_misses };
+        *count = count.saturating_add(1);
+    }
+
+    pub(super) fn cache_eviction(&mut self) {
+        self.cache_evictions = self.cache_evictions.saturating_add(1);
+    }
+
     fn work(&mut self, phase: Phase) -> &mut Work {
         match phase {
             Phase::Mixer => &mut self.mixer,
@@ -149,6 +162,8 @@ impl Timings {
             lookup_view = ?self.lookup, packed_validation = ?self.validate,
             weight_upload_api = ?self.upload, gpu_work_enqueue = ?self.enqueue,
             expert_fence = ?self.expert_fence, mixer_fence = ?self.mixer_fence,
+            expert_cache_hits = self.cache_hits, expert_cache_misses = self.cache_misses,
+            expert_cache_evictions = self.cache_evictions,
             selected_disjoint_ns = %selected_parts, selected_unclassified_ns = %selected_other,
             mixer_other_ns = %mixer_other, append_other_ns = %append_other,
             nesting_valid = selected_valid && mixer_valid && append_valid);

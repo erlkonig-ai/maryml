@@ -9,6 +9,8 @@
 //! to select immutable native expert operands; no retained parameter catalog.
 //!
 //! Each selected expert pair is fenced before release, as is the final result.
+//! Native sessions may retain immutable pairs within their admitted budget;
+//! standalone upload keeps the original one-visit lifetime.
 //! After dispatch any error/panic poisons this owner until reset succeeds.
 //! An outer hybrid owner must also discard/reset attention AND Mamba history;
 //! resetting this stateless mixer alone cannot undo another layer's effects.
@@ -28,6 +30,9 @@ use cubecl::{
 };
 use half::bf16;
 use triblespace::prelude::Id;
+
+#[path = "moe_cache.rs"]
+mod cache;
 
 pub type CudaTensor = CubeTensor<CudaRuntime>;
 pub type Result<T> = std::result::Result<T, String>;
@@ -160,7 +165,7 @@ pub struct Moe<P> {
     poisoned: bool,
     // Installed BEFORE projection dispatch. A failed sync is not a drain;
     // retain these operands until a subsequent successful completion/reset.
-    pending_expert: Option<(PackedWeight, PackedWeight)>,
+    expert_operands: cache::Operands<(PackedWeight, PackedWeight)>,
 }
 
 fn bytes(dims: &[usize], width: usize) -> Result<usize> {
@@ -181,6 +186,13 @@ fn packed_bytes(n: usize, k: usize) -> Result<usize> {
         .and_then(|v| v.checked_add(count / 16))
         .and_then(|v| v.checked_add(4))
         .ok_or("MoE packed length overflow".into())
+}
+/// Four device planes; the two trailing global scales remain host scalars.
+pub(super) fn expert_device_bytes() -> Result<usize> {
+    packed_bytes(INTERMEDIATE, LATENT)?
+        .checked_sub(4)
+        .and_then(|n| n.checked_mul(2))
+        .ok_or("MoE expert device byte overflow".into())
 }
 pub(super) fn admission(limits: Limits) -> Result<Admission> {
     let fixed_bytes = bytes(&[EXPERTS, HIDDEN], 2)?
@@ -227,6 +239,55 @@ fn validate_fixed(w: &FixedOperands<'_>) -> Result<()> {
     finite_bf16(w.fc2_bf16, HIDDEN, LATENT)?;
     validate_packed(&w.shared_up, SHARED, HIDDEN)?;
     validate_packed(&w.shared_down, HIDDEN, SHARED)
+}
+
+/// The same miss path for standalone and cached owners. The uploader seam
+/// lets host tests check query/validation/materialization without CUDA calls.
+fn load_expert<P: ExpertProvider, W>(
+    provider: &P,
+    index: usize,
+    mut upload: impl FnMut(&PackedOperation<'_>, usize, usize) -> Result<W>,
+    #[cfg(feature = "nemotron-timing")] mut timing: Option<&mut Timings>,
+) -> Result<(W, W)> {
+    #[cfg(feature = "nemotron-timing")]
+    let mut lookup = host_timing::Lookup::start(timing.as_deref());
+    let result = provider.with_expert(index, |pair| {
+        #[cfg(feature = "nemotron-timing")]
+        lookup.entered(timing.as_deref_mut());
+        #[cfg(feature = "nemotron-timing")]
+        let started = host_timing::clock(timing.as_deref());
+        let validation = (|| {
+            if pair.index != index {
+                return Err("MoE selected expert index mismatch".into());
+            }
+            validate_packed(&pair.up, INTERMEDIATE, LATENT)?;
+            validate_packed(&pair.down, LATENT, INTERMEDIATE)
+        })();
+        #[cfg(feature = "nemotron-timing")]
+        host_timing::record(timing.as_deref_mut(), Phase::Validate, started, 0, validation.is_ok());
+        validation?;
+        #[cfg(feature = "nemotron-timing")]
+        let started = host_timing::clock(timing.as_deref());
+        let up = upload(&pair.up, INTERMEDIATE, LATENT);
+        #[cfg(feature = "nemotron-timing")]
+        host_timing::record(
+            timing.as_deref_mut(), Phase::Upload, started,
+            pair.up.payload.len() - 4, up.is_ok(),
+        );
+        let up = up?;
+        #[cfg(feature = "nemotron-timing")]
+        let started = host_timing::clock(timing.as_deref());
+        let down = upload(&pair.down, LATENT, INTERMEDIATE);
+        #[cfg(feature = "nemotron-timing")]
+        host_timing::record(
+            timing.as_deref_mut(), Phase::Upload, started,
+            pair.down.payload.len() - 4, down.is_ok(),
+        );
+        Ok((up, down?))
+    });
+    #[cfg(feature = "nemotron-timing")]
+    lookup.returned(timing.as_deref_mut());
+    result
 }
 
 pub(super) fn working_bytes(t: usize) -> Result<usize> {
@@ -290,7 +351,26 @@ impl<P: ExpertProvider> Moe<P> {
         provider: P,
         limits: Limits,
     ) -> Result<Self> {
+        Self::upload_with_expert_cache(device, source, fixed, provider, limits, 0)
+    }
+    /// Only the native frozen-snapshot assembly enables retention, after
+    /// admitting all layer quotas against the aggregate resident limit.
+    pub(super) fn upload_with_expert_cache(
+        device: CudaDevice,
+        source: SourceBinding,
+        fixed: FixedOperands<'_>,
+        provider: P,
+        limits: Limits,
+        cache_pairs: usize,
+    ) -> Result<Self> {
         let admission = admission(limits)?;
+        let expert_operands = cache::Operands::new(cache_pairs)?;
+        let resident = expert_device_bytes()?.checked_mul(cache_pairs)
+            .and_then(|n| n.checked_add(admission.fixed_bytes))
+            .ok_or("MoE cached resident byte overflow")?;
+        if resident > limits.max_fixed_bytes {
+            return Err("MoE cached resident budget exceeded".into());
+        }
         if provider.source() != source {
             return Err("MoE provider/source binding mismatch".into());
         }
@@ -319,7 +399,7 @@ impl<P: ExpertProvider> Moe<P> {
             limits,
             admission,
             poisoned: false,
-            pending_expert: None,
+            expert_operands,
         })
     }
     pub fn source(&self) -> SourceBinding {
@@ -343,7 +423,7 @@ impl<P: ExpertProvider> Moe<P> {
     pub fn reset(&mut self) -> Result<()> {
         self.poisoned = true;
         fence(&self.client)?;
-        self.pending_expert = None;
+        self.expert_operands.complete(&Ok(()), false);
         self.poisoned = false;
         Ok(())
     }
@@ -477,9 +557,7 @@ impl<P: ExpertProvider> Moe<P> {
             0,
             completion.is_ok(),
         );
-        if completion.is_ok() {
-            self.pending_expert = None;
-        }
+        self.expert_operands.complete(&completion, false);
         let result = finish(result, completion);
         if result.is_ok() {
             self.poisoned = false;
@@ -534,67 +612,26 @@ impl<P: ExpertProvider> Moe<P> {
             // This immediate closure only collects Result returns for timing;
             // the existing per-expert and final fences remain on the same paths.
             let selected_result = (|| -> Result<()> {
+                if self.provider.source() != self.source {
+                    return Err("MoE selected expert/source binding mismatch".into());
+                }
+                let mut hit = true;
+                let staged = self.expert_operands.stage(index, || {
+                    hit = false;
+                    load_expert(
+                        &self.provider,
+                        index,
+                        |op, n, k| PackedWeight::upload(op, n, k, &self.device),
+                        #[cfg(feature = "nemotron-timing")]
+                        timing.as_deref_mut(),
+                    )
+                });
                 #[cfg(feature = "nemotron-timing")]
-                let mut lookup = host_timing::Lookup::start(timing.as_deref());
-                let pair = (|| {
-                    if self.provider.source() != self.source {
-                        return Err("MoE selected expert/source binding mismatch".into());
-                    }
-                    self.provider.with_expert(index, |pair| {
-                        #[cfg(feature = "nemotron-timing")]
-                        lookup.entered(timing.as_deref_mut());
-                        #[cfg(feature = "nemotron-timing")]
-                        let started = host_timing::clock(timing.as_deref());
-                        let validation = (|| {
-                            if pair.index != index {
-                                return Err("MoE selected expert index mismatch".into());
-                            }
-                            validate_packed(&pair.up, INTERMEDIATE, LATENT)?;
-                            validate_packed(&pair.down, LATENT, INTERMEDIATE)
-                        })();
-                        #[cfg(feature = "nemotron-timing")]
-                        host_timing::record(
-                            timing.as_deref_mut(),
-                            Phase::Validate,
-                            started,
-                            0,
-                            validation.is_ok(),
-                        );
-                        validation?;
-                        #[cfg(feature = "nemotron-timing")]
-                        let started = host_timing::clock(timing.as_deref());
-                        let up = PackedWeight::upload(&pair.up, INTERMEDIATE, LATENT, &self.device);
-                        #[cfg(feature = "nemotron-timing")]
-                        host_timing::record(
-                            timing.as_deref_mut(),
-                            Phase::Upload,
-                            started,
-                            pair.up.payload.len() - 4,
-                            up.is_ok(),
-                        );
-                        let up = up?;
-                        #[cfg(feature = "nemotron-timing")]
-                        let started = host_timing::clock(timing.as_deref());
-                        let down =
-                            PackedWeight::upload(&pair.down, LATENT, INTERMEDIATE, &self.device);
-                        #[cfg(feature = "nemotron-timing")]
-                        host_timing::record(
-                            timing.as_deref_mut(),
-                            Phase::Upload,
-                            started,
-                            pair.down.payload.len() - 4,
-                            down.is_ok(),
-                        );
-                        Ok((up, down?))
-                    })
-                })();
-                #[cfg(feature = "nemotron-timing")]
-                lookup.returned(timing.as_deref_mut());
-                self.pending_expert = Some(pair?);
-                let (up, down) = self
-                    .pending_expert
-                    .as_ref()
-                    .expect("installed before dispatch");
+                if (staged.is_ok() || !hit) && let Some(timing) = timing.as_deref_mut() {
+                    timing.cache_access(hit);
+                }
+                staged?;
+                let (up, down) = self.expert_operands.pending();
                 #[cfg(feature = "nemotron-timing")]
                 let enqueue_started = host_timing::clock(timing.as_deref());
                 let result = (|| {
@@ -651,9 +688,13 @@ impl<P: ExpertProvider> Moe<P> {
                     0,
                     completion.is_ok(),
                 );
-                if completion.is_ok() {
-                    self.pending_expert = None;
+                let evicted = self.expert_operands.complete(&completion, result.is_ok());
+                #[cfg(feature = "nemotron-timing")]
+                if evicted && let Some(timing) = timing.as_deref_mut() {
+                    timing.cache_eviction();
                 }
+                #[cfg(not(feature = "nemotron-timing"))]
+                let _ = (hit, evicted);
                 finish(result, completion)
             })();
             #[cfg(feature = "nemotron-timing")]

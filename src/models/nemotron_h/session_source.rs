@@ -257,7 +257,11 @@ pub(super) fn load<S: BlobStoreGet>(
     )
     .map_err(|e| e.to_string())?;
     validate_config(&config, limits)?;
-    resident_bytes(&config, limits)?;
+    let cache_pairs = expert_cache_pairs(
+        resident_bytes(&config, limits)?,
+        limits.max_resident_bytes,
+        config.layers_block_type.iter().filter(|kind| matches!(kind, LayerKind::Moe)).count(),
+    )?;
     if layer_ids.len() != config.layers_block_type.len() {
         return Err("selected layer sequence length differs from config".into());
     }
@@ -368,7 +372,7 @@ pub(super) fn load<S: BlobStoreGet>(
                     model_root: source.root,
                     layer: id,
                 };
-                Mixer::Moe(moe::Moe::upload(
+                Mixer::Moe(moe::Moe::upload_with_expert_cache(
                     device.clone(),
                     binding,
                     moe::FixedOperands {
@@ -385,6 +389,7 @@ pub(super) fn load<S: BlobStoreGet>(
                         source: binding,
                     },
                     moe_limits(limits),
+                    cache_pairs,
                 )?)
             }
         };
