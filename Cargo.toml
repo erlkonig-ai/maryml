@@ -65,6 +65,8 @@ serde_json = "1.0"
 # unconditional: a Repository needs a signing key (ed25519 + OsRng via rand)
 # and the loaders report errors via anyhow.
 anyhow = "1"
+# Optional, numeric per-turn diagnostics; no subscriber or sink in the model.
+tracing = { version = "0.1", optional = true }
 
 # NO COGNITION LOOP HERE, as of 2026-08-31. mary is the models and the ML; the
 # harness lives in drive. This is the direction JP fixed when the crate cycle
@@ -193,6 +195,8 @@ nvfp4-score-cuda = ["nvfp4-encode-cuda"]
 # Bounded Flint layer arithmetic on the existing raw CubeCL CUDA runtime.
 # Kept separate so the stored-weight/CPU diagnostics need no GPU dependency.
 flint-cuda = ["import", "dep:cubecl", "cubecl?/cuda"]
+nemotron-cuda = ["dep:cubecl", "cubecl?/cuda", "dep:burn-cubecl", "dep:cubek"]
+nemotron-timing = ["nemotron-cuda", "dep:tracing"]
 # Investigation-only: burn's REAL Cuda backend, for backend_matmul_probe.
 burn-cuda-bench = ["burn/cuda", "burn/autotune"]
 
@@ -998,6 +1002,10 @@ required-features = ["import"]
 [[bin]]
 name = "flint_generate"
 required-features = ["import", "tokenizer"]
+
+[[bin]]
+name = "nemotron_generate_smoke"
+required-features = ["nemotron-cuda", "import", "tokenizer"]
 
 [[bin]]
 name = "flint_head_repeat"

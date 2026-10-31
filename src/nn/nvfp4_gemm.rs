@@ -328,6 +328,23 @@ impl Nvfp4 {
     /// `t`, on the stored planes. A strided or misaligned activation is made
     /// contiguous first; type and device are checked.
     pub(crate) fn project(&self, x: &Tensor, lane: PromptLane) -> Result<Tensor> {
+        self.project_with_scale(x, lane, 1.0)
+    }
+
+    /// Calibrated W4A4 on unchanged typed weight planes. `input_scale` is the
+    /// positive finite activation dequantization global from THIS operation,
+    /// not an inverse scale or the weight global. Existing project() callers
+    /// retain unit activation global. Allocation admission belongs to caller.
+    ///
+    /// Per-block quantization uses (amax/6)/input_scale, then x/(block*global).
+    /// The epilogue uses F32(input_scale*weight_global) before the final narrow
+    /// cast. This association is explicit, not a claim of fake-quant bit parity.
+    pub(crate) fn project_w4a4_scaled(&self, x: &Tensor, input_scale: f32) -> Result<Tensor> {
+        calibrated_scale(input_scale, self.scale2)?;
+        self.project_with_scale(x, PromptLane::W4a4, input_scale)
+    }
+
+    fn project_with_scale(&self, x: &Tensor, lane: PromptLane, input_scale: f32) -> Result<Tensor> {
         let packed;
         let x = if x.is_contiguous() && x.handle.offset_start.unwrap_or(0) % 4 == 0 {
             x
@@ -344,8 +361,8 @@ impl Nvfp4 {
         let out = match (lane, self.dtype()) {
             (PromptLane::W4a16, DType::BF16) => self.w4a16::<bf16>(x, t),
             (PromptLane::W4a16, DType::F16) => self.w4a16::<f16>(x, t),
-            (PromptLane::W4a4, DType::BF16) => self.w4a4::<bf16>(x, t)?,
-            (PromptLane::W4a4, DType::F16) => self.w4a4::<f16>(x, t)?,
+            (PromptLane::W4a4, DType::BF16) => self.w4a4::<bf16>(x, t, input_scale)?,
+            (PromptLane::W4a4, DType::F16) => self.w4a4::<f16>(x, t, input_scale)?,
             (_, other) => anyhow::bail!("NVFP4 weight of {other:?}"),
         };
         let _ = k;
@@ -392,7 +409,7 @@ impl Nvfp4 {
         out
     }
 
-    fn w4a4<O: Scalar + Cast + CubeElement>(&self, x: &Tensor, t: usize) -> Result<Handle> {
+    fn w4a4<O: Scalar + Cast + CubeElement>(&self, x: &Tensor, t: usize, input_scale: f32) -> Result<Handle> {
         let (n, k) = (self.n(), self.k());
         ensure!(
             k % KTILE4 == 0,
@@ -402,9 +419,8 @@ impl Nvfp4 {
         let blocks = t * k / GROUP;
         let codes = client.empty(t * k / 2);
         let scales = client.empty(blocks);
-        // The activation's own per-16 recipe is the weight quantizer's with a
-        // unit global scale: e4m3_rn(min(bamax / 6, 448)), then the hardware
-        // E2M1 conversion of x / scale.
+        // Reuse the existing quantizer with the operation's activation global.
+        // Existing project() callers pass exactly 1.0, preserving their recipe.
         // SAFETY: one thread per complete 16-block of the checked [t, k]
         // activation; each writes its own two code words and scale byte.
         unsafe {
@@ -416,7 +432,7 @@ impl Nvfp4 {
                 ArrayArg::from_raw_parts(codes.clone(), t * k / 8),
                 ArrayArg::from_raw_parts(scales.clone(), blocks),
                 blocks,
-                1.0f32,
+                input_scale,
             );
         }
         let out = client.empty(t * n * core::mem::size_of::<O>());
@@ -439,9 +455,20 @@ impl Nvfp4 {
                 t as u32,
                 k,
                 n,
-                self.scale2,
+                self.scale2 * input_scale,
             );
         }
         Ok(out)
     }
+}
+
+/// Validate before any dispatch/allocation, including the existing contiguous
+/// conversion. Reject product underflow/overflow instead of silently erasing
+/// or overflowing a calibrated operation.
+pub(crate) fn calibrated_scale(input: f32, weight: f32) -> Result<f32> {
+    let product = input * weight;
+    ensure!(input.is_finite() && input > 0.0 && weight.is_finite() && weight > 0.0
+        && product.is_finite() && product > 0.0,
+        "W4A4 calibrated globals/product must be finite positive");
+    Ok(product)
 }

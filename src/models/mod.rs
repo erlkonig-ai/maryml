@@ -5,6 +5,7 @@
 pub mod f5;
 
 pub mod qwen3_5;
+pub mod nemotron_h;
 
 #[cfg(feature = "breeze")]
 pub mod breeze;
@@ -61,6 +62,28 @@ pub mod inkling;
 // `mary::models::inkling::spectree`.
 #[cfg(not(feature = "inkling-cuda"))]
 pub mod inkling {
+    // Reuse the existing runtime-generic online attention without enabling
+    // Inkling's importer/model stack. No second copy of either kernel file.
+    #[cfg(feature = "nemotron-cuda")]
+    #[path = "flash.rs"]
+    pub mod flash;
+    #[cfg(feature = "nemotron-cuda")]
+    #[path = "fp4quant.rs"]
+    pub mod fp4quant;
+    // Unchanged helpers reused by Nemotron's BF16/packed MoE paths. The codec
+    // is also referenced by fp4gemm's host helpers, not only device tests.
+    #[cfg(feature = "nemotron-cuda")]
+    #[path = "nvfp4.rs"]
+    pub mod nvfp4;
+    #[cfg(feature = "nemotron-cuda")]
+    #[path = "bf16gemm.rs"]
+    pub mod bf16gemm;
+    #[cfg(feature = "nemotron-cuda")]
+    #[path = "fp4gemm.rs"]
+    pub mod fp4gemm;
+    #[cfg(feature = "nemotron-cuda")]
+    #[path = "moegroup.rs"]
+    pub mod moegroup;
     #[path = "cache_pile.rs"]
     pub mod cache_pile;
     #[path = "spectree.rs"]
