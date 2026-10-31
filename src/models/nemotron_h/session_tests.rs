@@ -71,6 +71,49 @@ fn session_host_geometry_and_aggregate_admission() {
 }
 
 #[test]
+fn session_host_expert_cache_budget_boundaries_and_overflow() {
+    let base = resident_bytes(&config(), limits()).unwrap();
+    let pair = moe::expert_device_bytes().unwrap();
+    assert_eq!(pair, 3_096_576);
+    assert_eq!(expert_cache_pairs(base, base, 1).unwrap(), 0);
+    assert_eq!(expert_cache_pairs(base, base + pair - 1, 1).unwrap(), 0);
+    assert_eq!(expert_cache_pairs(base, base + pair, 1).unwrap(), 1);
+    assert_eq!(expert_cache_pairs(base, base + 2 * pair - 1, 2).unwrap(), 0);
+    assert_eq!(expert_cache_pairs(base, base + 2 * pair, 2).unwrap(), 1);
+    assert_eq!(expert_cache_pairs(base, usize::MAX, 0).unwrap(), 0);
+    assert_eq!(expert_cache_pairs(base, usize::MAX, 1).unwrap(), moe::EXPERTS);
+    assert!(expert_cache_pairs(base, base - 1, 0).is_err());
+    assert!(expert_cache_pairs(base, usize::MAX, usize::MAX).is_err());
+}
+
+#[test]
+fn session_host_expert_cache_full_geometry_uses_caller_resident_limit() {
+    let mut c = config();
+    c.layers_block_type = vec![LayerKind::Mamba; 40];
+    c.layers_block_type.extend(vec![LayerKind::Moe; 40]);
+    c.layers_block_type.extend(vec![LayerKind::Attention; 8]);
+    c.vocab_size = 131072;
+    c.max_position_embeddings = 2048;
+    c.mamba_num_heads = 128;
+    c.ssm_state_size = 128;
+    c.n_groups = 8;
+    c.conv_kernel = 4;
+    c.expand = 2;
+    let mut l = Limits { capacity: 2048, max_resident_bytes: 8 << 30, max_chunk_bytes: 6 << 30 };
+    validate_config(&c, l).unwrap();
+    let base = resident_bytes(&c, l).unwrap();
+    assert_eq!(base, 8_302_088_512);
+    assert_eq!(expert_cache_pairs(base, l.max_resident_bytes, 40).unwrap(), 2);
+    l.max_resident_bytes = 12 << 30;
+    let pairs = expert_cache_pairs(base, l.max_resident_bytes, 40).unwrap();
+    assert_eq!(pairs, 36);
+    let resident = base + 40 * pairs * moe::expert_device_bytes().unwrap();
+    assert_eq!(resident, 12_761_157_952);
+    assert!(resident <= l.max_resident_bytes);
+    assert!(resident + 40 * moe::expert_device_bytes().unwrap() > l.max_resident_bytes);
+}
+
+#[test]
 fn session_host_config_rejects_unsupported_policies() {
     for field in [
         "attention_bias",
