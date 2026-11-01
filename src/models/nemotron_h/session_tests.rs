@@ -289,6 +289,22 @@ fn session_host_complete_typed_expert_survives_merged_alternatives() {
     assert_eq!(up.weight.dims(), &[2688, 1024]);
     assert_eq!(down.weight.dims(), &[1024, 2688]);
     assert!(pile::nvfp4_expert_minimum(&snapshot, *layer, 8).is_none());
+    // The retained provider borrows its attributes across repeated lookups;
+    // compare its selected operands with the standalone fresh-attribute path.
+    let binding = moe::SourceBinding { model_root: *layer, layer: *layer };
+    let provider = NativeExperts::new(Arc::new(snapshot.clone()), binding);
+    for _ in 0..2 {
+        moe::ExpertProvider::with_expert(&provider, 7, |pair| {
+            assert_eq!(pair.index, 7);
+            for (selected, original) in [(&pair.up, &up), (&pair.down, &down)] {
+                assert_eq!(selected.operation, original.operation);
+                assert_eq!(selected.payload, &original.weight.payload()[..]);
+                assert_eq!(&selected.input_scale.to_le_bytes()[..], &original.input_scale.payload()[..]);
+            }
+            Ok(())
+        }).unwrap();
+    }
+    assert!(moe::ExpertProvider::with_expert(&provider, 8, |_| Ok(())).is_err());
     #[cfg(feature = "nemotron-timing")]
     {
         let mut detail = moe::LookupTimings::default();
@@ -303,6 +319,12 @@ fn session_host_complete_typed_expert_survives_merged_alternatives() {
             assert_eq!(&observed.input_scale.payload()[..], &original.input_scale.payload()[..]);
         }
         assert_eq!(detail.counts(), [(1, 1), (1, 1), (4, 4)]);
+        let mut reused = moe::LookupTimings::default();
+        moe::ExpertProvider::with_expert_timed(&provider, 7, |pair| {
+            assert_eq!((pair.up.operation, pair.down.operation), (up.operation, down.operation));
+            Ok(())
+        }, &mut reused).unwrap();
+        assert_eq!(reused.counts(), detail.counts());
         let mut missing = moe::LookupTimings::default();
         assert!(pile::nvfp4_expert_minimum_observed(
             &snapshot, *layer, 8, Some(&mut missing),
@@ -343,6 +365,10 @@ fn session_host_complete_typed_expert_survives_merged_alternatives() {
             .unwrap()
             .is_err()
     );
+    let provider = NativeExperts::new(Arc::new(snapshot.clone()), binding);
+    let reused_error = moe::ExpertProvider::with_expert(&provider, 8, |_| Ok(())).unwrap_err();
+    let fresh_error = pile::nvfp4_expert_minimum(&snapshot, *layer, 8).unwrap().err().unwrap();
+    assert_eq!(reused_error, fresh_error.to_string());
     #[cfg(feature = "nemotron-timing")]
     {
         let mut detail = moe::LookupTimings::default();

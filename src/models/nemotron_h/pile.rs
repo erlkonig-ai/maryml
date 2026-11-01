@@ -151,10 +151,25 @@ pub fn nvfp4_expert_minimum<S: BlobStoreGet>(
 
 pub(super) fn nvfp4_expert_minimum_observed<S: BlobStoreGet>(
     snapshot: &ModelSnapshot<S>, layer: Id, index: u64,
-    #[cfg(feature = "nemotron-timing")] mut timing: Option<&mut LookupTimings>,
+    #[cfg(feature = "nemotron-timing")] timing: Option<&mut LookupTimings>,
 ) -> Option<Result<(Id, Nvfp4Projection, Nvfp4Projection)>> {
+    // Keep fresh construction inside this caller's original timing phase.
     #[cfg(feature = "nemotron-timing")]
     let started = LookupTimings::clock(timing.as_deref());
+    nvfp4_expert_minimum_with_attributes(
+        snapshot, layer, index, &leaf::leaf::<NVFP4, 2>(), &leaf::leaf::<F32, 0>(),
+        #[cfg(feature = "nemotron-timing")] timing,
+        #[cfg(feature = "nemotron-timing")] started,
+    )
+}
+
+pub(super) fn nvfp4_expert_minimum_with_attributes<S: BlobStoreGet>(
+    snapshot: &ModelSnapshot<S>, layer: Id, index: u64,
+    weight_leaf: &Attribute<inlineencodings::Handle<Tensor<NVFP4, 2>>>,
+    scale_leaf: &Attribute<inlineencodings::Handle<Tensor<F32, 0>>>,
+    #[cfg(feature = "nemotron-timing")] mut timing: Option<&mut LookupTimings>,
+    #[cfg(feature = "nemotron-timing")] started: Option<std::time::Instant>,
+) -> Option<Result<(Id, Nvfp4Projection, Nvfp4Projection)>> {
     let query = find!((expert: Id,
     up: Id, uw: Inline<inlineencodings::Handle<Tensor<NVFP4, 2>>>, ui: Inline<inlineencodings::Handle<Tensor<F32, 0>>>,
     down: Id, dw: Inline<inlineencodings::Handle<Tensor<NVFP4, 2>>>, di: Inline<inlineencodings::Handle<Tensor<F32, 0>>>),
@@ -162,13 +177,13 @@ pub(super) fn nvfp4_expert_minimum_observed<S: BlobStoreGet>(
         { layer @ attrs::member: ?expert },
         { ?expert @ attrs::kind: EXPERT, attrs::index: index, attrs::member: ?up, attrs::member: ?down },
         { ?up @ attrs::kind: "moe.up_proj", attrs::weight: _?up_weight, attrs::member: _?up_input },
-        { _?up_weight @ leaf::leaf::<NVFP4, 2>(): ?uw },
+        { _?up_weight @ weight_leaf: ?uw },
         { _?up_input @ attrs::kind: INPUT_SCALE, attrs::weight: _?ui_leaf },
-        { _?ui_leaf @ leaf::leaf::<F32, 0>(): ?ui },
+        { _?ui_leaf @ scale_leaf: ?ui },
         { ?down @ attrs::kind: "moe.down_proj", attrs::weight: _?down_weight, attrs::member: _?down_input },
-        { _?down_weight @ leaf::leaf::<NVFP4, 2>(): ?dw },
+        { _?down_weight @ weight_leaf: ?dw },
         { _?down_input @ attrs::kind: INPUT_SCALE, attrs::weight: _?di_leaf },
-        { _?di_leaf @ leaf::leaf::<F32, 0>(): ?di }
+        { _?di_leaf @ scale_leaf: ?di }
     ]));
     #[cfg(feature = "nemotron-timing")]
     LookupTimings::record(timing.as_deref_mut(), LookupPhase::Construction, started, true);

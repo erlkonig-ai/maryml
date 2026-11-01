@@ -1,15 +1,28 @@
 //! Private query-at-use loader. Retains execution operands, not a graph mirror.
 use super::super::{ingress::tokenizer_binding, pile};
 use super::*;
-use crate::{format::attrs, jsonfacts, tokenizer};
+use crate::{format::attrs, jsonfacts, leaf, tokenizer};
 use triblespace::core::blob::encodings::tensor::{
-    TensorElement, TensorView,
-    elements::{BF16, F32},
+    Tensor, TensorElement, TensorView,
+    elements::{BF16, F32, NVFP4},
 };
 
 pub(super) struct NativeExperts<S> {
     snapshot: Arc<ModelSnapshot<S>>,
     source: moe::SourceBinding,
+    // The two schema operands are invariant for this immutable provider's
+    // lifetime. Queries still derive each expert tuple from the held snapshot.
+    weight_leaf: Attribute<inlineencodings::Handle<Tensor<NVFP4, 2>>>,
+    scale_leaf: Attribute<inlineencodings::Handle<Tensor<F32, 0>>>,
+}
+impl<S> NativeExperts<S> {
+    pub(super) fn new(snapshot: Arc<ModelSnapshot<S>>, source: moe::SourceBinding) -> Self {
+        Self {
+            snapshot, source,
+            weight_leaf: leaf::leaf::<NVFP4, 2>(),
+            scale_leaf: leaf::leaf::<F32, 0>(),
+        }
+    }
 }
 impl<S: BlobStoreGet> moe::ExpertProvider for NativeExperts<S> {
     fn source(&self) -> moe::SourceBinding {
@@ -42,9 +55,13 @@ impl<S: BlobStoreGet> NativeExperts<S> {
     ) -> Result<T> {
         // Choose only among complete typed expert/up/down/scale tuples. Missing
         // typed facts are negative matches; a selected missing blob is an error.
-        let (_, up, down) = pile::nvfp4_expert_minimum_observed(
+        #[cfg(feature = "nemotron-timing")]
+        let started = moe::LookupTimings::clock(timing.as_deref());
+        let (_, up, down) = pile::nvfp4_expert_minimum_with_attributes(
             &self.snapshot, self.source.layer, index as u64,
+            &self.weight_leaf, &self.scale_leaf,
             #[cfg(feature = "nemotron-timing")] timing,
+            #[cfg(feature = "nemotron-timing")] started,
         ).ok_or_else(|| format!("missing complete native expert {index}"))?
             .map_err(|e| e.to_string())?;
         shape(&up.weight, &[2688, 1024], "moe.up_proj")?;
@@ -405,10 +422,7 @@ pub(super) fn load<S: BlobStoreGet>(
                         shared_up: packed_op(&up)?,
                         shared_down: packed_op(&down)?,
                     },
-                    NativeExperts {
-                        snapshot: snapshot.clone(),
-                        source: binding,
-                    },
+                    NativeExperts::new(snapshot.clone(), binding),
                     moe_limits(limits),
                     cache_pairs,
                 )?)
