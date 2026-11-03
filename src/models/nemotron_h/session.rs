@@ -22,6 +22,7 @@ use burn::tensor::DType;
 use cubecl::{
     cuda::{CudaDevice, CudaRuntime},
     prelude::*,
+    stream_id::StreamId,
 };
 use half::bf16;
 use std::sync::Arc;
@@ -88,7 +89,7 @@ pub struct NextLogits<'a> {
     pub values: &'a [f32],
 }
 
-struct Mamba {
+struct MambaWeights {
     config: contract::Config,
     input: Projection,
     output: Projection,
@@ -98,6 +99,9 @@ struct Mamba {
     dt: CudaTensor,
     d: CudaTensor,
     gain: CudaTensor,
+}
+struct Mamba {
+    weights: Arc<MambaWeights>,
     committed: Option<gpu::State<CudaRuntime>>,
     staged: Option<gpu::State<CudaRuntime>>,
 }
@@ -112,16 +116,41 @@ struct Layer<S> {
     mixer: Mixer<S>,
 }
 
-pub struct Session<S> {
+enum MixerWeights {
+    Mamba(Arc<MambaWeights>),
+    Attention(Arc<attention::Weights>),
+    Moe(Arc<moe::Weights>),
+}
+struct LayerWeights {
+    id: Id,
+    norm: CudaTensor,
+    mixer: MixerWeights,
+}
+
+/// Immutable uploaded fixed operands and their exact held source observation.
+/// Shared only within this process/device. Expert caches and all sequence state
+/// belong to Sessions; this owner neither schedules them nor admits physical
+/// whole-device memory. No raw mutable weight handles are exposed.
+pub struct DeviceModel<S> {
     snapshot: Arc<ModelSnapshot<S>>,
     source: Source,
     client: ComputeClient<CudaRuntime>,
     device: CudaDevice,
     config: TextConfig,
-    limits: Limits,
     embedding: CudaTensor,
     final_norm: CudaTensor,
     head: Projection,
+    layers: Vec<LayerWeights>,
+}
+
+pub struct Session<S> {
+    model: Arc<DeviceModel<S>>,
+    // ComputeClient clones resolve the current stream dynamically. Keep every
+    // append/reset (including its fence and unwind) on the construction stream,
+    // even when this Send owner moves to another thread. Sessions constructed
+    // on one thread share its stream; this is not a new concurrent scheduler.
+    stream: StreamId,
+    limits: Limits,
     layers: Vec<Layer<S>>,
     status: Status,
     committed: Vec<u32>,
@@ -247,6 +276,13 @@ fn validate_config(c: &TextConfig, l: Limits) -> Result<()> {
 /// Pure admission before upload, so a later layer cannot exceed the global
 /// logical budget after earlier layers have already reserved their weights.
 fn resident_bytes(c: &TextConfig, l: Limits) -> Result<usize> {
+    Ok(resident_payload(c, l)?.0)
+}
+
+// Keep the original total's checked-add order and error strings. The second
+// result only separates already-counted private state from that same total.
+fn resident_payload(c: &TextConfig, l: Limits) -> Result<(usize, usize)> {
+    let mut private = 0;
     let mut total = add(bytes(&[c.vocab_size, H], 3)?, bytes(&[H], 2)?)?;
     for kind in &c.layers_block_type {
         total = add(total, bytes(&[H], 2)?)?;
@@ -254,7 +290,9 @@ fn resident_bytes(c: &TextConfig, l: Limits) -> Result<usize> {
             total,
             match kind {
                 LayerKind::Attention => {
-                    attention::admission(attention_limits(c, l))?.resident_bytes
+                    let a = attention::admission(attention_limits(c, l))?;
+                    private = add(private, a.kv_bytes)?;
+                    a.resident_bytes
                 }
                 LayerKind::Moe => moe::admission(moe_limits(l))?.fixed_bytes,
                 LayerKind::Mamba => {
@@ -274,6 +312,7 @@ fn resident_bytes(c: &TextConfig, l: Limits) -> Result<usize> {
                     if c.use_conv_bias {
                         n = add(n, bytes(&[g.conv_channels], 2)?)?;
                     }
+                    private = add(private, add(bytes(&[e.conv], 2)?, bytes(&[e.recurrent], 4)?)?)?;
                     n
                 }
             },
@@ -282,7 +321,34 @@ fn resident_bytes(c: &TextConfig, l: Limits) -> Result<usize> {
     if total > l.max_resident_bytes {
         return Err("session aggregate resident budget exceeded".into());
     }
-    Ok(total)
+    Ok((total, private))
+}
+
+/// Logical ownership breakdown for ONE Session using the unchanged complete-
+/// model Limits/quota calculation. For multiple sessions of the same exact
+/// DeviceModel, count fixed_model_bytes once and each private field separately.
+/// This is not physical admission; active or failed chunks retain extra owners.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResidentOwnership {
+    pub fixed_model_bytes: usize,
+    pub private_state_bytes: usize,
+    pub expert_cache_pairs_per_moe: usize,
+    pub private_expert_cache_bytes: usize,
+}
+
+pub fn resident_ownership(config: &TextConfig, limits: Limits) -> Result<ResidentOwnership> {
+    validate_config(config, limits)?;
+    let (base, private_state_bytes) = resident_payload(config, limits)?;
+    let moe_layers = config.layers_block_type.iter()
+        .filter(|kind| matches!(kind, LayerKind::Moe)).count();
+    let expert_cache_pairs_per_moe = expert_cache_pairs(base, limits.max_resident_bytes, moe_layers)?;
+    let private_expert_cache_bytes = moe::expert_device_bytes()?.checked_mul(moe_layers)
+        .and_then(|n| n.checked_mul(expert_cache_pairs_per_moe))
+        .ok_or("session expert cache byte sum overflow")?;
+    Ok(ResidentOwnership {
+        fixed_model_bytes: base - private_state_bytes,
+        private_state_bytes, expert_cache_pairs_per_moe, private_expert_cache_bytes,
+    })
 }
 
 /// Reserve the full uniform cache quota before any fixed upload. A miss still
@@ -412,7 +478,63 @@ fn planned_chunk_bytes(c: &TextConfig, l: Limits, start: usize, t: usize) -> Res
     Ok(total)
 }
 
+impl<S> DeviceModel<S> {
+    pub fn source(&self) -> Source { self.source }
+    pub fn snapshot(&self) -> &ModelSnapshot<S> { &self.snapshot }
+    pub fn config(&self) -> &TextConfig { &self.config }
+    /// Exact ordered selections used by the original loader, for provenance.
+    pub fn layer_ids(&self) -> impl ExactSizeIterator<Item = Id> + '_ {
+        self.layers.iter().map(|layer| layer.id)
+    }
+}
+
 impl<S: BlobStoreGet> Session<S> {
+    pub fn device_model(&self) -> &Arc<DeviceModel<S>> { &self.model }
+
+    /// Fresh private state on this thread's stream over the SAME uploaded
+    /// operands. No fixed source lookup/upload, provider rebinding or implicit
+    /// device selection. Limits retain their old complete-model meaning: fixed
+    /// weight savings do not silently enlarge the private expert-cache quota.
+    /// Sharing does not certify CUDA health or drain another failed Session;
+    /// a lost device context may affect every Session using this model.
+    pub fn from_device_model(model: Arc<DeviceModel<S>>, limits: Limits) -> Result<Self> {
+        validate_config(&model.config, limits)?;
+        let cache_pairs = expert_cache_pairs(
+            resident_bytes(&model.config, limits)?,
+            limits.max_resident_bytes,
+            model.config.layers_block_type.iter()
+                .filter(|kind| matches!(kind, LayerKind::Moe)).count(),
+        )?;
+        let stream = StreamId::current();
+        let mut layers = Vec::with_capacity(model.layers.len());
+        for layer in &model.layers {
+            let mixer = match &layer.mixer {
+                MixerWeights::Mamba(weights) => Mixer::Mamba(Mamba {
+                    weights: weights.clone(), committed: None, staged: None,
+                }),
+                MixerWeights::Attention(weights) => Mixer::Attention(
+                    attention::Attention::from_weights(
+                        weights.clone(), attention_limits(&model.config, limits),
+                    )?,
+                ),
+                MixerWeights::Moe(weights) => Mixer::Moe(moe::Moe::from_weights(
+                    weights.clone(),
+                    NativeExperts::new(model.snapshot.clone(), moe::SourceBinding {
+                        model_root: model.source.root, layer: layer.id,
+                    }),
+                    moe_limits(limits), cache_pairs,
+                )?),
+            };
+            layers.push(Layer { id: layer.id, norm: layer.norm.clone(), mixer });
+        }
+        Ok(Self {
+            model, stream, limits, layers, status: Status::Ready,
+            committed: Vec::new(), logits: Vec::new(), pending: Vec::new(),
+            #[cfg(test)]
+            fault: None,
+        })
+    }
+
     /// No publication, download or default collection selection. Layer IDs are
     /// explicit opaque choices in ordered config positions. Multiple matches
     /// remain legal. Fixed FP8/aux operands choose the first typed tuple and
@@ -431,10 +553,10 @@ impl<S: BlobStoreGet> Session<S> {
         source::load(snapshot, source, layer_ids, device, limits)
     }
     pub fn source(&self) -> Source {
-        self.source
+        self.model.source
     }
     pub fn snapshot(&self) -> &ModelSnapshot<S> {
-        &self.snapshot
+        &self.model.snapshot
     }
     pub fn status(&self) -> Status {
         self.status
@@ -443,7 +565,7 @@ impl<S: BlobStoreGet> Session<S> {
         self.limits.capacity
     }
     pub fn vocab_size(&self) -> usize {
-        self.config.vocab_size
+        self.model.config.vocab_size
     }
     /// While poisoned these IDs are diagnostic metadata, NOT a reusable cache.
     pub fn committed_ids(&self) -> &[u32] {
@@ -459,14 +581,14 @@ impl<S: BlobStoreGet> Session<S> {
         self.status == Status::Ready && rendered_ids.starts_with(&self.committed)
     }
     fn chunk_bytes(&self, t: usize) -> Result<usize> {
-        planned_chunk_bytes(&self.config, self.limits, self.committed.len(), t)
+        planned_chunk_bytes(&self.model.config, self.limits, self.committed.len(), t)
     }
     fn preflight(&self, ids: &[u32]) -> Result<()> {
         if self.status != Status::Ready {
             return Err("session poisoned; successful reset required".into());
         }
         if !(1..=MAX_CHUNK).contains(&ids.len())
-            || ids.iter().any(|&id| id as usize >= self.config.vocab_size)
+            || ids.iter().any(|&id| id as usize >= self.model.config.vocab_size)
             || self
                 .committed
                 .len()
@@ -502,6 +624,9 @@ impl<S: BlobStoreGet> Session<S> {
     /// All IDs (including EOS when intentionally attended) are ordinary inputs;
     /// a generator must keep emitted versus attended IDs separate.
     pub fn append_ids(&mut self, ids: &[u32]) -> Result<NextLogits<'_>> {
+        self.stream.executes(|| self.append_on_stream(ids))
+    }
+    fn append_on_stream(&mut self, ids: &[u32]) -> Result<NextLogits<'_>> {
         self.preflight(ids)?;
         // Poison BEFORE dispatch: even unwinding cannot expose a Ready prefix.
         self.status = Status::Poisoned;
@@ -543,29 +668,29 @@ impl<S: BlobStoreGet> Session<S> {
         #[cfg(feature = "nemotron-timing")] mut timing: Option<&mut super::host_timing::Timings>,
     ) -> Result<Vec<f32>> {
         let t = ids.len();
-        let h = self.client.create_from_slice(u32::as_bytes(ids));
+        let h = self.model.client.create_from_slice(u32::as_bytes(ids));
         self.pending.push(CudaTensor::new_contiguous(
-            self.client.clone(),
-            self.device.clone(),
+            self.model.client.clone(),
+            self.model.device.clone(),
             [t].into(),
             h.clone(),
             DType::U32,
         ));
-        let mut x = empty(&self.client, &self.device, t, H);
+        let mut x = empty(&self.model.client, &self.model.device, t, H);
         self.pending.push(x.clone());
         unsafe {
             embedding_kernel::launch_unchecked::<CudaRuntime>(
-                &self.client,
+                &self.model.client,
                 CubeCount::new_1d((t * H).div_ceil(128) as u32),
                 CubeDim::new_1d(128),
                 ArrayArg::from_raw_parts(h, t),
-                ArrayArg::from_raw_parts(self.embedding.handle.clone(), self.config.vocab_size * H),
+                ArrayArg::from_raw_parts(self.model.embedding.handle.clone(), self.model.config.vocab_size * H),
                 ArrayArg::from_raw_parts(x.handle.clone(), t * H),
                 t * H,
             );
         }
         for (_index, layer) in self.layers.iter_mut().enumerate() {
-            let norm = normalized(&x, &layer.norm, self.config.layer_norm_epsilon as f32);
+            let norm = normalized(&x, &layer.norm, self.model.config.layer_norm_epsilon as f32);
             self.pending.push(norm.clone());
             let y = match &mut layer.mixer {
                 Mixer::Attention(a) => a.enqueue(&norm, self.committed.len())?.values,
@@ -580,17 +705,17 @@ impl<S: BlobStoreGet> Session<S> {
                     result?.values
                 }
                 Mixer::Mamba(m) => {
-                    let projected = m.input.project(&norm, self.limits.max_chunk_bytes)?;
+                    let projected = m.weights.input.project(&norm, self.limits.max_chunk_bytes)?;
                     self.pending.push(projected.clone());
                     let out = gpu::chunk(
-                        m.config,
+                        m.weights.config,
                         &gpu::Parameters {
-                            conv_weight: &m.conv,
-                            conv_bias: m.bias.as_ref(),
-                            a_log: &m.a_log,
-                            dt_bias: &m.dt,
-                            d: &m.d,
-                            norm_gain: &m.gain,
+                            conv_weight: &m.weights.conv,
+                            conv_bias: m.weights.bias.as_ref(),
+                            a_log: &m.weights.a_log,
+                            dt_bias: &m.weights.dt,
+                            d: &m.weights.d,
+                            norm_gain: &m.weights.gain,
                         },
                         &projected,
                         m.committed.as_ref(),
@@ -598,7 +723,7 @@ impl<S: BlobStoreGet> Session<S> {
                     )?;
                     m.staged = Some(out.state);
                     self.pending.push(out.values.clone());
-                    m.output.project(&out.values, self.limits.max_chunk_bytes)?
+                    m.weights.output.project(&out.values, self.limits.max_chunk_bytes)?
                 }
             };
             self.pending.push(y.clone());
@@ -612,15 +737,15 @@ impl<S: BlobStoreGet> Session<S> {
                 }
             }
         }
-        let norm = normalized(&x, &self.final_norm, self.config.layer_norm_epsilon as f32);
+        let norm = normalized(&x, &self.model.final_norm, self.model.config.layer_norm_epsilon as f32);
         self.pending.push(norm.clone());
         // Copy the final row rather than manufacture an offset alias accepted
         // by neither Projection's zero-offset contract nor every downstream op.
-        let row = empty(&self.client, &self.device, 1, H);
+        let row = empty(&self.model.client, &self.model.device, 1, H);
         self.pending.push(row.clone());
         unsafe {
             last_row_kernel::launch_unchecked::<CudaRuntime>(
-                &self.client,
+                &self.model.client,
                 CubeCount::new_1d(32),
                 CubeDim::new_1d(128),
                 ArrayArg::from_raw_parts(norm.handle.clone(), t * H),
@@ -628,16 +753,16 @@ impl<S: BlobStoreGet> Session<S> {
                 (t - 1) * H,
             );
         }
-        let logits = self.head.project(&row, self.limits.max_chunk_bytes)?;
+        let logits = self.model.head.project(&row, self.limits.max_chunk_bytes)?;
         self.pending.push(logits.clone());
-        let data = self
+        let data = self.model
             .client
             .read_one(logits.handle.clone())
             .map_err(|e| format!("session logits read: {e:?}"))?;
-        if data.len() < self.config.vocab_size * 2 {
+        if data.len() < self.model.config.vocab_size * 2 {
             return Err("short session logits read".into());
         }
-        let values: Vec<f32> = data[..self.config.vocab_size * 2]
+        let values: Vec<f32> = data[..self.model.config.vocab_size * 2]
             .chunks_exact(2)
             .map(|v| bf16::from_bits(u16::from_le_bytes([v[0], v[1]])).to_f32())
             .collect();
@@ -655,7 +780,7 @@ impl<S: BlobStoreGet> Session<S> {
         Ok(values)
     }
     fn fence(&self) -> Result<()> {
-        cubecl::future::block_on(self.client.sync())
+        cubecl::future::block_on(self.model.client.sync())
             .map_err(|e| format!("session CUDA completion: {e:?}"))
     }
     fn invalidate(&mut self) {
@@ -672,6 +797,9 @@ impl<S: BlobStoreGet> Session<S> {
     /// state is published, no Mamba/pending/prefix owner is cleared. Attention
     /// may have individually reset: the hybrid remains poisoned, not rolled back.
     pub fn reset(&mut self) -> Result<()> {
+        self.stream.executes(|| self.reset_on_stream())
+    }
+    fn reset_on_stream(&mut self) -> Result<()> {
         self.invalidate();
         let mut errors = Vec::new();
         if let Err(e) = self.fence() {

@@ -31,6 +31,7 @@ use cubecl::{
     server::Handle,
 };
 use half::bf16;
+use std::sync::Arc;
 use triblespace::prelude::Id;
 
 #[path = "moe_cache.rs"]
@@ -157,10 +158,9 @@ impl PackedWeight {
     }
 }
 
-pub struct Moe<P> {
+pub(super) struct Weights {
     source: SourceBinding,
     fixed_operations: [Id; 6],
-    provider: P,
     client: ComputeClient<CudaRuntime>,
     device: CudaDevice,
     router: Handle,
@@ -169,6 +169,11 @@ pub struct Moe<P> {
     fc2: Handle,
     shared_up: PackedWeight,
     shared_down: PackedWeight,
+}
+
+pub struct Moe<P> {
+    pub(super) weights: Arc<Weights>,
+    provider: P,
     limits: Limits,
     admission: Admission,
     // One in-flight recovery bit, not model history or a commit protocol. Set
@@ -414,10 +419,9 @@ impl<P: ExpertProvider> Moe<P> {
             fixed.shared_up.operation,
             fixed.shared_down.operation,
         ];
-        Ok(Self {
+        let weights = Arc::new(Weights {
             source,
             fixed_operations,
-            provider,
             router: client.create_from_slice(fixed.router_bf16),
             bias: client.create_from_slice(f32::as_bytes(fixed.correction_bias)),
             fc1: client.create_from_slice(fixed.fc1_bf16),
@@ -426,23 +430,42 @@ impl<P: ExpertProvider> Moe<P> {
             shared_down: PackedWeight::upload(&fixed.shared_down, HIDDEN, SHARED, &device)?,
             client,
             device,
-            limits,
-            admission,
-            poisoned: false,
-            expert_operands,
-        })
+        });
+        Ok(Self { weights, provider, limits, admission, poisoned: false, expert_operands })
+    }
+    /// New private cache/recovery state over fixed operands. No expert pair is
+    /// inherited and no source payload is read or uploaded here.
+    pub(super) fn from_weights(
+        weights: Arc<Weights>, provider: P, limits: Limits, cache_pairs: usize,
+    ) -> Result<Self> {
+        let admission = admission(limits)?;
+        let expert_operands = cache::Operands::new(cache_pairs)?;
+        let resident = expert_device_bytes()?.checked_mul(cache_pairs)
+            .and_then(|n| n.checked_add(admission.fixed_bytes))
+            .ok_or("MoE cached resident byte overflow")?;
+        if resident > limits.max_fixed_bytes {
+            return Err("MoE cached resident budget exceeded".into());
+        }
+        if provider.source() != weights.source {
+            return Err("MoE provider/source binding mismatch".into());
+        }
+        Ok(Self { weights, provider, limits, admission, poisoned: false, expert_operands })
     }
     pub fn source(&self) -> SourceBinding {
-        self.source
+        self.weights.source
     }
     pub fn fixed_operations(&self) -> [Id; 6] {
-        self.fixed_operations
+        self.weights.fixed_operations
     }
     pub fn admission(&self) -> Admission {
         self.admission
     }
     pub fn is_poisoned(&self) -> bool {
         self.poisoned
+    }
+    #[cfg(test)]
+    pub(super) fn diagnostic_expert_owners(&self) -> (u64, bool) {
+        self.expert_operands.diagnostic_owners()
     }
     pub fn invalidate(&mut self) {
         self.poisoned = true;
@@ -452,15 +475,15 @@ impl<P: ExpertProvider> Moe<P> {
     /// decides how to recover its separate attention/Mamba state.
     pub fn reset(&mut self) -> Result<()> {
         self.poisoned = true;
-        fence(&self.client)?;
+        fence(&self.weights.client)?;
         self.expert_operands.complete(&Ok(()), false);
         self.poisoned = false;
         Ok(())
     }
     fn tensor(&self, h: Handle, t: usize, n: usize, dtype: DType) -> CudaTensor {
         CudaTensor::new_contiguous(
-            self.client.clone(),
-            self.device.clone(),
+            self.weights.client.clone(),
+            self.weights.device.clone(),
             [1, t, n].into(),
             h,
             dtype,
@@ -470,7 +493,7 @@ impl<P: ExpertProvider> Moe<P> {
         if self.poisoned {
             return Err("MoE poisoned; successful drain/reset required".into());
         }
-        if self.provider.source() != self.source {
+        if self.provider.source() != self.weights.source {
             return Err("MoE provider binding changed".into());
         }
         let dims = x.meta.shape().as_slice();
@@ -479,8 +502,8 @@ impl<P: ExpertProvider> Moe<P> {
             || dims[2] != HIDDEN
             || x.dtype != DType::BF16
             || x.qparams.is_some()
-            || x.device != self.device
-            || !std::ptr::eq(x.client.properties(), self.client.properties())
+            || x.device != self.weights.device
+            || !std::ptr::eq(x.client.properties(), self.weights.client.properties())
         {
             return Err("MoE expects BF16[1,T,4096] on its bound client/device".into());
         }
@@ -506,22 +529,22 @@ impl<P: ExpertProvider> Moe<P> {
     fn linear(&self, x: &CudaTensor, weight: &Handle, k: usize, n: usize) -> CudaTensor {
         let t = x.meta.shape().as_slice()[1];
         let p = t.div_ceil(16) * 16;
-        let padded = bf16gemm::pad_bf16_launch(&self.client, &x.handle, t * k, p * k);
-        let out = bf16gemm::bf16_linear_launch(&self.client, &padded, weight, p, k, n);
+        let padded = bf16gemm::pad_bf16_launch(&self.weights.client, &x.handle, t * k, p * k);
+        let out = bf16gemm::bf16_linear_launch(&self.weights.client, &padded, weight, p, k, n);
         self.tensor(out, t, n, DType::F32)
     }
     fn narrow(&self, x: &CudaTensor) -> CudaTensor {
         let s = x.meta.shape().as_slice();
-        let out = bf16gemm::to_bf16_launch(&self.client, &x.handle, s[1] * s[2], s[1] * s[2]);
+        let out = bf16gemm::to_bf16_launch(&self.weights.client, &x.handle, s[1] * s[2], s[1] * s[2]);
         self.tensor(out, s[1], s[2], DType::BF16)
     }
     fn relu2(&self, x: &CudaTensor) -> CudaTensor {
         let s = x.meta.shape().as_slice();
         let count = s[1] * s[2];
-        let out = self.client.empty(count * 2);
+        let out = self.weights.client.empty(count * 2);
         unsafe {
             relu2_kernel::launch_unchecked::<CudaRuntime>(
-                &self.client,
+                &self.weights.client,
                 CubeCount::new_1d(count.div_ceil(THREADS as usize) as u32),
                 CubeDim::new_1d(THREADS),
                 ArrayArg::from_raw_parts(x.handle.clone(), count),
@@ -578,7 +601,7 @@ impl<P: ExpertProvider> Moe<P> {
         );
         #[cfg(feature = "nemotron-timing")]
         let fence_started = host_timing::clock(timing.as_deref());
-        let completion = fence(&self.client);
+        let completion = fence(&self.weights.client);
         #[cfg(feature = "nemotron-timing")]
         host_timing::record(
             timing.as_deref_mut(),
@@ -605,21 +628,21 @@ impl<P: ExpertProvider> Moe<P> {
         observe: &mut impl FnMut(&str, &CudaTensor) -> Result<()>,
         #[cfg(feature = "nemotron-timing")] mut timing: Option<&mut Timings>,
     ) -> Result<Output> {
-        let logits = self.linear(x, &self.router, HIDDEN, EXPERTS);
-        let route = self.client.empty(t * ROUTE_WIDTH * 4);
+        let logits = self.linear(x, &self.weights.router, HIDDEN, EXPERTS);
+        let route = self.weights.client.empty(t * ROUTE_WIDTH * 4);
         unsafe {
             route_kernel::launch_unchecked::<CudaRuntime>(
-                &self.client,
+                &self.weights.client,
                 CubeCount::new_1d(t as u32),
                 CubeDim::new_1d(EXPERTS as u32),
                 ArrayArg::from_raw_parts(x.handle.clone(), t * HIDDEN),
                 ArrayArg::from_raw_parts(logits.handle.clone(), t * EXPERTS),
-                ArrayArg::from_raw_parts(self.bias.clone(), EXPERTS),
+                ArrayArg::from_raw_parts(self.weights.bias.clone(), EXPERTS),
                 ArrayArg::from_raw_parts(route.clone(), t * ROUTE_WIDTH),
             );
         }
         // One bounded readback, including error flags, BEFORE any expert lookup.
-        let raw = self
+        let raw = self.weights
             .client
             .read_one(route.clone())
             .map_err(|e| format!("MoE route read: {e:?}"))?;
@@ -629,10 +652,10 @@ impl<P: ExpertProvider> Moe<P> {
             "routing_record",
             &self.tensor(route, t, ROUTE_WIDTH, DType::F32),
         )?;
-        let latent = self.narrow(&self.linear(x, &self.fc1, HIDDEN, LATENT));
+        let latent = self.narrow(&self.linear(x, &self.weights.fc1, HIDDEN, LATENT));
         observe("latent", &latent)?;
         let schedule = Schedule::new(&routing)?;
-        let selected = self.client.empty(t * TOP_K * LATENT * 2);
+        let selected = self.weights.client.empty(t * TOP_K * LATENT * 2);
         for (index, rows) in schedule.by_expert.iter().enumerate() {
             if rows.is_empty() {
                 continue;
@@ -642,7 +665,7 @@ impl<P: ExpertProvider> Moe<P> {
             // This immediate closure only collects Result returns for timing;
             // the existing per-expert and final fences remain on the same paths.
             let selected_result = (|| -> Result<()> {
-                if self.provider.source() != self.source {
+                if self.provider.source() != self.weights.source {
                     return Err("MoE selected expert/source binding mismatch".into());
                 }
                 let mut hit = true;
@@ -651,7 +674,7 @@ impl<P: ExpertProvider> Moe<P> {
                     load_expert(
                         &self.provider,
                         index,
-                        |op, n, k| PackedWeight::upload(op, n, k, &self.device),
+                        |op, n, k| PackedWeight::upload(op, n, k, &self.weights.device),
                         #[cfg(feature = "nemotron-timing")]
                         timing.as_deref_mut(),
                     )
@@ -666,9 +689,9 @@ impl<P: ExpertProvider> Moe<P> {
                 let enqueue_started = host_timing::clock(timing.as_deref());
                 let result = (|| {
                     let idx: Vec<i32> = rows.iter().map(|&(token, _)| token as i32).collect();
-                    let idx = self.client.create_from_slice(i32::as_bytes(&idx));
+                    let idx = self.weights.client.create_from_slice(i32::as_bytes(&idx));
                     let gathered = moegroup::gather_grouped_bf16_from_bf16(
-                        &self.client,
+                        &self.weights.client,
                         &latent.handle,
                         &idx,
                         t,
@@ -686,7 +709,7 @@ impl<P: ExpertProvider> Moe<P> {
                     let len = rows.len() * LATENT;
                     unsafe {
                         copy_kernel::launch_unchecked::<CudaRuntime>(
-                            &self.client,
+                            &self.weights.client,
                             CubeCount::new_1d(len.div_ceil(THREADS as usize) as u32),
                             CubeDim::new_1d(THREADS),
                             ArrayArg::from_raw_parts(low.handle.clone(), len),
@@ -709,7 +732,7 @@ impl<P: ExpertProvider> Moe<P> {
                 // including setup/observer failures after the first projection.
                 #[cfg(feature = "nemotron-timing")]
                 let fence_started = host_timing::clock(timing.as_deref());
-                let completion = fence(&self.client);
+                let completion = fence(&self.weights.client);
                 #[cfg(feature = "nemotron-timing")]
                 host_timing::record(
                     timing.as_deref_mut(),
@@ -737,16 +760,16 @@ impl<P: ExpertProvider> Moe<P> {
             );
             selected_result?;
         }
-        let weights = self
+        let weights = self.weights
             .client
             .create_from_slice(f32::as_bytes(&schedule.weights));
-        let row_ids = self
+        let row_ids = self.weights
             .client
             .create_from_slice(u32::as_bytes(&schedule.token_rows));
         let counts = vec![TOP_K as u32; t];
-        let counts = self.client.create_from_slice(u32::as_bytes(&counts));
+        let counts = self.weights.client.create_from_slice(u32::as_bytes(&counts));
         let combined = moegroup::scatter_weighted_bf16(
-            &self.client,
+            &self.weights.client,
             &selected,
             &weights,
             &row_ids,
@@ -760,19 +783,19 @@ impl<P: ExpertProvider> Moe<P> {
         observe("combined_f32", &combined)?;
         let combined = self.narrow(&combined);
         observe("combined_bf16", &combined)?;
-        let expanded = self.narrow(&self.linear(&combined, &self.fc2, LATENT, HIDDEN));
-        let shared_up = self.shared_up.project(x)?;
+        let expanded = self.narrow(&self.linear(&combined, &self.weights.fc2, LATENT, HIDDEN));
+        let shared_up = self.weights.shared_up.project(x)?;
         let shared_active = self.relu2(&shared_up);
-        let shared = self.shared_down.project(&shared_active)?;
+        let shared = self.weights.shared_down.project(&shared_active)?;
         observe("expanded", &expanded)?;
         observe("shared_up", &shared_up)?;
         observe("shared_relu2", &shared_active)?;
         observe("shared_down", &shared)?;
-        let out = self.client.empty(t * HIDDEN * 2);
-        let flags = self.client.empty(t * 4);
+        let out = self.weights.client.empty(t * HIDDEN * 2);
+        let flags = self.weights.client.empty(t * 4);
         unsafe {
             sum_kernel::launch_unchecked::<CudaRuntime>(
-                &self.client,
+                &self.weights.client,
                 CubeCount::new_1d(t.div_ceil(THREADS as usize) as u32),
                 CubeDim::new_1d(THREADS),
                 ArrayArg::from_raw_parts(expanded.handle.clone(), t * HIDDEN),
@@ -782,7 +805,7 @@ impl<P: ExpertProvider> Moe<P> {
                 t,
             );
         }
-        let status = self
+        let status = self.weights
             .client
             .read_one(flags)
             .map_err(|e| format!("MoE finite read: {e:?}"))?;

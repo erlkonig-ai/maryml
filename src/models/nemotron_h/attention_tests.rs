@@ -211,7 +211,7 @@ impl Evidence {
     }
     fn cache(&mut self, prefix: &str, a: &Attention) {
         for (label, handle) in [("k", &a.keys), ("v", &a.values)] {
-            let bytes = a.client.read_one(handle.clone()).unwrap();
+            let bytes = a.weights.client.read_one(handle.clone()).unwrap();
             // Discard uninitialized/previous-context tail bytes, never export.
             let live = a.attended() * KV_WIDTH * 2;
             self.raw(

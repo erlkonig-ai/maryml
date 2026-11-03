@@ -21,6 +21,7 @@ use cubecl::{
     server::Handle,
 };
 use half::bf16;
+use std::sync::Arc;
 use triblespace::prelude::Id;
 
 type Result<T> = std::result::Result<T, String>;
@@ -120,11 +121,15 @@ impl Sequence {
     }
 }
 
-pub struct Attention {
+pub(super) struct Weights {
     source: SourceBinding,
     client: ComputeClient<CudaRuntime>,
     device: CudaDevice,
     projections: [Projection; 4],
+}
+
+pub struct Attention {
+    pub(super) weights: Arc<Weights>,
     keys: Handle,
     values: Handle,
     limits: Limits,
@@ -292,10 +297,7 @@ impl Attention {
         let keys = client.empty(admission.kv_bytes / 2);
         let values = client.empty(admission.kv_bytes / 2);
         Ok(Self {
-            source,
-            client,
-            device,
-            projections,
+            weights: Arc::new(Weights { source, client, device, projections }),
             keys,
             values,
             limits,
@@ -303,8 +305,16 @@ impl Attention {
             sequence: Sequence::default(),
         })
     }
+    /// Fresh KV and sequence state on the caller's current stream. The fixed
+    /// projections remain bound to the exact uploaded owner.
+    pub(super) fn from_weights(weights: Arc<Weights>, limits: Limits) -> Result<Self> {
+        let admission = admission(limits)?;
+        let keys = weights.client.empty(admission.kv_bytes / 2);
+        let values = weights.client.empty(admission.kv_bytes / 2);
+        Ok(Self { weights, keys, values, limits, admission, sequence: Sequence::default() })
+    }
     pub fn source(&self) -> SourceBinding {
-        self.source
+        self.weights.source
     }
     pub fn admission(&self) -> Admission {
         self.admission
@@ -330,8 +340,8 @@ impl Attention {
             || dims[2] != HIDDEN
             || input.dtype != DType::BF16
             || input.qparams.is_some()
-            || input.device != self.device
-            || !std::ptr::eq(input.client.properties(), self.client.properties())
+            || input.device != self.weights.device
+            || !std::ptr::eq(input.client.properties(), self.weights.client.properties())
         {
             return Err(
                 "attention needs contiguous BF16 [1,T,4096] on its owning client/device".into(),
@@ -359,7 +369,7 @@ impl Attention {
             return Err("attention input start offset or logical buffer span invalid".into());
         }
         // Recheck the peer's exact admitted sizes before any of its launches.
-        for projection in &self.projections {
+        for projection in &self.weights.projections {
             projection.working_bytes(p.tokens)?;
         }
         Ok(p)
@@ -372,15 +382,15 @@ impl Attention {
     pub fn enqueue(&mut self, input: &CudaTensor, expected_start: usize) -> Result<Output> {
         let p = self.preflight(input, expected_start)?;
         self.sequence.phase = Phase::Poisoned;
-        let q = self.projections[0].project(input, self.limits.max_working_bytes)?;
-        let k = self.projections[1].project(input, self.limits.max_working_bytes)?;
-        let v = self.projections[2].project(input, self.limits.max_working_bytes)?;
+        let q = self.weights.projections[0].project(input, self.limits.max_working_bytes)?;
+        let k = self.weights.projections[1].project(input, self.limits.max_working_bytes)?;
+        let v = self.weights.projections[2].project(input, self.limits.max_working_bytes)?;
         let n = p.tokens * KV_WIDTH;
         let cube = CubeDim::new_1d(128);
         unsafe {
             append_tail::launch_unchecked::<CudaRuntime>(
-                &self.client,
-                cubecl::calculate_cube_count_elemwise(&self.client, n, cube),
+                &self.weights.client,
+                cubecl::calculate_cube_count_elemwise(&self.weights.client, n, cube),
                 cube,
                 ArrayArg::from_raw_parts(k.handle.clone(), n),
                 ArrayArg::from_raw_parts(v.handle.clone(), n),
@@ -403,7 +413,7 @@ impl Attention {
             row0: 0,
         };
         let handle = flash::flash_attention_launch(
-            &self.client,
+            &self.weights.client,
             &q_f32.handle,
             &[run],
             &q_f32.handle,
@@ -421,15 +431,15 @@ impl Attention {
         );
         let attention = burn_cubecl::kernel::cast(
             CudaTensor::new_contiguous(
-                self.client.clone(),
-                self.device.clone(),
+                self.weights.client.clone(),
+                self.weights.device.clone(),
                 [1, p.tokens, HIDDEN].into(),
                 handle,
                 DType::F32,
             ),
             DType::BF16,
         );
-        let values = self.projections[3].project(&attention, self.limits.max_working_bytes)?;
+        let values = self.weights.projections[3].project(&attention, self.limits.max_working_bytes)?;
         self.sequence.phase = Phase::Pending(p.end);
         Ok(Output {
             values,
@@ -444,7 +454,7 @@ impl Attention {
     /// partially completed whole-network forward. If any layer commit fails,
     /// invalidate all owners and reset all state families together.
     pub fn commit(&mut self) -> Result<()> {
-        let client = &self.client;
+        let client = &self.weights.client;
         self.sequence.commit(|| {
             cubecl::future::block_on(client.sync())
                 .map_err(|e| format!("attention completion: {e:?}"))
@@ -458,7 +468,7 @@ impl Attention {
     /// Stale bytes are inaccessible behind hi=0 and overwritten on next append.
     /// Fatal device errors can prevent reset and require owner reconstruction.
     pub fn reset(&mut self) -> Result<()> {
-        let client = &self.client;
+        let client = &self.weights.client;
         self.sequence.reset(|| {
             cubecl::future::block_on(client.sync()).map_err(|e| format!("attention reset: {e:?}"))
         })
@@ -471,7 +481,7 @@ impl Attention {
         }
         let bytes = self.sequence.attended * KV_WIDTH * 2;
         let read = |h: &Handle| -> Result<Vec<u8>> {
-            self.client.read_one(h.clone()).map(|v| v[..bytes].to_vec())
+            self.weights.client.read_one(h.clone()).map(|v| v[..bytes].to_vec())
                 .map_err(|e| format!("diagnostic KV read: {e:?}"))
         };
         Ok([read(&self.keys)?, read(&self.values)?])

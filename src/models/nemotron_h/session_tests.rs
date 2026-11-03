@@ -66,6 +66,73 @@ fn full_limits(capacity: usize) -> Limits {
 }
 
 #[test]
+fn session_host_shared_ownership_preserves_admission_and_private_quotas() {
+    let c = full_config(1 << 20);
+    let small = resident_ownership(&c, full_limits(2048)).unwrap();
+    let large = resident_ownership(&c, full_limits(262144)).unwrap();
+    assert_eq!(small.fixed_model_bytes, 8_114_262_336);
+    assert_eq!(large.fixed_model_bytes, small.fixed_model_bytes);
+    assert_eq!(small.private_state_bytes, 187_826_176);
+    assert_eq!(large.private_state_bytes, 2_318_532_608);
+    assert_eq!(small.expert_cache_pairs_per_moe, 36);
+    assert_eq!(large.expert_cache_pairs_per_moe, 19);
+    assert_eq!(small.private_expert_cache_bytes, 4_459_069_440);
+    for (capacity, ownership) in [(2048, small), (262144, large)] {
+        let admitted = admission(&c, full_limits(capacity), 1).unwrap();
+        assert_eq!(ownership.fixed_model_bytes + ownership.private_state_bytes,
+            admitted.base_resident_bytes);
+        assert_eq!(ownership.private_expert_cache_bytes, admitted.expert_cache_bytes);
+        assert_eq!(ownership.expert_cache_pairs_per_moe, admitted.expert_cache_pairs_per_moe);
+        assert_eq!(ownership.fixed_model_bytes + ownership.private_state_bytes
+            + ownership.private_expert_cache_bytes, admitted.resident_bytes);
+    }
+    // Unequal contexts share only fixed operands. No saved bytes enter q.
+    let combined = small.fixed_model_bytes + small.private_state_bytes
+        + small.private_expert_cache_bytes + large.private_state_bytes
+        + large.private_expert_cache_bytes;
+    assert_eq!(combined, 17_433_088_320);
+    let base = resident_bytes(&c, full_limits(2048)).unwrap();
+    let no_cache = resident_ownership(&c, Limits {
+        max_resident_bytes: base, ..full_limits(2048)
+    }).unwrap();
+    assert_eq!(no_cache.expert_cache_pairs_per_moe, 0);
+    assert_eq!(no_cache.private_expert_cache_bytes, 0);
+    let rejected = Limits { max_resident_bytes: base - 1, ..full_limits(2048) };
+    assert_eq!(resident_ownership(&c, rejected).unwrap_err(),
+        admission(&c, rejected, 1).unwrap_err());
+    let mut invalid = c;
+    invalid.vocab_size = usize::MAX - 7;
+    assert_eq!(resident_ownership(&invalid, full_limits(2048)).unwrap_err(),
+        admission(&invalid, full_limits(2048), 1).unwrap_err());
+}
+
+#[test]
+fn session_host_real_owners_satisfy_thread_bounds() {
+    fn send<T: Send>() {}
+    fn shared<T: Send + Sync>() {}
+    type Store = triblespace::core::repo::pile::PileSnapshot;
+    shared::<DeviceModel<Store>>();
+    send::<Session<Store>>();
+    #[cfg(feature = "tokenizer")]
+    send::<super::super::generation::Generator<Store>>();
+}
+
+#[test]
+fn session_host_execution_stream_scope_restores_after_return_and_unwind() {
+    // Use a real other thread's identity; no CUDA client or allocations.
+    let owner = std::thread::spawn(StreamId::current).join().unwrap();
+    let caller = StreamId::current();
+    assert_ne!(owner, caller);
+    owner.executes(|| assert_eq!(StreamId::current(), owner));
+    assert_eq!(StreamId::current(), caller);
+    assert!(std::panic::catch_unwind(|| owner.executes(|| {
+        assert_eq!(StreamId::current(), owner);
+        panic!("synthetic session unwind");
+    })).is_err());
+    assert_eq!(StreamId::current(), caller);
+}
+
+#[test]
 fn session_host_geometry_and_aggregate_admission() {
     let c = config();
     validate_config(&c, limits()).unwrap();
@@ -447,7 +514,7 @@ fn sparse_bf(n: usize, k: usize) -> Vec<u8> {
     }
     v
 }
-fn fixture() -> (Arc<ModelSnapshot<impl BlobStoreGet>>, Source, Vec<Id>) {
+fn fixture() -> (Arc<ModelSnapshot<impl BlobStoreGet + Send + Sync>>, Source, Vec<Id>) {
     let mut repo = MemoryRepo::default();
     let key = SigningKey::generate(&mut rand::rngs::OsRng);
     let policy = CollectionPolicy::new(
@@ -665,4 +732,143 @@ fn session_gpu_three_kind_native_chain() {
     assert!(session.append_ids(&[2]).is_err());
     session.fault = None;
     session.reset().unwrap();
+}
+
+// Read only the committed state, on the session's execution stream. Comparing
+// bytes before/after another context executes detects aliasing that merely
+// checking two Rust wrapper addresses would miss.
+fn state_bytes<S: BlobStoreGet>(session: &Session<S>) -> Vec<Vec<u8>> {
+    session.stream.executes(|| {
+        let mut result = Vec::new();
+        for layer in &session.layers {
+            match &layer.mixer {
+                Mixer::Mamba(m) => {
+                    if let Some(state) = &m.committed {
+                        for tensor in [state.conv(), state.recurrent()] {
+                            result.push(tensor.client.read_one(tensor.handle.clone()).unwrap().to_vec());
+                        }
+                    }
+                }
+                Mixer::Attention(a) => result.extend(a.diagnostic_kv().unwrap()),
+                Mixer::Moe(_) => {}
+            }
+        }
+        result
+    })
+}
+
+#[test]
+#[ignore = "reserved CUDA: two synthetic Sessions, shared fixed weights/private state and stream movement"]
+fn session_gpu_shared_model_private_state_and_streams() {
+    // Only two sessions alive, capacity8 and at most ONE synchronous append at
+    // a time. Logical bound: shared W + 2*(private state/cache) + 128MiB chunk.
+    // Fixture source only; no checkpoint, tokenizer, external provider or pile.
+    let (snapshot, source, ids) = fixture();
+    let ownership = resident_ownership(&config(), limits()).unwrap();
+    assert_eq!(ownership.fixed_model_bytes, 132_483_896);
+    assert_eq!(ownership.private_state_bytes, 90_144);
+    assert_eq!(ownership.expert_cache_pairs_per_moe, 22);
+    assert_eq!(ownership.private_expert_cache_bytes, 68_124_672);
+    assert_eq!(ownership.fixed_model_bytes
+        + 2 * (ownership.private_state_bytes + ownership.private_expert_cache_bytes)
+        + limits().max_chunk_bytes, 403_131_256);
+    let mut a = Session::from_snapshot(snapshot, source, &ids, CudaDevice { index: 0 }, limits()).unwrap();
+    let model = a.device_model().clone();
+    assert_eq!(model.layer_ids().collect::<Vec<_>>(), ids);
+    assert_eq!(model.source().root, source.root);
+    assert!(std::ptr::eq(model.snapshot(), a.snapshot()));
+
+    let other_model = model.clone();
+    // Construct B on another stream, then MOVE its owner back. append/reset
+    // must still use B's stream; fixed weights resolve from their origin stream.
+    let mut b = std::thread::spawn(move || {
+        Session::from_device_model(other_model, limits()).unwrap()
+    }).join().unwrap();
+    assert_ne!(a.stream, b.stream);
+    assert!(Arc::ptr_eq(a.device_model(), b.device_model()));
+    for (left, right) in a.layers.iter().zip(&b.layers) {
+        match (&left.mixer, &right.mixer) {
+            (Mixer::Mamba(x), Mixer::Mamba(y)) => assert!(Arc::ptr_eq(&x.weights, &y.weights)),
+            (Mixer::Attention(x), Mixer::Attention(y)) => assert!(Arc::ptr_eq(&x.weights, &y.weights)),
+            (Mixer::Moe(x), Mixer::Moe(y)) => {
+                assert!(Arc::ptr_eq(&x.weights, &y.weights));
+                assert_eq!(x.diagnostic_expert_owners(), (0, false));
+                assert_eq!(y.diagnostic_expert_owners(), (0, false));
+            }
+            _ => panic!("shared model changed layer kind"),
+        }
+    }
+    // B's first forward consumes weights uploaded on A's stream before A has
+    // ever executed or fenced a chunk. Warming B must leave A's cache empty.
+    let cold_b1 = b.append_ids(&[5]).unwrap().values.to_vec();
+    for layer in &a.layers {
+        if let Mixer::Moe(m) = &layer.mixer {
+            assert_eq!(m.diagnostic_expert_owners(), (0, false));
+        }
+    }
+    // Exact comparisons below use the SAME append partitions as these isolated
+    // reference schedules; no stronger partition/numerical parity is asserted.
+    let expected_a2 = a.append_ids(&[1, 5]).unwrap().values.to_vec();
+    let expected_a3 = a.append_ids(&[7]).unwrap().values.to_vec();
+    a.reset().unwrap();
+    let expected_b1 = a.append_ids(&[5]).unwrap().values.to_vec();
+    let expected_b2 = a.append_ids(&[3]).unwrap().values.to_vec();
+    a.reset().unwrap();
+    assert_eq!(cold_b1, expected_b1);
+    b.reset().unwrap();
+    assert_eq!(b.append_ids(&[5]).unwrap().values, expected_b1);
+    assert_eq!(a.append_ids(&[1, 5]).unwrap().values, expected_a2);
+    let a_state = state_bytes(&a);
+    assert_eq!(b.append_ids(&[3]).unwrap().values, expected_b2);
+    assert_eq!(state_bytes(&a), a_state);
+    assert_eq!(a.committed_ids(), [1, 5]);
+    assert_eq!(a.append_ids(&[7]).unwrap().values, expected_a3);
+    let b_state = state_bytes(&b);
+    a.reset().unwrap();
+    assert_eq!(state_bytes(&b), b_state);
+    assert_eq!(b.committed_ids(), [5, 3]);
+
+    a.fault = Some(Fault::AfterLayer(1));
+    assert!(a.append_ids(&[1]).is_err());
+    let held = a.pending.len();
+    assert!(held > 0);
+    a.fault = Some(Fault::Reset);
+    assert!(a.reset().is_err());
+    assert_eq!(a.pending.len(), held);
+    assert_eq!(a.status(), Status::Poisoned);
+    assert_eq!(b.status(), Status::Ready);
+    assert_eq!(state_bytes(&b), b_state);
+    a.fault = None;
+    a.reset().unwrap();
+
+    // A moves threads as well. The panic scope must restore that caller's
+    // stream while preserving pending allocations until a successful reset.
+    let mut a = std::thread::spawn(move || {
+        let caller = StreamId::current();
+        assert_ne!(caller, a.stream);
+        a.fault = Some(Fault::PanicAfterLayer(1));
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = a.append_ids(&[1]);
+        })).is_err());
+        assert_eq!(StreamId::current(), caller);
+        assert_eq!(a.status(), Status::Poisoned);
+        assert!(!a.pending.is_empty());
+        assert!(a.pending.iter().all(|tensor| tensor.handle.stream == a.stream));
+        a.fault = None;
+        a.reset().unwrap();
+        assert_eq!(StreamId::current(), caller);
+        a
+    }).join().unwrap();
+    assert_eq!(state_bytes(&b), b_state);
+    a.append_ids(&[1, 5]).unwrap();
+    assert_eq!(a.append_ids(&[7]).unwrap().values, expected_a3);
+    let weak = Arc::downgrade(&model);
+    drop(model);
+    drop(a); // The original loader/session does not own B's lifetime.
+    assert!(weak.upgrade().is_some());
+    b.reset().unwrap();
+    assert_eq!(b.append_ids(&[5]).unwrap().values, expected_b1);
+    assert_eq!(b.append_ids(&[3]).unwrap().values, expected_b2);
+    drop(b);
+    assert!(weak.upgrade().is_none());
 }

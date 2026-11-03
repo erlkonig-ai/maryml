@@ -23,6 +23,11 @@ pub(super) struct Operands<T> {
 }
 
 impl<T> Operands<T> {
+    #[cfg(test)]
+    pub(super) fn diagnostic_owners(&self) -> (u64, bool) {
+        (self.entries.len(), self.pending.is_some())
+    }
+
     pub(super) fn new(capacity: usize) -> Result<Self> {
         if capacity > EXPERTS {
             return Err("MoE expert cache exceeds expert count".into());

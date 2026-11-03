@@ -332,48 +332,50 @@ pub(super) fn load<S: BlobStoreGet>(
                 let m = mamba_config(&config);
                 let g = m.layout()?;
                 Mixer::Mamba(Mamba {
-                    config: m,
-                    input: project(
-                        &fp8(&snapshot, id, "mamba.in_proj", [g.projected, H])?,
-                        &device,
-                        limits.max_resident_bytes,
-                    )?,
-                    output: project(
-                        &fp8(&snapshot, id, "mamba.out_proj", [H, g.inner])?,
-                        &device,
-                        limits.max_resident_bytes,
-                    )?,
-                    conv: bf16_aux::<3, S>(
-                        &snapshot,
-                        id,
-                        "mamba.conv1d.weight",
-                        &[g.conv_channels, 1, m.conv_kernel],
-                        &client,
-                        &device,
-                    )?,
-                    bias: if config.use_conv_bias {
-                        Some(bf16_aux::<1, S>(
+                    weights: Arc::new(MambaWeights {
+                        config: m,
+                        input: project(
+                            &fp8(&snapshot, id, "mamba.in_proj", [g.projected, H])?,
+                            &device,
+                            limits.max_resident_bytes,
+                        )?,
+                        output: project(
+                            &fp8(&snapshot, id, "mamba.out_proj", [H, g.inner])?,
+                            &device,
+                            limits.max_resident_bytes,
+                        )?,
+                        conv: bf16_aux::<3, S>(
                             &snapshot,
                             id,
-                            "mamba.conv1d.bias",
-                            &[g.conv_channels],
+                            "mamba.conv1d.weight",
+                            &[g.conv_channels, 1, m.conv_kernel],
                             &client,
                             &device,
-                        )?)
-                    } else {
-                        None
-                    },
-                    a_log: f32_aux(&snapshot, id, "mamba.A_log", m.heads, &client, &device)?,
-                    dt: f32_aux(&snapshot, id, "mamba.dt_bias", m.heads, &client, &device)?,
-                    d: f32_aux(&snapshot, id, "mamba.D", m.heads, &client, &device)?,
-                    gain: bf16_aux::<1, S>(
-                        &snapshot,
-                        id,
-                        "mamba.norm",
-                        &[g.inner],
-                        &client,
-                        &device,
-                    )?,
+                        )?,
+                        bias: if config.use_conv_bias {
+                            Some(bf16_aux::<1, S>(
+                                &snapshot,
+                                id,
+                                "mamba.conv1d.bias",
+                                &[g.conv_channels],
+                                &client,
+                                &device,
+                            )?)
+                        } else {
+                            None
+                        },
+                        a_log: f32_aux(&snapshot, id, "mamba.A_log", m.heads, &client, &device)?,
+                        dt: f32_aux(&snapshot, id, "mamba.dt_bias", m.heads, &client, &device)?,
+                        d: f32_aux(&snapshot, id, "mamba.D", m.heads, &client, &device)?,
+                        gain: bf16_aux::<1, S>(
+                            &snapshot,
+                            id,
+                            "mamba.norm",
+                            &[g.inner],
+                            &client,
+                            &device,
+                        )?,
+                    }),
                     committed: None,
                     staged: None,
                 })
@@ -430,16 +432,26 @@ pub(super) fn load<S: BlobStoreGet>(
         };
         layers.push(Layer { id, norm, mixer });
     }
+    // Build the reusable owner only after the original ordered uploads and
+    // private-state construction have succeeded. Cloning these handles/Arcs
+    // neither reselects source operands nor copies device payloads.
+    let fixed_layers = layers.iter().map(|layer| LayerWeights {
+        id: layer.id,
+        norm: layer.norm.clone(),
+        mixer: match &layer.mixer {
+            Mixer::Mamba(m) => MixerWeights::Mamba(m.weights.clone()),
+            Mixer::Attention(a) => MixerWeights::Attention(a.weights.clone()),
+            Mixer::Moe(m) => MixerWeights::Moe(m.weights.clone()),
+        },
+    }).collect();
+    let model = Arc::new(DeviceModel {
+        snapshot, source, client, device, config, embedding, final_norm, head,
+        layers: fixed_layers,
+    });
     Ok(Session {
-        snapshot,
-        source,
-        client,
-        device,
-        config,
+        model,
+        stream: StreamId::current(),
         limits,
-        embedding,
-        final_norm,
-        head,
         layers,
         status: Status::Ready,
         committed: Vec::new(),
