@@ -821,7 +821,8 @@ fn session_gpu_shared_model_rejects_origin_upload_error() {
         },
     )).err().expect("an origin upload error must not publish a Session/DeviceModel");
     assert!(error.starts_with("session CUDA completion:"), "{error}");
-    assert!(error.contains("UnsupportedStrides"), "{error}");
+    // CubeCL IoError's Debug delegates to Display, including this checked rejection.
+    assert!(error.contains("the provided strides are not supported for this operation"), "{error}");
     assert_eq!(StreamId::current(), caller);
     // Test teardown only: the error-returning fence was NOT a drain. Observe a
     // separate successful completion after refusal; never retry construction.
