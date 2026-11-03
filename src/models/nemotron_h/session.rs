@@ -130,7 +130,9 @@ struct LayerWeights {
 /// Immutable uploaded fixed operands and their exact held source observation.
 /// Shared only within this process/device. Expert caches and all sequence state
 /// belong to Sessions; this owner neither schedules them nor admits physical
-/// whole-device memory. No raw mutable weight handles are exposed.
+/// whole-device memory. Construction observes successful upload completion on
+/// the origin stream before this owner can escape. This is not a certificate of
+/// future device health. No raw mutable weight handles are exposed.
 pub struct DeviceModel<S> {
     snapshot: Arc<ModelSnapshot<S>>,
     source: Source,
@@ -543,6 +545,9 @@ impl<S: BlobStoreGet> Session<S> {
     /// queries of this snapshot.
     /// Only on-demand immutable device operands are cached; no expert catalog
     /// or source payloads are retained beside the frozen snapshot.
+    /// After the original ordered source checks/uploads, completion is observed
+    /// on the upload stream before publishing a shareable model. Deferred CUDA
+    /// upload errors therefore return here, before any Session can use it.
     pub fn from_snapshot(
         snapshot: Arc<ModelSnapshot<S>>,
         source: Source,
@@ -550,7 +555,10 @@ impl<S: BlobStoreGet> Session<S> {
         device: CudaDevice,
         limits: Limits,
     ) -> Result<Self> {
-        source::load(snapshot, source, layer_ids, device, limits)
+        source::load(snapshot, source, layer_ids, device, limits,
+            #[cfg(test)]
+            |_, _, _| {},
+        )
     }
     pub fn source(&self) -> Source {
         self.model.source

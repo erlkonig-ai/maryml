@@ -132,6 +132,36 @@ fn session_host_execution_stream_scope_restores_after_return_and_unwind() {
     assert_eq!(StreamId::current(), caller);
 }
 
+fn rejected_upload_layout() -> (cubecl::zspace::Shape, cubecl::zspace::Strides) {
+    // A transposed 2x2 byte layout: valid ranks and extent, rejected because
+    // the last stride is not 1. CUDA Command::write_to_gpu returns
+    // UnsupportedStrides BEFORE resource lookup, staging, or memcpy.
+    ([2, 2].into(), [1, 2].into())
+}
+
+#[test]
+fn session_host_upload_fault_is_a_checked_descriptor_rejection() {
+    let (shape, strides) = rejected_upload_layout();
+    assert_eq!(shape.len(), 2);
+    assert_eq!(shape.len(), strides.len());
+    assert_eq!(shape.iter().product::<usize>(), 4);
+    // This is a defined false return, not the validator's malformed-rank panic.
+    assert!(!cubecl::zspace::striding::has_pitched_row_major_strides(&shape, &strides));
+}
+
+fn enqueue_rejected_upload(device: &CudaDevice, handle: cubecl::server::Handle) {
+    use cubecl::{device::Device, device_handle::DeviceHandle, server::{ComputeServer, CopyDescriptor}};
+    assert!(handle.size() >= 4);
+    let stream = StreamId::current();
+    assert_eq!(handle.stream, stream);
+    let (shape, strides) = rejected_upload_layout();
+    let descriptor = CopyDescriptor::new(handle.binding(), shape, strides, 1);
+    let service = DeviceHandle::<<CudaRuntime as Runtime>::Server>::new(device.to_id());
+    service.submit_blocking(move |server| {
+        server.write(vec![(descriptor, cubecl::bytes::Bytes::from_bytes_vec(vec![1, 2, 3, 4]))], stream);
+    }).unwrap();
+}
+
 #[test]
 fn session_host_geometry_and_aggregate_admission() {
     let c = config();
@@ -758,6 +788,47 @@ fn state_bytes<S: BlobStoreGet>(session: &Session<S>) -> Vec<Vec<u8>> {
 }
 
 #[test]
+#[ignore = "reserved CUDA: rejected origin upload cannot publish shared model; no inference kernels"]
+fn session_gpu_shared_model_rejects_origin_upload_error() {
+    let (snapshot, source, ids) = fixture();
+    let ownership = resident_ownership(&config(), limits()).unwrap();
+    // One constructor only, no append/expert load or second context. Include
+    // the logical committed state although Mamba state is still unallocated.
+    assert_eq!(ownership.fixed_model_bytes + ownership.private_state_bytes, 132_574_040);
+    let caller = StreamId::current();
+    let origin = std::thread::spawn(StreamId::current).join().unwrap();
+    assert_ne!(caller, origin);
+    let device = CudaDevice { index: 0 };
+    let error = origin.executes(|| source::load(
+        snapshot, source, &ids, device.clone(), limits(),
+        |client, device, embedding| {
+            assert_eq!(StreamId::current(), origin);
+            // A real ordinary CUDA-server write Err, on a real fixed operand's
+            // origin stream. The checked rejection performs no invalid copy.
+            enqueue_rejected_upload(device, embedding.handle.clone());
+            caller.executes(|| {
+                // Exercise the precise trap: an actual cross-stream handle
+                // dependency waits for its origin event, yet reports no origin
+                // error. Reading this VALID prior upload is safe; the rejected
+                // replacement never touched it. The model must still refuse.
+                let bytes = client.read_one(embedding.handle.clone()).unwrap();
+                assert_eq!(bytes.len(), 32 * H * 2);
+                assert_eq!(&bytes[..2], &bf16::from_f32(-14.0 / 16.0).to_bits().to_le_bytes());
+                assert_eq!(&bytes[2..4], &bf16::from_f32(-7.0 / 16.0).to_bits().to_le_bytes());
+                cubecl::future::block_on(client.sync()).unwrap();
+            });
+            assert_eq!(StreamId::current(), origin);
+        },
+    )).err().expect("an origin upload error must not publish a Session/DeviceModel");
+    assert!(error.starts_with("session CUDA completion:"), "{error}");
+    assert!(error.contains("UnsupportedStrides"), "{error}");
+    assert_eq!(StreamId::current(), caller);
+    // Test teardown only: the error-returning fence was NOT a drain. Observe a
+    // separate successful completion after refusal; never retry construction.
+    origin.executes(|| cubecl::future::block_on(CudaRuntime::client(&device).sync())).unwrap();
+}
+
+#[test]
 #[ignore = "reserved CUDA: two synthetic Sessions, shared fixed weights/private state and stream movement"]
 fn session_gpu_shared_model_private_state_and_streams() {
     // Only two sessions alive, capacity8 and at most ONE synchronous append at
@@ -798,8 +869,8 @@ fn session_gpu_shared_model_private_state_and_streams() {
             _ => panic!("shared model changed layer kind"),
         }
     }
-    // B's first forward consumes weights uploaded on A's stream before A has
-    // ever executed or fenced a chunk. Warming B must leave A's cache empty.
+    // B's first forward consumes weights whose upload completed on A's stream,
+    // before A has executed any chunk. Warming B must leave A's cache empty.
     let cold_b1 = b.append_ids(&[5]).unwrap().values.to_vec();
     for layer in &a.layers {
         if let Mixer::Moe(m) = &layer.mixer {
@@ -828,6 +899,9 @@ fn session_gpu_shared_model_private_state_and_streams() {
     assert_eq!(state_bytes(&b), b_state);
     assert_eq!(b.committed_ids(), [5, 3]);
 
+    // This fault precedes the fixture's MoE layer. It covers retained outer
+    // outputs/Mamba staged state/attention state, NOT failed MoE completion or
+    // its expert-cache pending owner. That cache algorithm has separate tests.
     a.fault = Some(Fault::AfterLayer(1));
     assert!(a.append_ids(&[1]).is_err());
     let held = a.pending.len();

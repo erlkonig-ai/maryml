@@ -274,6 +274,9 @@ pub(super) fn load<S: BlobStoreGet>(
     layer_ids: &[Id],
     device: CudaDevice,
     limits: Limits,
+    #[cfg(test)] before_upload_completion: impl FnOnce(
+        &ComputeClient<CudaRuntime>, &CudaDevice, &CudaTensor,
+    ),
 ) -> Result<Session<S>> {
     let facts = snapshot.facts();
     let root = source.root;
@@ -308,6 +311,7 @@ pub(super) fn load<S: BlobStoreGet>(
             return Err(format!("selected layer is not at native position {i}"));
         }
     }
+    let stream = StreamId::current();
     let client = CudaRuntime::client(&device);
     let embedding = bf16_aux::<2, S>(
         &snapshot,
@@ -432,9 +436,17 @@ pub(super) fn load<S: BlobStoreGet>(
         };
         layers.push(Layer { id, norm, mixer });
     }
-    // Build the reusable owner only after the original ordered uploads and
-    // private-state construction have succeeded. Cloning these handles/Arcs
-    // neither reselects source operands nor copies device payloads.
+    #[cfg(test)]
+    before_upload_completion(&client, &device, &embedding);
+    // Cross-stream handle events order work, but do not propagate a queued
+    // origin-stream write error. Observe BOTH errors and completion here before
+    // any DeviceModel can escape. Every uploaded operand remains owned by the
+    // locals below until this fence resolves. An Err is not a drain: dropping
+    // those owners still uses the runtime's normal stream-ordered allocator.
+    stream.executes(|| cubecl::future::block_on(client.sync()))
+        .map_err(|e| format!("session CUDA completion: {e:?}"))?;
+    // Cloning these handles/Arcs neither reselects source operands nor copies
+    // device payloads. No source/upload/failure ordering changed before fence.
     let fixed_layers = layers.iter().map(|layer| LayerWeights {
         id: layer.id,
         norm: layer.norm.clone(),
@@ -450,7 +462,7 @@ pub(super) fn load<S: BlobStoreGet>(
     });
     Ok(Session {
         model,
-        stream: StreamId::current(),
+        stream,
         limits,
         layers,
         status: Status::Ready,
