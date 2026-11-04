@@ -74,11 +74,14 @@ pub struct Admission {
     pub expert_cache_pairs_per_moe: usize,
     pub expert_cache_bytes: usize,
     pub resident_bytes: usize,
+    /// Actual ordinary prompt path, including full-span slabs when >256.
+    pub prefill: PrefillAllocation,
+    /// Short-append comparison only; a long prompt uses prefill above.
     pub first_chunk_tokens: usize,
     pub first_chunk_bytes: usize,
     pub max_prompt_chunk_bytes: usize,
     /// Exact largest logical chunk within capacity, independent of this
-    /// prompt. Informational: only the actual prompt chunks are admitted.
+    /// prompt. Informational: only the actual prefill path is admitted.
     /// Future appends still enforce max_chunk_bytes before dispatch.
     pub max_capacity_chunk_bytes: usize,
 }
@@ -398,22 +401,24 @@ pub fn admission(config: &TextConfig, limits: Limits, prompt_tokens: usize) -> R
         .and_then(|n| n.checked_mul(expert_cache_pairs_per_moe))
         .ok_or("session expert cache byte sum overflow")?;
     let resident_bytes = add(base_resident_bytes, expert_cache_bytes)?;
+    let prefill = prefill_admission(config, limits, 0, prompt_tokens)?;
+    let comparison = Limits { max_chunk_bytes: usize::MAX, ..limits };
     let first_chunk_tokens = prompt_tokens.min(MAX_CHUNK);
-    let first_chunk_bytes = planned_chunk_bytes(config, limits, 0, first_chunk_tokens)?;
+    let first_chunk_bytes = planned_chunk_bytes(config, comparison, 0, first_chunk_tokens)?;
     let mut max_prompt_chunk_bytes = first_chunk_bytes;
-    // Generator uses MAX_CHUNK, with only the last chunk possibly partial.
+    // Preserve the old chunked schedule as an explicitly descriptive comparison.
     // For fixed width, only attention's split count depends on start, and it
     // is monotone. The last full chunk and the remainder cover every maximum.
     let remainder = prompt_tokens % MAX_CHUNK;
     let full_end = prompt_tokens - remainder;
     if full_end > 0 {
         max_prompt_chunk_bytes = max_prompt_chunk_bytes.max(planned_chunk_bytes(
-            config, limits, full_end - MAX_CHUNK, MAX_CHUNK,
+            config, comparison, full_end - MAX_CHUNK, MAX_CHUNK,
         )?);
     }
     if remainder > 0 {
         max_prompt_chunk_bytes = max_prompt_chunk_bytes.max(planned_chunk_bytes(
-            config, limits, full_end, remainder,
+            config, comparison, full_end, remainder,
         )?);
     }
     // Report all possible future widths without rejecting a prompt because
@@ -427,6 +432,7 @@ pub fn admission(config: &TextConfig, limits: Limits, prompt_tokens: usize) -> R
         })?;
     Ok(Admission {
         base_resident_bytes, expert_cache_pairs_per_moe, expert_cache_bytes, resident_bytes,
+        prefill,
         first_chunk_tokens, first_chunk_bytes, max_prompt_chunk_bytes, max_capacity_chunk_bytes,
     })
 }

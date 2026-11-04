@@ -631,7 +631,7 @@ impl<P: ExpertProvider> Moe<P> {
         observe: &mut impl FnMut(&str, &CudaTensor) -> Result<()>,
         #[cfg(feature = "nemotron-timing")] mut timing: Option<&mut Timings>,
     ) -> Result<Output> {
-        let (routing, latent) = self.route_tile(x, t, observe)?;
+        let (routing, latent) = self.route_tile(x, t, observe, None)?;
         let schedule = Schedule::new(&routing)?;
         let selected = self.weights.client.empty(t * TOP_K * LATENT * 2);
         for (index, rows) in schedule.by_expert.iter().enumerate() {
@@ -758,7 +758,7 @@ impl<P: ExpertProvider> Moe<P> {
         observe("combined_f32", &combined)?;
         let combined = self.narrow(&combined);
         observe("combined_bf16", &combined)?;
-        let values = self.finish_tile(x, &combined, t, observe)?;
+        let values = self.finish_tile(x, &combined, t, observe, None)?;
         Ok(Output {
             values,
             routing,
@@ -767,10 +767,16 @@ impl<P: ExpertProvider> Moe<P> {
     }
 
     fn route_tile(&self, x: &CudaTensor, t: usize,
-        observe: &mut impl FnMut(&str, &CudaTensor) -> Result<()>) -> Result<(Routing, CudaTensor)>
+        observe: &mut impl FnMut(&str, &CudaTensor) -> Result<()>,
+        mut held: Option<&mut Vec<CudaTensor>>) -> Result<(Routing, CudaTensor)>
     {
+        let mut hold = |value: &CudaTensor| {
+            if let Some(held) = held.as_deref_mut() { held.push(value.clone()); }
+        };
         let logits = self.linear(x, &self.weights.router, HIDDEN, EXPERTS);
+        hold(&logits);
         let route = self.weights.client.empty(t * ROUTE_WIDTH * 4);
+        hold(&self.tensor(route.clone(), t, ROUTE_WIDTH, DType::F32));
         unsafe {
             route_kernel::launch_unchecked::<CudaRuntime>(
                 &self.weights.client,
@@ -793,7 +799,10 @@ impl<P: ExpertProvider> Moe<P> {
             "routing_record",
             &self.tensor(route, t, ROUTE_WIDTH, DType::F32),
         )?;
-        let latent = self.narrow(&self.linear(x, &self.weights.fc1, HIDDEN, LATENT));
+        let latent_f32 = self.linear(x, &self.weights.fc1, HIDDEN, LATENT);
+        hold(&latent_f32);
+        let latent = self.narrow(&latent_f32);
+        hold(&latent);
         observe("latent", &latent)?;
         Ok((routing, latent))
     }
@@ -809,18 +818,30 @@ impl<P: ExpertProvider> Moe<P> {
         Ok((high, active, low))
     }
     fn finish_tile(&self, x: &CudaTensor, combined: &CudaTensor, t: usize,
-        observe: &mut impl FnMut(&str, &CudaTensor) -> Result<()>) -> Result<CudaTensor>
+        observe: &mut impl FnMut(&str, &CudaTensor) -> Result<()>,
+        mut held: Option<&mut Vec<CudaTensor>>) -> Result<CudaTensor>
     {
-        let expanded = self.narrow(&self.linear(combined, &self.weights.fc2, LATENT, HIDDEN));
+        let mut hold = |value: &CudaTensor| {
+            if let Some(held) = held.as_deref_mut() { held.push(value.clone()); }
+        };
+        let expanded_f32 = self.linear(combined, &self.weights.fc2, LATENT, HIDDEN);
+        hold(&expanded_f32);
+        let expanded = self.narrow(&expanded_f32);
+        hold(&expanded);
         let shared_up = self.weights.shared_up.project(x)?;
+        hold(&shared_up);
         let shared_active = self.relu2(&shared_up);
+        hold(&shared_active);
         let shared = self.weights.shared_down.project(&shared_active)?;
+        hold(&shared);
         observe("expanded", &expanded)?;
         observe("shared_up", &shared_up)?;
         observe("shared_relu2", &shared_active)?;
         observe("shared_down", &shared)?;
         let out = self.weights.client.empty(t * HIDDEN * 2);
+        hold(&self.tensor(out.clone(), t, HIDDEN, DType::BF16));
         let flags = self.weights.client.empty(t * 4);
+        hold(&self.tensor(flags.clone(), t, 1, DType::U32));
         unsafe {
             sum_kernel::launch_unchecked::<CudaRuntime>(
                 &self.weights.client,
@@ -862,7 +883,7 @@ impl<P: ExpertProvider> Moe<P> {
         -> Result<(Routing, CudaTensor)>
     {
         let (t, _) = self.check_input(x)?;
-        self.route_tile(x, t, &mut |_, value| { held.push(value.clone()); Ok(()) })
+        self.route_tile(x, t, &mut |_, _| Ok(()), Some(held))
     }
     pub(super) fn prefill_stage(&mut self, index: usize) -> Result<()> {
         if self.provider.source() != self.weights.source {
@@ -926,7 +947,7 @@ impl<P: ExpertProvider> Moe<P> {
         { return Err("MoE prefill accumulator tile mismatch".into()); }
         let combined = self.narrow(accumulator);
         held.push(combined.clone());
-        self.finish_tile(x, &combined, t, &mut |_, value| { held.push(value.clone()); Ok(()) })
+        self.finish_tile(x, &combined, t, &mut |_, _| Ok(()), Some(held))
     }
     pub(super) fn prefill_done(&mut self) { self.poisoned = false; }
 

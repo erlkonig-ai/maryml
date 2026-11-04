@@ -3,6 +3,7 @@
 //! failures and logits at the same private loop boundary used by production.
 use super::super::chat::ExecProposal;
 use super::*;
+use super::super::session::MAX_CHUNK;
 use std::{cell::Cell, collections::VecDeque, rc::Rc};
 
 struct Script {
@@ -16,6 +17,7 @@ struct Script {
     fail_reset: bool,
     fail_append: Option<usize>,
     cancel_after_append: Option<(usize, Rc<Cell<bool>>)>,
+    cancel_inside_prefill: Option<Rc<Cell<bool>>>,
 }
 fn row(id: u32) -> Vec<f32> {
     let mut values = vec![0.0; 16];
@@ -35,10 +37,25 @@ impl Script {
             fail_reset: false,
             fail_append: None,
             cancel_after_append: None,
+            cancel_inside_prefill: None,
         }
     }
 }
 impl Runtime for Script {
+    fn prefill(&mut self, ids: &[u32], cancelled: &mut dyn FnMut() -> bool) -> Result<PrefillOutcome> {
+        if cancelled() { return Ok(PrefillOutcome::Cancelled); }
+        if ids.len() > MAX_CHUNK {
+            if let Some(signal) = &self.cancel_inside_prefill {
+                self.appends.push(ids.to_vec());
+                self.status = Status::Poisoned;
+                signal.set(true); // Stand in for private layer advancement.
+                assert!(cancelled());
+                return Ok(PrefillOutcome::Cancelled);
+            }
+        }
+        self.append(ids)?;
+        Ok(PrefillOutcome::Completed)
+    }
     fn context_capacity(&self) -> usize {
         self.capacity
     }
@@ -245,7 +262,8 @@ fn generation_progress_distinguishes_returned_success_and_failure_without_rich_t
             assert_eq!(span.field("committed_after"), Some(if index == 0 || !ok { "2" } else { "3" }));
             assert_eq!(span.field("session_ready"), Some(if ok { "true" } else { "false" }));
             assert!(span.field("append_wall_ns").unwrap().parse::<u64>().is_ok());
-            assert_eq!(span.fields.len(), 10, "bounded numeric/static fields only");
+            assert_eq!(span.field("append_cancelled"), Some("false"));
+            assert_eq!(span.fields.len(), 11, "bounded numeric/static fields only");
         }
     }
 }
@@ -264,7 +282,7 @@ fn generation_progress_unwind_has_no_return_or_success_fields() {
     assert_eq!(spans.len(), 1);
     assert!(spans[0].closed, "an unwind closes the span without claiming a return");
     assert_eq!(spans[0].fields.len(), 4);
-    for name in ["append_returned", "append_ok", "completed_tokens", "committed_after", "session_ready", "append_wall_ns"] {
+    for name in ["append_returned", "append_ok", "append_cancelled", "completed_tokens", "committed_after", "session_ready", "append_wall_ns"] {
         assert_eq!(spans[0].field(name), None, "{name}");
     }
 }
@@ -285,12 +303,50 @@ fn generation_progress_cancellation_counts_only_appends_that_returned() {
         if initially_cancelled {
             assert!(spans.is_empty());
         } else {
-            assert_eq!(spans.len(), 1, "no span for the unstarted final prompt token");
-            assert_eq!(spans[0].field("completed_tokens"), Some("256"));
+            assert_eq!(spans.len(), 1, "one known prompt span");
+            assert_eq!(spans[0].field("completed_tokens"), Some("257"));
             assert_eq!(spans[0].field("prompt_tokens"), Some("257"));
             assert_eq!(spans[0].field("append_ok"), Some("true"));
         }
     }
+}
+
+#[test]
+fn generation_long_prefill_cancel_is_not_reusable_and_never_publishes_completion() {
+    let mut script = Script::new(&[11]);
+    script.committed = vec![9];
+    let signal = Rc::new(Cell::new(false));
+    script.cancel_inside_prefill = Some(signal.clone());
+    let prompt = [vec![9], vec![1; MAX_CHUNK + 1]].concat();
+    let capture = ProgressCapture::default();
+    let out = tracing::subscriber::with_default(capture.clone(), || run_turn(
+        &mut script, &mut Sampler::new(SamplingConfig::greedy(), 0).unwrap(),
+        &prompt, 1, &mut || signal.get(), DecodeScript::default(),
+    ));
+    assert_eq!(out.completion.stop, StopReason::Cancelled);
+    assert_eq!(out.session_status, Status::Poisoned);
+    assert_eq!(out.committed_tokens, 1, "old IDs are diagnostic only");
+    assert!(out.emitted_ids.is_empty());
+    assert_eq!(script.appends[0].len(), 257, "entire known suffix, not short fallback");
+    let spans = capture.0.lock().unwrap();
+    assert_eq!(spans.len(), 1);
+    for (name, value) in [("append_returned", "true"), ("append_ok", "false"),
+        ("append_cancelled", "true"), ("completed_tokens", "0"),
+        ("committed_after", "1"), ("session_ready", "false")] {
+        assert_eq!(spans[0].field(name), Some(value));
+    }
+    drop(spans);
+    script.cancel_inside_prefill = None;
+    let next = run(&mut script, &prompt, 1, DecodeScript::default());
+    assert_eq!(script.resets, 1, "diagnostic matching prefix MUST reset after cancellation");
+    assert_eq!(script.appends[1], prompt);
+    assert_eq!(next.emitted_ids, [11]);
+    assert_eq!(script.committed, prompt, "emitted EOS remains unattended");
+    // Exact reuse uses the previously computed last logits, no empty prefill.
+    let count = script.appends.len();
+    let again = run(&mut script, &prompt, 1, DecodeScript::default());
+    assert_eq!(again.emitted_ids, [11]);
+    assert_eq!(script.appends.len(), count);
 }
 
 // Observe the actual production loop event without a subscriber dependency or
@@ -437,7 +493,7 @@ fn generation_context_limit_is_budget_not_eos_and_does_not_overflow() {
 }
 
 #[test]
-fn generation_cancel_before_work_and_between_prefill_chunks() {
+fn generation_cancel_before_work_and_during_private_prefill() {
     let mut s = Script::new(&[5]);
     s.committed = vec![9];
     let mut sampler = Sampler::new(SamplingConfig::greedy(), 0).unwrap();
@@ -453,7 +509,7 @@ fn generation_cancel_before_work_and_between_prefill_chunks() {
     assert_eq!(s.committed, [9]);
     assert!(s.appends.is_empty() && s.resets == 0);
     let signal = Rc::new(Cell::new(false));
-    s.cancel_after_append = Some((1, signal.clone()));
+    s.cancel_inside_prefill = Some(signal.clone());
     let out = run_turn(
         &mut s,
         &mut sampler,
@@ -463,7 +519,8 @@ fn generation_cancel_before_work_and_between_prefill_chunks() {
         DecodeScript::default(),
     );
     assert_eq!(out.completion.stop, StopReason::Cancelled);
-    assert_eq!(out.committed_tokens, MAX_CHUNK);
+    assert_eq!(out.committed_tokens, 0, "no all-layer prefix was published");
+    assert_eq!(out.session_status, Status::Poisoned);
     assert_eq!(s.appends.len(), 1);
     assert_eq!(s.resets, 1);
     assert!(out.emitted_ids.is_empty() && out.completion.proposal.is_none());

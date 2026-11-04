@@ -11,6 +11,72 @@ fn source() -> SourceBinding {
         layer: *genid(),
     }
 }
+
+#[test]
+#[ignore = "reserved CUDA: ordered FMA tiles versus existing scatter and independent F32 recurrence"]
+fn moe_gpu_prefill_ordered_tiles_match_scatter() {
+    let client = CudaRuntime::client(&CudaDevice { index: 0 });
+    let tokens = 17;
+    let experts = 3;
+    let mut y = Vec::new();
+    let mut weights = Vec::new();
+    for expert in 0..experts {
+        for row in 0..tokens {
+            weights.push((row + expert + 1) as f32 / 29.0);
+            for col in 0..LATENT {
+                y.push(bf16::from_f32(match expert {
+                    0 => 1024.0 + (col % 7) as f32,
+                    1 => -1024.0 + (row % 5) as f32,
+                    _ => 0.5 + (col % 3) as f32 / 8.0,
+                }));
+            }
+        }
+    }
+    let selected = client.create_from_slice(bf16::as_bytes(&y));
+    let weight = client.create_from_slice(f32::as_bytes(&weights));
+    let row_ids: Vec<u32> = (0..tokens).flat_map(|row|
+        (0..experts).map(move |expert| (expert * tokens + row) as u32)).collect();
+    let ids = client.create_from_slice(u32::as_bytes(&row_ids));
+    let counts = client.create_from_slice(u32::as_bytes(&vec![experts as u32; tokens]));
+    let reference = moegroup::scatter_weighted_bf16(&client, &selected, &weight, &ids, &counts,
+        tokens * experts, tokens, LATENT, experts);
+    let accumulator = client.create_from_slice(f32::as_bytes(&vec![0.0; tokens * LATENT]));
+    let mut held = Vec::new();
+    for expert in 0..experts {
+        for start in [0, 16] {
+            let rows = (tokens - start).min(16);
+            let from = expert * tokens + start;
+            let low = client.create_from_slice(bf16::as_bytes(&y[from * LATENT..(from + rows) * LATENT]));
+            let idx: Vec<i32> = (start..start + rows).map(|v| v as i32).collect();
+            let idx = client.create_from_slice(i32::as_bytes(&idx));
+            let w = client.create_from_slice(f32::as_bytes(&weights[from..from + rows]));
+            let len = rows * LATENT;
+            unsafe {
+                ordered_update::launch_unchecked::<CudaRuntime>(&client,
+                    CubeCount::new_1d(len.div_ceil(THREADS as usize) as u32), CubeDim::new_1d(THREADS),
+                    ArrayArg::from_raw_parts(low.clone(), len), ArrayArg::from_raw_parts(idx.clone(), rows),
+                    ArrayArg::from_raw_parts(w.clone(), rows),
+                    ArrayArg::from_raw_parts(accumulator.clone(), tokens * LATENT), len);
+            }
+            held.extend([low, idx, w]);
+        }
+    }
+    fence(&client).unwrap();
+    let actual = client.read_one(accumulator).unwrap();
+    let reference = client.read_one(reference).unwrap();
+    assert_eq!(&actual[..tokens * LATENT * 4], &reference[..tokens * LATENT * 4]);
+    for row in 0..tokens {
+        for col in 0..LATENT {
+            let expected = (0..experts).fold(0.0f32, |a, expert| {
+                let r = expert * tokens + row;
+                y[r * LATENT + col].to_f32().mul_add(weights[r], a)
+            });
+            let offset = (row * LATENT + col) * 4;
+            assert_eq!(&actual[offset..offset + 4], &expected.to_le_bytes());
+        }
+    }
+    drop(held);
+}
 fn limits() -> Limits {
     Limits {
         max_fixed_bytes: 48 << 20,
@@ -610,6 +676,25 @@ fn moe_gpu_full_geometry_stages_for_stock_reference() {
     assert_eq!(moe.provider.calls.get(), calls);
     assert!(moe.forward(&full).is_err());
     moe.reset().unwrap();
+    // The span owner retains dispatch/readback payloads even when a helper
+    // returns an error before its usual diagnostic observer runs.
+    let mut held = Vec::new();
+    moe.prefill_begin().unwrap();
+    assert!(moe.prefill_route(&input(&client, &device, &bad, 1, HIDDEN), &mut held).is_err());
+    assert!(held.iter().any(|t| t.meta.shape().as_slice() == [1, 1, EXPERTS]));
+    assert!(held.iter().any(|t| t.meta.shape().as_slice() == [1, 1, ROUTE_WIDTH]));
+    assert!(moe.is_poisoned());
+    moe.reset().unwrap(); // Successful completion precedes owner release.
+    held.clear();
+    moe.prefill_begin().unwrap();
+    let nan = moe.tensor(client.create_from_slice(f32::as_bytes(&vec![f32::NAN; 3 * LATENT])),
+        3, LATENT, DType::F32);
+    assert!(moe.prefill_finish(&full, &nan, &mut held).is_err());
+    assert!(held.iter().filter(|t| t.meta.shape().as_slice() == [1, 3, SHARED]).count() >= 2);
+    assert!(held.iter().any(|t| t.meta.shape().as_slice() == [1, 3, HIDDEN] && t.dtype == DType::BF16));
+    assert!(held.iter().any(|t| t.meta.shape().as_slice() == [1, 3, 1] && t.dtype == DType::U32));
+    moe.reset().unwrap();
+    held.clear();
     moe.provider.fail.set(Some(1)); // Expert0 already ran; failure must drain and poison.
     let failure = moe.forward(&full).err().unwrap();
     assert!(failure.contains("injected"));

@@ -32,6 +32,38 @@ pub struct PrefillAllocation {
 mod tests {
     use super::*;
 
+    #[test]
+    fn session_host_prefill_progress_is_not_disabled_by_span_only_filter() {
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        #[derive(Clone, Default)]
+        struct Capture(Arc<AtomicUsize>);
+        impl tracing::Subscriber for Capture {
+            fn enabled(&self, m: &tracing::Metadata<'_>) -> bool {
+                m.is_span() && m.target() == "mary.nemotron.progress"
+                    && matches!(m.name(), "native_append" | "native_prefill_step")
+            }
+            fn new_span(&self, a: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                assert_eq!(a.metadata().name(), "native_prefill_step");
+                self.0.fetch_add(1, Ordering::SeqCst);
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, _: &tracing::Event<'_>) { panic!("no event admitted") }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+        let capture = Capture::default();
+        tracing::subscriber::with_default(capture.clone(), || {
+            assert!(!tracing::enabled!(target: "mary.nemotron.progress", tracing::Level::INFO));
+            let mut progress = Progress::new();
+            progress.completed(3, "expert_rows", 512, 257, 7, true);
+        });
+        assert_eq!(capture.0.load(Ordering::SeqCst), 1);
+        // Drive's native_timing fixture additionally applies its ACTUAL filter
+        // and visitor to this vocabulary, proving durable step->append->turn.
+    }
+
     fn routing(start: usize, tokens: usize) -> moe::Routing {
         let ids: Vec<_> = (start..start + tokens)
             .flat_map(|row| (0..moe::TOP_K).map(move |slot| (row * 3 + slot * 7) % moe::EXPERTS))
@@ -73,15 +105,6 @@ mod tests {
                 .collect();
             expected.sort_by_key(|&(id, _)| id);
             assert_eq!(&expected, selected);
-            // Independent recurrence witness: rank order must not replace the
-            // old scatter's ascending-expert F32 FMA order.
-            let result = selected.iter().fold(0.0f32, |a, &(id, w)| {
-                ((id as f32 - 256.0) / 3.0).mul_add(w, a)
-            });
-            let reference = expected.iter().fold(0.0f32, |a, &(id, w)| {
-                ((id as f32 - 256.0) / 3.0).mul_add(w, a)
-            });
-            assert_eq!(result.to_bits(), reference.to_bits());
         }
         assert!(routes.append(routing(257, 1)).is_err());
         let mut bad = routing(0, 1);
@@ -187,7 +210,7 @@ pub fn admission(
     // overcount outputs already included here. No unexplained 128MiB reserve.
     let tile_outer = add(bytes(&[MAX_CHUNK, H], 8)?, bytes(&[MAX_CHUNK], 12)?)?;
     let tile_workspace = add(tile_outer, mixer_peak)?.max(add(
-        bytes(&[1, H], 4)?,
+        bytes(&[1, H], 6)?,
         super::super::fp8::working_bytes(1, [c.vocab_size, H])?,
     )?);
     let expert = if has_moe {
@@ -216,7 +239,10 @@ pub fn admission(
             .div_ceil(64)
             .checked_mul(moe::EXPERTS * 8)
             .ok_or("prefill membership bytes overflow")?;
-        (add(routes, bits)?, MAX_CHUNK * (row + 188 + 8) + 4096)
+        // Readback and its decoded F32 copy coexist with bounded Routing.
+        // Expert row/index/weight vectors add 16 bytes/row. Fixed slack covers
+        // the duplicate bitmap and Vec headers, not general allocator overhead.
+        (add(routes, bits)?, MAX_CHUNK * (row + 2 * 188 + 16) + 4096)
     } else {
         (0, 0)
     };

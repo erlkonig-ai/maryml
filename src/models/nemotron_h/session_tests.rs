@@ -317,8 +317,14 @@ fn session_host_admission_budget_boundaries_precede_any_session() {
     assert_eq!(first.first_chunk_bytes, l.max_chunk_bytes);
     assert!(first.max_capacity_chunk_bytes > l.max_chunk_bytes);
     assert!(admission(&c, l, 300).is_ok());
-    // The first chunk fits, but the required late partial chunk does not.
-    assert!(admission(&c, l, 511).is_err());
+    // Long prefill admits its actual tile/slab schedule. The old late chunk
+    // comparison may exceed the allowance without being dispatched.
+    let span = admission(&c, l, 511).unwrap();
+    assert!(span.max_prompt_chunk_bytes > l.max_chunk_bytes);
+    assert!(span.prefill.device_working_bytes < l.max_chunk_bytes);
+    let span_exact = Limits { max_chunk_bytes: span.prefill.device_working_bytes, ..l };
+    assert!(admission(&c, span_exact, 511).is_ok());
+    assert!(admission(&c, Limits { max_chunk_bytes: span_exact.max_chunk_bytes - 1, ..l }, 511).is_err());
     l.max_chunk_bytes -= 1;
     assert!(admission(&c, l, 256).is_err());
     assert!(admission(&full_config(1048576), full_limits(1048576), 1).is_err());

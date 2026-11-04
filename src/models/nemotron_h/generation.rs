@@ -3,7 +3,8 @@
 //! Emitted IDs (including EOS) are authoritative and are NOT the attended
 //! prefix. Rendering may change earlier tokens: reuse requires the complete
 //! committed prefix, otherwise reset must succeed before prefill. Cancellation
-//! is cooperative at completed chunk boundaries, never a GPU interrupt/drain.
+//! is cooperative between bounded prefill tiles or completed decode appends,
+//! never a GPU interrupt/drain. Partial prefill cancellation poisons the Session.
 //! No executor, sampling policy switch, history truncation or implicit token mask.
 //!
 //! Available with BOTH nemotron-cuda and tokenizer. Runtime failures preserve
@@ -14,7 +15,7 @@ use super::{
         ChatCodec, Completion, History, OutputParser, PartialOutput, RenderOptions, RenderedPrompt,
         StopReason,
     },
-    session::{MAX_CHUNK, Session, Status},
+    session::{PrefillOutcome, Session, Status},
 };
 use crate::sampling::{Sampler, SamplingConfig};
 use anyhow::{Context, Result, ensure};
@@ -246,6 +247,7 @@ trait Runtime {
     fn last_logits(&self) -> Option<&[f32]>;
     fn reset(&mut self) -> Result<()>;
     fn append(&mut self, ids: &[u32]) -> Result<()>;
+    fn prefill(&mut self, ids: &[u32], cancelled: &mut dyn FnMut() -> bool) -> Result<PrefillOutcome>;
 }
 impl<S: BlobStoreGet> Runtime for Session<S> {
     fn context_capacity(&self) -> usize {
@@ -268,6 +270,9 @@ impl<S: BlobStoreGet> Runtime for Session<S> {
     }
     fn append(&mut self, ids: &[u32]) -> Result<()> {
         self.append_ids(ids).map(|_| ()).map_err(anyhow::Error::msg)
+    }
+    fn prefill(&mut self, ids: &[u32], cancelled: &mut dyn FnMut() -> bool) -> Result<PrefillOutcome> {
+        self.prefill_ids(ids, cancelled).map_err(anyhow::Error::msg)
     }
 }
 trait Decoder {
@@ -375,12 +380,14 @@ fn rejected(runtime: &impl Runtime, error: String) -> TurnOutput {
 /// in this span does not enable the optional per-expert host timing target.
 fn append_with_progress(
     runtime: &mut impl Runtime, ids: &[u32], role: &'static str, prompt_tokens: usize,
-) -> Result<()> {
+    cancelled: Option<&mut dyn FnMut() -> bool>,
+) -> Result<PrefillOutcome> {
     let span = tracing::info_span!(
         target: "mary.nemotron.progress", "native_append",
         role, committed_before = runtime.committed_ids().len(),
         attempted_tokens = ids.len(), prompt_tokens,
         append_returned = tracing::field::Empty, append_ok = tracing::field::Empty,
+        append_cancelled = tracing::field::Empty,
         completed_tokens = tracing::field::Empty, committed_after = tracing::field::Empty,
         session_ready = tracing::field::Empty, append_wall_ns = tracing::field::Empty,
     );
@@ -388,14 +395,20 @@ fn append_with_progress(
     // This guard never crosses an async suspension. On unwind only the initial
     // fields (and possibly span end) exist: absence is not successful progress.
     let _entered = span.enter();
-    let result = runtime.append(ids);
+    // The entered append remains the direct parent of every prefill step.
+    let result = match cancelled {
+        Some(cancelled) => runtime.prefill(ids, cancelled),
+        None => runtime.append(ids).map(|()| PrefillOutcome::Completed),
+    };
     if let Some(started) = started {
         let wall_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
         // Each late field is recorded once: the sink retains facts, not updates.
         // Poisoned committed counts are diagnostics, not reusable state claims.
         span.record("append_returned", true);
-        span.record("append_ok", result.is_ok());
-        span.record("completed_tokens", if result.is_ok() { ids.len() } else { 0 });
+        let completed = matches!(&result, Ok(PrefillOutcome::Completed));
+        span.record("append_ok", completed);
+        span.record("append_cancelled", matches!(&result, Ok(PrefillOutcome::Cancelled)));
+        span.record("completed_tokens", if completed { ids.len() } else { 0 });
         span.record("committed_after", runtime.committed_ids().len());
         span.record("session_ready", runtime.status() == Status::Ready);
         span.record("append_wall_ns", wall_ns);
@@ -437,26 +450,21 @@ fn run_turn(
             }
             reset.context("reset before prefix replacement")?;
         }
-        let mut from = runtime.committed_ids().len();
+        let from = runtime.committed_ids().len();
         #[cfg(feature = "nemotron-timing")]
         if let Some(timing) = &mut timing {
             timing.reused_tokens = from;
         }
-        while from < prompt.len() {
-            if cancelled() {
-                return Ok((StopReason::Cancelled, None));
-            }
-            let end = from.saturating_add(MAX_CHUNK).min(prompt.len());
+        if from < prompt.len() {
             #[cfg(feature = "nemotron-timing")]
             let started = timing.as_ref().map(|_| std::time::Instant::now());
-            let append = append_with_progress(runtime, &prompt[from..end], "prompt", prompt.len());
+            let append = append_with_progress(runtime, &prompt[from..], "prompt", prompt.len(), Some(&mut *cancelled));
             #[cfg(feature = "nemotron-timing")]
             if let (Some(timing), Some(started)) = (&mut timing, started) {
-                timing.prompt.record(started.elapsed(), end - from, append.is_ok());
+                timing.prompt.record(started.elapsed(), prompt.len() - from,
+                    matches!(&append, Ok(PrefillOutcome::Completed)));
             }
-            append.context("prompt append")?;
-            from = end;
-            if cancelled() {
+            if append.context("prompt prefill")? == PrefillOutcome::Cancelled {
                 return Ok((StopReason::Cancelled, None));
             }
         }
@@ -503,7 +511,7 @@ fn run_turn(
             // failed append retains the emitted ID and Session's actual status.
             #[cfg(feature = "nemotron-timing")]
             let started = timing.as_ref().map(|_| std::time::Instant::now());
-            let append = append_with_progress(runtime, &[id], "generated", prompt.len());
+            let append = append_with_progress(runtime, &[id], "generated", prompt.len(), None);
             #[cfg(feature = "nemotron-timing")]
             if let (Some(timing), Some(started)) = (&mut timing, started) {
                 timing.generated.record(started.elapsed(), 1, append.is_ok());
