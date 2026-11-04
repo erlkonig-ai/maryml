@@ -31,6 +31,9 @@ use triblespace::{core::collection::CollectionHandle, prelude::*};
 #[path = "session_source.rs"]
 mod source;
 use source::NativeExperts;
+#[path = "session_prefill.rs"]
+mod prefill;
+pub use prefill::{PrefillAllocation, PrefillOutcome, admission as prefill_admission};
 
 type Result<T> = std::result::Result<T, String>;
 const H: usize = 4096;
@@ -54,8 +57,9 @@ pub struct Limits {
     /// expert planes. Remaining room sets a uniform per-MoE cache quota (0..512).
     /// Logical payload bytes, not allocator reservation or host staging.
     pub max_resident_bytes: usize,
-    /// Sum of fresh logical allocations for one chunk, including staged state,
-    /// retained outer outputs and one transient expert pair. NOT physical peak,
+    /// Per-call logical transient allowance: short append OR an entire known
+    /// prefill span, including its full-span buffers and tile workspace.
+    /// NOT physical peak,
     /// host staging, allocator/JIT overhead or a whole-device reservation.
     pub max_chunk_bytes: usize,
 }
@@ -161,6 +165,9 @@ pub struct Session<S> {
     // across an uncertain append/reset. Component-private pending owners stay
     // inside their respective layers; Mamba staged states are installed early.
     pending: Vec<CudaTensor>,
+    // Span-wide owners survive an error/unwind independently of the current
+    // tile. A successful fence retires tile scratch, never these live slabs.
+    span_pending: Option<prefill::Pending>,
     #[cfg(test)]
     fault: Option<Fault>,
 }
@@ -442,42 +449,39 @@ fn planned_chunk_bytes(c: &TextConfig, l: Limits, start: usize, t: usize) -> Res
     let mut expert_peak = 0;
     for kind in &c.layers_block_type {
         total = add(total, bytes(&[t, H], 6)?)?;
-        total = add(
-            total,
-            match kind {
-                LayerKind::Attention => attention::Attention::planned_working_bytes(
-                    start, t, attention_limits(c, l),
-                )?,
-                LayerKind::Moe => {
-                    expert_peak = expert_peak.max(moe::admission(moe_limits(l))?.expert_bytes);
-                    moe::working_bytes(t)?
-                }
-                LayerKind::Mamba => {
-                    let m = mamba_config(c);
-                    let e = m.extents(1, t)?;
-                    let g = m.layout()?;
-                    let mut n = add(
-                        super::fp8::working_bytes(t, [g.projected, H])?,
-                        super::fp8::working_bytes(t, [H, g.inner])?,
-                    )?;
-                    for v in [
-                        bytes(&[e.output], 6)?,
-                        bytes(&[t, g.conv_channels], 2)?,
-                        bytes(&[e.conv], 2)?,
-                        bytes(&[e.recurrent], 4)?,
-                    ] {
-                        n = add(n, v)?;
-                    }
-                    n
-                }
-            },
-        )?;
+        if matches!(kind, LayerKind::Moe) {
+            expert_peak = expert_peak.max(moe::admission(moe_limits(l))?.expert_bytes);
+        }
+        total = add(total, layer_working_bytes(c, l, start, t, kind)?)?;
     }
     total = add(total, expert_peak)?;
     if total > l.max_chunk_bytes {
         return Err("session aggregate chunk budget exceeded".into());
     }
     Ok(total)
+}
+
+fn layer_working_bytes(c: &TextConfig, l: Limits, start: usize, t: usize, kind: &LayerKind) -> Result<usize> {
+    Ok(match kind {
+        LayerKind::Attention => attention::Attention::planned_working_bytes(
+            start, t, attention_limits(c, l),
+        )?,
+        LayerKind::Moe => moe::working_bytes(t)?,
+        LayerKind::Mamba => {
+            let m = mamba_config(c);
+            let e = m.extents(1, t)?;
+            let g = m.layout()?;
+            let mut n = add(
+                super::fp8::working_bytes(t, [g.projected, H])?,
+                super::fp8::working_bytes(t, [H, g.inner])?,
+            )?;
+            for v in [bytes(&[e.output], 6)?, bytes(&[t, g.conv_channels], 2)?,
+                bytes(&[e.conv], 2)?, bytes(&[e.recurrent], 4)?] {
+                n = add(n, v)?;
+            }
+            n
+        }
+    })
 }
 
 impl<S> DeviceModel<S> {
@@ -531,7 +535,7 @@ impl<S: BlobStoreGet> Session<S> {
         }
         Ok(Self {
             model, stream, limits, layers, status: Status::Ready,
-            committed: Vec::new(), logits: Vec::new(), pending: Vec::new(),
+            committed: Vec::new(), logits: Vec::new(), pending: Vec::new(), span_pending: None,
             #[cfg(test)]
             fault: None,
         })
@@ -838,6 +842,7 @@ impl<S: BlobStoreGet> Session<S> {
             }
         }
         self.pending.clear();
+        self.span_pending = None;
         self.committed.clear();
         self.logits.clear();
         self.status = Status::Ready;

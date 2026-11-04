@@ -66,6 +66,38 @@ fn full_limits(capacity: usize) -> Limits {
 }
 
 #[test]
+fn session_host_prefill_full_window_pages_and_allocation_inventory() {
+    let c = full_config(1 << 20);
+    let l = Limits { capacity: 1 << 20, max_resident_bytes: 21_334_315_328,
+        max_chunk_bytes: usize::MAX };
+    for (tokens, pages, hidden, latent, accumulator, total) in [
+        (785_039, 3, 6_431_039_488, 1_607_759_872, 3_215_519_744, 11_325_854_728),
+        (1_048_576, 4, 8_589_934_592, 2_147_483_648, 4_294_967_296, 15_103_921_160),
+    ] {
+        let a = prefill_admission(&c, l, 0, tokens).unwrap();
+        assert!(a.layer_major);
+        assert_eq!((a.hidden_pages, a.hidden_bytes, a.latent_bytes, a.accumulator_bytes),
+            (pages, hidden, latent, accumulator));
+        assert_eq!(a.largest_hidden_page_bytes, 1 << 31);
+        assert_eq!(a.tile_workspace_bytes, 68_439_040);
+        assert_eq!(a.pending_expert_bytes, 3_096_584);
+        assert_eq!(a.device_working_bytes, total);
+        assert_eq!(a.host_routing_bytes, tokens * 272 + tokens.div_ceil(64) * 512 * 8);
+        assert!(prefill_admission(&c, Limits { max_chunk_bytes: total, ..l }, 0, tokens).is_ok());
+        assert!(prefill_admission(&c, Limits { max_chunk_bytes: total - 1, ..l }, 0, tokens).is_err());
+    }
+    let tail = prefill_admission(&c, l, 7, prefill::PAGE_ROWS + 1).unwrap();
+    assert_eq!(tail.hidden_pages, 2);
+    assert_eq!(tail.hidden_bytes, (prefill::PAGE_ROWS + 1) * H * 2);
+    let short = prefill_admission(&c, l, 17, 256).unwrap();
+    assert!(!short.layer_major);
+    assert_eq!(short.device_working_bytes, planned_chunk_bytes(&c, l, 17, 256).unwrap());
+    for (start, tokens) in [(0, 0), (l.capacity, 1), (usize::MAX, 2), (1, l.capacity)] {
+        assert!(prefill_admission(&c, l, start, tokens).is_err());
+    }
+}
+
+#[test]
 fn session_host_shared_ownership_preserves_admission_and_private_quotas() {
     let c = full_config(1 << 20);
     let small = resident_ownership(&c, full_limits(2048)).unwrap();

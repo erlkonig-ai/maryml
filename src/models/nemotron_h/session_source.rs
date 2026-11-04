@@ -469,6 +469,7 @@ pub(super) fn load<S: BlobStoreGet>(
         committed: Vec::new(),
         logits: Vec::new(),
         pending: Vec::new(),
+        span_pending: None,
         #[cfg(test)]
         fault: None,
     })
