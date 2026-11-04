@@ -9,6 +9,8 @@
   responsible for selected operand/arithmetic compatibility. This prepares a
   portable checkpoint payload seam, not a pile schema, sync service or claim
   of cross-device numerical equivalence; existing private suffix forks remain.
+  Failed restore keeps the existing Session poisoned with pending operands;
+  successful restore replaces private suffix buffers one layer at a time.
 
 - Native Nemotron generation reaches the Session reuse observer instead of
   recursively dispatching back to its own runtime adapter. Unconditional

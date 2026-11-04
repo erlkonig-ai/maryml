@@ -202,47 +202,71 @@ impl<S> Prefix<S> {
             })
         })
     }
+}
 
-    /// Restore the observed state into this exact local uploaded model. The
-    /// mandatory caller policy must approve actual selected operand content,
+impl<S: BlobStoreGet> Session<S> {
+    /// Replace this context with the observed checkpoint on its existing model.
+    /// Its completed Prefix is then available through saved_prefix/from_prefix.
+    /// The mandatory caller policy must approve actual selected operand content,
     /// codec/token meaning and compatible producer/destination arithmetic. The
     /// supplied provenance and DeviceModel::snapshot/source/config/layer_ids
     /// are inspectable for that query-boundary decision; ID equality by itself
     /// is NOT such verification. This is a numerical trust contract, not Rust
     /// memory unsafety or authentication. No general cross-device parity claim.
     ///
-    /// Shape/config/position and all payloads are checked before allocations.
-    /// Reads use the caller's immutable content-validated BlobStoreGet. Each
-    /// typed view owns its host bytes; upload staging and destination handles
-    /// stay owned until origin completion. No Prefix escapes on any error.
-    pub fn restore<B: BlobStoreGet>(model: Arc<DeviceModel<S>>, checkpoint: &PrefixCheckpoint,
-        store: &B, limits: Limits, expected_tokens: &[u32],
-        caller_policy: impl FnOnce(&PrefixProvenance, &DeviceModel<S>) -> Result<()>) -> Result<Arc<Self>>
+    /// Policy, config/position and every payload are checked before mutation or
+    /// allocation. Subsequent error/unwind leaves this Session poisoned, with
+    /// staged device tensors in its existing pending owner list. reset() can
+    /// release them only after successful fences; dropping an error does not.
+    /// StreamId::executes restores the caller's stream even during unwinding.
+    ///
+    /// Host views are never borrowed by CUDA: create/write owns a staging copy
+    /// in the runtime's stream drop queue. Ordinary Session Drop retains the
+    /// existing managed-allocation semantics, NOT proof of a drained/lost CUDA
+    /// context. No external/mapped pointer is registered or freed here.
+    ///
+    /// Old context overlaps imported P rows. After successful import fencing,
+    /// attention layers replace old buffers one at a time with C-P rows; no
+    /// second full-C context or second expert cache is constructed. Limits keep
+    /// their logical meaning, not physical admission for temporary overlap.
+    pub fn restore_checkpoint<B: BlobStoreGet>(&mut self, checkpoint: &PrefixCheckpoint,
+        store: &B, expected_tokens: &[u32],
+        caller_policy: impl FnOnce(&PrefixProvenance, &DeviceModel<S>) -> Result<()>) -> Result<()>
     {
-        Self::restore_inner(model, checkpoint, store, limits, expected_tokens, caller_policy,
+        self.restore_checkpoint_inner(checkpoint, store, expected_tokens, caller_policy,
             #[cfg(test)] |_, _| {},
         )
     }
 
-    fn restore_inner<B: BlobStoreGet>(model: Arc<DeviceModel<S>>, checkpoint: &PrefixCheckpoint,
-        store: &B, limits: Limits, expected_tokens: &[u32],
+    fn restore_checkpoint_inner<B: BlobStoreGet>(&mut self, checkpoint: &PrefixCheckpoint,
+        store: &B, expected_tokens: &[u32],
         caller_policy: impl FnOnce(&PrefixProvenance, &DeviceModel<S>) -> Result<()>,
         #[cfg(test)] before_fence: impl FnOnce(&DeviceModel<S>, &[Boundary]),
-    ) -> Result<Arc<Self>> {
-        caller_policy(&checkpoint.provenance, &model)?;
-        checkpoint.validate(store, &model.config, &model.layer_ids().collect::<Vec<_>>(), limits, expected_tokens)?;
-        let stream = StreamId::current();
+    ) -> Result<()> {
+        caller_policy(&checkpoint.provenance, &self.model)?;
+        checkpoint.validate(store, &self.model.config, &self.model.layer_ids().collect::<Vec<_>>(), self.limits, expected_tokens)?;
+        let stream = self.stream;
         stream.executes(|| {
+            self.invalidate();
+            self.fence()?;
+            self.pending.clear();
+            self.span_pending = None;
+            let model = self.model.clone();
             let mut layers = Vec::with_capacity(model.layers.len());
             for (weights, state) in model.layers.iter().zip(&checkpoint.layers) {
                 let boundary = match (&weights.mixer, state) {
                     (MixerWeights::Attention(w), PrefixLayer::Attention(chunks)) => {
                         let size = bytes(&[checkpoint.position, attention::KV_HEADS, attention::HEAD_DIM], 2)?;
-                        let keys = model.client.empty(size);
-                        let values = model.client.empty(size);
-                        // Hold both complete destinations before starting any
-                        // writes; all slices retain the same managed owners.
-                        let kv = attention::KvPrefix::imported(w.clone(), checkpoint.position, keys, values)?;
+                        let shape = [checkpoint.position, attention::KV_HEADS, attention::HEAD_DIM];
+                        let keys = CudaTensor::new_contiguous(model.client.clone(), model.device.clone(), shape.into(),
+                            model.client.empty(size), DType::BF16);
+                        self.pending.push(keys.clone());
+                        let values = CudaTensor::new_contiguous(model.client.clone(), model.device.clone(), shape.into(),
+                            model.client.empty(size), DType::BF16);
+                        self.pending.push(values.clone());
+                        // Session owns destinations across every failed fence
+                        // or unwind, independently of these local wrappers.
+                        let kv = attention::KvPrefix::imported(w.clone(), checkpoint.position, keys.handle.clone(), values.handle.clone())?;
                         for chunk in chunks {
                             let targets = kv.range(chunk.start, chunk.rows)?;
                             for (target, handle) in targets.into_iter().zip([chunk.keys, chunk.values]) {
@@ -259,6 +283,7 @@ impl<S> Prefix<S> {
                         let conv = read::<BF16, 3, _>(store, *conv, conv_shape)?;
                         let conv = CudaTensor::new_contiguous(model.client.clone(), model.device.clone(), conv_shape.into(),
                             model.client.create_from_slice(conv.payload()), DType::BF16);
+                        self.pending.push(conv.clone());
                         // Fence each bounded staging operation. A failed sync
                         // is not called a drain; managed owners retain normal
                         // CubeCL stream lifetime, with no external pointer free.
@@ -266,6 +291,7 @@ impl<S> Prefix<S> {
                         let recurrent = read::<F32, 4, _>(store, *recurrent, recurrent_shape)?;
                         let recurrent = CudaTensor::new_contiguous(model.client.clone(), model.device.clone(), recurrent_shape.into(),
                             model.client.create_from_slice(recurrent.payload()), DType::F32);
+                        self.pending.push(recurrent.clone());
                         fence(&model.client)?;
                         Boundary::Mamba(Arc::new(gpu::State::imported(m, *position, conv, recurrent)?))
                     }
@@ -278,7 +304,30 @@ impl<S> Prefix<S> {
             let logits: Vec<f32> = view.payload().chunks_exact(4).map(|v| f32::from_le_bytes(v.try_into().unwrap())).collect();
             #[cfg(test)] before_fence(&model, &layers);
             fence(&model.client)?;
-            Ok(Arc::new(Self { model, stream, ids: checkpoint.tokens.clone(), logits: Arc::from(logits), layers }))
+            let prefix = Arc::new(Prefix { model: model.clone(), stream, ids: checkpoint.tokens.clone(),
+                logits: Arc::from(logits), layers });
+            // Retain imported operands even if private suffix allocation fails
+            // or unwinds. Replace one layer at a time, not a second full-C
+            // Session. Existing private expert residency/quotas stay owned.
+            self.prefix = Some(prefix.clone());
+            for (index, layer) in self.layers.iter_mut().enumerate() {
+                match &mut layer.mixer {
+                    Mixer::Mamba(m) => { m.committed = prefix.mamba(index); m.staged = None; }
+                    Mixer::Attention(a) => {
+                        *a = attention::Attention::from_prefix(a.weights.clone(), prefix.attention(index)?,
+                            attention_limits(&model.config, self.limits))?;
+                    }
+                    Mixer::Moe(m) => m.reset()?,
+                }
+            }
+            fence(&model.client)?;
+            self.pending.clear();
+            self.seed = None;
+            self.committed = prefix.ids.to_vec();
+            self.logits = prefix.logits.to_vec();
+            self.status = Status::Ready;
+            self.observe_prefix("imported", prefix.ids.len());
+            Ok(())
         })
     }
 }

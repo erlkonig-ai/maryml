@@ -167,21 +167,23 @@ fn checkpoint_gpu_restores_exact_state_and_independent_continuation() {
     assert!(prefix.export(&mut blobs, 0).is_err());
     let checkpoint = prefix.export(&mut blobs, 2).unwrap();
     let blobs = blobs.snapshot().unwrap();
-    let other = Session::from_snapshot(snapshot, source, &ids, CudaDevice { index: 0 }, l).unwrap();
+    let mut other = Session::from_snapshot(snapshot, source, &ids, CudaDevice { index: 0 }, l).unwrap();
     let destination = other.device_model().clone();
     assert!(!prefix.compatible_with(&destination));
-    drop(other);
-    let rejected = Prefix::restore(destination.clone(), &checkpoint, &blobs, l, &[1, 5, 7], |_, _| Err("caller rejects arithmetic profile".into()));
+    let rejected = other.restore_checkpoint(&checkpoint, &blobs, &[1, 5, 7], |_, _| Err("caller rejects arithmetic profile".into()));
     assert!(rejected.err().unwrap().contains("caller rejects"));
-    let restored = Prefix::restore(destination.clone(), &checkpoint, &blobs, l, &[1, 5, 7], |provenance, model| {
+    assert_eq!(other.status(), Status::Ready);
+    assert!(other.committed_ids().is_empty() && other.pending.is_empty());
+    other.restore_checkpoint(&checkpoint, &blobs, &[1, 5, 7], |provenance, model| {
         // Concrete policy for this fixture: both loaders used the SAME held
         // immutable snapshot and selections, with the same native executable.
         assert!(std::ptr::eq(model.snapshot(), producer.device_model().snapshot()));
         assert_eq!(provenance.source, model.source());
         Ok(())
     }).unwrap();
+    let restored = other.saved_prefix().unwrap().clone();
     assert!(restored.compatible_with(&destination));
-    let mut a = Session::from_prefix(destination.clone(), restored.clone(), l).unwrap();
+    let mut a = other;
     assert_eq!(state_bytes(&a), expected);
     assert_eq!(a.last_logits().unwrap().values, expected_logits);
     assert_eq!(a.prefix_ownership().unwrap().shared_kv_bytes, 3 * 1024);
@@ -213,13 +215,39 @@ fn checkpoint_gpu_failed_origin_upload_never_publishes_restore() {
     let mut blobs = MemoryBlobStore::new();
     let checkpoint = producer.saved_prefix().unwrap().export(&mut blobs, 1).unwrap();
     let snapshot = blobs.snapshot().unwrap();
-    let result = Prefix::restore_inner(producer.device_model().clone(), &checkpoint, &snapshot,
-        limits(), &[1, 5, 7], |_, _| Ok(()), |model, boundaries| {
+    let caller = StreamId::current();
+    let origin = std::thread::spawn(StreamId::current).join().unwrap();
+    let mut destination = origin.executes(|| Session::from_device_model(producer.device_model().clone(), limits())).unwrap();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        destination.restore_checkpoint_inner(&checkpoint, &snapshot, &[1, 5, 7], |_, _| Ok(()), |_, _| {
+            assert_eq!(StreamId::current(), origin);
+            panic!("injected restore unwind after actual uploads");
+        })
+    }));
+    assert!(result.is_err());
+    assert_eq!(StreamId::current(), caller);
+    assert_eq!(destination.status(), Status::Poisoned);
+    assert!(destination.saved_prefix().is_none() && destination.pending.len() == 4);
+    let retained = destination.pending.len();
+    destination.fault = Some(Fault::Reset);
+    assert!(destination.reset().is_err());
+    assert_eq!(destination.pending.len(), retained, "failed reset cannot retire uncertain restore operands");
+    destination.fault = None;
+    destination.reset().unwrap();
+    assert!(destination.pending.is_empty());
+    let result = destination.restore_checkpoint_inner(&checkpoint, &snapshot,
+        &[1, 5, 7], |_, _| Ok(()), |model, boundaries| {
             let Boundary::Mamba(state) = &boundaries[0] else { panic!() };
             enqueue_rejected_upload(&model.device, state.conv().handle.clone());
         });
     assert!(result.err().unwrap().contains("checkpoint CUDA completion"));
+    assert_eq!(StreamId::current(), caller);
+    assert_eq!(destination.status(), Status::Poisoned);
+    assert!(destination.saved_prefix().is_none() && destination.pending.len() == 4);
     // No inference/recovery after the defined checked descriptor rejection.
     // The caller still owns the original immutable checkpoint and host blobs.
     assert_eq!(checkpoint.tokens.as_ref(), &[1, 5, 7]);
+    // Ordinary owner Drop uses the established managed stream/drop-queue path;
+    // it is not a successful recovery or a claimed drain of a failed context.
+    drop(destination);
 }

@@ -160,7 +160,7 @@ impl<S: BlobStoreGet> Session<S> {
         }
         Ok(result)
     }
-    fn observe_prefix(&self, outcome: &'static str, reused: usize) {
+    pub(super) fn observe_prefix(&self, outcome: &'static str, reused: usize) {
         if let Ok(bytes) = self.prefix_ownership() {
             // No IDs, prompt text or hashes. The fields describe only this
             // completed transition, not allocator reservation/physical fit.
