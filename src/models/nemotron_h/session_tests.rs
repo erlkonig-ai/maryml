@@ -77,6 +77,20 @@ fn session_host_prefix_admission_counts_shared_boundary_and_only_private_suffix(
     assert_eq!(resident_ownership(&c, l).unwrap().expert_cache_pairs_per_moe, 36);
     assert_eq!(p.suffix.unwrap().device_working_bytes,
         planned_prefix_chunk_bytes(&c, l, 786_432, 17, 786_432).unwrap());
+    // Scalar diagnostic from the actual planner, not a measured allocation.
+    // Reset retains the prefix while replacing private buffers; 2C bounds KV
+    // overlap including an old tensor during replacement, before pool overhead.
+    println!("PREFIX_ALLOCATION {}", json!({
+        "scope": "synthetic_full_geometry_logical_payload_not_physical_peak",
+        "capacity": l.capacity, "prefix_tokens": p.after_advance.prefix_tokens,
+        "seed_tokens": p.seed.tokens, "seed_working_bytes": p.seed.device_working_bytes,
+        "suffix_tokens": p.suffix.unwrap().tokens,
+        "suffix_working_bytes": p.suffix.unwrap().device_working_bytes,
+        "shared_kv_bytes": p.after_advance.shared_kv_bytes,
+        "private_kv_bytes": p.after_advance.private_kv_bytes,
+        "extra_retained_mamba_bytes": p.after_advance.shared_mamba_bytes,
+        "cold_miss_kv_overlap_conservative_bytes": 2 * (p.after_advance.shared_kv_bytes + p.after_advance.private_kv_bytes),
+    }));
     assert_eq!(prefix_admission(&c, l, l.capacity, l.capacity).unwrap().after_advance.private_kv_bytes, 0);
     assert!(prefix_admission(&c, l, l.capacity, l.capacity).unwrap().suffix.is_none());
     for (prompt, prefix) in [(0, 0), (1, 0), (2, 3), (l.capacity + 1, 1), (1, usize::MAX)] {

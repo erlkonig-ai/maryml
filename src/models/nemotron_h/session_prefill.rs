@@ -577,8 +577,12 @@ impl<S: BlobStoreGet> Session<S> {
             if count > 0 && self.prefill_span(&ids[..count], cancelled)? == PrefillOutcome::Cancelled {
                 return Ok(PrefillOutcome::Cancelled);
             }
-            if cancelled() { return Ok(PrefillOutcome::Cancelled); }
             self.publish_seed_if_complete()?;
+            // A completed long seed must finish the same ownership transition
+            // as short append before cancellation can expose Ready. Otherwise
+            // exact-seed reuse can skip prefill but still lack suffix storage.
+            // Cancellation remains Cancelled; publication describes only P.
+            if cancelled() { return Ok(PrefillOutcome::Cancelled); }
             if count == ids.len() { return Ok(PrefillOutcome::Completed); }
             return self.prefill_span(&ids[count..], cancelled);
         }

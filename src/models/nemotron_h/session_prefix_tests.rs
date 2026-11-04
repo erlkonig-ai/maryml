@@ -135,6 +135,29 @@ fn session_gpu_prefix_never_publishes_partial_or_failed_completion() {
     let model = session.device_model().clone();
     session.reset().unwrap();
     drop(session);
+    // The last callback for an exact >256-token seed is the post-span check.
+    // Count it on this same deterministic fixture instead of guessing a tile or
+    // expert-loop count. Cancel exactly there on a fresh owner: the completely
+    // fenced seed is retained, but the operation still reports cancellation.
+    let mut completed = Session::from_device_model_seed(model.clone(), l, &ids).unwrap();
+    let mut checkpoints = 0;
+    assert_eq!(completed.prefill_ids(&ids, &mut || { checkpoints += 1; false }).unwrap(), PrefillOutcome::Completed);
+    let boundary_logits = completed.last_logits().unwrap().values.to_vec();
+    assert!(completed.saved_prefix().is_some() && checkpoints > 2);
+    drop(completed);
+    let mut resumed = Session::from_device_model_seed(model.clone(), l, &ids).unwrap();
+    let mut visits = 0;
+    assert_eq!(resumed.prefill_ids(&ids, &mut || { visits += 1; visits == checkpoints }).unwrap(), PrefillOutcome::Cancelled);
+    assert_eq!(visits, checkpoints);
+    assert_eq!(resumed.status(), Status::Ready);
+    assert_eq!(resumed.committed_ids(), ids);
+    assert!(resumed.saved_prefix().is_some() && resumed.can_reuse_prefix(&ids));
+    assert_eq!(resumed.last_logits().unwrap().values, boundary_logits);
+    // Exact-seed resume skips prefill in generation. Its next decode append
+    // must have real C-P storage and cannot hit "crosses prepared prefix".
+    resumed.append_ids(&[9]).unwrap();
+    assert_eq!(resumed.committed_ids().len(), ids.len() + 1);
+    drop(resumed);
     for fault in [Fault::AfterLayer(1), Fault::PanicAfterLayer(1)] {
         let mut failed = Session::from_device_model_seed(model.clone(), l, &ids).unwrap();
         failed.fault = Some(fault);
