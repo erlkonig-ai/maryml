@@ -32,7 +32,7 @@
 //! `+0`. It must stay that way: a stored projection is gated against the
 //! device's own codes, bit for bit, before it is published.
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use triblespace::core::blob::encodings::tensor::TensorElement;
 use triblespace::core::blob::encodings::tensor::elements::{NVFP4, NVFP4_BLOCK};
 
@@ -151,7 +151,7 @@ pub fn block_unit(block: &[f32], scale2: f32) -> (u8, f32) {
 
 /// Split a payload for `elems` logical elements into its three planes.
 pub fn split_payload(payload: &[u8], elems: usize) -> Result<(&[u8], &[u8], f32)> {
-    let want = NVFP4::payload_len(elems);
+    let want = NVFP4::payload_len(elems).context("NVFP4 payload extent overflow")?;
     ensure!(
         payload.len() == want,
         "NVFP4 payload is {} bytes, {elems} elements need {want}",
@@ -201,8 +201,9 @@ impl Packed {
 
     /// The payload a `Tensor<NVFP4, 2>` leaf carries.
     pub fn payload(&self) -> Vec<u8> {
-        let mut payload = Vec::with_capacity(NVFP4::payload_len(self.elems()));
-        payload.extend_from_slice(&self.codes);
+        // Serialize the already-owned planes. Shape validation belongs to
+        // from_payload / typed leaf construction, not an optional reservation.
+        let mut payload = self.codes.clone();
         payload.extend_from_slice(&self.scales);
         payload.extend_from_slice(&self.scale2.to_le_bytes());
         payload
@@ -418,10 +419,27 @@ mod tests {
         let w = sample(rows, cols);
         let p = pack_nearest(&w, cols).expect("packs");
         let payload = p.payload();
-        assert_eq!(payload.len(), NVFP4::payload_len(rows * cols));
+        assert_eq!(Some(payload.len()), NVFP4::payload_len(rows * cols));
         let back = Packed::from_payload(&payload, rows, cols).expect("splits");
         assert_eq!(back, p);
         assert_eq!(decode_payload(&payload, rows * cols).expect("decodes"), p.decode());
+    }
+
+    #[test]
+    fn payload_serializes_owned_planes_without_shape_sized_allocation() {
+        let mut p = Packed { rows: 1, cols: 16, codes: vec![0xabu8; 8],
+            scales: vec![0x38], scale2: -0.0 };
+        let original = p.payload();
+        assert_eq!(&original[..8], &[0xabu8; 8]);
+        assert_eq!(original[8], 0x38);
+        assert_eq!(&original[9..], &(-0.0f32).to_le_bytes());
+        // Shape is not used to reserve an unrelated amount of memory. The
+        // existing typed construction boundary still refuses these dimensions.
+        p.rows = usize::MAX;
+        p.cols = 2;
+        assert_eq!(p.payload(), original);
+        assert!(crate::leaf::leaf_blob::<NVFP4, 2>([p.rows as u64, 2],
+            anybytes::Bytes::from_source(p.payload())).is_err());
     }
 
     #[test]

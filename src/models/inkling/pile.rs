@@ -903,8 +903,8 @@ pub fn mem_available_bytes() -> Result<u64> {
 /// what makes a checkpoint need an `original_shape` field; writing the logical
 /// width is what makes it unnecessary.
 pub fn expert_blob(q: &PackedExpert) -> Result<Blob<Tensor<NVFP4, 2>>> {
-    let logical = q.cols * 2;
-    let elems = q.rows * logical;
+    let logical = q.cols.checked_mul(2).context("expert logical width overflow")?;
+    let elems = q.rows.checked_mul(logical).context("expert logical extent overflow")?;
 
     // Checked here rather than trusted, because the failure is silent: a
     // scales plane of the wrong length still decodes, just against the wrong
@@ -924,7 +924,7 @@ pub fn expert_blob(q: &PackedExpert) -> Result<Blob<Tensor<NVFP4, 2>>> {
         elems / NVFP4_BLOCK
     );
 
-    let mut payload = Vec::with_capacity(NVFP4::payload_len(elems));
+    let mut payload = Vec::with_capacity(NVFP4::payload_len(elems).context("expert payload extent overflow")?);
     payload.extend_from_slice(&q.codes);
     payload.extend_from_slice(&q.scales);
     payload.extend_from_slice(&q.scale2.to_le_bytes());
@@ -940,7 +940,7 @@ pub fn expert_blob(q: &PackedExpert) -> Result<Blob<Tensor<NVFP4, 2>>> {
 /// boundaries from the same two facts — the element count and the block size —
 /// so they cannot disagree.
 pub fn split_payload(payload: &[u8], elems: usize) -> Result<(&[u8], &[u8], f32)> {
-    let want = NVFP4::payload_len(elems);
+    let want = NVFP4::payload_len(elems).context("expert payload extent overflow")?;
     anyhow::ensure!(
         payload.len() == want,
         "payload is {} bytes, expected {want}",
@@ -2091,11 +2091,11 @@ impl PileSource {
                 _ => super::tpshard::Cut::Rows(0..rows),
             };
             let (cut_rows, cut_logical) = cut.dims(rows, logical);
-            let cut_elems = cut_rows * cut_logical;
+            let cut_elems = cut_rows.checked_mul(cut_logical).context("cut logical extent overflow")?;
             let cut_payload = match nvfp4 {
                 true => NVFP4::payload_len(cut_elems),
-                false => cut_elems * 2,
-            };
+                false => cut_elems.checked_mul(2),
+            }.context("cut payload extent overflow")?;
             shapes.insert(
                 name.clone(),
                 Shape {
@@ -3443,7 +3443,7 @@ mod tests {
         assert_eq!(elems / NVFP4_BLOCK, 4096 * 256, "scale width matches");
         assert_eq!(
             NVFP4::payload_len(elems),
-            elems / 2 + elems / NVFP4_BLOCK + 4
+            Some(elems / 2 + elems / NVFP4_BLOCK + 4)
         );
     }
 }

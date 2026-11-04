@@ -11,6 +11,9 @@
   of cross-device numerical equivalence; existing private suffix forks remain.
   Failed restore keeps the existing Session poisoned with pending operands;
   successful restore replaces private suffix buffers one layer at a time.
+  Typed checkpoint extent validation uses the shared checked Tensor decoder.
+  Tensor payload-length overflow propagates through leaf/import callers;
+  legacy two-blob leaves reject overflowing geometry without copying payloads.
 
 - Native Nemotron generation reaches the Session reuse observer instead of
   recursively dispatching back to its own runtime adapter. Unconditional

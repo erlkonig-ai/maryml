@@ -6,7 +6,7 @@ use super::*;
 use super::prefix::Boundary;
 use crate::leaf;
 use triblespace::core::blob::{Blob, encodings::tensor::{Tensor, TensorElement, TensorView,
-    TENSOR_HEADER_LEN, elements::{BF16, F32}}};
+    elements::{BF16, F32}}};
 use triblespace::core::inline::{Inline, encodings::hash::Handle as BlobHandle};
 
 /// The state interpretation implemented here, not a general cross-device
@@ -70,22 +70,18 @@ fn put<T: TensorElement, const R: usize, B: BlobStorePut>(store: &mut B,
     store.put(blob).map_err(|e| format!("checkpoint put: {e}"))
 }
 
-/// Check header dimensions/size BEFORE TensorView's product. Even a malformed
-/// u64-overflowing header cannot panic or wrap the model decoder's geometry.
+/// The shared typed decoder validates all extent arithmetic before exposing
+/// its owning view. This layer checks only the model's expected geometry.
 fn read<T: TensorElement, const R: usize, B: BlobStoreGet>(store: &B,
     handle: Inline<BlobHandle<Tensor<T, R>>>, dims: [usize; R]) -> Result<TensorView>
 {
     let expected = bytes(&dims, T::BITS / 8)?;
     let blob: Blob<Tensor<T, R>> = store.get(handle).map_err(|e| format!("checkpoint get: {e}"))?;
-    if blob.bytes.len() != expected.checked_add(TENSOR_HEADER_LEN).ok_or("checkpoint byte overflow")? {
-        return Err("checkpoint typed payload length differs".into());
+    let view = leaf::read_leaf(blob).map_err(|e| e.to_string())?;
+    if view.dims() != dims.map(|d| d as u64).as_slice() || view.payload().len() != expected {
+        return Err("checkpoint typed shape or payload extent differs".into());
     }
-    for (axis, &dim) in dims.iter().enumerate() {
-        let start = axis * 8;
-        let actual = u64::from_le_bytes(blob.bytes[start..start + 8].try_into().unwrap());
-        if actual != dim as u64 { return Err("checkpoint typed shape differs".into()); }
-    }
-    leaf::read_leaf(blob).map_err(|e| e.to_string())
+    Ok(view)
 }
 
 impl PrefixCheckpoint {

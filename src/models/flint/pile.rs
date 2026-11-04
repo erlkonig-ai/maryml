@@ -62,8 +62,8 @@ fn checked_view<T:TensorElement,const R:usize>(blob:Blob<Tensor<T,R>>,dims:&[usi
     // Full mapped embedding/head geometry is admitted separately from bounded
     // selected row materialization. The frozen snapshot owns these mapped bytes.
     ensure!(elements<=super::forward::VOCAB*super::math::H,"typed full geometry bound exceeded");
-    let payload=T::payload_len(elements);
-    ensure!(blob.bytes.len()==TENSOR_HEADER_LEN+payload,"typed tensor byte length differs");
+    let payload=T::payload_len(elements).context("typed payload extent overflow")?;
+    ensure!(Some(blob.bytes.len())==TENSOR_HEADER_LEN.checked_add(payload),"typed tensor byte length differs");
     for (axis,&expected) in dims.iter().rev().enumerate() {
         let got=u64::from_le_bytes(blob.bytes[axis*8..axis*8+8].try_into()?);
         ensure!(got==u64::try_from(expected)?,"typed row-major axis{axis} differs");
@@ -87,8 +87,9 @@ pub(super) fn native_rows(view:&TensorView,first:usize,rows:usize)->Result<Tenso
     let (cols,start,elements)=row_range(view,first,rows)?;
     ensure!(cols%64==0,"native row alignment differs");
     let (codes,scales,global)=crate::nvfp4::split_payload(view.payload(),view.elems())?;
-    ensure!(NVFP4::payload_len(elements)<=MAX_READ as usize+4,"native selected payload exceeds bound");
-    let mut payload=Vec::with_capacity(NVFP4::payload_len(elements));
+    let payload_len=NVFP4::payload_len(elements).context("native selected payload extent overflow")?;
+    ensure!(payload_len<=MAX_READ as usize+4,"native selected payload exceeds bound");
+    let mut payload=Vec::with_capacity(payload_len);
     payload.extend_from_slice(&codes[start/2..(start+elements)/2]);
     payload.extend_from_slice(&scales[start/16..(start+elements)/16]);
     payload.extend_from_slice(&global.to_le_bytes());

@@ -2,7 +2,7 @@
 use super::*;
 use super::super::tests::{config, limits, fixture, state_bytes, enqueue_rejected_upload};
 use triblespace::core::{blob::{MemoryBlobStore, MemoryBlobStoreSnapshot,
-    encodings::simplearchive::SimpleArchive}, repo::SnapshotSource};
+    encodings::{simplearchive::SimpleArchive, tensor::TENSOR_HEADER_LEN}}, repo::SnapshotSource};
 
 fn host_checkpoint() -> (PrefixCheckpoint, MemoryBlobStore) {
     let mut store = MemoryBlobStore::new();

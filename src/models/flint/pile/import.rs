@@ -15,7 +15,7 @@ fn copy_packed_rows(payload:&mut [u8],elements:usize,cols:usize,row:usize,rows:u
     let start=row.checked_mul(cols).context("chunk offset overflow")?;
     let n=rows.checked_mul(cols).context("chunk element overflow")?;
     ensure!(cols%64==0 && start.checked_add(n).is_some_and(|end|end<=elements)
-        && payload.len()==NVFP4::payload_len(elements),"invalid native ingress chunk");
+        && Some(payload.len())==NVFP4::payload_len(elements),"invalid native ingress chunk");
     let converted=typed::payload(raw,n)?;
     payload[start/2..(start+n)/2].copy_from_slice(&converted[..n/2]);
     payload[elements/2+start/16..elements/2+(start+n)/16]
@@ -42,7 +42,7 @@ fn store_selected<T:TensorElement,const R:usize>(w:&mut GgufWeights,pile:&mut Pi
     ensure!(rows.checked_mul(cols)==Some(elements),"selected shape differs");
     let total_rows=info.elements()?.checked_div(cols as u64).context("empty row width")?;
     ensure!(first.checked_add(rows).is_some_and(|end|end as u64<=total_rows),"import row range outside source");
-    let len=T::payload_len(elements);
+    let len=T::payload_len(elements).context("import payload extent overflow")?;
     let mut payload=vec![0u8;len];
     let row_bytes=usize::try_from(info.row_bytes()?)?;
     let chunk_rows=(MAX_READ as usize/row_bytes).min(super::super::forward::HEAD_ROWS);
@@ -176,7 +176,7 @@ mod tests {
         for row in 0..4u8 {
             let mut block=[(row+1)*0x11;36];block[..4].fill(0x30+row);raw.extend(block);
         }
-        let mut payload=vec![0;NVFP4::payload_len(256)];
+        let mut payload=vec![0u8;NVFP4::payload_len(256).context("fixture payload extent overflow")?];
         for (first,rows) in [(0,1),(1,2),(3,1)] {
             copy_packed_rows(&mut payload,256,64,first,rows,&raw[first*36..(first+rows)*36])?;
         }

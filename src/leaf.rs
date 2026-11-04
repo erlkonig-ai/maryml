@@ -79,7 +79,7 @@ pub enum Elem {
 
 impl Elem {
     /// Payload bytes `elems` logical elements of this format occupy.
-    fn payload_len(self, elems: usize) -> usize {
+    fn payload_len(self, elems: usize) -> Option<usize> {
         match self {
             Elem::F32 => <F32 as TensorElement>::payload_len(elems),
             Elem::F16 => <F16 as TensorElement>::payload_len(elems),
@@ -118,7 +118,9 @@ impl Leaf {
 
     /// Logical element count.
     pub fn elems(&self) -> usize {
-        self.dims.iter().product::<u64>() as usize
+        // Both typed and legacy construction validate the nonzero product.
+        // A zero axis wins even when preceding nonzero dimensions overflow.
+        if self.dims.contains(&0) { 0 } else { self.dims.iter().product::<u64>() as usize }
     }
 
     /// The payload bytes. Aligned to 256 by construction — a typed leaf's
@@ -217,8 +219,14 @@ impl std::fmt::Debug for Leaf {
 /// exists solely because pre-migration piles state the two separately. A typed
 /// leaf reaches [`Leaf`] without passing through here.
 pub fn legacy(elem: Elem, dims: Vec<u64>, payload: anybytes::Bytes) -> Result<Leaf> {
-    let elems: u64 = dims.iter().product();
-    let expected = elem.payload_len(elems as usize);
+    // This old two-blob form has no Tensor header or const-generic rank. Do
+    // not copy its entire payload into a new typed blob just to validate it.
+    let elems = if dims.contains(&0) { 0 } else {
+        dims.iter().try_fold(1u64, |n, &d| n.checked_mul(d))
+            .context("legacy leaf logical extent overflow")?
+    };
+    let elems = usize::try_from(elems).context("legacy leaf extent exceeds usize")?;
+    let expected = elem.payload_len(elems).context("legacy leaf payload extent overflow")?;
     anyhow::ensure!(
         payload.len() == expected,
         "legacy {elem:?} leaf: payload is {} bytes, shape {dims:?} implies {expected}",
@@ -763,6 +771,21 @@ mod tests {
 
     fn bytes(n: usize) -> anybytes::Bytes {
         anybytes::Bytes::from_source(vec![0u8; n])
+    }
+
+    #[test]
+    fn legacy_extent_refuses_overflow_and_preserves_zero_axes_and_scalar() {
+        assert!(legacy(Elem::Bf16, vec![1u64 << 63, 2, 1], bytes(0)).is_err());
+        assert!(legacy(Elem::F32, vec![u64::MAX], bytes(0)).is_err());
+        for dims in [vec![u64::MAX, 2, 0], vec![0, u64::MAX, 2]] {
+            let old = legacy(Elem::Bf16, dims.clone(), bytes(0)).unwrap();
+            assert_eq!(old.dims(), dims);
+            assert_eq!(old.elems(), 0);
+            let typed = read_leaf(leaf_blob::<BF16, 3>(dims.try_into().unwrap(), bytes(0)).unwrap()).unwrap();
+            assert_eq!(Leaf::from_view(Elem::Bf16, typed).elems(), 0);
+        }
+        assert_eq!(legacy(Elem::F32, vec![], bytes(4)).unwrap().elems(), 1);
+        assert!(legacy(Elem::F32, vec![], bytes(0)).is_err());
     }
 
     /// One handle, not two, and the shape travels with the data so they cannot
