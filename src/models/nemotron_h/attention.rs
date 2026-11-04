@@ -450,9 +450,10 @@ impl Attention {
     }
 
     /// Fence the shared client before advancing this layer's committed length.
-    /// Hybrid owners stage all work first; do not commit one layer during a
-    /// partially completed whole-network forward. If any layer commit fails,
-    /// invalidate all owners and reset all state families together.
+    /// This advances this layer's PRIVATE position, not a hybrid usable prefix.
+    /// Short append commits after all layers; layer-major prefill may advance
+    /// private tiles while Session stays unavailable. On any failure invalidate
+    /// all owners and reset all state families together; no rollback is implied.
     pub fn commit(&mut self) -> Result<()> {
         let client = &self.weights.client;
         self.sequence.commit(|| {

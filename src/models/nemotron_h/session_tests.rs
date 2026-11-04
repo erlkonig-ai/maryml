@@ -577,6 +577,9 @@ fn sparse_bf(n: usize, k: usize) -> Vec<u8> {
     v
 }
 fn fixture() -> (Arc<ModelSnapshot<impl BlobStoreGet + Send + Sync>>, Source, Vec<Id>) {
+    fixture_capacity(8)
+}
+fn fixture_capacity(capacity: usize) -> (Arc<ModelSnapshot<impl BlobStoreGet + Send + Sync>>, Source, Vec<Id>) {
     let mut repo = MemoryRepo::default();
     let key = SigningKey::generate(&mut rand::rngs::OsRng);
     let policy = CollectionPolicy::new(
@@ -585,7 +588,9 @@ fn fixture() -> (Arc<ModelSnapshot<impl BlobStoreGet + Send + Sync>>, Source, Ve
     );
     let collection: model_collection::ModelCollection =
         repo.collection("synthetic-hybrid", policy).unwrap();
-    let c = config();
+    let mut value = configuration();
+    value["max_position_embeddings"] = json!(capacity);
+    let c: TextConfig = serde_json::from_value(value.clone()).unwrap();
     let g = mamba_config(&c).layout().unwrap();
     let mut layer_ids = Vec::new();
     let mut members = Fragment::empty();
@@ -686,7 +691,7 @@ fn fixture() -> (Arc<ModelSnapshot<impl BlobStoreGet + Send + Sync>>, Source, Ve
     members += dense(&mut repo, "lm-head", 32, H);
     let mut facts = TribleSet::new();
     let config =
-        jsonfacts::save_json(&json!({"text":configuration()}), &mut repo, &mut facts).unwrap();
+        jsonfacts::save_json(&json!({"text":value}), &mut repo, &mut facts).unwrap();
     members += entity! {attrs::kind:"nemotron-h-config",attrs::member:config};
     // A source-binding fixture only; this milestone does not rebuild a codec.
     let base = *genid();
@@ -799,6 +804,72 @@ fn session_gpu_three_kind_native_chain() {
 // Read only the committed state, on the session's execution stream. Comparing
 // bytes before/after another context executes detects aliasing that merely
 // checking two Rust wrapper addresses would miss.
+#[test]
+#[ignore = "reserved CUDA: synthetic layer-major equivalence/cancellation/poison/reset, not model acceptance"]
+fn session_gpu_layer_major_prefill_publication_and_failure_owners() {
+    let (snapshot, source, layers) = fixture_capacity(260);
+    let limits = Limits { capacity: 260, max_chunk_bytes: 256 << 20, ..limits() };
+    let mut session = Session::from_snapshot(snapshot, source, &layers,
+        CudaDevice { index: 0 }, limits).unwrap();
+    let prompt: Vec<_> = (0..257).map(|i| [1, 5, 7][i % 3]).collect();
+    session.append_ids(&[9]).unwrap();
+    for tile in prompt.chunks(MAX_CHUNK) { session.append_ids(tile).unwrap(); }
+    let expected = session.last_logits().unwrap().values.to_vec();
+    let expected_state = state_bytes(&session);
+    session.reset().unwrap();
+    session.append_ids(&[9]).unwrap();
+    assert_eq!(session.prefill_ids(&prompt, &mut || false).unwrap(), PrefillOutcome::Completed);
+    assert_eq!(session.committed_ids(), [vec![9], prompt.clone()].concat());
+    assert!(session.span_pending.is_none() && session.pending.is_empty());
+    assert_eq!(state_bytes(&session), expected_state);
+    for (&a, &b) in expected.iter().zip(session.last_logits().unwrap().values) {
+        assert!((a - b).abs() <= 0.02 + 0.02 * a.abs());
+    }
+    // Short append still follows the established path after span publication.
+    session.append_ids(&[3]).unwrap();
+    assert_eq!(session.committed_ids().len(), 259);
+    session.reset().unwrap();
+    session.append_ids(&[9]).unwrap();
+    let old_state = state_bytes(&session);
+    assert_eq!(session.prefill_ids(&prompt, &mut || true).unwrap(), PrefillOutcome::Cancelled);
+    assert_eq!(session.status(), Status::Ready);
+    assert_eq!(session.committed_ids(), [9]);
+    assert_eq!(state_bytes(&session), old_state);
+    // Cancellation after the first Mamba tile privately advances one layer.
+    // It retains owners and cannot expose
+    // the diagnostic old prefix as a reusable context.
+    let mut polls = 0;
+    assert_eq!(session.prefill_ids(&prompt, &mut || { polls += 1; polls == 7 }).unwrap(),
+        PrefillOutcome::Cancelled);
+    match &session.layers[0].mixer {
+        Mixer::Mamba(m) => assert_eq!(m.committed.as_ref().unwrap().attended(), 257),
+        _ => panic!("fixture begins with Mamba"),
+    }
+    assert_eq!(session.status(), Status::Poisoned);
+    assert_eq!(session.committed_ids(), [9]);
+    assert!(!session.can_reuse_prefix(&[9, 1]) && session.last_logits().is_none());
+    assert!(session.span_pending.is_some());
+    session.reset().unwrap();
+    for fault in [Fault::AfterLayer(1), Fault::PanicAfterLayer(1)] {
+        session.fault = Some(fault);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
+            session.prefill_ids(&prompt, &mut || false)));
+        match fault {
+            Fault::PanicAfterLayer(_) => assert!(result.is_err()),
+            _ => assert!(result.unwrap().is_err()),
+        }
+        assert_eq!(session.status(), Status::Poisoned);
+        assert!(session.committed_ids().is_empty() && session.last_logits().is_none());
+        assert!(session.span_pending.is_some());
+        session.fault = Some(Fault::Reset);
+        assert!(session.reset().is_err());
+        assert!(session.span_pending.is_some(), "uncertain reset retains span owners");
+        session.fault = None;
+        session.reset().unwrap();
+        assert!(session.span_pending.is_none());
+    }
+}
+
 fn state_bytes<S: BlobStoreGet>(session: &Session<S>) -> Vec<Vec<u8>> {
     session.stream.executes(|| {
         let mut result = Vec::new();

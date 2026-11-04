@@ -493,6 +493,9 @@ impl<P: ExpertProvider> Moe<P> {
         if self.poisoned {
             return Err("MoE poisoned; successful drain/reset required".into());
         }
+        self.check_input(x)
+    }
+    fn check_input(&self, x: &CudaTensor) -> Result<(usize, usize)> {
         if self.provider.source() != self.weights.source {
             return Err("MoE provider binding changed".into());
         }
@@ -628,32 +631,7 @@ impl<P: ExpertProvider> Moe<P> {
         observe: &mut impl FnMut(&str, &CudaTensor) -> Result<()>,
         #[cfg(feature = "nemotron-timing")] mut timing: Option<&mut Timings>,
     ) -> Result<Output> {
-        let logits = self.linear(x, &self.weights.router, HIDDEN, EXPERTS);
-        let route = self.weights.client.empty(t * ROUTE_WIDTH * 4);
-        unsafe {
-            route_kernel::launch_unchecked::<CudaRuntime>(
-                &self.weights.client,
-                CubeCount::new_1d(t as u32),
-                CubeDim::new_1d(EXPERTS as u32),
-                ArrayArg::from_raw_parts(x.handle.clone(), t * HIDDEN),
-                ArrayArg::from_raw_parts(logits.handle.clone(), t * EXPERTS),
-                ArrayArg::from_raw_parts(self.weights.bias.clone(), EXPERTS),
-                ArrayArg::from_raw_parts(route.clone(), t * ROUTE_WIDTH),
-            );
-        }
-        // One bounded readback, including error flags, BEFORE any expert lookup.
-        let raw = self.weights
-            .client
-            .read_one(route.clone())
-            .map_err(|e| format!("MoE route read: {e:?}"))?;
-        let routing = decode_routing(&raw, t)?;
-        observe("router_logits", &logits)?;
-        observe(
-            "routing_record",
-            &self.tensor(route, t, ROUTE_WIDTH, DType::F32),
-        )?;
-        let latent = self.narrow(&self.linear(x, &self.weights.fc1, HIDDEN, LATENT));
-        observe("latent", &latent)?;
+        let (routing, latent) = self.route_tile(x, t, observe)?;
         let schedule = Schedule::new(&routing)?;
         let selected = self.weights.client.empty(t * TOP_K * LATENT * 2);
         for (index, rows) in schedule.by_expert.iter().enumerate() {
@@ -684,7 +662,6 @@ impl<P: ExpertProvider> Moe<P> {
                     timing.cache_access(hit);
                 }
                 staged?;
-                let (up, down) = self.expert_operands.pending();
                 #[cfg(feature = "nemotron-timing")]
                 let enqueue_started = host_timing::clock(timing.as_deref());
                 let result = (|| {
@@ -699,9 +676,7 @@ impl<P: ExpertProvider> Moe<P> {
                         LATENT,
                     );
                     let gathered = self.tensor(gathered, rows.len(), LATENT, DType::BF16);
-                    let high = up.project(&gathered)?;
-                    let active = self.relu2(&high);
-                    let low = down.project(&active)?;
+                    let (high, active, low) = self.project_pending(&gathered, None)?;
                     observe(&format!("expert{index}_input"), &gathered)?;
                     observe(&format!("expert{index}_up"), &high)?;
                     observe(&format!("expert{index}_relu2"), &active)?;
@@ -783,7 +758,60 @@ impl<P: ExpertProvider> Moe<P> {
         observe("combined_f32", &combined)?;
         let combined = self.narrow(&combined);
         observe("combined_bf16", &combined)?;
-        let expanded = self.narrow(&self.linear(&combined, &self.weights.fc2, LATENT, HIDDEN));
+        let values = self.finish_tile(x, &combined, t, observe)?;
+        Ok(Output {
+            values,
+            routing,
+            working_bytes: working,
+        })
+    }
+
+    fn route_tile(&self, x: &CudaTensor, t: usize,
+        observe: &mut impl FnMut(&str, &CudaTensor) -> Result<()>) -> Result<(Routing, CudaTensor)>
+    {
+        let logits = self.linear(x, &self.weights.router, HIDDEN, EXPERTS);
+        let route = self.weights.client.empty(t * ROUTE_WIDTH * 4);
+        unsafe {
+            route_kernel::launch_unchecked::<CudaRuntime>(
+                &self.weights.client,
+                CubeCount::new_1d(t as u32),
+                CubeDim::new_1d(EXPERTS as u32),
+                ArrayArg::from_raw_parts(x.handle.clone(), t * HIDDEN),
+                ArrayArg::from_raw_parts(logits.handle.clone(), t * EXPERTS),
+                ArrayArg::from_raw_parts(self.weights.bias.clone(), EXPERTS),
+                ArrayArg::from_raw_parts(route.clone(), t * ROUTE_WIDTH),
+            );
+        }
+        // One bounded readback, including error flags, BEFORE any expert lookup.
+        let raw = self.weights
+            .client
+            .read_one(route.clone())
+            .map_err(|e| format!("MoE route read: {e:?}"))?;
+        let routing = decode_routing(&raw, t)?;
+        observe("router_logits", &logits)?;
+        observe(
+            "routing_record",
+            &self.tensor(route, t, ROUTE_WIDTH, DType::F32),
+        )?;
+        let latent = self.narrow(&self.linear(x, &self.weights.fc1, HIDDEN, LATENT));
+        observe("latent", &latent)?;
+        Ok((routing, latent))
+    }
+    fn project_pending(&self, gathered: &CudaTensor, mut held: Option<&mut Vec<CudaTensor>>)
+        -> Result<(CudaTensor, CudaTensor, CudaTensor)> {
+        let (up, down) = self.expert_operands.pending();
+        let high = up.project(gathered)?;
+        if let Some(held) = held.as_deref_mut() { held.push(high.clone()); }
+        let active = self.relu2(&high);
+        if let Some(held) = held.as_deref_mut() { held.push(active.clone()); }
+        let low = down.project(&active)?;
+        if let Some(held) = held { held.push(low.clone()); }
+        Ok((high, active, low))
+    }
+    fn finish_tile(&self, x: &CudaTensor, combined: &CudaTensor, t: usize,
+        observe: &mut impl FnMut(&str, &CudaTensor) -> Result<()>) -> Result<CudaTensor>
+    {
+        let expanded = self.narrow(&self.linear(combined, &self.weights.fc2, LATENT, HIDDEN));
         let shared_up = self.weights.shared_up.project(x)?;
         let shared_active = self.relu2(&shared_up);
         let shared = self.weights.shared_down.project(&shared_active)?;
@@ -818,11 +846,104 @@ impl<P: ExpertProvider> Moe<P> {
         }
         let values = self.tensor(out, t, HIDDEN, DType::BF16);
         observe("output", &values)?;
-        Ok(Output {
-            values,
-            routing,
-            working_bytes: working,
-        })
+        Ok(values)
+    }
+
+    // The ordinary Session owns whole-span availability. These internal tile
+    // seams run only while that Session and this mixer are unavailable.
+    pub(super) fn prefill_begin(&mut self) -> Result<()> {
+        if self.poisoned || self.provider.source() != self.weights.source {
+            return Err("MoE prefill unavailable/source changed".into());
+        }
+        self.poisoned = true;
+        Ok(())
+    }
+    pub(super) fn prefill_route(&self, x: &CudaTensor, held: &mut Vec<CudaTensor>)
+        -> Result<(Routing, CudaTensor)>
+    {
+        let (t, _) = self.check_input(x)?;
+        self.route_tile(x, t, &mut |_, value| { held.push(value.clone()); Ok(()) })
+    }
+    pub(super) fn prefill_stage(&mut self, index: usize) -> Result<()> {
+        if self.provider.source() != self.weights.source {
+            return Err("MoE selected expert/source binding mismatch".into());
+        }
+        self.expert_operands.stage(index, || load_expert(
+            &self.provider, index,
+            |op, n, k| PackedWeight::upload(op, n, k, &self.weights.device),
+            #[cfg(feature = "nemotron-timing")] None,
+        ))
+    }
+    pub(super) fn prefill_expert_tile(&self, latent: &CudaTensor, accumulator: &CudaTensor,
+        rows: &[(i32, f32)], held: &mut Vec<CudaTensor>) -> Result<()>
+    {
+        let shape = latent.meta.shape().as_slice();
+        if shape.len() != 3 || shape[0] != 1 || shape[2] != LATENT
+            || accumulator.meta.shape().as_slice() != shape || latent.dtype != DType::BF16
+            || accumulator.dtype != DType::F32 || rows.is_empty() || rows.len() > MAX_CHUNK
+            || latent.device != self.weights.device || accumulator.device != self.weights.device
+            || !std::ptr::eq(latent.client.properties(), self.weights.client.properties())
+            || !std::ptr::eq(accumulator.client.properties(), self.weights.client.properties())
+            || shape[1].checked_mul(LATENT).is_none_or(|n| n > u32::MAX as usize)
+            || rows.iter().any(|&(i, w)| i < 0 || i as usize >= shape[1] || !w.is_finite())
+            || rows.windows(2).any(|pair| pair[0].0 >= pair[1].0)
+        { return Err("MoE prefill expert tile binding/range/order mismatch".into()); }
+        let indices: Vec<i32> = rows.iter().map(|r| r.0).collect();
+        let weights: Vec<f32> = rows.iter().map(|r| r.1).collect();
+        let idx = self.tensor(self.weights.client.create_from_slice(i32::as_bytes(&indices)),
+            rows.len(), 1, DType::I32);
+        held.push(idx.clone());
+        let weight = self.tensor(self.weights.client.create_from_slice(f32::as_bytes(&weights)),
+            rows.len(), 1, DType::F32);
+        held.push(weight.clone());
+        let gathered = moegroup::gather_grouped_bf16_from_bf16(&self.weights.client,
+            &latent.handle, &idx.handle, shape[1], rows.len(), LATENT);
+        let gathered = self.tensor(gathered, rows.len(), LATENT, DType::BF16);
+        held.push(gathered.clone());
+        let (_high, _active, low) = self.project_pending(&gathered, Some(held))?;
+        let len = rows.len() * LATENT;
+        unsafe {
+            ordered_update::launch_unchecked::<CudaRuntime>(&self.weights.client,
+                CubeCount::new_1d(len.div_ceil(THREADS as usize) as u32), CubeDim::new_1d(THREADS),
+                ArrayArg::from_raw_parts(low.handle.clone(), len),
+                ArrayArg::from_raw_parts(idx.handle.clone(), rows.len()),
+                ArrayArg::from_raw_parts(weight.handle.clone(), rows.len()),
+                ArrayArg::from_raw_parts(accumulator.handle.clone(), shape[1] * LATENT), len,
+            );
+        }
+        Ok(())
+    }
+    pub(super) fn prefill_complete_expert(&mut self, completion: &Result<()>, executed: bool) {
+        self.expert_operands.complete(completion, executed);
+    }
+    pub(super) fn prefill_finish(&self, x: &CudaTensor, accumulator: &CudaTensor,
+        held: &mut Vec<CudaTensor>) -> Result<CudaTensor>
+    {
+        let (t, _) = self.check_input(x)?;
+        if accumulator.meta.shape().as_slice() != [1, t, LATENT]
+            || accumulator.dtype != DType::F32 || accumulator.device != self.weights.device
+            || !std::ptr::eq(accumulator.client.properties(), self.weights.client.properties())
+        { return Err("MoE prefill accumulator tile mismatch".into()); }
+        let combined = self.narrow(accumulator);
+        held.push(combined.clone());
+        self.finish_tile(x, &combined, t, &mut |_, value| { held.push(value.clone()); Ok(()) })
+    }
+    pub(super) fn prefill_done(&mut self) { self.poisoned = false; }
+
+}
+
+// Expert launches are ordered and each tile contains distinct token IDs.
+// Preserve scatter_weighted_bf16's ascending-expert F32 FMA recurrence, with
+// no separately rounded product and no atomic/reassociated contributions.
+#[cube(launch_unchecked)]
+fn ordered_update(y: &Array<bf16>, indices: &Array<i32>, weights: &Array<f32>,
+    accumulator: &mut Array<f32>, len: usize)
+{
+    let i = ABSOLUTE_POS as usize;
+    if i < len {
+        let row = i / LATENT;
+        let out = indices[row] as usize * LATENT + i % LATENT;
+        accumulator[out] = fma(f32::cast_from(y[i]), weights[row], accumulator[out]);
     }
 }
 

@@ -611,14 +611,17 @@ impl<S: BlobStoreGet> Session<S> {
             return Err("empty/oversized chunk, invalid ID or capacity exhausted".into());
         }
         self.chunk_bytes(ids.len())?;
+        self.check_boundary(self.committed.len())
+    }
+    fn check_boundary(&self, position: usize) -> Result<()> {
         for layer in &self.layers {
             let ready = match &layer.mixer {
                 Mixer::Mamba(m) => {
                     m.staged.is_none()
-                        && m.committed.as_ref().map_or(0, |s| s.attended()) == self.committed.len()
+                        && m.committed.as_ref().map_or(0, |s| s.attended()) == position
                 }
                 Mixer::Attention(a) => {
-                    !a.is_poisoned() && !a.has_pending() && a.attended() == self.committed.len()
+                    !a.is_poisoned() && !a.has_pending() && a.attended() == position
                 }
                 Mixer::Moe(m) => !m.is_poisoned(),
             };
@@ -702,45 +705,10 @@ impl<S: BlobStoreGet> Session<S> {
             );
         }
         for (_index, layer) in self.layers.iter_mut().enumerate() {
-            let norm = normalized(&x, &layer.norm, self.model.config.layer_norm_epsilon as f32);
-            self.pending.push(norm.clone());
-            let y = match &mut layer.mixer {
-                Mixer::Attention(a) => a.enqueue(&norm, self.committed.len())?.values,
-                Mixer::Moe(m) => {
-                    #[cfg(feature = "nemotron-timing")]
-                    let result = match timing.as_deref_mut() {
-                        Some(timing) => m.forward_timed(&norm, timing),
-                        None => m.forward(&norm),
-                    };
-                    #[cfg(not(feature = "nemotron-timing"))]
-                    let result = m.forward(&norm);
-                    result?.values
-                }
-                Mixer::Mamba(m) => {
-                    let projected = m.weights.input.project(&norm, self.limits.max_chunk_bytes)?;
-                    self.pending.push(projected.clone());
-                    let out = gpu::chunk(
-                        m.weights.config,
-                        &gpu::Parameters {
-                            conv_weight: &m.weights.conv,
-                            conv_bias: m.weights.bias.as_ref(),
-                            a_log: &m.weights.a_log,
-                            dt_bias: &m.weights.dt,
-                            d: &m.weights.d,
-                            norm_gain: &m.weights.gain,
-                        },
-                        &projected,
-                        m.committed.as_ref(),
-                        self.limits.max_chunk_bytes,
-                    )?;
-                    m.staged = Some(out.state);
-                    self.pending.push(out.values.clone());
-                    m.weights.output.project(&out.values, self.limits.max_chunk_bytes)?
-                }
-            };
-            self.pending.push(y.clone());
-            x = residual(&x, &y);
-            self.pending.push(x.clone());
+            x = enqueue_layer_tile(layer, &x, self.committed.len(), self.limits,
+                self.model.config.layer_norm_epsilon as f32, &mut self.pending,
+                #[cfg(feature = "nemotron-timing")] timing.as_deref_mut(),
+            )?;
             #[cfg(test)]
             {
                 inject(self.fault, Fault::AfterLayer(_index))?;
@@ -749,7 +717,20 @@ impl<S: BlobStoreGet> Session<S> {
                 }
             }
         }
-        let norm = normalized(&x, &self.model.final_norm, self.model.config.layer_norm_epsilon as f32);
+        let values = self.project_last_logits(&x)?;
+        for (_index, layer) in self.layers.iter_mut().enumerate() {
+            if let Mixer::Attention(a) = &mut layer.mixer {
+                a.commit()?;
+                #[cfg(test)]
+                inject(self.fault, Fault::AfterCommit(_index))?;
+            }
+        }
+        self.fence()?; // Even a no-attention chain needs an explicit completion.
+        Ok(values)
+    }
+    fn project_last_logits(&mut self, x: &CudaTensor) -> Result<Vec<f32>> {
+        let t = x.meta.shape().as_slice()[1];
+        let norm = normalized(x, &self.model.final_norm, self.model.config.layer_norm_epsilon as f32);
         self.pending.push(norm.clone());
         // Copy the final row rather than manufacture an offset alias accepted
         // by neither Projection's zero-offset contract nor every downstream op.
@@ -781,14 +762,6 @@ impl<S: BlobStoreGet> Session<S> {
         if values.iter().any(|v| !v.is_finite()) {
             return Err("nonfinite session logits".into());
         }
-        for (_index, layer) in self.layers.iter_mut().enumerate() {
-            if let Mixer::Attention(a) = &mut layer.mixer {
-                a.commit()?;
-                #[cfg(test)]
-                inject(self.fault, Fault::AfterCommit(_index))?;
-            }
-        }
-        self.fence()?; // Even a no-attention chain needs an explicit completion.
         Ok(values)
     }
     fn fence(&self) -> Result<()> {
@@ -848,6 +821,55 @@ impl<S: BlobStoreGet> Session<S> {
         self.status = Status::Ready;
         Ok(())
     }
+}
+
+// Both ordinary short append and span prefill share this exact layer dispatch.
+// Caller owns publication and chooses when a successful tile may be retired.
+fn enqueue_layer_tile<S: BlobStoreGet>(layer: &mut Layer<S>, x: &CudaTensor,
+    start: usize, limits: Limits, epsilon: f32, pending: &mut Vec<CudaTensor>,
+    #[cfg(feature = "nemotron-timing")] mut timing: Option<&mut super::host_timing::Timings>,
+) -> Result<CudaTensor> {
+    let norm = normalized(x, &layer.norm, epsilon);
+    pending.push(norm.clone());
+    let y = match &mut layer.mixer {
+        Mixer::Attention(a) => a.enqueue(&norm, start)?.values,
+        Mixer::Moe(m) => {
+            #[cfg(feature = "nemotron-timing")]
+            let result = match timing.as_deref_mut() {
+                Some(timing) => m.forward_timed(&norm, timing),
+                None => m.forward(&norm),
+            };
+            #[cfg(not(feature = "nemotron-timing"))]
+            let result = m.forward(&norm);
+            result?.values
+        }
+        Mixer::Mamba(m) => {
+            let projected = m.weights.input.project(&norm, limits.max_chunk_bytes)?;
+            pending.push(projected.clone());
+            let out = gpu::chunk(
+                m.weights.config,
+                &gpu::Parameters {
+                    conv_weight: &m.weights.conv,
+                    conv_bias: m.weights.bias.as_ref(),
+                    a_log: &m.weights.a_log,
+                    dt_bias: &m.weights.dt,
+                    d: &m.weights.d,
+                    norm_gain: &m.weights.gain,
+                },
+                &projected,
+                m.committed.as_ref(),
+                limits.max_chunk_bytes,
+            )?;
+            m.staged = Some(out.state);
+            pending.push(out.values.clone());
+            m.weights.output.project(&out.values, limits.max_chunk_bytes)?
+        }
+    };
+    pending.push(y.clone());
+    let output = residual(x, &y);
+    pending.push(output.clone());
+    Ok(output)
+
 }
 
 fn empty(
