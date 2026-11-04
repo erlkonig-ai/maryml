@@ -371,6 +371,38 @@ fn rejected(runtime: &impl Runtime, error: String) -> TurnOutput {
     }
 }
 
+/// One cheap observation at the actual synchronous append boundary. Interest
+/// in this span does not enable the optional per-expert host timing target.
+fn append_with_progress(
+    runtime: &mut impl Runtime, ids: &[u32], role: &'static str, prompt_tokens: usize,
+) -> Result<()> {
+    let span = tracing::info_span!(
+        target: "mary.nemotron.progress", "native_append",
+        role, committed_before = runtime.committed_ids().len(),
+        attempted_tokens = ids.len(), prompt_tokens,
+        append_returned = tracing::field::Empty, append_ok = tracing::field::Empty,
+        completed_tokens = tracing::field::Empty, committed_after = tracing::field::Empty,
+        session_ready = tracing::field::Empty, append_wall_ns = tracing::field::Empty,
+    );
+    let started = (!span.is_disabled()).then(std::time::Instant::now);
+    // This guard never crosses an async suspension. On unwind only the initial
+    // fields (and possibly span end) exist: absence is not successful progress.
+    let _entered = span.enter();
+    let result = runtime.append(ids);
+    if let Some(started) = started {
+        let wall_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        // Each late field is recorded once: the sink retains facts, not updates.
+        // Poisoned committed counts are diagnostics, not reusable state claims.
+        span.record("append_returned", true);
+        span.record("append_ok", result.is_ok());
+        span.record("completed_tokens", if result.is_ok() { ids.len() } else { 0 });
+        span.record("committed_after", runtime.committed_ids().len());
+        span.record("session_ready", runtime.status() == Status::Ready);
+        span.record("append_wall_ns", wall_ns);
+    }
+    result
+}
+
 fn run_turn(
     runtime: &mut impl Runtime,
     sampler: &mut Sampler,
@@ -417,18 +449,7 @@ fn run_turn(
             let end = from.saturating_add(MAX_CHUNK).min(prompt.len());
             #[cfg(feature = "nemotron-timing")]
             let started = timing.as_ref().map(|_| std::time::Instant::now());
-            let append = {
-                // Synchronous append: this entered guard never crosses an async
-                // suspension. Role comes from the actual generation branch, not T.
-                #[cfg(feature = "nemotron-timing")]
-                let _append = timing.as_ref().map(|_| {
-                    tracing::info_span!(
-                        target: "mary.nemotron.timing", "native_append", role = "prompt",
-                        committed_before = from, attempted_tokens = end - from,
-                    ).entered()
-                });
-                runtime.append(&prompt[from..end])
-            };
+            let append = append_with_progress(runtime, &prompt[from..end], "prompt", prompt.len());
             #[cfg(feature = "nemotron-timing")]
             if let (Some(timing), Some(started)) = (&mut timing, started) {
                 timing.prompt.record(started.elapsed(), end - from, append.is_ok());
@@ -482,16 +503,7 @@ fn run_turn(
             // failed append retains the emitted ID and Session's actual status.
             #[cfg(feature = "nemotron-timing")]
             let started = timing.as_ref().map(|_| std::time::Instant::now());
-            let append = {
-                #[cfg(feature = "nemotron-timing")]
-                let _append = timing.as_ref().map(|_| {
-                    tracing::info_span!(
-                        target: "mary.nemotron.timing", "native_append", role = "generated",
-                        committed_before = runtime.committed_ids().len(), attempted_tokens = 1_usize,
-                    ).entered()
-                });
-                runtime.append(&[id])
-            };
+            let append = append_with_progress(runtime, &[id], "generated", prompt.len());
             #[cfg(feature = "nemotron-timing")]
             if let (Some(timing), Some(started)) = (&mut timing, started) {
                 timing.generated.record(started.elapsed(), 1, append.is_ok());

@@ -155,6 +155,144 @@ fn errored(out: &TurnOutput, needle: &str) {
     assert!(out.completion.proposal.is_none());
 }
 
+#[derive(Default)]
+struct ProgressSpan {
+    fields: Vec<(String, String)>,
+    closed: bool,
+}
+
+#[derive(Clone, Default)]
+struct ProgressCapture(std::sync::Arc<std::sync::Mutex<Vec<ProgressSpan>>>);
+
+struct ProgressFields<'a>(&'a mut Vec<(String, String)>);
+impl tracing::field::Visit for ProgressFields<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0.push((field.name().into(), format!("{value:?}")));
+    }
+}
+impl tracing::Subscriber for ProgressCapture {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        metadata.is_span() && metadata.target() == "mary.nemotron.progress"
+            && metadata.name() == "native_append"
+    }
+    fn new_span(&self, attributes: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        let mut span = ProgressSpan::default();
+        attributes.record(&mut ProgressFields(&mut span.fields));
+        let mut spans = self.0.lock().unwrap();
+        spans.push(span);
+        tracing::span::Id::from_u64(spans.len() as u64)
+    }
+    fn record(&self, id: &tracing::span::Id, record: &tracing::span::Record<'_>) {
+        record.record(&mut ProgressFields(&mut self.0.lock().unwrap()[id.into_u64() as usize - 1].fields));
+    }
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+    fn event(&self, _: &tracing::Event<'_>) { panic!("progress enables no events") }
+    fn try_close(&self, id: tracing::span::Id) -> bool {
+        self.0.lock().unwrap()[id.into_u64() as usize - 1].closed = true;
+        true
+    }
+}
+impl ProgressSpan {
+    fn field(&self, name: &str) -> Option<&str> {
+        let mut values = self.fields.iter().filter(|(key, _)| key == name);
+        let value = values.next().map(|(_, value)| value.as_str());
+        assert!(values.next().is_none(), "{name} must be written only once");
+        value
+    }
+}
+
+#[test]
+fn generation_progress_distinguishes_returned_success_and_failure_without_rich_timing() {
+    for fail in [false, true] {
+        let make = || {
+            let mut script = Script::new(&[5, 11]);
+            script.fail_append = fail.then_some(2);
+            script
+        };
+        let mut baseline = make();
+        let off = tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(),
+            || run(&mut baseline, &[1, 3], 2, DecodeScript::default()));
+        let capture = ProgressCapture::default();
+        let mut script = make();
+        let on = tracing::subscriber::with_default(capture.clone(), || {
+            assert!(!tracing::enabled!(target: "mary.nemotron.timing", tracing::Level::INFO));
+            #[cfg(feature = "nemotron-timing")]
+            {
+                assert!(TurnTiming::start(0).is_none());
+                assert!(super::super::host_timing::start().is_none());
+            }
+            run(&mut script, &[1, 3], 2, DecodeScript::default())
+        });
+        assert_eq!(on.emitted_ids, off.emitted_ids);
+        assert_eq!(on.completion.stop, off.completion.stop);
+        assert_eq!(on.session_status, off.session_status);
+        assert_eq!(on.committed_tokens, off.committed_tokens);
+        assert_eq!(script.appends, baseline.appends);
+        let spans = capture.0.lock().unwrap();
+        assert_eq!(spans.len(), 2);
+        for (index, span) in spans.iter().enumerate() {
+            let ok = index == 0 || !fail;
+            assert!(span.closed);
+            assert_eq!(span.field("role"), Some(if index == 0 { "\"prompt\"" } else { "\"generated\"" }));
+            assert_eq!(span.field("committed_before"), Some(if index == 0 { "0" } else { "2" }));
+            assert_eq!(span.field("attempted_tokens"), Some(if index == 0 { "2" } else { "1" }));
+            assert_eq!(span.field("prompt_tokens"), Some("2"));
+            assert_eq!(span.field("append_returned"), Some("true"));
+            assert_eq!(span.field("append_ok"), Some(if ok { "true" } else { "false" }));
+            assert_eq!(span.field("completed_tokens"), Some(if index == 0 { "2" } else if ok { "1" } else { "0" }));
+            assert_eq!(span.field("committed_after"), Some(if index == 0 || !ok { "2" } else { "3" }));
+            assert_eq!(span.field("session_ready"), Some(if ok { "true" } else { "false" }));
+            assert!(span.field("append_wall_ns").unwrap().parse::<u64>().is_ok());
+            assert_eq!(span.fields.len(), 10, "bounded numeric/static fields only");
+        }
+    }
+}
+
+#[test]
+fn generation_progress_unwind_has_no_return_or_success_fields() {
+    let capture = ProgressCapture::default();
+    let mut script = Script::new(&[]); // Missing scripted logits panics inside append.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        tracing::subscriber::with_default(capture.clone(),
+            || run(&mut script, &[1], 1, DecodeScript::default()));
+    }));
+    assert!(result.is_err());
+    assert_eq!(script.status, Status::Poisoned);
+    let spans = capture.0.lock().unwrap();
+    assert_eq!(spans.len(), 1);
+    assert!(spans[0].closed, "an unwind closes the span without claiming a return");
+    assert_eq!(spans[0].fields.len(), 4);
+    for name in ["append_returned", "append_ok", "completed_tokens", "committed_after", "session_ready", "append_wall_ns"] {
+        assert_eq!(spans[0].field(name), None, "{name}");
+    }
+}
+
+#[test]
+fn generation_progress_cancellation_counts_only_appends_that_returned() {
+    for initially_cancelled in [false, true] {
+        let capture = ProgressCapture::default();
+        let cancelled = Rc::new(Cell::new(initially_cancelled));
+        let mut script = Script::new(&[5]);
+        script.cancel_after_append = Some((1, Rc::clone(&cancelled)));
+        let output = tracing::subscriber::with_default(capture.clone(), || run_turn(
+            &mut script, &mut Sampler::new(SamplingConfig::greedy(), 0).unwrap(),
+            &vec![1; 257], 2, &mut || cancelled.get(), DecodeScript::default(),
+        ));
+        assert_eq!(output.completion.stop, StopReason::Cancelled);
+        let spans = capture.0.lock().unwrap();
+        if initially_cancelled {
+            assert!(spans.is_empty());
+        } else {
+            assert_eq!(spans.len(), 1, "no span for the unstarted final prompt token");
+            assert_eq!(spans[0].field("completed_tokens"), Some("256"));
+            assert_eq!(spans[0].field("prompt_tokens"), Some("257"));
+            assert_eq!(spans[0].field("append_ok"), Some("true"));
+        }
+    }
+}
+
 // Observe the actual production loop event without a subscriber dependency or
 // a CPU model. These remain scripted state/control-flow witnesses, not kernels.
 #[cfg(feature = "nemotron-timing")]
@@ -176,7 +314,9 @@ fn generation_timing_counts_include_failed_attempts_without_state_changes() {
         }
     }
     impl Subscriber for Capture {
-        fn enabled(&self, meta: &Metadata<'_>) -> bool { meta.target() == "mary.nemotron.timing" }
+        fn enabled(&self, meta: &Metadata<'_>) -> bool {
+            meta.target() == "mary.nemotron.timing" || meta.target() == "mary.nemotron.progress"
+        }
         fn new_span(&self, attrs: &Attributes<'_>) -> Id {
             assert_eq!(attrs.metadata().name(), "native_append");
             let mut fields = Fields::default();
