@@ -274,6 +274,7 @@ pub(super) fn load<S: BlobStoreGet>(
     layer_ids: &[Id],
     device: CudaDevice,
     limits: Limits,
+    seed: Option<Arc<[u32]>>,
     #[cfg(test)] before_upload_completion: impl FnOnce(
         &ComputeClient<CudaRuntime>, &CudaDevice, &CudaTensor,
     ),
@@ -298,6 +299,7 @@ pub(super) fn load<S: BlobStoreGet>(
     )
     .map_err(|e| e.to_string())?;
     validate_config(&config, limits)?;
+    prefix::validate_seed(&config, limits, seed.as_deref())?;
     let cache_pairs = expert_cache_pairs(
         resident_bytes(&config, limits)?,
         limits.max_resident_bytes,
@@ -402,7 +404,9 @@ pub(super) fn load<S: BlobStoreGet>(
                         attention_op(&v)?,
                         attention_op(&o)?,
                     ],
-                    attention_limits(&config, limits),
+                    attention_limits(&config, Limits {
+                        capacity: seed.as_ref().map_or(limits.capacity, |ids| ids.len()), ..limits
+                    }),
                 )?)
             }
             LayerKind::Moe => {
@@ -470,6 +474,8 @@ pub(super) fn load<S: BlobStoreGet>(
         logits: Vec::new(),
         pending: Vec::new(),
         span_pending: None,
+        seed,
+        prefix: None,
         #[cfg(test)]
         fault: None,
     })

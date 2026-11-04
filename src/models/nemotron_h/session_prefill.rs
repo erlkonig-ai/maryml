@@ -148,13 +148,18 @@ pub fn admission(
     start: usize,
     tokens: usize,
 ) -> Result<PrefillAllocation> {
+    admission_with_prefix(c, l, start, tokens, 0)
+}
+pub(super) fn admission_with_prefix(c: &TextConfig, l: Limits, start: usize,
+    tokens: usize, prefix: usize) -> Result<PrefillAllocation>
+{
     validate_config(c, l)?;
     let end = start
         .checked_add(tokens)
         .filter(|&n| tokens > 0 && n <= l.capacity)
         .ok_or("prefill empty suffix or capacity exceeded")?;
     if tokens <= MAX_CHUNK {
-        let working = planned_chunk_bytes(c, l, start, tokens)?;
+        let working = planned_prefix_chunk_bytes(c, l, start, tokens, prefix)?;
         return Ok(PrefillAllocation {
             tokens,
             layer_major: false,
@@ -202,7 +207,7 @@ pub fn admission(
     for width in 1..=MAX_CHUNK {
         for kind in &c.layers_block_type {
             mixer_peak =
-                mixer_peak.max(layer_working_bytes(c, unbounded, end - width, width, kind)?);
+                mixer_peak.max(layer_prefix_working_bytes(c, unbounded, end - width, width, kind, prefix)?);
         }
     }
     // Copied tile, normalized input, mixer output, residual; tile IDs; the
@@ -554,6 +559,33 @@ impl<S: BlobStoreGet> Session<S> {
         ids: &[u32],
         cancelled: &mut dyn FnMut() -> bool,
     ) -> Result<PrefillOutcome> {
+        if let Some(seed) = self.seed.clone() {
+            let start = self.committed.len();
+            let count = seed.len().checked_sub(start).ok_or("prefix seed position exceeded")?.min(ids.len());
+            if self.status != Status::Ready || ids.is_empty()
+                || ids.iter().any(|&id| id as usize >= self.vocab_size())
+                || seed.get(start..start + count) != Some(&ids[..count]) {
+                return Err("invalid prefill or prepared prefix mismatch".into());
+            }
+            // Admit BOTH actual spans before changing either. The suffix uses
+            // two key runs even though its prefix has not yet been published.
+            if count > 0 { admission(&self.model.config, self.limits, start, count)?; }
+            if count < ids.len() {
+                admission_with_prefix(&self.model.config, self.limits, seed.len(), ids.len() - count, seed.len())?;
+            }
+            if cancelled() { return Ok(PrefillOutcome::Cancelled); }
+            if count > 0 && self.prefill_span(&ids[..count], cancelled)? == PrefillOutcome::Cancelled {
+                return Ok(PrefillOutcome::Cancelled);
+            }
+            if cancelled() { return Ok(PrefillOutcome::Cancelled); }
+            self.publish_seed_if_complete()?;
+            if count == ids.len() { return Ok(PrefillOutcome::Completed); }
+            return self.prefill_span(&ids[count..], cancelled);
+        }
+        self.prefill_span(ids, cancelled)
+    }
+
+    fn prefill_span(&mut self, ids: &[u32], cancelled: &mut dyn FnMut() -> bool) -> Result<PrefillOutcome> {
         if self.status != Status::Ready
             || self.span_pending.is_some()
             || ids
@@ -562,11 +594,12 @@ impl<S: BlobStoreGet> Session<S> {
         {
             return Err("prefill unavailable session or invalid token ID".into());
         }
-        let plan = admission(
+        let plan = admission_with_prefix(
             &self.model.config,
             self.limits,
             self.committed.len(),
             ids.len(),
+            self.prefix.as_ref().map_or(0, |p| p.ids.len()),
         )?;
         self.check_boundary(self.committed.len())?;
         if cancelled() {
@@ -708,7 +741,7 @@ impl<S: BlobStoreGet> Session<S> {
                     match &mut self.layers[index].mixer {
                         Mixer::Attention(a) => a.commit()?,
                         Mixer::Mamba(m) => {
-                            m.committed = m.staged.take();
+                            m.committed = m.staged.take().map(Arc::new);
                         }
                         Mixer::Moe(_) => unreachable!(),
                     }

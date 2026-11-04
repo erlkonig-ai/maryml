@@ -132,9 +132,20 @@ pub struct Attention {
     pub(super) weights: Arc<Weights>,
     keys: Handle,
     values: Handle,
+    private_rows: usize,
+    prefix: Option<Arc<KvPrefix>>,
     limits: Limits,
     admission: Admission,
     sequence: Sequence,
+}
+
+/// Sealed contiguous BF16 K/V at a completed boundary. Never writable through
+/// a Session. The exact uploaded projection owner is part of compatibility.
+pub(super) struct KvPrefix {
+    weights: Arc<Weights>,
+    keys: Handle,
+    values: Handle,
+    rows: usize,
 }
 
 pub struct Output {
@@ -191,7 +202,11 @@ struct Plan {
     rows: usize,
     working_bytes: usize,
 }
+#[cfg(test)]
 fn plan(start: usize, tokens: usize, limits: Limits) -> Result<Plan> {
+    plan_with_prefix(start, tokens, limits, 0)
+}
+fn plan_with_prefix(start: usize, tokens: usize, limits: Limits, prefix: usize) -> Result<Plan> {
     if !(1..=MAX_CHUNK).contains(&tokens) {
         return Err("attention requires B1 and T in 1..=256".into());
     }
@@ -201,6 +216,7 @@ fn plan(start: usize, tokens: usize, limits: Limits) -> Result<Plan> {
     if end > limits.capacity || end > u32::MAX as usize {
         return Err("attention append exceeds reserved capacity/position range".into());
     }
+    if prefix > start { return Err("attention prefix exceeds committed position".into()); }
     let rows = if tokens == 1 {
         flash::decode_rows(16)
     } else {
@@ -209,12 +225,11 @@ fn plan(start: usize, tokens: usize, limits: Limits) -> Result<Plan> {
     if !flash::applies(HEADS, KV_HEADS, HEAD_DIM, rows) {
         return Err("unsupported online attention tile".into());
     }
-    // Same single-run split calculation as unchanged flash.rs:1183-1202.
-    // Both constants are properties of that launcher, not a new policy.
+    // Use the launcher's actual per-run split rounding, including the extra
+    // partial slot a second run can require. No full-capacity tail is counted.
     let q_tiles = tokens.div_ceil(rows / 16);
-    let slots = (1024 / (q_tiles * KV_HEADS))
-        .max(1)
-        .min(end.div_ceil(128).max(1));
+    let spans = if prefix == 0 { vec![end] } else { vec![prefix, end - prefix] };
+    let slots: usize = flash::key_run_splits(&spans, q_tiles, KV_HEADS).iter().sum();
     let partial = checked_elements(&[slots, tokens, HEADS, HEAD_DIM], 4)? * 4;
     let stats = checked_elements(&[slots, tokens, HEADS, 2], 4)? * 4;
     let q = checked_elements(&[tokens, HIDDEN], 4)?;
@@ -261,8 +276,8 @@ fn validate_operations(operations: &[Operation<'_>; 4]) -> Result<()> {
 }
 
 impl Attention {
-    pub(super) fn planned_working_bytes(start: usize, tokens: usize, limits: Limits) -> Result<usize> {
-        Ok(plan(start, tokens, limits)?.working_bytes)
+    pub(super) fn planned_prefix_working_bytes(start: usize, tokens: usize, limits: Limits, prefix: usize) -> Result<usize> {
+        Ok(plan_with_prefix(start, tokens, limits, prefix)?.working_bytes)
     }
     /// Upload each operation once onto ONE client/device and reserve KV once.
     /// All host geometry, scale and aggregate resident checks precede device
@@ -300,6 +315,8 @@ impl Attention {
             weights: Arc::new(Weights { source, client, device, projections }),
             keys,
             values,
+            private_rows: limits.capacity,
+            prefix: None,
             limits,
             admission,
             sequence: Sequence::default(),
@@ -311,7 +328,59 @@ impl Attention {
         let admission = admission(limits)?;
         let keys = weights.client.empty(admission.kv_bytes / 2);
         let values = weights.client.empty(admission.kv_bytes / 2);
-        Ok(Self { weights, keys, values, limits, admission, sequence: Sequence::default() })
+        Ok(Self { weights, keys, values, private_rows: limits.capacity, prefix: None,
+            limits, admission, sequence: Sequence::default() })
+    }
+    /// Caller fences the whole hybrid before publication. Requiring a full
+    /// seed buffer prevents accidentally retaining an unused full-C tail.
+    pub(super) fn seal_kv(&self) -> Result<Arc<KvPrefix>> {
+        if self.sequence.phase != Phase::Ready || self.prefix.is_some()
+            || self.sequence.attended != self.private_rows || self.private_rows == 0 {
+            return Err("attention prefix needs a completed exact-size seed".into());
+        }
+        Ok(Arc::new(KvPrefix { weights: self.weights.clone(), keys: self.keys.clone(),
+            values: self.values.clone(), rows: self.private_rows }))
+    }
+    pub(super) fn from_prefix(weights: Arc<Weights>, prefix: Arc<KvPrefix>, limits: Limits) -> Result<Self> {
+        let admission = admission(limits)?;
+        if !Arc::ptr_eq(&weights, &prefix.weights) || prefix.rows > limits.capacity {
+            return Err("attention prefix owner or capacity differs".into());
+        }
+        let private_rows = limits.capacity - prefix.rows;
+        // At P=C no append is possible. These owning placeholders are never
+        // passed as writable bindings; no zero-byte allocation is manufactured.
+        let keys = if private_rows == 0 { prefix.keys.clone() }
+            else { weights.client.empty(private_rows * KV_WIDTH * 2) };
+        let values = if private_rows == 0 { prefix.values.clone() }
+            else { weights.client.empty(private_rows * KV_WIDTH * 2) };
+        let sequence = Sequence { attended: prefix.rows, phase: Phase::Ready };
+        Ok(Self { weights, keys, values, private_rows, prefix: Some(prefix), limits, admission, sequence })
+    }
+    pub(super) fn prefix_len(&self) -> usize { self.prefix.as_ref().map_or(0, |p| p.rows) }
+    pub(super) fn private_kv_bytes(&self) -> usize { self.private_rows * KV_WIDTH * 4 }
+    pub(super) fn restore_prefix(&mut self) -> Result<()> {
+        let position = self.prefix.as_ref().ok_or("attention has no saved prefix")?.rows;
+        self.reset()?;
+        self.sequence.attended = position;
+        Ok(())
+    }
+    pub(super) fn reset_capacity(&mut self, capacity: usize) -> Result<()> {
+        self.reset()?;
+        let limits = Limits { capacity, ..self.limits };
+        let admission = admission(limits)?;
+        if self.prefix.is_some() || self.private_rows != capacity {
+            // The old state is drained. Partial allocation failure/unwind must
+            // not advertise a Ready attention owner with insufficient backing.
+            self.sequence.phase = Phase::Poisoned;
+            self.keys = self.weights.client.empty(admission.kv_bytes / 2);
+            self.values = self.weights.client.empty(admission.kv_bytes / 2);
+            self.private_rows = capacity;
+            self.prefix = None;
+            self.limits = limits;
+            self.admission = admission;
+            self.sequence = Sequence::default();
+        }
+        Ok(())
     }
     pub fn source(&self) -> SourceBinding {
         self.weights.source
@@ -347,7 +416,7 @@ impl Attention {
                 "attention needs contiguous BF16 [1,T,4096] on its owning client/device".into(),
             );
         }
-        let p = plan(expected_start, dims[1], self.limits)?;
+        let p = plan_with_prefix(expected_start, dims[1], self.limits, self.prefix_len())?;
         let elements = checked_elements(dims, 2)?;
         let mut stride = 1usize;
         if input.meta.strides().len() != 3 {
@@ -394,28 +463,33 @@ impl Attention {
                 cube,
                 ArrayArg::from_raw_parts(k.handle.clone(), n),
                 ArrayArg::from_raw_parts(v.handle.clone(), n),
-                ArrayArg::from_raw_parts(self.keys.clone(), self.limits.capacity * KV_WIDTH),
-                ArrayArg::from_raw_parts(self.values.clone(), self.limits.capacity * KV_WIDTH),
+                ArrayArg::from_raw_parts(self.keys.clone(), self.private_rows * KV_WIDTH),
+                ArrayArg::from_raw_parts(self.values.clone(), self.private_rows * KV_WIDTH),
                 n,
-                expected_start * KV_WIDTH,
+                (expected_start - self.prefix_len()) * KV_WIDTH,
             );
         }
         let q_f32 = burn_cubecl::kernel::cast(q.clone(), DType::F32);
-        let run = KeyRun {
+        let mut runs = Vec::with_capacity(2);
+        if let Some(prefix) = &self.prefix {
+            runs.push(KeyRun { k: &prefix.keys, v: &prefix.values, k_scales: None, v_scales: None,
+                rows: prefix.rows, base: 0, lo: 0, hi: prefix.rows, row0: 0 });
+        }
+        runs.push(KeyRun {
             k: &self.keys,
             v: &self.values,
             k_scales: None,
             v_scales: None,
-            rows: self.limits.capacity,
-            base: 0,
+            rows: self.private_rows,
+            base: self.prefix_len(),
             lo: 0,
-            hi: p.end,
+            hi: p.end - self.prefix_len(),
             row0: 0,
-        };
+        });
         let handle = flash::flash_attention_launch(
             &self.weights.client,
             &q_f32.handle,
-            &[run],
+            &runs,
             &q_f32.handle,
             KvElem::Bf16,
             p.tokens,
@@ -480,12 +554,20 @@ impl Attention {
         if self.sequence.phase != Phase::Ready {
             return Err("diagnostic KV read requires committed ready state".into());
         }
-        let bytes = self.sequence.attended * KV_WIDTH * 2;
-        let read = |h: &Handle| -> Result<Vec<u8>> {
+        let read = |h: &Handle, rows: usize| -> Result<Vec<u8>> {
+            let bytes = rows * KV_WIDTH * 2;
             self.weights.client.read_one(h.clone()).map(|v| v[..bytes].to_vec())
                 .map_err(|e| format!("diagnostic KV read: {e:?}"))
         };
-        Ok([read(&self.keys)?, read(&self.values)?])
+        let mut result = if let Some(prefix) = &self.prefix {
+            [read(&prefix.keys, prefix.rows)?, read(&prefix.values, prefix.rows)?]
+        } else { [Vec::new(), Vec::new()] };
+        let suffix = self.sequence.attended - self.prefix_len();
+        if suffix > 0 {
+            result[0].extend(read(&self.keys, suffix)?);
+            result[1].extend(read(&self.values, suffix)?);
+        }
+        Ok(result)
     }
 }
 

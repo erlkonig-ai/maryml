@@ -2,7 +2,8 @@
 //!
 //! Emitted IDs (including EOS) are authoritative and are NOT the attended
 //! prefix. Rendering may change earlier tokens: reuse requires the complete
-//! committed prefix, otherwise reset must succeed before prefill. Cancellation
+//! committed prefix, otherwise an exact saved wake is restored or empty reset
+//! must succeed before prefill. Cancellation
 //! is cooperative between bounded prefill tiles or completed decode appends,
 //! never a GPU interrupt/drain. Partial prefill cancellation poisons the Session.
 //! No executor, sampling policy switch, history truncation or implicit token mask.
@@ -96,7 +97,7 @@ pub enum ReplacementOutcome {
         session_status: Status,
         committed_tokens: usize,
     },
-    /// Reset succeeded: Ready with empty attended prefix, NOT prefilled. The
+    /// Reset/restore succeeded: Ready at zero or the exact saved prefix. The
     /// caller may now assign its host History; this owner never stores that copy.
     ReadyForAssignment { admission: PromptAdmission },
 }
@@ -179,9 +180,9 @@ impl<S: BlobStoreGet> Generator<S> {
     }
 
     /// Validate the same COMPLETE proposal and conservative generation reserve
-    /// BEFORE attempting reset, even for zero budget or an already-matching
-    /// prefix. Success permits host-history assignment, not immediate sampling;
-    /// a later turn must prefill it. Failure after reset is NOT rollback/drain.
+    /// BEFORE attempting reset/restore, even for zero budget. Success permits
+    /// host-history assignment; a later turn computes any uncached suffix.
+    /// An exact saved prompt has boundary logits already. Failure is NOT rollback.
     /// Inspect session() for actual diagnostic count/status after any outcome.
     pub fn prepare_history_replacement(
         &mut self,
@@ -246,10 +247,20 @@ trait Runtime {
     fn status(&self) -> Status;
     fn last_logits(&self) -> Option<&[f32]>;
     fn reset(&mut self) -> Result<()>;
+    fn reset_for_prompt(&mut self, _ids: &[u32]) -> Result<()> { self.reset() }
+    fn can_reuse(&self, ids: &[u32]) -> bool {
+        self.status() == Status::Ready && ids.starts_with(self.committed_ids())
+    }
+    fn observe_reuse(&self) {}
     fn append(&mut self, ids: &[u32]) -> Result<()>;
     fn prefill(&mut self, ids: &[u32], cancelled: &mut dyn FnMut() -> bool) -> Result<PrefillOutcome>;
 }
 impl<S: BlobStoreGet> Runtime for Session<S> {
+    fn reset_for_prompt(&mut self, ids: &[u32]) -> Result<()> {
+        Session::reset_for_prompt(self, ids).map_err(anyhow::Error::msg)
+    }
+    fn can_reuse(&self, ids: &[u32]) -> bool { self.can_reuse_prefix(ids) }
+    fn observe_reuse(&self) { Session::observe_reuse(self) }
     fn context_capacity(&self) -> usize {
         Session::capacity(self)
     }
@@ -351,7 +362,7 @@ fn replace_admitted(
             };
         }
     };
-    match runtime.reset() {
+    match runtime.reset_for_prompt(&admission.prompt.token_ids) {
         Ok(()) => ReplacementOutcome::ReadyForAssignment { admission },
         Err(error) => ReplacementOutcome::ResetFailedTerminal {
             error: format!("{error:#}"),
@@ -438,17 +449,18 @@ fn run_turn(
         if cancelled() {
             return Ok((StopReason::Cancelled, None));
         }
-        let reuse =
-            runtime.status() == Status::Ready && prompt.starts_with(runtime.committed_ids());
+        let reuse = runtime.can_reuse(prompt);
         if !reuse {
             #[cfg(feature = "nemotron-timing")]
             let started = timing.as_ref().map(|_| std::time::Instant::now());
-            let reset = runtime.reset();
+            let reset = runtime.reset_for_prompt(prompt);
             #[cfg(feature = "nemotron-timing")]
             if let (Some(timing), Some(started)) = (&mut timing, started) {
                 timing.reset.record(started.elapsed(), 0, reset.is_ok());
             }
             reset.context("reset before prefix replacement")?;
+        } else {
+            runtime.observe_reuse();
         }
         let from = runtime.committed_ids().len();
         #[cfg(feature = "nemotron-timing")]

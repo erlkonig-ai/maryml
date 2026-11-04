@@ -66,6 +66,28 @@ fn full_limits(capacity: usize) -> Limits {
 }
 
 #[test]
+fn session_host_prefix_admission_counts_shared_boundary_and_only_private_suffix() {
+    let c = full_config(1 << 20);
+    let l = Limits { capacity: 1 << 20, max_resident_bytes: 21_334_315_328, max_chunk_bytes: usize::MAX };
+    let p = prefix_admission(&c, l, 786_432 + 17, 786_432).unwrap();
+    assert_eq!(p.after_advance.shared_kv_bytes, 6 << 30);
+    assert_eq!(p.after_advance.private_kv_bytes, 2 << 30);
+    assert_eq!(p.after_advance.shared_mamba_bytes, 171_048_960);
+    assert_eq!(p.after_advance.private_mamba_bytes, 171_048_960);
+    assert_eq!(resident_ownership(&c, l).unwrap().expert_cache_pairs_per_moe, 36);
+    assert_eq!(p.suffix.unwrap().device_working_bytes,
+        planned_prefix_chunk_bytes(&c, l, 786_432, 17, 786_432).unwrap());
+    assert_eq!(prefix_admission(&c, l, l.capacity, l.capacity).unwrap().after_advance.private_kv_bytes, 0);
+    assert!(prefix_admission(&c, l, l.capacity, l.capacity).unwrap().suffix.is_none());
+    for (prompt, prefix) in [(0, 0), (1, 0), (2, 3), (l.capacity + 1, 1), (1, usize::MAX)] {
+        assert!(prefix_admission(&c, l, prompt, prefix).is_err());
+    }
+    assert!(prefix::validate_seed(&c, l, Some(&[])).is_err());
+    assert!(prefix::validate_seed(&c, l, Some(&[c.vocab_size as u32])).is_err());
+    assert!(prefix::validate_seed(&c, l, Some(&[1, 2])).is_ok());
+}
+
+#[test]
 fn session_host_prefill_full_window_pages_and_allocation_inventory() {
     let c = full_config(1 << 20);
     let l = Limits { capacity: 1 << 20, max_resident_bytes: 21_334_315_328,
@@ -144,6 +166,7 @@ fn session_host_real_owners_satisfy_thread_bounds() {
     fn shared<T: Send + Sync>() {}
     type Store = triblespace::core::repo::pile::PileSnapshot;
     shared::<DeviceModel<Store>>();
+    shared::<Prefix<Store>>();
     send::<Session<Store>>();
     #[cfg(feature = "tokenizer")]
     send::<super::super::generation::Generator<Store>>();
@@ -181,7 +204,7 @@ fn session_host_upload_fault_is_a_checked_descriptor_rejection() {
     assert!(!cubecl::zspace::striding::has_pitched_row_major_strides(&shape, &strides));
 }
 
-fn enqueue_rejected_upload(device: &CudaDevice, handle: cubecl::server::Handle) {
+pub(super) fn enqueue_rejected_upload(device: &CudaDevice, handle: cubecl::server::Handle) {
     use cubecl::{device::Device, device_handle::DeviceHandle, server::{ComputeServer, CopyDescriptor}};
     assert!(handle.size() >= 4);
     let stream = StreamId::current();
@@ -193,6 +216,9 @@ fn enqueue_rejected_upload(device: &CudaDevice, handle: cubecl::server::Handle) 
         server.write(vec![(descriptor, cubecl::bytes::Bytes::from_bytes_vec(vec![1, 2, 3, 4]))], stream);
     }).unwrap();
 }
+
+#[path = "session_prefix_tests.rs"]
+mod prefix_tests;
 
 #[test]
 fn session_host_geometry_and_aggregate_admission() {
@@ -909,7 +935,7 @@ fn session_gpu_shared_model_rejects_origin_upload_error() {
     assert_ne!(caller, origin);
     let device = CudaDevice { index: 0 };
     let error = origin.executes(|| source::load(
-        snapshot, source, &ids, device.clone(), limits(),
+        snapshot, source, &ids, device.clone(), limits(), None,
         |client, device, embedding| {
             assert_eq!(StreamId::current(), origin);
             // A real ordinary CUDA-server write Err, on a real fixed operand's

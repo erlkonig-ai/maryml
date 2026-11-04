@@ -104,6 +104,31 @@ fn attention_pending_failure_cancel_and_reset_protocol() {
     assert_eq!(s.attended, 0);
 }
 
+#[test]
+fn attention_prefix_split_admission_uses_actual_runs_and_absolute_positions() {
+    let l = limits(1024);
+    // Each independently launched run owns at least one partial. A 128-row
+    // prefix plus one new row therefore needs two, not ceil(129/128) by luck:
+    // use the small 3+1 witness where one contiguous run has only one slot.
+    let one = plan(3, 1, l).unwrap();
+    let two = plan_with_prefix(3, 1, l, 3).unwrap();
+    assert_eq!(flash::key_run_splits(&[4], 1, KV_HEADS), [1]);
+    assert_eq!(flash::key_run_splits(&[3, 1], 1, KV_HEADS), [1, 1]);
+    assert_eq!(two.working_bytes - one.working_bytes, (HEADS * HEAD_DIM + HEADS * 2) * 4);
+    assert_eq!(two.end, 4);
+    assert!(plan_with_prefix(2, 1, l, 3).is_err());
+    assert!(plan_with_prefix(1024, 1, l, 1024).is_err());
+    for (prefix, start, count) in [(3, 3, 1), (3, 4, 7), (257, 511, 256), (1023, 1023, 1)] {
+        let exact = plan_with_prefix(start, count, l, prefix).unwrap();
+        assert!(plan_with_prefix(start, count, Limits { max_working_bytes: exact.working_bytes - 1, ..l }, prefix).is_err());
+        assert!(plan_with_prefix(start, count, Limits { max_working_bytes: exact.working_bytes, ..l }, prefix).is_ok());
+    }
+    for (start, count) in [(0, 1), (0, 256), (511, 5)] {
+        assert_eq!(plan(start, count, l).unwrap().working_bytes,
+            plan_with_prefix(start, count, l, 0).unwrap().working_bytes);
+    }
+}
+
 fn source() -> SourceBinding {
     use triblespace::prelude::genid;
     SourceBinding {

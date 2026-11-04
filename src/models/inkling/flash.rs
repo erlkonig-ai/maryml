@@ -1182,21 +1182,8 @@ pub fn flash_attention_launch<R: Runtime>(
     // and splits until the device is busy. Proportional to the run's span, so a
     // merged 1M-row page and a 128-row tail page do not get the same treatment.
     let spans: Vec<usize> = runs.iter().map(|r| r.hi.saturating_sub(r.lo)).collect();
-    let total_span: usize = spans.iter().sum();
-    let want = (TARGET_CUBES / (q_tiles * kv_heads)).max(1);
-    let mut split_of = Vec::with_capacity(runs.len());
-    let mut slots = 0usize;
-    for span in &spans {
-        let by_span = if total_span == 0 {
-            1
-        } else {
-            (want * span).div_ceil(total_span)
-        };
-        let by_work = span.div_ceil(MIN_KEYS_PER_SPLIT).max(1);
-        let s = by_span.min(by_work).max(1);
-        split_of.push(s);
-        slots += s;
-    }
+    let split_of = key_run_splits(&spans, q_tiles, kv_heads);
+    let slots: usize = split_of.iter().sum();
 
     let po_elems = slots * nq * heads * head_dim;
     let pml_elems = slots * nq * heads * 2;
@@ -1326,6 +1313,17 @@ pub fn flash_attention_launch<R: Runtime>(
         )
     };
     out
+}
+
+/// The launcher's exact scratch geometry, also used by native admission.
+/// Inputs are the live spans of already extent-checked runs, not buffer capacity.
+pub(crate) fn key_run_splits(spans: &[usize], q_tiles: usize, kv_heads: usize) -> Vec<usize> {
+    let total_span: usize = spans.iter().sum();
+    let want = (TARGET_CUBES / (q_tiles * kv_heads)).max(1);
+    spans.iter().map(|span| {
+        let by_span = if total_span == 0 { 1 } else { (want * span).div_ceil(total_span) };
+        by_span.min(span.div_ceil(MIN_KEYS_PER_SPLIT).max(1)).max(1)
+    }).collect()
 }
 
 #[cfg(test)]

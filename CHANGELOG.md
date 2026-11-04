@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Native Nemotron can retain one exact, fenced hybrid prefix and fork private
+  suffixes from the same uploaded model. Attention shares immutable P-row K/V
+  and allocates only C-P writable rows; Mamba advances an immutable boundary
+  into private state. Restore retains boundary logits, while a token mismatch
+  resets to full-capacity empty backing. Multi-run scratch is explicitly
+  admitted. This does not add a scheduler, shared expert cache or cross-process
+  cache, and does not promise bitwise one-run/two-run reduction equivalence.
+
 - The Qwen3-TTS text tokenizer is read from the model pile, not the build
   tree. `qwen3tts_persist` names the checkpoint's `vocab.json` and
   `merges.txt` on the exact base root as `dataset::text` documents (the

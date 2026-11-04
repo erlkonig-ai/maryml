@@ -18,6 +18,8 @@ struct Script {
     fail_append: Option<usize>,
     cancel_after_append: Option<(usize, Rc<Cell<bool>>)>,
     cancel_inside_prefill: Option<Rc<Cell<bool>>>,
+    saved_prefix: Option<Vec<u32>>,
+    restored: usize,
 }
 fn row(id: u32) -> Vec<f32> {
     let mut values = vec![0.0; 16];
@@ -38,10 +40,23 @@ impl Script {
             fail_append: None,
             cancel_after_append: None,
             cancel_inside_prefill: None,
+            saved_prefix: None,
+            restored: 0,
         }
     }
 }
 impl Runtime for Script {
+    fn reset_for_prompt(&mut self, ids: &[u32]) -> Result<()> {
+        if let Some(prefix) = self.saved_prefix.clone().filter(|p| ids.starts_with(p)) {
+            self.status = Status::Poisoned;
+            ensure!(!self.fail_reset, "scripted restore failure");
+            self.committed = prefix;
+            self.logits = row(11); // Saved boundary predicts EOS, unlike the tail.
+            self.restored += 1;
+            self.status = Status::Ready;
+            Ok(())
+        } else { self.reset() }
+    }
     fn prefill(&mut self, ids: &[u32], cancelled: &mut dyn FnMut() -> bool) -> Result<PrefillOutcome> {
         if cancelled() { return Ok(PrefillOutcome::Cancelled); }
         if ids.len() > MAX_CHUNK {
@@ -873,6 +888,50 @@ fn generation_replacement_success_is_empty_ready_not_prefilled() {
     assert_eq!(s.resets, 1);
     assert!(s.committed.is_empty() && s.logits.is_empty() && s.appends.is_empty());
     assert_eq!(s.status, Status::Ready);
+}
+
+#[test]
+fn generation_saved_prefix_uses_boundary_logits_and_only_prefills_suffix() {
+    let mut s = Script::new(&[]);
+    s.saved_prefix = Some(vec![1, 2]);
+    s.committed = vec![1, 2, 9];
+    s.logits = row(5);
+    let output = run(&mut s, &[1, 2], 1, DecodeScript::default());
+    assert_eq!(output.emitted_ids, [11], "exact seed uses saved EOS logits, not later-tail logits");
+    assert_eq!(s.restored, 1);
+    assert!(s.appends.is_empty() && s.resets == 0);
+    s.committed.push(9);
+    s.predictions.push_back(11);
+    let output = run(&mut s, &[1, 2, 3], 1, DecodeScript::default());
+    assert_eq!(output.emitted_ids, [11]);
+    assert_eq!(s.appends, [vec![3]]);
+    assert_eq!(s.restored, 2);
+    s.predictions.push_back(11);
+    let _ = run(&mut s, &[1], 1, DecodeScript::default());
+    assert_eq!(s.resets, 1, "a shorter common prefix cannot use a later Mamba boundary");
+    assert_eq!(s.appends.last().unwrap(), &[1]);
+}
+
+#[test]
+fn generation_saved_prefix_refusal_cancel_and_restore_failure_preserve_control_contract() {
+    let mut s = Script::new(&[]);
+    s.saved_prefix = Some(vec![1, 2]);
+    s.committed = vec![1, 2, 9];
+    s.logits = row(5);
+    s.capacity = 3;
+    let invalid = admit_prompt(&s, rendered(&[1, 2]), 2);
+    assert!(matches!(replace_admitted(&mut s, invalid), ReplacementOutcome::RejectedUnchanged { .. }));
+    assert_eq!(s.restored, 0);
+    let output = run_turn(&mut s, &mut Sampler::new(SamplingConfig::greedy(), 0).unwrap(),
+        &[1, 2], 1, &mut || true, DecodeScript::default());
+    assert!(matches!(output.completion.stop, StopReason::Cancelled));
+    assert_eq!(s.committed, [1, 2, 9]);
+    assert_eq!(s.restored, 0);
+    s.fail_reset = true;
+    let admitted = admit_prompt(&s, rendered(&[1, 2]), 1);
+    assert!(matches!(replace_admitted(&mut s, admitted), ReplacementOutcome::ResetFailedTerminal { .. }));
+    assert_eq!(s.status, Status::Poisoned);
+    assert!(s.appends.is_empty());
 }
 
 #[test]

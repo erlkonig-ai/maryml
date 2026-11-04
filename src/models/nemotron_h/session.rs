@@ -31,6 +31,10 @@ use triblespace::{core::collection::CollectionHandle, prelude::*};
 #[path = "session_source.rs"]
 mod source;
 use source::NativeExperts;
+
+#[path = "session_prefix.rs"]
+mod prefix;
+pub use prefix::{Prefix, PrefixAllocation, PrefixOwnership, prefix_admission};
 #[path = "session_prefill.rs"]
 mod prefill;
 pub use prefill::{PrefillAllocation, PrefillOutcome, admission as prefill_admission};
@@ -109,7 +113,7 @@ struct MambaWeights {
 }
 struct Mamba {
     weights: Arc<MambaWeights>,
-    committed: Option<gpu::State<CudaRuntime>>,
+    committed: Option<Arc<gpu::State<CudaRuntime>>>,
     staged: Option<gpu::State<CudaRuntime>>,
 }
 enum Mixer<S> {
@@ -168,6 +172,9 @@ pub struct Session<S> {
     // across an uncertain append/reset. Component-private pending owners stay
     // inside their respective layers; Mamba staged states are installed early.
     pending: Vec<CudaTensor>,
+    // One explicit checkpoint, not an indexed cache of past observations.
+    seed: Option<Arc<[u32]>>,
+    prefix: Option<Arc<Prefix<S>>>,
     // Span-wide owners survive an error/unwind independently of the current
     // tile. A successful fence retires tile scratch, never these live slabs.
     span_pending: Option<prefill::Pending>,
@@ -175,7 +182,8 @@ pub struct Session<S> {
     fault: Option<Fault>,
 }
 
-// Control-injection only, not an imitation of CUDA failure/drain semantics.
+// Control injection except PrefixUpload, which queues the same checked CUDA
+// descriptor rejection as the existing origin-upload fixture (no invalid copy).
 #[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Fault {
@@ -183,6 +191,7 @@ enum Fault {
     AfterCommit(usize),
     Reset,
     PanicAfterLayer(usize),
+    PrefixUpload,
 }
 #[cfg(test)]
 fn inject(fault: Option<Fault>, point: Fault) -> Result<()> {
@@ -442,6 +451,9 @@ pub fn admission(config: &TextConfig, limits: Limits, prompt_tokens: usize) -> R
 /// Mamba input [projected,H]/output [H,inner] and each fixed attention/MoE shape
 /// before constructing a Session, so these are the uploaded operand extents.
 fn planned_chunk_bytes(c: &TextConfig, l: Limits, start: usize, t: usize) -> Result<usize> {
+    planned_prefix_chunk_bytes(c, l, start, t, 0)
+}
+fn planned_prefix_chunk_bytes(c: &TextConfig, l: Limits, start: usize, t: usize, prefix: usize) -> Result<usize> {
     if !(1..=MAX_CHUNK).contains(&t)
         || start.checked_add(t).filter(|&end| end <= l.capacity).is_none()
     {
@@ -458,7 +470,7 @@ fn planned_chunk_bytes(c: &TextConfig, l: Limits, start: usize, t: usize) -> Res
         if matches!(kind, LayerKind::Moe) {
             expert_peak = expert_peak.max(moe::admission(moe_limits(l))?.expert_bytes);
         }
-        total = add(total, layer_working_bytes(c, l, start, t, kind)?)?;
+        total = add(total, layer_prefix_working_bytes(c, l, start, t, kind, prefix)?)?;
     }
     total = add(total, expert_peak)?;
     if total > l.max_chunk_bytes {
@@ -467,10 +479,10 @@ fn planned_chunk_bytes(c: &TextConfig, l: Limits, start: usize, t: usize) -> Res
     Ok(total)
 }
 
-fn layer_working_bytes(c: &TextConfig, l: Limits, start: usize, t: usize, kind: &LayerKind) -> Result<usize> {
+fn layer_prefix_working_bytes(c: &TextConfig, l: Limits, start: usize, t: usize, kind: &LayerKind, prefix: usize) -> Result<usize> {
     Ok(match kind {
-        LayerKind::Attention => attention::Attention::planned_working_bytes(
-            start, t, attention_limits(c, l),
+        LayerKind::Attention => attention::Attention::planned_prefix_working_bytes(
+            start, t, attention_limits(c, l), prefix,
         )?,
         LayerKind::Moe => moe::working_bytes(t)?,
         LayerKind::Mamba => {
@@ -510,25 +522,35 @@ impl<S: BlobStoreGet> Session<S> {
     /// Sharing does not certify CUDA health or drain another failed Session;
     /// a lost device context may affect every Session using this model.
     pub fn from_device_model(model: Arc<DeviceModel<S>>, limits: Limits) -> Result<Self> {
+        Self::from_state(model, limits, None, None)
+    }
+    fn from_state(model: Arc<DeviceModel<S>>, limits: Limits, seed: Option<Arc<[u32]>>,
+        prefix: Option<Arc<Prefix<S>>>) -> Result<Self>
+    {
         validate_config(&model.config, limits)?;
+        prefix::validate_initial(&model, limits, seed.as_deref(), prefix.as_deref())?;
         let cache_pairs = expert_cache_pairs(
             resident_bytes(&model.config, limits)?,
             limits.max_resident_bytes,
             model.config.layers_block_type.iter()
                 .filter(|kind| matches!(kind, LayerKind::Moe)).count(),
         )?;
-        let stream = StreamId::current();
+        let stream = prefix.as_ref().map_or_else(StreamId::current, |p| p.stream);
+        stream.executes(|| {
         let mut layers = Vec::with_capacity(model.layers.len());
-        for layer in &model.layers {
+        for (index, layer) in model.layers.iter().enumerate() {
             let mixer = match &layer.mixer {
                 MixerWeights::Mamba(weights) => Mixer::Mamba(Mamba {
-                    weights: weights.clone(), committed: None, staged: None,
+                    weights: weights.clone(),
+                    committed: prefix.as_ref().and_then(|p| p.mamba(index)), staged: None,
                 }),
-                MixerWeights::Attention(weights) => Mixer::Attention(
-                    attention::Attention::from_weights(
-                        weights.clone(), attention_limits(&model.config, limits),
-                    )?,
-                ),
+                MixerWeights::Attention(weights) => {
+                    let mut al = attention_limits(&model.config, limits);
+                    if let Some(seed) = &seed { al.capacity = seed.len(); }
+                    Mixer::Attention(if let Some(p) = &prefix {
+                        attention::Attention::from_prefix(weights.clone(), p.attention(index)?, al)?
+                    } else { attention::Attention::from_weights(weights.clone(), al)? })
+                }
                 MixerWeights::Moe(weights) => Mixer::Moe(moe::Moe::from_weights(
                     weights.clone(),
                     NativeExperts::new(model.snapshot.clone(), moe::SourceBinding {
@@ -539,11 +561,18 @@ impl<S: BlobStoreGet> Session<S> {
             };
             layers.push(Layer { id: layer.id, norm: layer.norm.clone(), mixer });
         }
-        Ok(Self {
+        let committed = prefix.as_ref().map_or_else(Vec::new, |p| p.ids.to_vec());
+        let logits = prefix.as_ref().map_or_else(Vec::new, |p| p.logits.to_vec());
+        let session = Self {
             model, stream, limits, layers, status: Status::Ready,
-            committed: Vec::new(), logits: Vec::new(), pending: Vec::new(), span_pending: None,
+            committed, logits, pending: Vec::new(), span_pending: None, seed, prefix,
             #[cfg(test)]
             fault: None,
+        };
+        // Prefix publication has already fenced the origin. Observe allocation
+        // errors here too before a fork advertises a usable boundary.
+        if session.prefix.is_some() { session.fence()?; }
+        Ok(session)
         })
     }
 
@@ -565,7 +594,7 @@ impl<S: BlobStoreGet> Session<S> {
         device: CudaDevice,
         limits: Limits,
     ) -> Result<Self> {
-        source::load(snapshot, source, layer_ids, device, limits,
+        source::load(snapshot, source, layer_ids, device, limits, None,
             #[cfg(test)]
             |_, _, _| {},
         )
@@ -597,9 +626,11 @@ impl<S: BlobStoreGet> Session<S> {
     }
     pub fn can_reuse_prefix(&self, rendered_ids: &[u32]) -> bool {
         self.status == Status::Ready && rendered_ids.starts_with(&self.committed)
+            && self.seed.as_ref().is_none_or(|ids| rendered_ids.starts_with(ids))
     }
     fn chunk_bytes(&self, t: usize) -> Result<usize> {
-        planned_chunk_bytes(&self.model.config, self.limits, self.committed.len(), t)
+        planned_prefix_chunk_bytes(&self.model.config, self.limits, self.committed.len(), t,
+            self.prefix.as_ref().map_or(0, |p| p.ids.len()))
     }
     fn preflight(&self, ids: &[u32]) -> Result<()> {
         if self.status != Status::Ready {
@@ -617,6 +648,12 @@ impl<S: BlobStoreGet> Session<S> {
             return Err("empty/oversized chunk, invalid ID or capacity exhausted".into());
         }
         self.chunk_bytes(ids.len())?;
+        if let Some(seed) = &self.seed {
+            let start = self.committed.len();
+            if seed.get(start..start + ids.len()) != Some(ids) {
+                return Err("append differs from or crosses the prepared prefix".into());
+            }
+        }
         self.check_boundary(self.committed.len())
     }
     fn check_boundary(&self, position: usize) -> Result<()> {
@@ -668,13 +705,17 @@ impl<S: BlobStoreGet> Session<S> {
             Ok(logits) => {
                 for layer in &mut self.layers {
                     if let Mixer::Mamba(m) = &mut layer.mixer {
-                        m.committed = m.staged.take();
+                        m.committed = m.staged.take().map(Arc::new);
                     }
                 }
                 self.committed.extend_from_slice(ids);
                 self.logits = logits;
                 self.pending.clear();
                 self.status = Status::Ready;
+                if let Err(error) = self.publish_seed_if_complete() {
+                    self.invalidate();
+                    return Err(error);
+                }
                 Ok(self.last_logits().expect("nonempty completed chunk"))
             }
             Err(error) => {
@@ -802,7 +843,7 @@ impl<S: BlobStoreGet> Session<S> {
         }
         for layer in &mut self.layers {
             let result = match &mut layer.mixer {
-                Mixer::Attention(a) => a.reset(),
+                Mixer::Attention(a) => a.reset_capacity(self.limits.capacity),
                 Mixer::Moe(m) => m.reset(),
                 Mixer::Mamba(_) => Ok(()),
             };
@@ -814,6 +855,7 @@ impl<S: BlobStoreGet> Session<S> {
             self.invalidate();
             return Err(errors.join("; "));
         }
+        if self.seed.is_some() || self.prefix.is_some() { self.fence()?; }
         for layer in &mut self.layers {
             if let Mixer::Mamba(m) = &mut layer.mixer {
                 m.committed = None;
@@ -821,6 +863,8 @@ impl<S: BlobStoreGet> Session<S> {
             }
         }
         self.pending.clear();
+        self.seed = None;
+        self.prefix = None;
         self.span_pending = None;
         self.committed.clear();
         self.logits.clear();
@@ -863,7 +907,7 @@ fn enqueue_layer_tile<S: BlobStoreGet>(layer: &mut Layer<S>, x: &CudaTensor,
                     norm_gain: &m.weights.gain,
                 },
                 &projected,
-                m.committed.as_ref(),
+                m.committed.as_deref(),
                 limits.max_chunk_bytes,
             )?;
             m.staged = Some(out.state);
