@@ -75,11 +75,10 @@ fn put<T: TensorElement, const R: usize, B: BlobStorePut>(store: &mut B,
 fn read<T: TensorElement, const R: usize, B: BlobStoreGet>(store: &B,
     handle: Inline<BlobHandle<Tensor<T, R>>>, dims: [usize; R]) -> Result<TensorView>
 {
-    let expected = bytes(&dims, T::BITS / 8)?;
     let blob: Blob<Tensor<T, R>> = store.get(handle).map_err(|e| format!("checkpoint get: {e}"))?;
     let view = leaf::read_leaf(blob).map_err(|e| e.to_string())?;
-    if view.dims() != dims.map(|d| d as u64).as_slice() || view.payload().len() != expected {
-        return Err("checkpoint typed shape or payload extent differs".into());
+    if view.dims() != dims.map(|d| d as u64).as_slice() {
+        return Err("checkpoint typed shape differs".into());
     }
     Ok(view)
 }
