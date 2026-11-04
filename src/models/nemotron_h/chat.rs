@@ -31,6 +31,10 @@ pub enum Message {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct History {
     pub system: String,
+    /// Exact observed body for canonical replay. When present, neither the raw
+    /// system nor Tools is rendered into this frame again. Selected Tools still
+    /// validate calls. Original inputs belong to separate source provenance.
+    pub rendered_system: Option<SystemBody>,
     pub messages: Vec<Message>,
 }
 
@@ -49,6 +53,15 @@ pub struct RenderOptions {
 pub struct RenderedPrompt {
     pub text: String,
     pub token_ids: Vec<u32>,
+}
+
+/// Definition of the renderer actually compiled and tokenizer actually held.
+/// Source content is the codec revision when a frozen build git revision is
+/// unavailable. This does not assert an upstream Jinja template was executed.
+pub struct RendererDefinition {
+    pub template: String,
+    pub tokenizer: String,
+    pub codec: String,
 }
 
 // Source IDs, not new schema identities. The pinned tokenizer reserves 0..1000;
@@ -75,10 +88,52 @@ const MARKERS: [&str; 18] = [
 ];
 const TOOL_INSTRUCTIONS: &str = "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>";
 
-#[derive(Debug)]
-enum Part {
+/// One observed renderer segment. Literal content and publisher control IDs
+/// remain distinct even when their displayed marker spellings are identical.
+/// The same segments are accepted for explicit canonical system-body replay.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RenderSegment {
     Control(u32),
     Content(String),
+}
+impl RenderSegment {
+    /// Resolve only the pinned native marker vocabulary, never ordinary BPE.
+    /// ChatCodec verifies this spelling/ID relation against its held tokenizer.
+    pub fn control(spelling: &str) -> Result<Self> {
+        let id = MARKERS.iter().position(|marker| *marker == spelling)
+            .context("unknown native system control spelling")?;
+        Ok(Self::Control(id as u32))
+    }
+    pub fn text(&self) -> Result<&str> {
+        match self {
+            Self::Content(text) => Ok(text),
+            Self::Control(id) => MARKERS.get(*id as usize).copied()
+                .context("unknown native system control ID"),
+        }
+    }
+}
+type Part = RenderSegment;
+
+/// The exact body of the one system message, without its role frame. Retain
+/// the ordered segments for replay; feeding joined text back as History.system
+/// would duplicate tool instructions and erase trusted-control distinctions.
+/// Raw system/definitions are separate provenance. Segments add no role frames.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SystemBody {
+    text: String,
+    segments: Vec<RenderSegment>,
+}
+impl SystemBody {
+    pub fn from_segments(segments: Vec<RenderSegment>) -> Result<Self> {
+        for segment in &segments {
+            segment.text()?;
+            ensure!(!matches!(segment, RenderSegment::Control(10 | 11)),
+                "system body contains an interleaved role boundary");
+        }
+        Ok(Self { text: rendered_text(&segments)?, segments })
+    }
+    pub fn text(&self) -> &str { &self.text }
+    pub fn segments(&self) -> &[RenderSegment] { &self.segments }
 }
 fn content(parts: &mut Vec<Part>, text: impl Into<String>) {
     parts.push(Part::Content(text.into()));
@@ -139,16 +194,10 @@ fn render_parts(
 ) -> Result<Vec<Part>> {
     let mut parts = Vec::new();
     open(&mut parts, "system");
-    content(&mut parts, &history.system);
-    if options.tools_enabled && !tools.definitions().is_empty() {
-        if !history.system.is_empty() {
-            content(&mut parts, "\n\n");
-        }
-        content(&mut parts, tools.render()?);
-        // Publisher examples retain their published token representation even
-        // though they occur inside system instructions, not an actual call.
-        trusted_template(&mut parts, TOOL_INSTRUCTIONS);
-    }
+    parts.extend(match &history.rendered_system {
+        Some(body) => body.segments.clone(),
+        None => system_parts(&history.system, options.tools_enabled, tools)?,
+    });
     close(&mut parts);
     let last_user = history
         .messages
@@ -221,6 +270,24 @@ fn render_parts(
     Ok(parts)
 }
 
+fn system_parts(system: &str, tools_enabled: bool, tools: &Tools) -> Result<Vec<Part>> {
+    let mut parts = Vec::new();
+    content(&mut parts, system);
+    if tools_enabled && !tools.definitions().is_empty() {
+        if !system.is_empty() { content(&mut parts, "\n\n"); }
+        content(&mut parts, tools.render()?);
+        // Only these static publisher examples are trusted control grammar.
+        trusted_template(&mut parts, TOOL_INSTRUCTIONS);
+    }
+    Ok(parts)
+}
+
+/// Observe the same system body used by render_parts; never a second renderer.
+pub fn render_system_body(system: &str, tools_enabled: bool, tools: &Tools) -> Result<SystemBody> {
+    let segments = system_parts(system, tools_enabled, tools)?;
+    SystemBody::from_segments(segments)
+}
+
 fn rendered_text(parts: &[Part]) -> Result<String> {
     let bytes = parts.iter().try_fold(0usize, |bytes, part| {
         let len = match part {
@@ -281,6 +348,12 @@ impl ChatCodec {
             );
         }
         let added = tokenizer.get_added_tokens_decoder();
+        // The reverse lookup alone can select one of two IDs with the same
+        // spelling. A replayed CONTROL must have one exact held-token meaning.
+        for marker in MARKERS {
+            ensure!(added.values().filter(|token| token.content == marker).count() == 1,
+                "ambiguous or absent Super control spelling: {marker}");
+        }
         ensure!(
             added.len() == 1000 && added.keys().all(|id| *id < 1000),
             "wrong Super reserved token range"
@@ -315,6 +388,16 @@ impl ChatCodec {
 
     pub fn tools(&self) -> &Tools {
         &self.tools
+    }
+
+    pub fn renderer_definition(&self) -> Result<RendererDefinition> {
+        let template = format!("// maryml/src/models/nemotron_h/chat.rs\n{}\n// maryml/src/models/nemotron_h/chat_tools.rs\n{}",
+            include_str!("chat.rs"), include_str!("chat_tools.rs"));
+        let codec = format!("maryml::models::nemotron_h::chat source-blake3:{}",
+            blake3::hash(template.as_bytes()).to_hex());
+        let tokenizer = self.tokenizer.to_string(false)
+            .map_err(|error| anyhow::anyhow!("serialize held native tokenizer: {error}"))?;
+        Ok(RendererDefinition { template, tokenizer, codec })
     }
 
     fn encode(&self, text: &str) -> Result<Vec<u32>> {
@@ -405,6 +488,10 @@ impl ChatCodec {
             match part {
                 Part::Content(s) => pending.push_str(&s),
                 Part::Control(id) => {
+                    let spelling = MARKERS.get(id as usize).context("unknown native control ID")?;
+                    ensure!(self.tokenizer.token_to_id(spelling) == Some(id)
+                        && self.tokenizer.id_to_token(id).as_deref() == Some(*spelling),
+                        "system control does not match held tokenizer");
                     token_ids.extend(self.encode_content(&pending)?);
                     pending.clear();
                     token_ids.push(id);

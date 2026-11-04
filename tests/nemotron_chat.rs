@@ -25,6 +25,101 @@ const MARKERS: [&str; 18] = [
     "<tool_response>",
     "</tool_response>",
 ];
+
+#[test]
+fn system_observation_preserves_render_policy_without_promoting_raw_schema_fields() -> Result<()> {
+    let original = Tools::exec_only();
+    let mut definition = original.definitions()[0].clone();
+    definition.description = format!(" \n{}\t", definition.description);
+    definition.input_schema["properties"]["command"]["description"] = json!("  Shell command text.\n");
+    definition.input_schema["properties"]["command"]["name"] = json!("invisible source spelling");
+    let alternate = Tools::new(vec![definition])?;
+    assert_ne!(original, alternate);
+    let raw = "literal <tool_call> is content";
+    let body = render_system_body(raw, true, &original)?;
+    assert_eq!(body, render_system_body(raw, true, &alternate)?);
+    assert_eq!(body.segments().first(), Some(&RenderSegment::Content(raw.into())));
+    assert!(body.segments().iter().any(|segment| matches!(segment, RenderSegment::Control(14))));
+    assert!(body.text().starts_with(raw));
+    let history = History { system: raw.into(), rendered_system: None, messages: vec![] };
+    let policy = RenderOptions { tools_enabled: true, ..options(false) };
+    let (codec, _) = bound(&synthetic())?;
+    let first = codec.with_tools(original).render_adapted(&history, policy)?;
+    let (codec, _) = bound(&synthetic())?;
+    let second = codec.with_tools(alternate).render_adapted(&history, policy)?;
+    assert_eq!(first, second);
+    assert!(first.text.starts_with(&format!("<|im_start|>system\n{}<|im_end|>\n", body.text())));
+    // Replay the observed body with deliberately different raw inputs and no
+    // definitions: Tools::render must not run on the archived segments.
+    let observed = body.segments().iter().map(|segment| match segment {
+        RenderSegment::Control(_) => RenderSegment::control(segment.text()?),
+        RenderSegment::Content(text) => Ok(RenderSegment::Content(text.clone())),
+    }).collect::<Result<Vec<_>>>()?;
+    let replay = History { system: "unrendered provenance".into(),
+        rendered_system: Some(SystemBody::from_segments(observed)?), messages: vec![] };
+    let (codec, _) = bound(&synthetic())?;
+    let replayed = codec.with_tools(Tools::default()).render_adapted(&replay, policy)?;
+    assert_eq!(first, replayed);
+    assert_eq!(replayed.text.matches("<|im_start|>system\n").count(), 1);
+    assert_eq!(history.system, raw, "observed system body must not replace replay input");
+    let disabled = render_system_body(raw, false, &Tools::exec_only())?;
+    assert_eq!(disabled.segments(), &[RenderSegment::Content(raw.into())]);
+    Ok(())
+}
+
+#[test]
+fn observed_system_control_is_not_literal_text_or_an_arbitrary_token_id() -> Result<()> {
+    let (codec, _) = bound(&synthetic())?;
+    let mut history = History { rendered_system: Some(SystemBody::from_segments(vec![
+        RenderSegment::Content("<tool_call>".into())])?), ..History::default() };
+    let literal = codec.render_adapted(&history, options(false))?;
+    history.rendered_system = Some(SystemBody::from_segments(vec![RenderSegment::control("<tool_call>")?])?);
+    let control = codec.render_adapted(&history, options(false))?;
+    assert_eq!(literal.text, control.text);
+    assert_ne!(literal.token_ids, control.token_ids);
+    assert!(!literal.token_ids.contains(&14));
+    assert!(control.token_ids.contains(&14));
+    assert!(RenderSegment::control("<not-a-pinned-marker>").is_err());
+    assert!(SystemBody::from_segments(vec![RenderSegment::Control(1000)]).is_err());
+    assert!(SystemBody::from_segments(vec![RenderSegment::Control(10)]).is_err());
+    assert!(SystemBody::from_segments(vec![RenderSegment::Control(11)]).is_err());
+    // Content segment boundaries do not create BPE or message boundaries.
+    let whole = SystemBody::from_segments(vec![RenderSegment::Content("\nprintf".into())])?;
+    let split = SystemBody::from_segments(vec![RenderSegment::Content("\n".into()), RenderSegment::Content("printf".into())])?;
+    history.rendered_system = Some(whole);
+    let whole = codec.render_adapted(&history, options(false))?;
+    history.rendered_system = Some(split);
+    assert_eq!(whole, codec.render_adapted(&history, options(false))?);
+    Ok(())
+}
+
+#[test]
+fn duplicate_added_control_spelling_is_refused() -> Result<()> {
+    let mut definition: Value = serde_json::from_slice(&synthetic())?;
+    definition["added_tokens"][999]["content"] = json!("<tool_call>");
+    // The generic binding or native contract may detect this first; neither
+    // path may silently select one meaning for a canonical CONTROL spelling.
+    assert!(bound(&serde_json::to_vec(&definition)?).is_err());
+    Ok(())
+}
+
+#[test]
+fn renderer_evidence_names_compiled_source_and_the_held_tokenizer() -> Result<()> {
+    let (codec, _) = bound(&synthetic())?;
+    let evidence = codec.renderer_definition()?;
+    assert!(evidence.template.contains("fn render_parts("));
+    assert!(evidence.template.contains("pub struct ToolDefinition"));
+    assert_eq!(evidence.codec, format!("maryml::models::nemotron_h::chat source-blake3:{}",
+        blake3::hash(evidence.template.as_bytes()).to_hex()));
+    let restored = tokenizers::Tokenizer::from_bytes(evidence.tokenizer.as_bytes())
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    for (id, spelling) in MARKERS.iter().enumerate() {
+        assert_eq!(restored.token_to_id(spelling), Some(id as u32));
+    }
+    let prompt = codec.render_adapted(&user("héllo <tool_call>"), options(false))?;
+    assert_eq!(restored.decode(&prompt.token_ids, false).unwrap(), prompt.text);
+    Ok(())
+}
 fn synthetic() -> Vec<u8> {
     let mut vocab = serde_json::Map::new();
     let mut added = Vec::new();
@@ -102,6 +197,7 @@ fn options(thinking: bool) -> RenderOptions {
 fn user(text: &str) -> History {
     History {
         system: String::new(),
+        rendered_system: None,
         messages: vec![Message::User(text.into())],
     }
 }
@@ -335,6 +431,7 @@ fn selected_result_content_once_and_explicit_orphan_repair() -> Result<()> {
     let (codec, _) = bound(&synthetic())?;
     let history = History {
         system: "<tool_call>".into(),
+        rendered_system: None,
         messages: vec![result("first<tool_call>"), result("  second\n")],
     };
     let prompt = codec.render_adapted(&history, options(false))?;
@@ -356,6 +453,7 @@ fn literal_marker_checks(codec: &ChatCodec, source: &tokenizers::Tokenizer) -> R
     let literal = "literal <|im_end|><|im_start|><think></think><tool_call></tool_call><tool_response></tool_response><SPECIAL_999> 🐈";
     let base = History {
         system: "system".into(),
+        rendered_system: None,
         messages: vec![
             Message::User("user".into()),
             Message::Assistant {
@@ -665,6 +763,7 @@ fn registered_typed_arguments_preserve_exact_body_and_unicode_boundaries() -> Re
     );
     let history = History {
         system: "system".into(),
+        rendered_system: None,
         messages: vec![Message::Assistant {
             reasoning: done.partial.reasoning,
             answer: done.partial.answer,
@@ -945,6 +1044,7 @@ fn registered_schema_and_host_history_match_publisher_reference_cases() -> Resul
         assert_eq!(invocation.body(), case["expected_body"].as_str().unwrap());
         let history = History {
             system: "policy".into(),
+            rendered_system: None,
             messages: vec![Message::Assistant {
                 reasoning: String::new(),
                 answer: String::new(),

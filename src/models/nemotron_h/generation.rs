@@ -14,7 +14,7 @@
 use super::{
     chat::{
         ChatCodec, Completion, History, OutputParser, PartialOutput, RenderOptions, RenderedPrompt,
-        StopReason,
+        StopReason, Tools,
     },
     session::{PrefillOutcome, Session, Status},
 };
@@ -130,6 +130,12 @@ impl<S: BlobStoreGet> Generator<S> {
     /// Rebuild the codec from exactly the Session's held native observation and
     /// explicit binding/base/pre-tokenizer. No default collection or new reader.
     pub fn new(session: Session<S>) -> Result<Self> {
+        Self::new_with_tools(session, Tools::exec_only())
+    }
+
+    /// Install the immutable selected function definitions before any prompt
+    /// admission, prefix reuse or generation. No late registry mutation exists.
+    pub fn new_with_tools(session: Session<S>, tools: Tools) -> Result<Self> {
         let source = session.source();
         let snapshot = session.snapshot();
         let codec = ChatCodec::rebuild(
@@ -138,7 +144,7 @@ impl<S: BlobStoreGet> Generator<S> {
             source.tokenizer_binding,
             source.tokenizer_base,
             source.pre_tokenizer,
-        )?;
+        )?.with_tools(tools);
         Ok(Self {
             session,
             codec,
@@ -149,6 +155,14 @@ impl<S: BlobStoreGet> Generator<S> {
 
     pub fn session(&self) -> &Session<S> {
         &self.session
+    }
+
+    pub fn tools(&self) -> &Tools {
+        self.codec.tools()
+    }
+
+    pub fn renderer_definition(&self) -> Result<super::chat::RendererDefinition> {
+        self.codec.renderer_definition()
     }
 
     fn render_prompt(&self, history: &History, options: TurnOptions) -> Result<RenderedPrompt> {

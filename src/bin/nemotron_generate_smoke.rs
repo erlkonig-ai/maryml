@@ -192,6 +192,7 @@ fn execute(args: &Args, record: &mut Value) -> Result<()> {
     record["initialization_seconds"] = json!(started.elapsed().as_secs_f64());
     let history = History {
         system: String::new(),
+        rendered_system: None,
         messages: vec![Message::User(args.prompt.clone())],
     };
     let options = TurnOptions {
