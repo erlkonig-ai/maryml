@@ -194,6 +194,65 @@ fn ordinary_histories_match_complete_source_tokenization() -> Result<()> {
     ordinary_id_checks(&codec, &source)
 }
 
+#[test]
+fn full_window_payload_over_one_mebibyte_is_not_truncated() -> Result<()> {
+    let (codec, source) = bound(&synthetic())?;
+    // Existing native fixture merges three bytes into one ordinary token.
+    // Byte length cannot substitute for the model's actual token capacity.
+    let payload = "\npr".repeat(400_000);
+    assert!(payload.len() > 1_048_576);
+    let ids = codec.encode_content(&payload)?;
+    assert_eq!(ids, vec![1257; 400_000]);
+    assert_eq!(codec.decode(&ids)?, payload);
+
+    let expected = format!(
+        "<|im_start|>system\n<|im_end|>\n<|im_start|>user\n{payload}<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    );
+    let history = user(&payload);
+    assert_eq!(render_reference_text(&history, options(true))?, expected);
+    let prompt = codec.render_adapted(&history, options(true))?;
+    assert_eq!(prompt.text, expected);
+    assert_eq!(
+        prompt.token_ids,
+        source.encode(expected.as_str(), false).unwrap().get_ids()
+    );
+    assert_eq!(codec.decode(&prompt.token_ids)?, expected);
+    assert!(prompt.token_ids.len() + 1024 < 1_048_576);
+    Ok(())
+}
+
+#[test]
+fn more_than_4096_messages_preserve_complete_history_and_reasoning() -> Result<()> {
+    let (codec, source) = bound(&synthetic())?;
+    let mut history = History::default();
+    let mut expected = String::from("<|im_start|>system\n<|im_end|>\n");
+    for i in 0..2050 {
+        history.messages.push(Message::User(format!("user {i}")));
+        history.messages.push(Message::Assistant {
+            reasoning: format!("reasoning {i}"),
+            answer: format!("answer {i}"),
+            exec: None,
+        });
+        // Independent complete publisher text, not another renderer result.
+        expected.push_str(&format!(
+            "<|im_start|>user\nuser {i}<|im_end|>\n<|im_start|>assistant\n<think>\nreasoning {i}</think>answer {i}<|im_end|>\n"
+        ));
+    }
+    expected.push_str("<|im_start|>assistant\n<think>\n");
+    assert_eq!(history.messages.len(), 4100);
+    assert_eq!(render_reference_text(&history, options(true))?, expected);
+    let prompt = codec.render_adapted(&history, options(true))?;
+    assert_eq!(prompt.text, expected);
+    assert_eq!(
+        prompt.token_ids,
+        source.encode(expected.as_str(), false).unwrap().get_ids()
+    );
+    assert_eq!(codec.decode(&prompt.token_ids)?, expected);
+    assert_eq!(prompt.token_ids.iter().filter(|&&id| id == 10).count(), 4102);
+    assert!(prompt.token_ids.len() + 1024 < 1_048_576);
+    Ok(())
+}
+
 fn safety_checks(codec: &ChatCodec, native: &tokenizers::Tokenizer) -> Result<()> {
     for text in [
         "hello  café\n東京 🐈",

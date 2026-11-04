@@ -1,4 +1,7 @@
-//! Bounded text-only Super chat protocol (HF revision da5b2650).
+//! Text-only Super chat protocol (HF revision da5b2650).
+//!
+//! The inference runtime admits the complete tokenized prompt against its real
+//! context capacity. Byte and message counts are not token-capacity bounds.
 //!
 //! The reference template's `truncate_history_thinking` is deliberately false.
 //! Rendering is not append-only: callers must compare token prefixes before
@@ -71,7 +74,6 @@ const MARKERS: [&str; 18] = [
     "<tool_response>",
     "</tool_response>",
 ];
-const MAX_HISTORY_BYTES: usize = 1_048_576;
 const EXEC_SCHEMA: &str = "# Tools\n\nYou have access to the following functions:\n\n<tools>\n<function>\n<name>exec</name>\n<description>Propose a shell command.</description>\n<parameters>\n<parameter>\n<name>command</name>\n<type>string</type>\n<description>Shell command text.</description>\n</parameter>\n<required>[\"command\"]</required>\n</parameters>\n</function>\n</tools>";
 const TOOL_INSTRUCTIONS: &str = "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>";
 const CALL_PREFIX: &str = "\n<function=exec>\n<parameter=command>\n";
@@ -134,27 +136,6 @@ fn valid_command(command: &str) -> Result<()> {
 }
 
 fn render_parts(history: &History, options: RenderOptions, adapted: bool) -> Result<Vec<Part>> {
-    let mut bytes = history.system.len();
-    for message in &history.messages {
-        bytes = bytes
-            .checked_add(match message {
-                Message::User(s) => s.len(),
-                Message::Assistant {
-                    reasoning,
-                    answer,
-                    exec,
-                } => reasoning
-                    .len()
-                    .saturating_add(answer.len())
-                    .saturating_add(exec.as_ref().map_or(0, |e| e.command.len())),
-                Message::ToolResult { content } => content.len(),
-            })
-            .context("history size overflow")?;
-    }
-    ensure!(
-        bytes <= MAX_HISTORY_BYTES && history.messages.len() <= 4096,
-        "history bound exceeded"
-    );
     let mut parts = Vec::new();
     open(&mut parts, "system");
     content(&mut parts, &history.system);
@@ -241,15 +222,24 @@ fn render_parts(history: &History, options: RenderOptions, adapted: bool) -> Res
     Ok(parts)
 }
 
-fn rendered_text(parts: &[Part]) -> String {
+fn rendered_text(parts: &[Part]) -> Result<String> {
+    let bytes = parts.iter().try_fold(0usize, |bytes, part| {
+        let len = match part {
+            Part::Control(id) => MARKERS[*id as usize].len(),
+            Part::Content(s) => s.len(),
+        };
+        bytes.checked_add(len).context("rendered history size overflow")
+    })?;
     let mut text = String::new();
+    text.try_reserve_exact(bytes)
+        .context("allocate complete rendered history")?;
     for part in parts {
         match part {
             Part::Control(id) => text.push_str(MARKERS[*id as usize]),
             Part::Content(s) => text.push_str(s),
         }
     }
-    text
+    Ok(text)
 }
 
 /// Literal reference text only, never safe-to-feed tokenization. A leading
@@ -257,7 +247,7 @@ fn rendered_text(parts: &[Part]) -> String {
 /// prompts. Embedded assistant marker strings are treated as typed content,
 /// not upstream's implicit reasoning.
 pub fn render_reference_text(history: &History, options: RenderOptions) -> Result<String> {
-    Ok(rendered_text(&render_parts(history, options, false)?))
+    rendered_text(&render_parts(history, options, false)?)
 }
 
 #[cfg(feature = "tokenizer")]
@@ -361,7 +351,6 @@ impl ChatCodec {
     /// BOTH added-token matching and BPE from reconstructing a marker token.
     /// The full decode is verified; unsupported content fails closed.
     pub fn encode_content(&self, text: &str) -> Result<Vec<u32>> {
-        ensure!(text.len() <= MAX_HISTORY_BYTES, "content bound exceeded");
         let mut ids = self.encode(text)?;
         if ids.iter().any(|id| self.forbidden.contains(id)) {
             ids.clear();
@@ -391,7 +380,7 @@ impl ChatCodec {
         options: RenderOptions,
     ) -> Result<RenderedPrompt> {
         let parts = render_parts(history, options, true)?;
-        let text = rendered_text(&parts);
+        let text = rendered_text(&parts)?;
         let mut token_ids = Vec::new();
         // Coalesce adjacent content so benign text keeps normal BPE boundaries.
         let mut pending = String::new();

@@ -86,3 +86,11 @@ pub mod tiktoken;
 pub mod tokenizer;
 
 pub use format::*;
+
+// Run the codec's existing cases via --lib without Cargo's integration-test
+// auto-build of unrelated import binaries. The standalone test stays available.
+#[cfg(all(test, feature = "import", feature = "tokenizer"))]
+extern crate self as mary;
+#[cfg(all(test, feature = "import", feature = "tokenizer"))]
+#[path = "../tests/nemotron_chat.rs"]
+mod nemotron_chat_tests;
