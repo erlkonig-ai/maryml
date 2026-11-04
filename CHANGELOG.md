@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Native Nemotron's codec accepts an explicit immutable selection of registered
+  function schemas, with typed arguments and exact generated call bodies in
+  history. Schemas participate in prompt rendering and token admission before
+  prefix reuse. Free speech remains supported and exec retains command-string
+  semantics. Single calls require complete lossless envelopes and matching EOS;
+  ambiguous delimiters, unknown calls and unsupported type inverses release no
+  proposal. A narrow const-discriminator rule covers existing field-dependent
+  arguments; full argument validation remains at the owning Faculty boundary.
+
 - Native Nemotron's completed Prefix can export token-aligned BF16 KV chunks,
   BF16 convolution/F32 recurrent boundaries and last logits through the existing
   typed blob store, and restore into a local uploaded model after complete

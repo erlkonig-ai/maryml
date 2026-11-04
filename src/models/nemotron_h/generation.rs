@@ -25,9 +25,9 @@ use triblespace::prelude::BlobStoreGet;
 #[derive(Clone, Copy, Debug)]
 pub struct TurnOptions {
     pub enable_thinking: bool,
-    /// Advertises the existing proposal grammar and permits returning a parsed
-    /// proposal. False also suppresses unsolicited proposals; never executes.
-    pub exec_tool: bool,
+    /// Advertises the codec's selected tools and permits returning a parsed
+    /// invocation. False also suppresses unsolicited proposals; never executes.
+    pub tools_enabled: bool,
     /// External authority's emission bound, INCLUDING a generated EOS.
     pub max_new_tokens: usize,
 }
@@ -158,7 +158,7 @@ impl<S: BlobStoreGet> Generator<S> {
                 enable_thinking: options.enable_thinking,
                 medium_effort: false,
                 add_generation_prompt: true,
-                exec_tool: options.exec_tool,
+                tools_enabled: options.tools_enabled,
             },
         )
     }
@@ -230,7 +230,7 @@ impl<S: BlobStoreGet> Generator<S> {
             &mut cancelled,
             parser,
         );
-        if !options.exec_tool {
+        if !options.tools_enabled {
             output.completion.proposal = None;
         }
         output

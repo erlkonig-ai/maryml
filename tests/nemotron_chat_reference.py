@@ -33,3 +33,18 @@ for case in cases:
     assert actual == case["expected"], (case["name"], actual, case["expected"])
     print("PASS", case["name"])
 print(f"{len(cases)} pinned-template fixtures passed")
+
+# New typed cases share expected publisher fragments with the Rust gate. The
+# reference uses the retained template, not Mary's rendering implementation.
+registered = json.loads(Path(__file__).with_name("fixtures").joinpath("nemotron_registered_chat_reference.json").read_text())
+for case in registered:
+    actual = render(messages=[{"role":"system", "content":"policy"},
+        {"role":"assistant", "content":"", "tool_calls":[{"function":{
+            "name":case["tool"]["name"], "arguments":case["arguments"]}}]}],
+        tools=[{"type":"function", "function":case["tool"]}],
+        enable_thinking=False, medium_effort=False, add_generation_prompt=True,
+        truncate_history_thinking=False)
+    assert case["expected_schema"] in actual, (case["name"], actual)
+    assert "<tool_call>" + case["expected_body"] + "</tool_call>" in actual, (case["name"], actual)
+    print("PASS", case["name"])
+print(f"{len(registered)} registered-tool publisher fragments passed")

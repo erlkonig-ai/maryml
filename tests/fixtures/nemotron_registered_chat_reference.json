@@ -1,0 +1,41 @@
+[
+  {
+    "name": "typed_parameters",
+    "tool": {
+      "name": "fixture_apply",
+      "description": "Apply typed data.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "flag": {"type": "boolean"},
+          "items": {"type": "array", "items": {"type": "string"}},
+          "nothing": {"type": "null"},
+          "object": {"type": "object"},
+          "text": {"type": "string"}
+        },
+        "required": ["text", "flag"],
+        "additionalProperties": false
+      }
+    },
+    "arguments": {
+      "flag": false,
+      "items": ["", "東京"],
+      "nothing": null,
+      "object": {"nested": [true, null, {"café": "🐈"}]},
+      "text": "true"
+    },
+    "expected_schema": "<function>\n<name>fixture_apply</name>\n<description>Apply typed data.</description>\n<parameters>\n<parameter>\n<name>flag</name>\n<type>boolean</type>\n</parameter>\n<parameter>\n<name>items</name>\n<type>array</type>\n<items>{\"type\": \"string\"}</items>\n</parameter>\n<parameter>\n<name>nothing</name>\n<type>null</type>\n</parameter>\n<parameter>\n<name>object</name>\n<type>object</type>\n</parameter>\n<parameter>\n<name>text</name>\n<type>string</type>\n</parameter>\n<additionalProperties>False</additionalProperties>\n<required>[\"text\", \"flag\"]</required>\n</parameters>\n</function>",
+    "expected_body": "\n<function=fixture_apply>\n<parameter=flag>\nFalse\n</parameter>\n<parameter=items>\n[\"\", \"東京\"]\n</parameter>\n<parameter=nothing>\nNone\n</parameter>\n<parameter=object>\n{\"nested\": [true, null, {\"café\": \"🐈\"}]}\n</parameter>\n<parameter=text>\ntrue\n</parameter>\n</function>\n"
+  },
+  {
+    "name": "empty_arguments",
+    "tool": {
+      "name": "fixture_empty",
+      "description": "No arguments.",
+      "parameters": {"type": "object", "properties": {}, "additionalProperties": false}
+    },
+    "arguments": {},
+    "expected_schema": "<function>\n<name>fixture_empty</name>\n<description>No arguments.</description>\n<parameters>\n<additionalProperties>False</additionalProperties>\n</parameters>\n</function>",
+    "expected_body": "\n<function=fixture_empty>\n</function>\n"
+  }
+]

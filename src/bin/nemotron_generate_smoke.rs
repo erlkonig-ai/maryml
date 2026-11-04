@@ -196,7 +196,7 @@ fn execute(args: &Args, record: &mut Value) -> Result<()> {
     };
     let options = TurnOptions {
         enable_thinking: false,
-        exec_tool: false,
+        tools_enabled: false,
         max_new_tokens: MAX_NEW,
     };
     record["phase"] = json!("prompt-preflight");

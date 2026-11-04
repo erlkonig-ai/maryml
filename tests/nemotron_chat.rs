@@ -80,12 +80,23 @@ fn bound(bytes: &[u8]) -> Result<(ChatCodec, tokenizers::Tokenizer)> {
             .map_err(|error| anyhow::anyhow!("source tokenizer: {error}"))?,
     ))
 }
+fn exec_invocation(command: &str) -> Invocation {
+    Invocation::new(
+        "exec",
+        json!({"command":command}).as_object().unwrap().clone(),
+        &Tools::exec_only(),
+    )
+    .unwrap()
+}
+fn exec_reference(history: &History, options: RenderOptions) -> Result<String> {
+    render_reference_text(history, options, &Tools::exec_only())
+}
 fn options(thinking: bool) -> RenderOptions {
     RenderOptions {
         enable_thinking: thinking,
         medium_effort: false,
         add_generation_prompt: true,
-        exec_tool: false,
+        tools_enabled: false,
     }
 }
 fn user(text: &str) -> History {
@@ -130,9 +141,7 @@ fn fixture(case: &Value) -> (History, RenderOptions) {
             "assistant" => history.messages.push(Message::Assistant {
                 reasoning: msg["reasoning_content"].as_str().unwrap_or_default().into(),
                 answer: text,
-                exec: msg["command"]
-                    .as_str()
-                    .map(|s| ExecProposal { command: s.into() }),
+                tool_call: msg["command"].as_str().map(exec_invocation),
             }),
             "tool" => history.messages.push(result(&text)),
             _ => unreachable!(),
@@ -142,7 +151,7 @@ fn fixture(case: &Value) -> (History, RenderOptions) {
         enable_thinking: case["thinking"].as_bool().unwrap(),
         medium_effort: case["medium"].as_bool().unwrap(),
         add_generation_prompt: case["generation"].as_bool().unwrap(),
-        exec_tool: case["tools"].as_bool().unwrap(),
+        tools_enabled: case["tools"].as_bool().unwrap(),
     };
     (history, o)
 }
@@ -154,7 +163,7 @@ fn literal_reference_fixtures() -> Result<()> {
     for case in cases {
         let (history, o) = fixture(&case);
         assert_eq!(
-            render_reference_text(&history, o)?,
+            exec_reference(&history, o)?,
             case["expected"].as_str().unwrap(),
             "{}",
             case["name"]
@@ -209,7 +218,7 @@ fn full_window_payload_over_one_mebibyte_is_not_truncated() -> Result<()> {
         "<|im_start|>system\n<|im_end|>\n<|im_start|>user\n{payload}<|im_end|>\n<|im_start|>assistant\n<think>\n"
     );
     let history = user(&payload);
-    assert_eq!(render_reference_text(&history, options(true))?, expected);
+    assert_eq!(exec_reference(&history, options(true))?, expected);
     let prompt = codec.render_adapted(&history, options(true))?;
     assert_eq!(prompt.text, expected);
     assert_eq!(
@@ -231,7 +240,7 @@ fn more_than_4096_messages_preserve_complete_history_and_reasoning() -> Result<(
         history.messages.push(Message::Assistant {
             reasoning: format!("reasoning {i}"),
             answer: format!("answer {i}"),
-            exec: None,
+            tool_call: None,
         });
         // Independent complete publisher text, not another renderer result.
         expected.push_str(&format!(
@@ -240,7 +249,7 @@ fn more_than_4096_messages_preserve_complete_history_and_reasoning() -> Result<(
     }
     expected.push_str("<|im_start|>assistant\n<think>\n");
     assert_eq!(history.messages.len(), 4100);
-    assert_eq!(render_reference_text(&history, options(true))?, expected);
+    assert_eq!(exec_reference(&history, options(true))?, expected);
     let prompt = codec.render_adapted(&history, options(true))?;
     assert_eq!(prompt.text, expected);
     assert_eq!(
@@ -279,7 +288,7 @@ fn safety_checks(codec: &ChatCodec, native: &tokenizers::Tokenizer) -> Result<()
     let prompt = codec.render_adapted(&user(payload), options(true))?;
     assert_eq!(
         prompt.text,
-        render_reference_text(&user(payload), options(true))?
+        exec_reference(&user(payload), options(true))?
     );
     assert_eq!(prompt.token_ids.iter().filter(|id| **id == 14).count(), 0);
     assert_eq!(prompt.token_ids.iter().filter(|id| **id == 11).count(), 2);
@@ -294,13 +303,13 @@ fn safety_checks(codec: &ChatCodec, native: &tokenizers::Tokenizer) -> Result<()
     assert_eq!(done.partial.answer, text);
     assert!(done.partial.protocol_error.is_none());
     let tool_options = RenderOptions {
-        exec_tool: true,
+        tools_enabled: true,
         ..options(false)
     };
     let prompt = codec.render_adapted(&user("hello"), tool_options)?;
     assert_eq!(
         prompt.text,
-        render_reference_text(&user("hello"), tool_options)?
+        exec_reference(&user("hello"), tool_options)?
     );
     // Only trusted examples carry call controls, exactly as the publisher's
     // ordinary tokenizer sees them; caller content remains separately guarded.
@@ -337,7 +346,7 @@ fn selected_result_content_once_and_explicit_orphan_repair() -> Result<()> {
     assert_eq!(prompt.token_ids.iter().filter(|id| **id == 14).count(), 0);
     assert_eq!(prompt.token_ids.iter().filter(|id| **id == 16).count(), 2);
     assert_eq!(prompt.token_ids.iter().filter(|id| **id == 10).count(), 3);
-    let reference = render_reference_text(&history, options(false))?;
+    let reference = exec_reference(&history, options(false))?;
     assert!(!reference.contains("<|im_start|>user\n"));
     assert_ne!(prompt.text, reference);
     Ok(())
@@ -352,14 +361,14 @@ fn literal_marker_checks(codec: &ChatCodec, source: &tokenizers::Tokenizer) -> R
             Message::Assistant {
                 reasoning: "reason".into(),
                 answer: "answer".into(),
-                exec: None,
+                tool_call: None,
             },
             result("result"),
         ],
     };
     for tools in [false, true] {
         let options = RenderOptions {
-            exec_tool: tools,
+            tools_enabled: tools,
             ..options(true)
         };
         let normal = codec.render_adapted(&base, options)?;
@@ -443,7 +452,7 @@ fn eos_only_proposals_preserve_command_bytes() -> Result<()> {
         assert_eq!(parser.snapshot()?.reasoning, "consider café 🐈");
         parser.push(&[eos]);
         let done = parser.finish(StopReason::Eos { id: eos })?;
-        assert_eq!(done.proposal.unwrap().command, command);
+        assert_eq!(done.proposal.unwrap().arguments()["command"], command);
         assert_eq!(done.partial.answer, "I'll check.\n");
         assert!(done.partial.protocol_error.is_none());
     }
@@ -464,7 +473,7 @@ fn eos_only_proposals_preserve_command_bytes() -> Result<()> {
         )
         .proposal
         .unwrap()
-        .command,
+        .arguments()["command"],
         literal
     );
     Ok(())
@@ -579,6 +588,382 @@ fn retained_real_tokenizer_content_policy() -> Result<()> {
         &call(&codec, command, Some(11)),
         StopReason::Eos { id: 11 },
     );
-    assert_eq!(done.proposal.unwrap().command, command);
+    assert_eq!(done.proposal.unwrap().arguments()["command"], command);
+    Ok(())
+}
+
+fn registered_tools() -> Result<Tools> {
+    Tools::new(vec![
+        ToolDefinition::exec(),
+        ToolDefinition {
+            name: "fixture_apply".into(),
+            description: "Apply typed fixture data.".into(),
+            input_schema: json!({"type":"object","properties":{
+            "text":{"type":"string"},"empty":{"type":"string"},
+            "flag":{"type":"boolean"},"nothing":{"type":"null"},
+            "count":{"type":"integer"},"ratio":{"type":"number"},
+            "items":{"type":"array","items":{"type":"string"}},
+            "object":{"type":"object"}},"required":["text"],"additionalProperties":false}),
+        },
+        ToolDefinition {
+            name: "fixture_empty".into(),
+            description: "No arguments.".into(),
+            input_schema: json!({"type":"object","properties":{},"additionalProperties":false}),
+        },
+    ])
+}
+
+fn body_ids(codec: &ChatCodec, body: &str) -> Result<Vec<u32>> {
+    let mut ids = vec![14];
+    ids.extend(codec.encode_content(body)?);
+    ids.extend([15, 11]);
+    Ok(ids)
+}
+
+#[test]
+fn registered_typed_arguments_preserve_exact_body_and_unicode_boundaries() -> Result<()> {
+    let (codec, _) = bound(&synthetic())?;
+    let codec = codec.with_tools(registered_tools()?);
+    let body = concat!(
+        "\n<function=fixture_apply>\n",
+        "<parameter=object>\n{ \"nested\": [true, null, {\"café\":\"東京 🐈\"}] }\n</parameter>\n",
+        "<parameter=text>\n  true\n東京 🐈  \n</parameter>\n",
+        "<parameter=empty>\n\n</parameter>\n",
+        "<parameter=flag>\nFalse\n</parameter>\n",
+        "<parameter=nothing>\nNone\n</parameter>\n",
+        "<parameter=count>\n42\n</parameter>\n",
+        "<parameter=ratio>\n1.25\n</parameter>\n",
+        "<parameter=items>\n[\"\",\"é\"]\n</parameter>\n</function>\n"
+    );
+    let ids = body_ids(&codec, body)?;
+    let mut parser = OutputParser::new(&codec, true, ids.len() + 100);
+    for id in codec.encode_content("consider 🐈")? {
+        parser.push(&[id]);
+    }
+    parser.push(&[13]);
+    for id in codec.encode_content("I'll apply it.")? {
+        parser.push(&[id]);
+    }
+    for id in ids {
+        assert!(parser.push(&[id]));
+        parser.snapshot()?;
+    }
+    let done = parser.finish(StopReason::Eos { id: 11 })?;
+    assert!(done.partial.protocol_error.is_none());
+    assert_eq!(done.partial.reasoning, "consider 🐈");
+    assert_eq!(done.partial.answer, "I'll apply it.");
+    let invocation = done.proposal.unwrap();
+    assert_eq!(invocation.name(), "fixture_apply");
+    assert_eq!(invocation.body(), body);
+    assert_eq!(
+        invocation.arguments(),
+        json!({"object":{"nested":[true,null,{"café":"東京 🐈"}]},
+        "text":"  true\n東京 🐈  ","empty":"","flag":false,"nothing":null,
+        "count":42,"ratio":1.25,"items":["","é"]})
+        .as_object()
+        .unwrap()
+    );
+    let history = History {
+        system: "system".into(),
+        messages: vec![Message::Assistant {
+            reasoning: done.partial.reasoning,
+            answer: done.partial.answer,
+            tool_call: Some(invocation),
+        }],
+    };
+    let rendered = codec.render_adapted(&history, options(true))?;
+    assert!(
+        rendered
+            .text
+            .contains(&format!("<tool_call>{body}</tool_call>"))
+    );
+    assert_eq!(codec.decode(&rendered.token_ids)?, rendered.text);
+    Ok(())
+}
+
+fn headspace_schema() -> Value {
+    // Exact shape of the existing Faculty's field-discriminated value. This
+    // is not a generic schema evaluator or a special case for its tool name.
+    json!({"type":"object","properties":{
+    "field":{"type":"string","enum":["model","base-url","reasoning-effort","stream",
+        "context-window-tokens","max-output-tokens","prompt-safety-margin-tokens","prompt-chars-per-token"]},
+    "value":{}},"required":["field","value"],"additionalProperties":false,
+    "oneOf":[
+        {"properties":{"field":{"const":"model"},"value":{"type":"string"}}},
+        {"properties":{"field":{"const":"base-url"},"value":{"type":"string"}}},
+        {"properties":{"field":{"const":"reasoning-effort"},"value":{"type":"string"}}},
+        {"properties":{"field":{"const":"stream"},"value":{"type":"boolean"}}},
+        {"properties":{"field":{"const":"context-window-tokens"},"value":{"type":"integer","minimum":0}}},
+        {"properties":{"field":{"const":"max-output-tokens"},"value":{"type":"integer","minimum":0}}},
+        {"properties":{"field":{"const":"prompt-safety-margin-tokens"},"value":{"type":"integer","minimum":0}}},
+        {"properties":{"field":{"const":"prompt-chars-per-token"},"value":{"type":"integer","minimum":0}}}
+    ]})
+}
+
+#[test]
+fn registered_discriminator_preserves_string_true_and_publisher_false() -> Result<()> {
+    let schema = headspace_schema();
+    let tools = Tools::new(vec![ToolDefinition {
+        name: "headspace_set".into(),
+        description: "Set one field.".into(),
+        input_schema: schema.clone(),
+    }])?;
+    let (codec, _) = bound(&synthetic())?;
+    let codec = codec.with_tools(tools);
+    for (field, value, expected) in [
+        ("model", "true", json!("true")),
+        ("stream", "False", json!(false)),
+        ("context-window-tokens", "4096", json!(4096)),
+    ] {
+        // Discriminator follows value on the wire; decode all explicit base
+        // parameters before selecting the branch, independent of wire order.
+        let body = format!(
+            "\n<function=headspace_set>\n<parameter=value>\n{value}\n</parameter>\n<parameter=field>\n{field}\n</parameter>\n</function>\n"
+        );
+        let done = complete(
+            &codec,
+            &body_ids(&codec, &body)?,
+            StopReason::Eos { id: 11 },
+        );
+        let invocation = done.proposal.unwrap();
+        assert_eq!(invocation.arguments()["value"], expected);
+        assert_eq!(invocation.body(), body);
+    }
+    assert_eq!(codec.tools().definitions()[0].input_schema, schema);
+    let rendered = codec.render_adapted(
+        &user("set it"),
+        RenderOptions {
+            tools_enabled: true,
+            ..options(false)
+        },
+    )?;
+    assert!(rendered.text.contains("<oneOf>"));
+    assert!(rendered.text.contains("\"const\": \"stream\""));
+    Ok(())
+}
+
+#[test]
+fn registered_ambiguous_or_unmatched_types_never_propose() -> Result<()> {
+    let (codec, _) = bound(&synthetic())?;
+    let mut ambiguous = headspace_schema();
+    let duplicate = ambiguous["oneOf"][0].clone();
+    ambiguous["oneOf"].as_array_mut().unwrap().push(duplicate);
+    let codec = codec.with_tools(Tools::new(vec![ToolDefinition {
+        name: "configure".into(),
+        description: String::new(),
+        input_schema: ambiguous,
+    }])?);
+    for field in ["model", "unknown"] {
+        let body = format!(
+            "\n<function=configure>\n<parameter=field>\n{field}\n</parameter>\n<parameter=value>\ntrue\n</parameter>\n</function>\n"
+        );
+        let done = complete(
+            &codec,
+            &body_ids(&codec, &body)?,
+            StopReason::Eos { id: 11 },
+        );
+        assert!(done.proposal.is_none());
+        assert!(done.partial.protocol_error.is_some());
+    }
+    let tools = Tools::new(vec![ToolDefinition {
+        name: "union".into(),
+        description: String::new(),
+        input_schema: json!({"type":"object","properties":{"value":{"type":["string","boolean"]}}}),
+    }])?;
+    assert!(
+        tools
+            .parse_call("\n<function=union>\n<parameter=value>\ntrue\n</parameter>\n</function>\n")
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn registered_calls_require_known_complete_typed_envelope_and_matching_eos() -> Result<()> {
+    let (codec, _) = bound(&synthetic())?;
+    let codec = codec.with_tools(registered_tools()?);
+    let body = "\n<function=fixture_empty>\n</function>\n";
+    let ids = body_ids(&codec, body)?;
+    let done = complete(&codec, &ids, StopReason::Eos { id: 11 });
+    assert_eq!(done.proposal.unwrap().arguments().len(), 0);
+    for stop in [
+        StopReason::Budget,
+        StopReason::Cancelled,
+        StopReason::Error("fixture".into()),
+        StopReason::Eos { id: 2 },
+    ] {
+        assert!(complete(&codec, &ids, stop).proposal.is_none());
+    }
+    for end in 0..ids.len() {
+        assert!(
+            complete(&codec, &ids[..end], StopReason::Eos { id: 11 })
+                .proposal
+                .is_none()
+        );
+    }
+    for bad in [
+        "\n<function=absent>\n</function>\n",
+        "\n<function=fixture_apply>\n</function>\n",
+        "\n<function=fixture_apply>\n<parameter=text>\nx\n</parameter>\n<parameter=count>\n1.5\n</parameter>\n</function>\n",
+        "\n<function=fixture_apply>\n<parameter=text>\nx</parameter>y\n</parameter>\n</function>\n",
+    ] {
+        let done = complete(&codec, &body_ids(&codec, bad)?, StopReason::Eos { id: 11 });
+        assert!(done.proposal.is_none());
+        assert!(done.partial.protocol_error.is_some());
+    }
+    Ok(())
+}
+
+#[test]
+fn registered_integer_bounds_and_original_numeric_lexemes_are_distinct() -> Result<()> {
+    let (codec, _) = bound(&synthetic())?;
+    let codec = codec.with_tools(registered_tools()?);
+    for integer in ["18446744073709551616", "-9223372036854775809", "1.5", "1e0"] {
+        let body = format!(
+            "\n<function=fixture_apply>\n<parameter=text>\nx\n</parameter>\n<parameter=count>\n{integer}\n</parameter>\n</function>\n"
+        );
+        let done = complete(&codec, &body_ids(&codec, &body)?, StopReason::Eos { id: 11 });
+        assert!(done.proposal.is_none(), "{integer}");
+        assert!(done.partial.protocol_error.is_some(), "{integer}");
+    }
+    for integer in ["18446744073709551615", "-9223372036854775808"] {
+        let body = format!(
+            "\n<function=fixture_apply>\n<parameter=text>\nx\n</parameter>\n<parameter=count>\n{integer}\n</parameter>\n</function>\n"
+        );
+        let invocation = codec.tools().parse_call(&body)?;
+        assert_eq!(invocation.arguments()["count"].to_string(), integer);
+        assert_eq!(invocation.body(), body);
+    }
+    // The typed projection intentionally has finite-f64 semantics for numbers
+    // and nested free-form JSON. The exact original is still independently
+    // available even where serializing that projection loses numeric spelling.
+    let body = concat!(
+        "\n<function=fixture_apply>\n<parameter=text>\nx\n</parameter>\n",
+        "<parameter=ratio>\n1.2300e+2\n</parameter>\n",
+        "<parameter=object>\n{\"n\":18446744073709551616,\"f\":1.2300e+2}\n</parameter>\n</function>\n"
+    );
+    let invocation = codec.tools().parse_call(body)?;
+    assert_eq!(invocation.body(), body);
+    assert_eq!(invocation.arguments()["ratio"].as_f64(), Some(123.0));
+    assert_ne!(invocation.arguments()["ratio"].to_string(), "1.2300e+2");
+    for nonfinite in ["1e400", "NaN", "Infinity"] {
+        let body = format!(
+            "\n<function=fixture_apply>\n<parameter=text>\nx\n</parameter>\n<parameter=ratio>\n{nonfinite}\n</parameter>\n</function>\n"
+        );
+        assert!(codec.tools().parse_call(&body).is_err());
+    }
+    Ok(())
+}
+
+#[test]
+fn registered_tools_leave_speech_free_and_change_actual_prompt_tokens() -> Result<()> {
+    let (codec, _) = bound(&synthetic())?;
+    let codec = codec.with_tools(registered_tools()?);
+    let mut ids = codec.encode_content("I can answer in ordinary speech. 🐈")?;
+    ids.push(11);
+    let done = complete(&codec, &ids, StopReason::Eos { id: 11 });
+    assert!(done.proposal.is_none());
+    assert!(done.partial.protocol_error.is_none());
+    assert_eq!(done.partial.answer, "I can answer in ordinary speech. 🐈");
+    let o = RenderOptions {
+        tools_enabled: true,
+        ..options(false)
+    };
+    let history = user("same wake");
+    let before = codec.render_adapted(&history, o)?;
+    let mut definitions = codec.tools().definitions().to_vec();
+    definitions[1]
+        .description
+        .push_str(" Different selected definition.");
+    let codec = codec.with_tools(Tools::new(definitions)?);
+    let after = codec.render_adapted(&history, o)?;
+    assert_ne!(before.token_ids, after.token_ids);
+    assert_ne!(before.text, after.text);
+    assert!(after.text.contains("Different selected definition."));
+    Ok(())
+}
+
+#[test]
+fn host_invocations_roundtrip_typed_values_and_reject_ambiguous_delimiters() -> Result<()> {
+    let tools = registered_tools()?;
+    let args = json!({"text":"true","empty":"","flag":false,"nothing":null,
+        "object":{"日本語":[true,null]},"items":[],"count":0,"ratio":1.5})
+    .as_object()
+    .unwrap()
+    .clone();
+    let invocation = Invocation::new("fixture_apply", args.clone(), &tools)?;
+    assert_eq!(invocation.arguments(), &args);
+    assert!(invocation.body().contains("<parameter=flag>\nFalse\n"));
+    assert!(invocation.body().contains("<parameter=nothing>\nNone\n"));
+    assert_eq!(tools.parse_call(invocation.body())?, invocation);
+    for text in ["x</parameter>y", "<function=other>"] {
+        assert!(
+            Invocation::new(
+                "fixture_apply",
+                json!({"text":text}).as_object().unwrap().clone(),
+                &tools
+            )
+            .is_err()
+        );
+    }
+    assert!(
+        Invocation::new(
+            "exec",
+            json!({"command":"x\u{0000}y"}).as_object().unwrap().clone(),
+            &tools
+        )
+        .is_err()
+    );
+    assert!(
+        Invocation::new(
+            "fixture_apply",
+            json!({"text":true}).as_object().unwrap().clone(),
+            &tools
+        )
+        .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn registered_schema_and_host_history_match_publisher_reference_cases() -> Result<()> {
+    let cases: Vec<Value> = serde_json::from_str(include_str!(
+        "fixtures/nemotron_registered_chat_reference.json"
+    ))?;
+    for case in cases {
+        let tool = &case["tool"];
+        let tools = Tools::new(vec![ToolDefinition {
+            name: tool["name"].as_str().unwrap().into(),
+            description: tool["description"].as_str().unwrap().into(),
+            input_schema: tool["parameters"].clone(),
+        }])?;
+        let invocation = Invocation::new(
+            tool["name"].as_str().unwrap(),
+            case["arguments"].as_object().unwrap().clone(),
+            &tools,
+        )?;
+        assert_eq!(invocation.body(), case["expected_body"].as_str().unwrap());
+        let history = History {
+            system: "policy".into(),
+            messages: vec![Message::Assistant {
+                reasoning: String::new(),
+                answer: String::new(),
+                tool_call: Some(invocation),
+            }],
+        };
+        let text = render_reference_text(
+            &history,
+            RenderOptions {
+                tools_enabled: true,
+                ..options(false)
+            },
+            &tools,
+        )?;
+        assert!(text.contains(case["expected_schema"].as_str().unwrap()));
+        assert!(text.contains(&format!(
+            "<tool_call>{}</tool_call>",
+            case["expected_body"].as_str().unwrap()
+        )));
+    }
     Ok(())
 }

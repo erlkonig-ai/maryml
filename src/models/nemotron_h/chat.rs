@@ -10,10 +10,9 @@
 
 use anyhow::{Context, Result, ensure};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ExecProposal {
-    pub command: String,
-}
+#[path = "chat_tools.rs"]
+mod tools;
+pub use tools::{Invocation, ToolDefinition, Tools};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Message {
@@ -21,7 +20,7 @@ pub enum Message {
     Assistant {
         reasoning: String,
         answer: String,
-        exec: Option<ExecProposal>,
+        tool_call: Option<Invocation>,
     },
     /// Selected model-visible text. Result identity/status remain host-side.
     ToolResult {
@@ -43,7 +42,7 @@ pub struct RenderOptions {
     /// Initial resident mode sets false; any reuse still needs prefix equality.
     pub medium_effort: bool,
     pub add_generation_prompt: bool,
-    pub exec_tool: bool,
+    pub tools_enabled: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -74,10 +73,7 @@ const MARKERS: [&str; 18] = [
     "<tool_response>",
     "</tool_response>",
 ];
-const EXEC_SCHEMA: &str = "# Tools\n\nYou have access to the following functions:\n\n<tools>\n<function>\n<name>exec</name>\n<description>Propose a shell command.</description>\n<parameters>\n<parameter>\n<name>command</name>\n<type>string</type>\n<description>Shell command text.</description>\n</parameter>\n<required>[\"command\"]</required>\n</parameters>\n</function>\n</tools>";
 const TOOL_INSTRUCTIONS: &str = "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>";
-const CALL_PREFIX: &str = "\n<function=exec>\n<parameter=command>\n";
-const CALL_SUFFIX: &str = "\n</parameter>\n</function>\n";
 
 #[derive(Debug)]
 enum Part {
@@ -135,15 +131,20 @@ fn valid_command(command: &str) -> Result<()> {
     Ok(())
 }
 
-fn render_parts(history: &History, options: RenderOptions, adapted: bool) -> Result<Vec<Part>> {
+fn render_parts(
+    history: &History,
+    options: RenderOptions,
+    tools: &Tools,
+    adapted: bool,
+) -> Result<Vec<Part>> {
     let mut parts = Vec::new();
     open(&mut parts, "system");
     content(&mut parts, &history.system);
-    if options.exec_tool {
+    if options.tools_enabled && !tools.definitions().is_empty() {
         if !history.system.is_empty() {
             content(&mut parts, "\n\n");
         }
-        content(&mut parts, EXEC_SCHEMA);
+        content(&mut parts, tools.render()?);
         // Publisher examples retain their published token representation even
         // though they occur inside system instructions, not an actual call.
         trusted_template(&mut parts, TOOL_INSTRUCTIONS);
@@ -166,7 +167,7 @@ fn render_parts(history: &History, options: RenderOptions, adapted: bool) -> Res
             Message::Assistant {
                 reasoning,
                 answer,
-                exec,
+                tool_call,
             } => {
                 open(&mut parts, "assistant");
                 control(&mut parts, 12);
@@ -177,13 +178,11 @@ fn render_parts(history: &History, options: RenderOptions, adapted: bool) -> Res
                 // Reference trims the combined body, whose first bytes are
                 // always <think>; thus only the answer's trailing space goes.
                 content(&mut parts, answer.trim_end());
-                if let Some(exec) = exec {
-                    valid_command(&exec.command)?;
+                if let Some(invocation) = tool_call {
+                    invocation.validate(tools)?;
                     content(&mut parts, "\n");
                     control(&mut parts, 14);
-                    content(&mut parts, CALL_PREFIX);
-                    content(&mut parts, &exec.command);
-                    content(&mut parts, CALL_SUFFIX);
+                    content(&mut parts, invocation.body());
                     control(&mut parts, 15);
                     content(&mut parts, "\n");
                 }
@@ -246,14 +245,19 @@ fn rendered_text(parts: &[Part]) -> Result<String> {
 /// orphan retains the upstream missing opener. Use `render_adapted` for actual
 /// prompts. Embedded assistant marker strings are treated as typed content,
 /// not upstream's implicit reasoning.
-pub fn render_reference_text(history: &History, options: RenderOptions) -> Result<String> {
-    rendered_text(&render_parts(history, options, false)?)
+pub fn render_reference_text(
+    history: &History,
+    options: RenderOptions,
+    tools: &Tools,
+) -> Result<String> {
+    rendered_text(&render_parts(history, options, tools, false)?)
 }
 
 #[cfg(feature = "tokenizer")]
 pub struct ChatCodec {
     tokenizer: tokenizers::Tokenizer,
     forbidden: std::collections::HashSet<u32>,
+    tools: Tools,
 }
 
 #[cfg(feature = "tokenizer")]
@@ -297,7 +301,20 @@ impl ChatCodec {
         Ok(Self {
             tokenizer,
             forbidden,
+            tools: Tools::exec_only(),
         })
+    }
+
+    /// Install the actual immutable tool selection BEFORE preparing any wake
+    /// or retained prefix. The selection is rendered/token-admitted normally;
+    /// it is not a late execution-only attachment or a mutable registry.
+    pub fn with_tools(mut self, tools: Tools) -> Self {
+        self.tools = tools;
+        self
+    }
+
+    pub fn tools(&self) -> &Tools {
+        &self.tools
     }
 
     fn encode(&self, text: &str) -> Result<Vec<u32>> {
@@ -379,7 +396,7 @@ impl ChatCodec {
         history: &History,
         options: RenderOptions,
     ) -> Result<RenderedPrompt> {
-        let parts = render_parts(history, options, true)?;
+        let parts = render_parts(history, options, &self.tools, true)?;
         let text = rendered_text(&parts)?;
         let mut token_ids = Vec::new();
         // Coalesce adjacent content so benign text keeps normal BPE boundaries.
@@ -425,7 +442,7 @@ pub struct PartialOutput {
 pub struct Completion {
     pub partial: PartialOutput,
     pub stop: StopReason,
-    pub proposal: Option<ExecProposal>,
+    pub proposal: Option<Invocation>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -550,22 +567,13 @@ impl<'a> OutputParser<'a> {
                 if !suffix.is_empty() && suffix != "\n" {
                     self.fail("suffix after tool call");
                 }
-                let body = self.codec.decode_command(&self.call);
-                match body
-                    .as_ref()
-                    .ok()
-                    .and_then(|s| s.strip_prefix(CALL_PREFIX))
-                    .and_then(|s| s.strip_suffix(CALL_SUFFIX))
+                match self
+                    .codec
+                    .decode_command(&self.call)
+                    .and_then(|body| self.codec.tools.parse_call(&body))
                 {
-                    Some(command) => match valid_command(command) {
-                        Ok(()) => {
-                            proposal = Some(ExecProposal {
-                                command: command.to_owned(),
-                            })
-                        }
-                        Err(_) => self.fail("ambiguous command delimiters"),
-                    },
-                    None => self.fail("expected exactly one exec(command) XML block"),
+                    Ok(invocation) => proposal = Some(invocation),
+                    Err(error) => self.fail(&format!("invalid registered tool call: {error:#}")),
                 }
             }
         }

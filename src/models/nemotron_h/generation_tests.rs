@@ -2,7 +2,7 @@
 //! The scripted cases are NOT a CPU model, codec oracle or GPU witness.
 //! Existing chat tests own token grammar/UTF-8 semantics; these scripts inject
 //! failures and logits at the same private loop boundary used by production.
-use super::super::chat::ExecProposal;
+use super::super::chat::{Invocation, Tools};
 use super::*;
 use super::super::session::MAX_CHUNK;
 use std::{cell::Cell, collections::VecDeque, rc::Rc};
@@ -167,9 +167,11 @@ impl Decoder for DecodeScript {
         Ok(Completion {
             partial,
             stop,
-            proposal: Some(ExecProposal {
-                command: "mock, never executed".into(),
-            }),
+            proposal: Some(Invocation::new(
+                "exec",
+                serde_json::from_value(serde_json::json!({"command":"mock, never executed"}))?,
+                &Tools::exec_only(),
+            )?),
         })
     }
 }
