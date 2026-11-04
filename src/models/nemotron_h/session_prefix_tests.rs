@@ -31,7 +31,11 @@ fn session_gpu_prefix_forks_restore_and_keep_independent_suffixes() {
     let boundary_logits = a.last_logits().unwrap().values.to_vec();
     assert_eq!(a.prefix_ownership().unwrap().private_mamba_bytes, 0);
     a.append_ids(&[4, 6]).unwrap();
+    let a_state = state_bytes(&a);
+    let a_logits = a.last_logits().unwrap().values.to_vec();
     b.append_ids(&[9]).unwrap();
+    assert_eq!(state_bytes(&a), a_state, "another fork cannot overwrite private state");
+    assert_eq!(a.last_logits().unwrap().values, a_logits);
     assert!(a.prefix_ownership().unwrap().private_mamba_bytes > 0);
     let b_state = state_bytes(&b);
     let b_logits = b.last_logits().unwrap().values.to_vec();
