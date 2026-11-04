@@ -35,6 +35,9 @@ use source::NativeExperts;
 #[path = "session_prefix.rs"]
 mod prefix;
 pub use prefix::{Prefix, PrefixAllocation, PrefixOwnership, prefix_admission};
+#[path = "session_checkpoint.rs"]
+mod checkpoint;
+pub use checkpoint::{PrefixCheckpoint, PrefixExecution, PrefixProvenance, PrefixLayer, KvChunk};
 #[path = "session_prefill.rs"]
 mod prefill;
 pub use prefill::{PrefillAllocation, PrefillOutcome, admission as prefill_admission};
@@ -45,7 +48,7 @@ pub const MAX_CHUNK: usize = 256;
 
 /// Explicit caller-selected observation coordinates. Collection is provenance,
 /// not an extra authorization check; the held ModelSnapshot carries support.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Source {
     pub collection: CollectionHandle,
     pub root: Id,

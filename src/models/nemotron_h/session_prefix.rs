@@ -2,20 +2,22 @@
 //! cross-process identity. Tokens and exact uploaded ownership decide reuse.
 use super::*;
 
-enum Boundary {
+pub(super) enum Boundary {
     Mamba(Arc<gpu::State<CudaRuntime>>),
     Attention(Arc<attention::KvPrefix>),
     Stateless,
 }
 
 /// Published only after successful origin-stream completion. Private fields
-/// prevent importing or relabelling a checkpoint from another model/runtime.
+/// prevent unfenced device state from being relabelled as a usable prefix.
+/// Portable import goes through the model-owned restore contract, not these
+/// process-local Arc/stream/Handle descriptors.
 pub struct Prefix<S> {
     pub(super) model: Arc<DeviceModel<S>>,
     pub(super) stream: StreamId,
     pub(super) ids: Arc<[u32]>,
     pub(super) logits: Arc<[f32]>,
-    layers: Vec<Boundary>,
+    pub(super) layers: Vec<Boundary>,
 }
 impl<S> Prefix<S> {
     pub fn token_ids(&self) -> &[u32] { &self.ids }

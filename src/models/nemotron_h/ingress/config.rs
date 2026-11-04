@@ -37,7 +37,7 @@ impl<'de> Deserialize<'de> for TimeStepBound {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct TextConfig {
     pub model_type: String,
     pub layers_block_type: Vec<LayerKind>,

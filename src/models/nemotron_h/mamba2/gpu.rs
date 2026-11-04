@@ -45,6 +45,18 @@ pub struct State<R: CubeRuntime> {
     recurrent: CubeTensor<R>,
 }
 impl<R: CubeRuntime> State<R> {
+    /// Model-owned import of a completed boundary. Descriptor checks do not
+    /// establish model compatibility or CUDA completion; the hybrid owner does.
+    pub(in crate::models::nemotron_h) fn imported(config: Config, attended: usize,
+        conv: CubeTensor<R>, recurrent: CubeTensor<R>) -> Result<Self>
+    {
+        if attended == 0 { return Err("empty imported Mamba boundary".into()); }
+        let layout = config.layout()?;
+        check(&conv, &conv, "imported convolution", &[1, layout.conv_channels, config.conv_kernel], DType::BF16)?;
+        check(&recurrent, &conv, "imported recurrence", &[1, config.heads, config.head_dim, config.state_dim], DType::F32)?;
+        Ok(Self { config, batch: 1, attended, conv, recurrent })
+    }
+
     pub fn attended(&self) -> usize {
         self.attended
     }

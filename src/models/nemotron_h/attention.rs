@@ -148,6 +148,31 @@ pub(super) struct KvPrefix {
     rows: usize,
 }
 
+impl KvPrefix {
+    /// Owning handles over one exact contiguous token range. The caller keeps
+    /// this immutable prefix alive and reads on its fenced origin stream.
+    pub(super) fn range(&self, start: usize, rows: usize) -> Result<[Handle; 2]> {
+        let end = start.checked_add(rows).ok_or("KV export range overflow")?;
+        if rows == 0 || end > self.rows { return Err("KV export outside prefix".into()); }
+        let hi = checked_elements(&[end, KV_WIDTH], 2)? * 2;
+        let lo = start * KV_WIDTH * 2; // bounded by checked hi
+        let slice = |h: &Handle| -> Result<Handle> {
+            if h.size_in_used() < hi as u64 { return Err("short KV backing".into()); }
+            Ok(h.clone().offset_start(lo as u64).offset_end(h.size_in_used() - hi as u64))
+        };
+        Ok([slice(&self.keys)?, slice(&self.values)?])
+    }
+
+    /// The hybrid importer owns/fences both uploads before publishing Prefix.
+    pub(super) fn imported(weights: Arc<Weights>, rows: usize, keys: Handle, values: Handle) -> Result<Arc<Self>> {
+        let size = checked_elements(&[rows, KV_WIDTH], 2)? * 2;
+        if keys.size_in_used() != size as u64 || values.size_in_used() != size as u64 {
+            return Err("imported KV backing differs from prefix extent".into());
+        }
+        Ok(Arc::new(Self { weights, rows, keys, values }))
+    }
+}
+
 pub struct Output {
     /// Queued BF16 [1,T,4096], before the caller's outer residual addition.
     pub values: CudaTensor,

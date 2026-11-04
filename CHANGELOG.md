@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Native Nemotron's completed Prefix can export token-aligned BF16 KV chunks,
+  BF16 convolution/F32 recurrent boundaries and last logits through the existing
+  typed blob store, and restore into a local uploaded model after complete
+  structural validation and successful origin upload. Caller policy remains
+  responsible for selected operand/arithmetic compatibility. This prepares a
+  portable checkpoint payload seam, not a pile schema, sync service or claim
+  of cross-device numerical equivalence; existing private suffix forks remain.
+
 - Native Nemotron generation reaches the Session reuse observer instead of
   recursively dispatching back to its own runtime adapter. Unconditional
   recursion is now a crate-level compile error. A reserved CUDA regression

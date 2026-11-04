@@ -35,7 +35,7 @@ fn configuration() -> Value {
         "routed_scaling_factor":5.0,"n_group":1,"topk_group":1
     }"#).unwrap()
 }
-fn config() -> TextConfig {
+pub(super) fn config() -> TextConfig {
     serde_json::from_value(configuration()).unwrap()
 }
 pub(in crate::models::nemotron_h) fn limits() -> Limits {
@@ -916,7 +916,7 @@ fn session_gpu_layer_major_prefill_publication_and_failure_owners() {
     }
 }
 
-fn state_bytes<S: BlobStoreGet>(session: &Session<S>) -> Vec<Vec<u8>> {
+pub(super) fn state_bytes<S: BlobStoreGet>(session: &Session<S>) -> Vec<Vec<u8>> {
     session.stream.executes(|| {
         let mut result = Vec::new();
         for layer in &session.layers {
