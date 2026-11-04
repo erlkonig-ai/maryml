@@ -169,7 +169,8 @@ impl<S: BlobStoreGet> Session<S> {
                 session_ready = self.status == Status::Ready).entered();
         }
     }
-    pub(super) fn observe_reuse(&self) {
+    // generation is a sibling of session; pub(super) here only reaches session.
+    pub(in crate::models::nemotron_h) fn observe_reuse(&self) {
         if self.status == Status::Ready {
             let outcome = if self.prefix.is_some() { "continued" }
                 else if self.seed.is_some() { "seed_pending" } else { "no_saved_prefix" };

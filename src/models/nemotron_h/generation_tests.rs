@@ -1,4 +1,5 @@
-//! Scripted control-flow tests, NOT a CPU model, codec oracle or GPU witness.
+//! Scripted control-flow tests plus one explicitly ignored native dispatch test.
+//! The scripted cases are NOT a CPU model, codec oracle or GPU witness.
 //! Existing chat tests own token grammar/UTF-8 semantics; these scripts inject
 //! failures and logits at the same private loop boundary used by production.
 use super::super::chat::ExecProposal;
@@ -193,8 +194,13 @@ struct ProgressSpan {
     closed: bool,
 }
 
-#[derive(Clone, Default)]
-struct ProgressCapture(std::sync::Arc<std::sync::Mutex<Vec<ProgressSpan>>>);
+#[derive(Clone)]
+struct ProgressCapture(std::sync::Arc<std::sync::Mutex<Vec<ProgressSpan>>>, &'static str);
+impl Default for ProgressCapture {
+    fn default() -> Self {
+        Self(Default::default(), "native_append")
+    }
+}
 
 struct ProgressFields<'a>(&'a mut Vec<(String, String)>);
 impl tracing::field::Visit for ProgressFields<'_> {
@@ -205,7 +211,7 @@ impl tracing::field::Visit for ProgressFields<'_> {
 impl tracing::Subscriber for ProgressCapture {
     fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
         metadata.is_span() && metadata.target() == "mary.nemotron.progress"
-            && metadata.name() == "native_append"
+            && metadata.name() == self.1
     }
     fn new_span(&self, attributes: &tracing::span::Attributes<'_>) -> tracing::span::Id {
         let mut span = ProgressSpan::default();
@@ -233,6 +239,57 @@ impl ProgressSpan {
         assert!(values.next().is_none(), "{name} must be written only once");
         value
     }
+}
+
+#[test]
+#[ignore = "reserved CUDA: real Session reuse dispatch, cancelled before prefill"]
+fn generation_gpu_session_reuse_dispatch_returns_before_prefill_cancel() {
+    use super::super::session::tests::{fixture, limits};
+    use cubecl::cuda::CudaDevice;
+
+    let (snapshot, source, layers) = fixture();
+    let seed = [1, 5, 7];
+    let mut session = Session::from_snapshot_seed(
+        snapshot, source, &layers, CudaDevice { index: 0 }, limits(), &seed,
+    ).unwrap();
+    let ownership = session.prefix_ownership().unwrap();
+    assert!(session.can_reuse_prefix(&seed));
+    assert!(session.committed_ids().is_empty());
+    let capture = ProgressCapture(Default::default(), "native_prefix");
+    let cancel_calls = Cell::new(0);
+    let output = tracing::subscriber::with_default(capture.clone(), || run_turn(
+        &mut session,
+        &mut Sampler::new(SamplingConfig::greedy(), 0).unwrap(),
+        &seed,
+        1,
+        &mut || {
+            cancel_calls.set(cancel_calls.get() + 1);
+            let spans = capture.0.lock().unwrap();
+            if cancel_calls.get() == 1 {
+                assert!(spans.is_empty());
+                false // Enter the actual Runtime<Session> reuse branch.
+            } else {
+                assert_eq!(cancel_calls.get(), 2);
+                assert_eq!(spans.len(), 1, "real Session reuse hook must have run");
+                assert!(spans[0].closed, "reuse dispatch must return before cancellation");
+                true // Session::prefill_ids checks this before any prefill work.
+            }
+        },
+        DecodeScript::default(),
+    ));
+    assert_eq!(cancel_calls.get(), 2);
+    assert_eq!(output.completion.stop, StopReason::Cancelled);
+    assert!(output.emitted_ids.is_empty());
+    assert_eq!(output.committed_tokens, 0);
+    assert_eq!(output.session_status, Status::Ready);
+    assert_eq!(session.prefix_ownership().unwrap(), ownership);
+    assert!(session.saved_prefix().is_none());
+    assert!(session.can_reuse_prefix(&seed));
+    let spans = capture.0.lock().unwrap();
+    assert_eq!(spans[0].field("outcome"), Some("\"seed_pending\""));
+    assert_eq!(spans[0].field("reused_prefix_tokens"), Some("0"));
+    assert_eq!(spans[0].field("saved_prefix_tokens"), Some("0"));
+    assert_eq!(spans[0].field("session_ready"), Some("true"));
 }
 
 #[test]

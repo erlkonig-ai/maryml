@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Native Nemotron generation reaches the Session reuse observer instead of
+  recursively dispatching back to its own runtime adapter. Unconditional
+  recursion is now a crate-level compile error. A reserved CUDA regression
+  checks the real Session dispatch and cancels before prefill work.
+
 - Native Nemotron can retain one exact, fenced hybrid prefix and fork private
   suffixes from the same uploaded model. Attention shares immutable P-row K/V
   and allocates only C-P writable rows; Mamba advances an immutable boundary

@@ -1,3 +1,5 @@
+#![deny(unconditional_recursion)]
+
 //! mary — our Burn model zoo, held in TribleSpace.
 //!
 //! Named for Mary — Mary Wollstonecraft Shelley, who wrote the creature into

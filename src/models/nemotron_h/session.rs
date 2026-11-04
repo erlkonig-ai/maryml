@@ -1020,4 +1020,4 @@ fn residual(x: &CudaTensor, y: &CudaTensor) -> CudaTensor {
 
 #[cfg(test)]
 #[path = "session_tests.rs"]
-mod tests;
+pub(super) mod tests;

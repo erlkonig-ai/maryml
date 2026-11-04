@@ -38,7 +38,7 @@ fn configuration() -> Value {
 fn config() -> TextConfig {
     serde_json::from_value(configuration()).unwrap()
 }
-fn limits() -> Limits {
+pub(in crate::models::nemotron_h) fn limits() -> Limits {
     Limits {
         capacity: 8,
         max_resident_bytes: 192 << 20,
@@ -622,7 +622,7 @@ fn sparse_bf(n: usize, k: usize) -> Vec<u8> {
     }
     v
 }
-fn fixture() -> (Arc<ModelSnapshot<impl BlobStoreGet + Send + Sync>>, Source, Vec<Id>) {
+pub(in crate::models::nemotron_h) fn fixture() -> (Arc<ModelSnapshot<impl BlobStoreGet + Send + Sync>>, Source, Vec<Id>) {
     fixture_capacity(8)
 }
 fn fixture_capacity(capacity: usize) -> (Arc<ModelSnapshot<impl BlobStoreGet + Send + Sync>>, Source, Vec<Id>) {
