@@ -72,6 +72,47 @@ fn attention_geometry_budgets_and_positions_before_device() {
 }
 
 #[test]
+fn attention_native_full_tile_rows_preserve_decode_and_short_tails() {
+    let l = Limits { max_resident_bytes: 2 << 30, ..limits(1 << 20) };
+    for start in [0, 257, 524_032] {
+        for prefix in [0, start] {
+            for tokens in 1..=MAX_CHUNK {
+                let p = plan_with_prefix(start, tokens, l, prefix).unwrap();
+                let expected = match tokens { 1 => 16, MAX_CHUNK => 48, _ => 32 };
+                assert_eq!(p.rows, expected, "start={start}, prefix={prefix}, tokens={tokens}");
+                assert_eq!((p.tokens, p.end), (tokens, start + tokens));
+            }
+        }
+    }
+    // The shared Inkling selection remains unchanged.
+    assert_eq!(flash::prefill_rows(16), 32);
+}
+
+#[test]
+fn attention_native_full_tile_budget_counts_prefix_and_private_run_rounding() {
+    let l = Limits { max_resident_bytes: 2 << 30, ..limits(1 << 20) };
+    // 256 rows: Q/casts + four FP8 projections = 28,049,408 B; every
+    // reduction slot adds 4,259,840 B of F32 partials and statistics.
+    for (prefix, start, expected_splits, expected_bytes) in [
+        (0, 0, vec![2], 36_569_088),
+        (0, 16_128, vec![5], 49_348_608),
+        (0, 524_032, vec![5], 49_348_608),
+        (257, 511, vec![2, 4], 53_608_448),
+        (524_032, 524_032, vec![5, 1], 53_608_448),
+    ] {
+        let p = plan_with_prefix(start, MAX_CHUNK, l, prefix).unwrap();
+        assert_eq!(p.rows, 48);
+        let spans = if prefix == 0 { vec![p.end] } else { vec![prefix, p.end - prefix] };
+        assert_eq!(flash::key_run_splits(&spans, MAX_CHUNK.div_ceil(p.rows / 16), KV_HEADS), expected_splits);
+        assert_eq!(p.working_bytes, expected_bytes);
+        assert!(plan_with_prefix(start, MAX_CHUNK,
+            Limits { max_working_bytes: expected_bytes - 1, ..l }, prefix).is_err());
+        assert!(plan_with_prefix(start, MAX_CHUNK,
+            Limits { max_working_bytes: expected_bytes, ..l }, prefix).is_ok());
+    }
+}
+
+#[test]
 fn attention_pending_failure_cancel_and_reset_protocol() {
     let mut s = Sequence::default();
     assert!(s.ready(1).is_err());

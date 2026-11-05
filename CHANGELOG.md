@@ -2,10 +2,17 @@
 
 ## Unreleased
 
+- Native Nemotron attention selects 48 rows for full 256-query blocks, with
+  split/scratch admission and launch using the same plan. Decode and short
+  tails retain the existing shared Inkling selection. Same-recipe full-tile
+  checkpoint coverage preserves caller refusal before mutation; this does
+  not approve checkpoint reuse across arithmetic policies or change format.
+
 - Add a finite, ignored synthetic Nemotron attention diagnostic comparing the
   existing Inkling kernel at 32 and 48 rows, with an independent small CPU
-  oracle, causal/split/tail cases and separate warm host timing. Native
-  attention selection and checkpoint compatibility are unchanged.
+  oracle, causal/split/tail cases and separate warm host timing at early, mid
+  and long key prefixes. This diagnostic does not establish an adaptive key
+  threshold or whole-model performance/numerical equivalence.
 
 - Native Nemotron's codec accepts an explicit immutable selection of registered
   function schemas, with typed arguments and exact generated call bodies in

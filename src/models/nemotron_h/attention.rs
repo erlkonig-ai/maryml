@@ -244,6 +244,10 @@ fn plan_with_prefix(start: usize, tokens: usize, limits: Limits, prefix: usize) 
     if prefix > start { return Err("attention prefix exceeds committed position".into()); }
     let rows = if tokens == 1 {
         flash::decode_rows(16)
+    } else if tokens == MAX_CHUNK {
+        // Native full query blocks only. Short tails keep the shared policy;
+        // split geometry, admission and enqueue all consume this same choice.
+        48
     } else {
         flash::prefill_rows(16)
     };

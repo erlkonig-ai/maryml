@@ -1,6 +1,6 @@
 //! Synthetic host blobs and reserved native fixtures; no live pile/checkpoint.
 use super::*;
-use super::super::tests::{config, limits, fixture, state_bytes, enqueue_rejected_upload};
+use super::super::tests::{config, limits, fixture, fixture_capacity, state_bytes, enqueue_rejected_upload};
 use triblespace::core::{blob::{MemoryBlobStore, MemoryBlobStoreSnapshot,
     encodings::{simplearchive::SimpleArchive, tensor::TENSOR_HEADER_LEN}}, repo::SnapshotSource};
 
@@ -152,29 +152,41 @@ fn checkpoint_host_new_tensor_preserves_previous_immutable_selection() {
 #[test]
 #[ignore = "reserved CUDA: typed prefix export/restore across two local model owners and private continuation"]
 fn checkpoint_gpu_restores_exact_state_and_independent_continuation() {
-    let (snapshot, source, ids) = fixture();
-    let l = limits();
-    let o = resident_ownership(&config(), l).unwrap();
+    checkpoint_roundtrip(&[1, 5, 7], limits(), 2);
+}
+
+#[test]
+#[ignore = "reserved CUDA: same-recipe full-256 ROW48 seed checkpoint and private continuation"]
+fn checkpoint_gpu_full_tile_restores_exact_state_and_independent_continuation() {
+    let seed: Vec<_> = (0..MAX_CHUNK).map(|i| [1, 5, 7][i % 3]).collect();
+    checkpoint_roundtrip(&seed, Limits { capacity: 260, max_chunk_bytes: 256 << 20, ..limits() }, 128);
+}
+
+fn checkpoint_roundtrip(seed: &[u32], l: Limits, export_rows: usize) {
+    let (snapshot, source, ids) = fixture_capacity(l.capacity);
+    let mut c = config();
+    c.max_position_embeddings = l.capacity;
+    let o = resident_ownership(&c, l).unwrap();
     assert!(2 * o.fixed_model_bytes + 5 * o.private_state_bytes
         + 4 * o.private_expert_cache_bytes + l.max_chunk_bytes < 1 << 30);
-    let mut producer = Session::from_snapshot_seed(snapshot.clone(), source, &ids, CudaDevice { index: 0 }, l, &[1, 5, 7]).unwrap();
+    let mut producer = Session::from_snapshot_seed(snapshot.clone(), source, &ids, CudaDevice { index: 0 }, l, seed).unwrap();
     assert!(producer.saved_prefix().is_none(), "partial seed has no exportable Prefix");
-    producer.append_ids(&[1, 5, 7]).unwrap();
+    producer.append_ids(seed).unwrap();
     let prefix = producer.saved_prefix().unwrap().clone();
     let expected = state_bytes(&producer);
     let expected_logits = producer.last_logits().unwrap().values.to_vec();
     let mut blobs = MemoryBlobStore::new();
     assert!(prefix.export(&mut blobs, 0).is_err());
-    let checkpoint = prefix.export(&mut blobs, 2).unwrap();
+    let checkpoint = prefix.export(&mut blobs, export_rows).unwrap();
     let blobs = blobs.snapshot().unwrap();
     let mut other = Session::from_snapshot(snapshot, source, &ids, CudaDevice { index: 0 }, l).unwrap();
     let destination = other.device_model().clone();
     assert!(!prefix.compatible_with(&destination));
-    let rejected = other.restore_checkpoint(&checkpoint, &blobs, &[1, 5, 7], |_, _| Err("caller rejects arithmetic profile".into()));
+    let rejected = other.restore_checkpoint(&checkpoint, &blobs, seed, |_, _| Err("caller rejects arithmetic profile".into()));
     assert!(rejected.err().unwrap().contains("caller rejects"));
     assert_eq!(other.status(), Status::Ready);
     assert!(other.committed_ids().is_empty() && other.pending.is_empty());
-    other.restore_checkpoint(&checkpoint, &blobs, &[1, 5, 7], |provenance, model| {
+    other.restore_checkpoint(&checkpoint, &blobs, seed, |provenance, model| {
         // Concrete policy for this fixture: both loaders used the SAME held
         // immutable snapshot and selections, with the same native executable.
         assert!(std::ptr::eq(model.snapshot(), producer.device_model().snapshot()));
@@ -186,8 +198,8 @@ fn checkpoint_gpu_restores_exact_state_and_independent_continuation() {
     let mut a = other;
     assert_eq!(state_bytes(&a), expected);
     assert_eq!(a.last_logits().unwrap().values, expected_logits);
-    assert_eq!(a.prefix_ownership().unwrap().shared_kv_bytes, 3 * 1024);
-    assert_eq!(a.prefix_ownership().unwrap().private_kv_bytes, 5 * 1024);
+    assert_eq!(a.prefix_ownership().unwrap().shared_kv_bytes, seed.len() * 1024);
+    assert_eq!(a.prefix_ownership().unwrap().private_kv_bytes, (l.capacity - seed.len()) * 1024);
     let mut b = Session::from_prefix(destination, restored, l).unwrap();
     producer.append_ids(&[9]).unwrap();
     a.append_ids(&[9]).unwrap();

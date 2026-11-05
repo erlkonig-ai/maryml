@@ -134,6 +134,35 @@ fn session_host_prefill_full_window_pages_and_allocation_inventory() {
 }
 
 #[test]
+fn session_host_full_tile_rows48_chunk_and_span_budgets() {
+    // Isolate attention's contribution so an unchanged larger Mamba maximum
+    // cannot hide stale native split accounting in the aggregate planners.
+    let mut c = full_config(1 << 20);
+    c.layers_block_type = vec![LayerKind::Attention];
+    let l = Limits { max_chunk_bytes: usize::MAX, ..full_limits(1 << 20) };
+    for (prefix, chunk_bytes, span_bytes, tile_bytes) in [
+        (0, 60_634_112, 59_845_632, 57_740_288),
+        (524_032, 64_893_952, 64_105_472, 62_000_128),
+    ] {
+        assert_eq!(planned_prefix_chunk_bytes(&c, l, 524_032, 256, prefix).unwrap(), chunk_bytes);
+        let short = prefill::admission_with_prefix(&c, l, 524_032, 256, prefix).unwrap();
+        assert!(!short.layer_major);
+        assert_eq!(short.device_working_bytes, chunk_bytes);
+        let span = prefill::admission_with_prefix(&c, l, 524_032, 257, prefix).unwrap();
+        assert!(span.layer_major);
+        assert_eq!(span.tile_workspace_bytes, tile_bytes);
+        assert_eq!(span.device_working_bytes, span_bytes);
+        assert_eq!(span.hidden_bytes, 257 * H * 2);
+        for (tokens, exact) in [(256, chunk_bytes), (257, span_bytes)] {
+            assert!(prefill::admission_with_prefix(&c,
+                Limits { max_chunk_bytes: exact, ..l }, 524_032, tokens, prefix).is_ok());
+            assert!(prefill::admission_with_prefix(&c,
+                Limits { max_chunk_bytes: exact - 1, ..l }, 524_032, tokens, prefix).is_err());
+        }
+    }
+}
+
+#[test]
 fn session_host_shared_ownership_preserves_admission_and_private_quotas() {
     let c = full_config(1 << 20);
     let small = resident_ownership(&c, full_limits(2048)).unwrap();
@@ -303,7 +332,7 @@ fn session_host_admission_full_geometry_matches_existing_accounting() {
     assert_eq!(a.first_chunk_tokens, 88);
     assert_eq!(a.first_chunk_bytes, 1_809_020_264);
     assert_eq!(a.max_prompt_chunk_bytes, 1_809_020_264);
-    assert_eq!(a.max_capacity_chunk_bytes, 4_992_726_024);
+    assert_eq!(a.max_capacity_chunk_bytes, 5_026_804_744);
 
     let a = admission(&full_config(262144), full_limits(262144), 513).unwrap();
     assert_eq!(a.base_resident_bytes, 10_432_794_944);
@@ -312,7 +341,7 @@ fn session_host_admission_full_geometry_matches_existing_accounting() {
     assert_eq!(a.first_chunk_tokens, MAX_CHUNK);
     assert_eq!(a.first_chunk_bytes, 4_924_568_584);
     assert_eq!(a.max_prompt_chunk_bytes, 4_992_726_024);
-    assert_eq!(a.max_capacity_chunk_bytes, 4_992_726_024);
+    assert_eq!(a.max_capacity_chunk_bytes, 5_026_804_744);
 }
 
 #[test]
@@ -625,7 +654,7 @@ fn sparse_bf(n: usize, k: usize) -> Vec<u8> {
 pub(in crate::models::nemotron_h) fn fixture() -> (Arc<ModelSnapshot<impl BlobStoreGet + Send + Sync>>, Source, Vec<Id>) {
     fixture_capacity(8)
 }
-fn fixture_capacity(capacity: usize) -> (Arc<ModelSnapshot<impl BlobStoreGet + Send + Sync>>, Source, Vec<Id>) {
+pub(in crate::models::nemotron_h) fn fixture_capacity(capacity: usize) -> (Arc<ModelSnapshot<impl BlobStoreGet + Send + Sync>>, Source, Vec<Id>) {
     let mut repo = MemoryRepo::default();
     let key = SigningKey::generate(&mut rand::rngs::OsRng);
     let policy = CollectionPolicy::new(

@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 
 const LONG_KEYS: usize = 524_288;
 const LONG_QUERIES: usize = 256;
+const FULL_QUERY_KEYS: [usize; 3] = [256, 16_384, LONG_KEYS];
 const TAIL: usize = 16;
 const SEED: u64 = 0x5eeda77e;
 const MAX_SECONDS: u64 = 250;
@@ -118,7 +119,7 @@ impl Evidence {
     fn record(&mut self, label: &str, data: Value) {
         self.check();
         self.records += 1;
-        assert!(self.records <= 96);
+        assert!(self.records <= 160);
         let record = json!({"label":label,"process_elapsed_ns":self.started.elapsed().as_nanos(),
             "unix_ns":SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),"data":data});
         let encoded = serde_json::to_vec(&record).unwrap();
@@ -212,6 +213,11 @@ fn native_rows32_48_plan_and_oracle_contract() {
     assert_eq!(a["partial_bytes"],16<<20); assert_eq!(b["partial_bytes"],20<<20);
     assert_eq!(a["stats_bytes"],262144); assert_eq!(b["stats_bytes"],327680);
     assert_eq!(a["shared_bytes_per_cube"],36992); assert_eq!(b["shared_bytes_per_cube"],47232);
+    for keys in FULL_QUERY_KEYS {
+        let c = Case { queries:LONG_QUERIES, keys, capacity:keys+TAIL, q0:keys-LONG_QUERIES };
+        assert_eq!(native_plan(c).rows, 48);
+        for rows in [32, 48] { plan(c, rows, &[keys]); }
+    }
     assert!(!flash::applies(HEADS,KV_HEADS,HEAD_DIM,64)); // current policy, not hardware limit
     let small=Case{queries:2,keys:4,capacity:4,q0:2};
     let out=oracle(small,true);
@@ -223,13 +229,50 @@ fn native_rows32_48_plan_and_oracle_contract() {
     }}}
 }
 
+fn native_plan(case: Case) -> super::Plan {
+    super::plan_with_prefix(case.q0, case.queries, Limits {
+        capacity: case.capacity, context_limit: case.capacity,
+        max_resident_bytes: usize::MAX, max_working_bytes: usize::MAX,
+    }, 0).unwrap()
+}
+
+fn full_query_case(client: &ComputeClient<CudaRuntime>, device: &CudaDevice,
+    keys: usize, evidence: &mut Evidence)
+{
+    let case=Case{queries:LONG_QUERIES,keys,capacity:keys+TAIL,q0:keys-LONG_QUERIES};
+    // The candidate arm consumes the production planner's selection. The
+    // retained ROW32 arm is an explicit comparison, not a second selector.
+    let selected=native_plan(case);
+    assert_eq!(selected.rows,48);
+    evidence.record("native_plan",json!({"keys":keys,"rows":selected.rows,
+        "working_bytes":selected.working_bytes,"end":selected.end}));
+    let (_q,q)=queries(client,device,case,false);
+    let k=key_buffer(client,device,case,0,case.capacity,2);
+    let v=key_buffer(client,device,case,0,case.capacity,3);
+    let run=KeyRun{k:&k.handle,v:&v.handle,k_scales:None,v_scales:None,
+        rows:case.capacity,base:0,lo:0,hi:case.keys,row0:0};
+    let baseline=launch(case,32,&q,&[run],evidence,&format!("full-keys{keys}-first-rows32"));
+    let expected:Vec<f64>=baseline.iter().map(|&v|f64::from(v)).collect();
+    let candidate=launch(case,selected.rows,&q,&[run],evidence,&format!("full-keys{keys}-first-rows48"));
+    evidence.record("full_first_comparison",json!({"keys":keys,"comparison":compare(&candidate,&expected)}));
+    drop(candidate); drop(baseline);
+    for (order_index,order) in [[32,selected.rows],[selected.rows,32]].into_iter().enumerate() {
+        for repeat in 0..3 { for rows in order {
+            let label=format!("full-keys{keys}-warm-order{order_index}-repeat{repeat}-rows{rows}");
+            let got=launch(case,rows,&q,&[run],evidence,&label);
+            evidence.record("full_equivalence",json!({"phase":label,"comparison":compare(&got,&expected)}));
+        }}
+    }
+    fence(client);
+}
+
 #[test]
 #[ignore = "finite owned GPU: synthetic 32/2 GQA rows32/48, no model or pile"]
 fn gpu_native_rows32_48_diagnostic() {
     let mut evidence=Evidence::new();
     let device=CudaDevice{index:0}; let client=CudaRuntime::client(&device);
     evidence.record("contract",json!({"seed":SEED,"rows":[32,48],"heads":HEADS,
-        "kv_heads":KV_HEADS,"head_dim":HEAD_DIM,"max_seconds":MAX_SECONDS,
+        "kv_heads":KV_HEADS,"head_dim":HEAD_DIM,"max_seconds":MAX_SECONDS,"full_query_keys":FULL_QUERY_KEYS,
         "timing":"host enqueue plus existing completion fence; NOT CUDA-event duration"}));
     let case=Case{queries:17,keys:281,capacity:288,q0:264};
     for uniform in [true,false] {
@@ -252,26 +295,9 @@ fn gpu_native_rows32_48_diagnostic() {
         }
     }
     fence(&client);
-    let case=Case{queries:LONG_QUERIES,keys:LONG_KEYS,capacity:LONG_KEYS+TAIL,q0:LONG_KEYS-LONG_QUERIES};
-    let (_q,q)=queries(&client,&device,case,false);
-    let k=key_buffer(&client,&device,case,0,case.capacity,2);
-    let v=key_buffer(&client,&device,case,0,case.capacity,3);
-    let run=KeyRun{k:&k.handle,v:&v.handle,k_scales:None,v_scales:None,
-        rows:case.capacity,base:0,lo:0,hi:case.keys,row0:0};
-    let baseline=launch(case,32,&q,&[run],&mut evidence,"long-first-rows32");
-    let expected:Vec<f64>=baseline.iter().map(|&v|f64::from(v)).collect();
-    let candidate=launch(case,48,&q,&[run],&mut evidence,"long-first-rows48");
-    evidence.record("long_first_comparison",compare(&candidate,&expected));
-    drop(candidate); drop(baseline);
-    for (order_index,order) in [[32,48],[48,32]].into_iter().enumerate() {
-        for repeat in 0..3 { for rows in order {
-            let label=format!("warm-order{order_index}-repeat{repeat}-rows{rows}");
-            let got=launch(case,rows,&q,&[run],&mut evidence,&label);
-            evidence.record("long_equivalence",json!({"phase":label,"comparison":compare(&got,&expected)}));
-        }}
-    }
+    for keys in FULL_QUERY_KEYS { full_query_case(&client,&device,keys,&mut evidence); }
     fence(&client);
-    evidence.record("completed",json!({"passed":true,"long_timed_launches":12,
-        "first_long_launches":2,"small_launches":8}));
+    evidence.record("completed",json!({"passed":true,"full_timed_launches":36,
+        "first_full_launches":6,"small_launches":8}));
     fs::write(evidence.root.join("complete.json"),b"{\"passed\":true}\n").unwrap();
 }
