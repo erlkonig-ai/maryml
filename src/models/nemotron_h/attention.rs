@@ -615,3 +615,7 @@ fn append_tail(
 #[cfg(test)]
 #[path = "attention_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "attention_tile_tests.rs"]
+mod tile_tests;

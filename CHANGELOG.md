@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Add a finite, ignored synthetic Nemotron attention diagnostic comparing the
+  existing Inkling kernel at 32 and 48 rows, with an independent small CPU
+  oracle, causal/split/tail cases and separate warm host timing. Native
+  attention selection and checkpoint compatibility are unchanged.
+
 - Native Nemotron's codec accepts an explicit immutable selection of registered
   function schemas, with typed arguments and exact generated call bodies in
   history. Schemas participate in prompt rendering and token admission before
