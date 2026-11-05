@@ -38,6 +38,8 @@ pub use prefix::{Prefix, PrefixAllocation, PrefixOwnership, prefix_admission, pr
 #[path = "session_checkpoint.rs"]
 mod checkpoint;
 pub use checkpoint::{PrefixCheckpoint, PrefixExecution, PrefixProvenance, PrefixLayer, KvChunk};
+#[path = "session_checkpoint_manifest.rs"]
+pub mod checkpoint_manifest;
 #[path = "session_prefill.rs"]
 mod prefill;
 pub use prefill::{PrefillAllocation, PrefillOutcome, admission as prefill_admission,

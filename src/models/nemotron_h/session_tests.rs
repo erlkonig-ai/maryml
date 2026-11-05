@@ -18,7 +18,7 @@ use triblespace::core::{
     collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt},
 };
 
-fn configuration() -> Value {
+pub(super) fn configuration() -> Value {
     serde_json::from_str(r#"{
         "model_type":"nemotron_h","layers_block_type":["mamba","attention","moe"],
         "hidden_size":4096,"vocab_size":32,"max_position_embeddings":8,"layer_norm_epsilon":0.00001,

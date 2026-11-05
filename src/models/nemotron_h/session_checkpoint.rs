@@ -361,4 +361,4 @@ fn write<S>(model: &DeviceModel<S>, target: cubecl::server::Handle, payload: &an
 
 #[cfg(test)]
 #[path = "session_checkpoint_tests.rs"]
-mod tests;
+pub(super) mod tests;

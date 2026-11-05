@@ -4,7 +4,7 @@ use super::super::tests::{config, limits, fixture, fixture_capacity, state_bytes
 use triblespace::core::{blob::{MemoryBlobStore, MemoryBlobStoreSnapshot,
     encodings::{simplearchive::SimpleArchive, tensor::TENSOR_HEADER_LEN}}, repo::SnapshotSource};
 
-fn host_checkpoint() -> (PrefixCheckpoint, MemoryBlobStore) {
+pub(in crate::models::nemotron_h::session) fn host_checkpoint() -> (PrefixCheckpoint, MemoryBlobStore) {
     let mut store = MemoryBlobStore::new();
     let c = config();
     let ids: Vec<_> = (0..3).map(|_| *genid()).collect();
