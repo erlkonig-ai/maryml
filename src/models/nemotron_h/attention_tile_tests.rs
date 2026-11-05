@@ -215,7 +215,7 @@ fn native_rows32_48_plan_and_oracle_contract() {
     assert_eq!(a["shared_bytes_per_cube"],36992); assert_eq!(b["shared_bytes_per_cube"],47232);
     for keys in FULL_QUERY_KEYS {
         let c = Case { queries:LONG_QUERIES, keys, capacity:keys+TAIL, q0:keys-LONG_QUERIES };
-        assert_eq!(native_plan(c).rows, 48);
+        assert_eq!(native_plan(c,0).rows, 48);
         for rows in [32, 48] { plan(c, rows, &[keys]); }
     }
     assert!(!flash::applies(HEADS,KV_HEADS,HEAD_DIM,64)); // current policy, not hardware limit
@@ -229,11 +229,11 @@ fn native_rows32_48_plan_and_oracle_contract() {
     }}}
 }
 
-fn native_plan(case: Case) -> super::Plan {
+fn native_plan(case: Case, prefix: usize) -> super::Plan {
     super::plan_with_prefix(case.q0, case.queries, Limits {
         capacity: case.capacity, context_limit: case.capacity,
         max_resident_bytes: usize::MAX, max_working_bytes: usize::MAX,
-    }, 0).unwrap()
+    }, prefix).unwrap()
 }
 
 fn full_query_case(client: &ComputeClient<CudaRuntime>, device: &CudaDevice,
@@ -242,7 +242,7 @@ fn full_query_case(client: &ComputeClient<CudaRuntime>, device: &CudaDevice,
     let case=Case{queries:LONG_QUERIES,keys,capacity:keys+TAIL,q0:keys-LONG_QUERIES};
     // The candidate arm consumes the production planner's selection. The
     // retained ROW32 arm is an explicit comparison, not a second selector.
-    let selected=native_plan(case);
+    let selected=native_plan(case,0);
     assert_eq!(selected.rows,48);
     evidence.record("native_plan",json!({"keys":keys,"rows":selected.rows,
         "working_bytes":selected.working_bytes,"end":selected.end}));
@@ -262,6 +262,30 @@ fn full_query_case(client: &ComputeClient<CudaRuntime>, device: &CudaDevice,
             let got=launch(case,rows,&q,&[run],evidence,&label);
             evidence.record("full_equivalence",json!({"phase":label,"comparison":compare(&got,&expected)}));
         }}
+    }
+    if keys == 16_384 {
+        // One full native tile over an immutable prefix + private tail. The
+        // same inputs above are partitioned without changing absolute keys.
+        // Per-run rounding requires six slots instead of the one-run five.
+        let prefix=8_192;
+        let selected=native_plan(case,prefix);
+        assert_eq!(selected.rows,48);
+        assert_eq!(selected.working_bytes,53_608_448);
+        assert_eq!(flash::key_run_splits(&[prefix,keys-prefix],
+            case.queries.div_ceil(selected.rows/16),KV_HEADS),[3,3]);
+        evidence.record("native_split_plan",json!({"keys":keys,"prefix":prefix,
+            "rows":selected.rows,"working_bytes":selected.working_bytes,"splits":[3,3]}));
+        let spans=[(0,prefix),(prefix,case.capacity-prefix)];
+        let owners:Vec<_>=spans.iter().map(|&(start,rows)|(
+            key_buffer(client,device,case,start,rows,2),
+            key_buffer(client,device,case,start,rows,3))).collect();
+        let runs:Vec<_>=owners.iter().zip(&spans).map(|((k,v),&(base,rows))|KeyRun {
+            k:&k.handle,v:&v.handle,k_scales:None,v_scales:None,rows,base,
+            lo:0,hi:rows.min(case.keys-base),row0:0,
+        }).collect();
+        let got=launch(case,selected.rows,&q,&runs,evidence,"full-keys16384-split8192-rows48");
+        evidence.record("full_split_equivalence",json!({"keys":keys,"prefix":prefix,
+            "comparison":compare(&got,&expected)}));
     }
     fence(client);
 }
@@ -298,6 +322,6 @@ fn gpu_native_rows32_48_diagnostic() {
     for keys in FULL_QUERY_KEYS { full_query_case(&client,&device,keys,&mut evidence); }
     fence(&client);
     evidence.record("completed",json!({"passed":true,"full_timed_launches":36,
-        "first_full_launches":6,"small_launches":8}));
+        "first_full_launches":6,"full_split_launches":1,"small_launches":8}));
     fs::write(evidence.root.join("complete.json"),b"{\"passed\":true}\n").unwrap();
 }
