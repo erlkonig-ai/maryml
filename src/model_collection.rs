@@ -25,7 +25,7 @@ use triblespace::core::collection::simplearchive_union::PreparedCollectionCommit
 use triblespace::core::collection::{
     ACTION_READ, ACTION_WRITE, AdmissionPolicy, Collection, CollectionCommit, CollectionHandle,
     CollectionPolicy, CollectionRead, CollectionRecord, CollectionSnapshotExt, CollectionStoreExt,
-    Support,
+    Cover, Support,
 };
 use triblespace::core::inline::encodings::UnknownInline;
 use triblespace::core::metadata;
@@ -49,12 +49,22 @@ fn direct_model_policy(root: VerifyingKey) -> CollectionPolicy {
     CollectionPolicy::new(AdmissionPolicy::direct(root), AdmissionPolicy::direct(root))
 }
 
+/// Physical provenance of the held facts, not model semantic identity. Neither
+/// regrouping collection members nor adding unrelated facts changes model IDs.
+#[derive(Clone, Debug)]
+enum ModelFactsOrigin {
+    Unspecified,
+    Collection(Cover<SimpleArchive>),
+    Image(Inline<inlineencodings::Handle<SimpleArchive>>),
+}
+
 /// One coherent observation of materialized model facts.
 #[derive(Clone, Debug)]
 pub struct ModelSnapshot<S> {
     facts: TribleSet,
     support: Support,
     store: S,
+    origin: ModelFactsOrigin,
 }
 
 impl<S> ModelSnapshot<S> {
@@ -63,6 +73,71 @@ impl<S> ModelSnapshot<S> {
             facts,
             support,
             store,
+            origin: ModelFactsOrigin::Unspecified,
+        }
+    }
+
+    /// Retain the actual selected resident/acquiring cover, without serializing
+    /// its union or substituting the support's historical foundations for it.
+    fn from_cover(
+        facts: TribleSet,
+        support: Support,
+        store: S,
+        cover: Cover<SimpleArchive>,
+    ) -> Self {
+        Self {
+            facts,
+            support,
+            store,
+            origin: ModelFactsOrigin::Collection(cover),
+        }
+    }
+
+    /// Decode exactly this supplied immutable image. `support` remains caller
+    /// provenance; this does not prove collection membership, admission, model
+    /// selection or that any computation used the image.
+    pub fn from_image(
+        store: S,
+        support: Support,
+        image: Inline<inlineencodings::Handle<SimpleArchive>>,
+    ) -> anyhow::Result<Self>
+    where
+        S: BlobStoreGet,
+    {
+        let facts = store
+            .get::<TribleSet, SimpleArchive>(image)
+            .map_err(|error| anyhow!("read exact model facts image: {error}"))?;
+        Ok(Self {
+            facts,
+            support,
+            store,
+            origin: ModelFactsOrigin::Image(image),
+        })
+    }
+
+    /// Physical members actually used by the collection reader, when known.
+    pub fn cover(&self) -> Option<&Cover<SimpleArchive>> {
+        match &self.origin {
+            ModelFactsOrigin::Collection(cover) => Some(cover),
+            _ => None,
+        }
+    }
+
+    /// An already-held archive containing precisely all of `facts()`. A union
+    /// of multiple members (or a facts-only constructor) has no such known
+    /// image. This is availability, not a uniqueness constraint or model ID.
+    pub fn complete_image(&self) -> Option<Inline<inlineencodings::Handle<SimpleArchive>>> {
+        match &self.origin {
+            ModelFactsOrigin::Image(image) => Some(*image),
+            ModelFactsOrigin::Collection(cover) => {
+                let mut members = cover.members();
+                if members.len() == 1 {
+                    members.next()
+                } else {
+                    None
+                }
+            }
+            ModelFactsOrigin::Unspecified => None,
         }
     }
 
@@ -479,7 +554,8 @@ pub fn snapshot_model_collection_exact<R: StoreRead>(
     let facts = attached
         .view::<TribleSet>()
         .context("materialize model support")?;
-    Ok(ModelSnapshot::new(facts, support.clone(), store.clone()))
+    let (store, support, cover) = attached.into_parts().context("retain selected model cover")?;
+    Ok(ModelSnapshot::from_cover(facts, support, store, cover))
 }
 
 pub fn snapshot_model_bundle_collection_exact<R: StoreRead>(
@@ -554,8 +630,8 @@ pub fn snapshot_model_collection_acquiring_in<R: StoreRead>(
         .collection_acquiring(collection)
         .context("select model collection for acquisition")?;
     let facts = observed.view::<TribleSet>().context("read selected model collection")?;
-    let (store, support, _) = observed.into_parts().context("resolve selected model support")?;
-    Ok(ModelSnapshot::new(facts, support, store))
+    let (store, support, cover) = observed.into_parts().context("resolve selected model support")?;
+    Ok(ModelSnapshot::from_cover(facts, support, store, cover))
 }
 
 /// The sole model collection of this name, frozen from the local observation.
@@ -594,10 +670,10 @@ pub fn snapshot_model_collection_for<R: StoreRead>(
     let facts = observed
         .view::<TribleSet>()
         .context("read model collection")?;
-    let (store, support, _) = observed
+    let (store, support, cover) = observed
         .into_parts()
         .context("resolve model collection support for snapshot")?;
-    Ok(ModelSnapshot::new(facts, support, store))
+    Ok(ModelSnapshot::from_cover(facts, support, store, cover))
 }
 
 pub fn snapshot_model_bundle_collection_local_latest(
@@ -1147,6 +1223,97 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.0);
         }
+    }
+
+    #[test]
+    fn snapshot_provenance_retains_selected_cover_and_exact_image() {
+        use triblespace::core::repo::memoryrepo::MemoryRepo;
+        let mut repo = MemoryRepo::default();
+        let key = SigningKey::from_bytes(&[0x70; 32]);
+        let collection = repo.collection(mary_model_graph_name(),
+            direct_model_policy(key.verifying_key())).unwrap();
+        let subject = genid();
+        let fragment = entity! { &subject @ metadata::tag: metadata::KIND_MULTI };
+        let expected = fragment.facts().clone();
+        let image: Inline<inlineencodings::Handle<SimpleArchive>> = expected.clone().to_blob().get_handle();
+        repo.commit(collection, &key, fragment).unwrap();
+        let reader = repo.snapshot().unwrap();
+        let selected = snapshot_model_collection_for(&reader, collection).unwrap();
+        let exact = snapshot_model_collection_exact(&reader, selected.support()).unwrap();
+        let acquiring = snapshot_model_collection_acquiring_in(&reader).unwrap();
+        for model in [selected, exact, acquiring] {
+            assert_eq!(model.facts(), &expected);
+            assert_eq!(model.complete_image(), Some(image));
+            let cover = model.cover().unwrap();
+            assert_eq!(cover.collection(), collection);
+            assert_eq!(cover.members().collect::<Vec<_>>(), vec![image]);
+            assert_eq!(model.clone().complete_image(), Some(image));
+        }
+    }
+
+    #[test]
+    fn snapshot_provenance_multi_member_union_has_no_fabricated_image() {
+        use triblespace::core::repo::memoryrepo::MemoryRepo;
+        let mut repo = MemoryRepo::default();
+        let key = SigningKey::from_bytes(&[0x70; 32]);
+        let collection = repo.collection("provenance union",
+            direct_model_policy(key.verifying_key())).unwrap();
+        let empty = snapshot_model_collection_for(&repo.snapshot().unwrap(), collection).unwrap();
+        assert_eq!(empty.cover().unwrap().members().len(), 0);
+        assert_eq!(empty.complete_image(), None);
+        let root = genid();
+        let a = entity! { &root @ metadata::tag: metadata::KIND_MULTI };
+        let b = entity! { &root @ metadata::tag: metadata::KIND_INLINE_ENCODING };
+        let expected = a.facts().clone() + b.facts().clone();
+        repo.commit(collection, &key, a).unwrap();
+        let before = snapshot_model_collection_for(&repo.snapshot().unwrap(), collection).unwrap();
+        repo.commit(collection, &key, b).unwrap();
+        let after = snapshot_model_collection_for(&repo.snapshot().unwrap(), collection).unwrap();
+        assert_eq!(after.facts(), &expected);
+        assert_eq!(after.cover().unwrap().members().len(), 2);
+        assert_eq!(after.complete_image(), None);
+        assert!(before.complete_image().is_some());
+        assert_eq!(before.cover().unwrap().members().len(), 1);
+        // No model/entity identity is rewritten by physical regrouping.
+        assert!(after.facts().iter().all(|row| row.e() == &root.id));
+        let regrouped = repo.collection("regrouped provenance union",
+            direct_model_policy(key.verifying_key())).unwrap();
+        repo.commit(regrouped, &key, Fragment::rooted(root.id, expected.clone())).unwrap();
+        let regrouped = snapshot_model_collection_for(&repo.snapshot().unwrap(), regrouped).unwrap();
+        assert_eq!(regrouped.facts(), after.facts());
+        assert!(regrouped.complete_image().is_some());
+        assert_eq!(regrouped.cover().unwrap().members().len(), 1);
+        let facts_only = ModelSnapshot::new(expected.clone(), after.support().clone(), after.store().clone());
+        assert!(facts_only.cover().is_none());
+        assert_eq!(facts_only.complete_image(), None);
+        assert_eq!(facts_only.into_parts().0, expected);
+    }
+
+    #[test]
+    fn snapshot_provenance_explicit_image_decodes_only_that_image() {
+        use triblespace::core::repo::memoryrepo::MemoryRepo;
+        let mut repo = MemoryRepo::default();
+        let key = SigningKey::from_bytes(&[0x70; 32]);
+        let collection = repo.collection("explicit image",
+            direct_model_policy(key.verifying_key())).unwrap();
+        let a = entity! { metadata::tag: metadata::KIND_MULTI };
+        repo.commit(collection, &key, a).unwrap();
+        let selected = snapshot_model_collection_for(&repo.snapshot().unwrap(), collection).unwrap();
+        let different = entity! { metadata::tag: metadata::KIND_BLOB_ENCODING };
+        let expected = different.facts().clone();
+        let image = repo.put::<SimpleArchive, _>(expected.clone()).unwrap();
+        let explicit = ModelSnapshot::from_image(repo.snapshot().unwrap(),
+            selected.support().clone(), image).unwrap();
+        assert_eq!(explicit.facts(), &expected);
+        assert_ne!(explicit.facts(), selected.facts());
+        assert_eq!(explicit.complete_image(), Some(image));
+        assert!(explicit.cover().is_none(), "caller support does not prove image membership");
+        assert_eq!(explicit.support(), selected.support());
+        let missing: Blob<SimpleArchive> = entity! {
+            metadata::tag: metadata::KIND_INLINE_ENCODING
+        }.into_facts().to_blob();
+        assert!(ModelSnapshot::from_image(repo.snapshot().unwrap(),
+            selected.support().clone(), missing.get_handle()).is_err());
     }
 
     #[test]

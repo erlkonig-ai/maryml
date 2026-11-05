@@ -2,6 +2,21 @@
 use super::*;
 use super::super::{checkpoint::tests::host_checkpoint, tests::{configuration, limits}};
 use triblespace::core::{blob::MemoryBlobStoreSnapshot, trible::Trible};
+use triblespace::core::{collection::{AdmissionPolicy, CollectionPolicy,
+    CollectionSnapshotExt, CollectionStoreExt}, repo::pile::Pile};
+
+// Only these tests own this create-new temporary file. No caller pile or key.
+struct ManifestTestPile(std::path::PathBuf);
+impl ManifestTestPile {
+    fn new() -> Self {
+        let path = std::env::temp_dir().join(format!("mary-manifest-{}.pile", *genid()));
+        std::fs::OpenOptions::new().write(true).create_new(true).open(&path).unwrap();
+        Self(path)
+    }
+}
+impl Drop for ManifestTestPile {
+    fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
+}
 
 fn fixture() -> (PrefixCheckpoint, MemoryBlobStore, Inline<Handle<SimpleArchive>>) {
     let (mut checkpoint, mut store) = host_checkpoint();
@@ -411,4 +426,153 @@ fn manifest_host_old_snapshot_survives_new_manifest() {
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].as_ref().unwrap().provenance.execution,
         PrefixExecution::NativeB1Bf16KvF32Mamba { attention: attention::Profile::ScalarF32V1 });
+}
+
+#[test]
+fn manifest_host_pile_reopen_preserves_profiles_payloads_and_opaque_alternatives() {
+    for attention in [attention::Profile::ScalarF32V1, attention::Profile::MmaBf16PV1,
+        attention::Profile::MmaHiLoPV1] {
+        let path = ManifestTestPile::new();
+        let mut pile = Pile::open(&path.0).unwrap();
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[0x51; 32]);
+        let policy = CollectionPolicy::new(AdmissionPolicy::direct(signer.verifying_key()),
+            AdmissionPolicy::direct(signer.verifying_key()));
+        let collection = pile.collection("manifest CPU reopen fixture", policy).unwrap();
+        let (mut checkpoint, mut memory, image) = fixture();
+        checkpoint.provenance.execution = PrefixExecution::NativeB1Bf16KvF32Mamba { attention };
+        // Synthetic host fixture only: append dependencies individually, as
+        // export does. Do not stage the tensor payloads in a publication Fragment.
+        for (handle, blob) in memory.snapshot().unwrap().iter() {
+            assert_eq!(pile.put(blob).unwrap(), handle);
+        }
+        let reader = pile.snapshot().unwrap();
+        let fragment = encode(&reader, &mut pile, &checkpoint, image, limits()).unwrap();
+        let derived_root = fragment.root().unwrap();
+        let opaque_root = *genid();
+        let (_, original, metafacts, blobs) = fragment.into_parts();
+        let mut changed = TribleSet::new();
+        for row in original.iter() {
+            let subject = if row.e() == &derived_root { opaque_root } else { *row.e() };
+            changed.insert(&Trible::force(&subject, row.a(),
+                row.v::<triblespace::core::inline::encodings::UnknownInline>()));
+        }
+        let other = if attention == attention::Profile::ScalarF32V1 {
+            attention::Profile::MmaHiLoPV1
+        } else { attention::Profile::ScalarF32V1 };
+        let other_profile = pile.put::<UTF8String, _>(
+            format!("native-b1-bf16-kv-f32-mamba/{}", other.as_str())).unwrap();
+        let future_profile = pile.put::<UTF8String, _>("unknown-future-profile").unwrap();
+        let extra = entity! { ExclusiveId::force_ref(&opaque_root) @
+            metadata::tag: *genid(),
+            schema::execution_profile*: [other_profile, future_profile]
+        };
+        changed.union(extra.facts().clone());
+        changed.union(changed.clone());
+        let expected_facts = changed.clone();
+        pile.commit(collection, &signer, Fragment::from_parts(changed, metafacts, blobs)).unwrap();
+        pile.flush().unwrap();
+        drop(reader);
+        drop(memory);
+        pile.close().unwrap();
+
+        let mut reopened = Pile::open(&path.0).unwrap();
+        let reader = reopened.snapshot().unwrap();
+        let observed = reader.collection(collection).unwrap();
+        let facts = observed.view::<TribleSet>().unwrap();
+        assert_eq!(facts, expected_facts);
+        let mut success = 0;
+        let mut refused = 0;
+        let flow = visit_selected(&reader, &facts, opaque_root, limits(),
+            checkpoint.provenance.execution, |actual_image, result| {
+                assert_eq!(actual_image, image);
+                match result {
+                    Ok(actual) => { assert_checkpoint(&actual, &checkpoint); success += 1; }
+                    Err(error) => {
+                        assert_eq!(error, "checkpoint execution profile differs");
+                        refused += 1;
+                    }
+                }
+                ControlFlow::Continue(())
+            });
+        assert!(flow.is_continue());
+        assert_eq!((success, refused), (1, 1)); // unsupported profile is skipped
+        let PrefixLayer::Attention(chunks) = &checkpoint.layers[1] else { panic!() };
+        for chunk in chunks {
+            let keys: Blob<Tensor<BF16, 3>> = reader.get(chunk.keys).unwrap();
+            let values: Blob<Tensor<BF16, 3>> = reader.get(chunk.values).unwrap();
+            assert_ne!(keys.bytes, values.bytes);
+            assert_eq!(&leaf::read_leaf(keys).unwrap().payload()[..4], &[0, 128, 1, 128]);
+            assert_eq!(&leaf::read_leaf(values).unwrap().payload()[..4], &[0, 64, 1, 64]);
+        }
+        drop(observed);
+        drop(reader);
+        reopened.close().unwrap();
+    }
+}
+
+#[test]
+fn manifest_host_pile_precommit_failure_preserves_completed_manifest() {
+    let path = ManifestTestPile::new();
+    let mut pile = Pile::open(&path.0).unwrap();
+    let signer = ed25519_dalek::SigningKey::from_bytes(&[0x52; 32]);
+    let policy = CollectionPolicy::new(AdmissionPolicy::direct(signer.verifying_key()),
+        AdmissionPolicy::direct(signer.verifying_key()));
+    let collection = pile.collection("manifest CPU failure fixture", policy).unwrap();
+    let (checkpoint, mut memory, image) = fixture();
+    for (handle, blob) in memory.snapshot().unwrap().iter() {
+        assert_eq!(pile.put(blob).unwrap(), handle);
+    }
+    let reader = pile.snapshot().unwrap();
+    let completed = encode(&reader, &mut pile, &checkpoint, image, limits()).unwrap();
+    let root = completed.root().unwrap();
+    let expected_facts = completed.facts().clone();
+    pile.commit(collection, &signer, completed).unwrap();
+    pile.flush().unwrap();
+    drop(reader);
+    let mut newer = checkpoint.clone();
+    newer.tokens = Arc::from([1, 5, 2]);
+    let mut abandoned_root = None;
+    let failure: Result<()> = (|| {
+        let payload: Vec<u8> = (0..newer.provenance.config.vocab_size)
+            .flat_map(|_| 1f32.to_le_bytes()).collect();
+        newer.last_logits = pile.put(leaf::leaf_blob::<F32, 1>(
+            [newer.provenance.config.vocab_size as u64],
+            anybytes::Bytes::from_source(payload)).unwrap()).unwrap();
+        let reader = pile.snapshot().unwrap();
+        let pending = encode(&reader, &mut pile, &newer, image, limits())?;
+        abandoned_root = pending.root();
+        // Fault boundary: child/token/profile appends have happened, but the
+        // completed-manifest COMMIT has not. No production fault hook needed.
+        Err("injected before manifest COMMIT".into())
+    })();
+    assert_eq!(failure.unwrap_err(), "injected before manifest COMMIT");
+    assert_ne!(abandoned_root, Some(root));
+    assert_ne!(newer.last_logits, checkpoint.last_logits);
+    // Deliberately persist even the abandoned payload: unreferenced bytes do
+    // not create a completed candidate or remove the earlier publication.
+    pile.flush().unwrap();
+    drop(memory);
+    pile.close().unwrap();
+    let mut reopened = Pile::open(&path.0).unwrap();
+    let reader = reopened.snapshot().unwrap();
+    let observed = reader.collection(collection).unwrap();
+    let facts = observed.view::<TribleSet>().unwrap();
+    assert_eq!(facts, expected_facts);
+    let _: Blob<Tensor<F32, 1>> = reader.get(newer.last_logits).unwrap();
+    let mut successes = 0;
+    let flow = visit_selected(&reader, &facts, root, limits(), checkpoint.provenance.execution,
+        |actual_image, result| {
+            assert_eq!(actual_image, image);
+            assert_checkpoint(&result.unwrap(), &checkpoint);
+            successes += 1;
+            ControlFlow::Continue(())
+        });
+    assert!(flow.is_continue());
+    assert_eq!(successes, 1);
+    let flow = visit_selected(&reader, &facts, abandoned_root.unwrap(), limits(),
+        checkpoint.provenance.execution, |_, _| panic!("uncommitted manifest was exposed"));
+    assert!(flow.is_continue());
+    drop(observed);
+    drop(reader);
+    reopened.close().unwrap();
 }
