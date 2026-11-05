@@ -226,9 +226,9 @@ fn execute(args: &Args, record: &mut Value) -> Result<()> {
         "limit":limit, "committed_tokens":output.committed_tokens,
         "committed_ids":generator.session().committed_ids(),
         "session_status":format!("{:?}", output.session_status),
-        "proposal_returned":output.completion.proposal.is_some()});
+        "proposal_returned":!output.completion.proposals.is_empty()});
     ensure!(
-        output.completion.proposal.is_none(),
+        output.completion.proposals.is_empty(),
         "unexpected proposal with tools disabled"
     );
     if let StopReason::Error(error) = &output.completion.stop {

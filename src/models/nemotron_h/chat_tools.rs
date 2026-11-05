@@ -1,4 +1,4 @@
-//! Selected native tool definitions and the publisher's single-call envelope.
+//! Selected native tool definitions and one body in the publisher's call list.
 //!
 //! This is a codec, not a JSON-schema validator or an execution registry.
 //! Faculty argument validation still owns operation-specific constraints.

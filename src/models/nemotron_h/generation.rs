@@ -245,7 +245,7 @@ impl<S: BlobStoreGet> Generator<S> {
             parser,
         );
         if !options.tools_enabled {
-            output.completion.proposal = None;
+            output.completion.proposals.clear();
         }
         output
     }
@@ -392,7 +392,7 @@ fn rejected(runtime: &impl Runtime, error: String) -> TurnOutput {
         completion: Completion {
             partial: PartialOutput::default(),
             stop: StopReason::Error(error),
-            proposal: None,
+            proposals: Vec::new(),
         },
         decoded_complete: true,
         limit: None,
@@ -552,7 +552,7 @@ fn run_turn(
     let fallback = |stop| Completion {
         partial: partial.clone(),
         stop,
-        proposal: None,
+        proposals: Vec::new(),
     };
     let mut completion = if decoded_complete {
         match decoder.finish(stop.clone()) {
@@ -567,7 +567,7 @@ fn run_turn(
                         _ => format!("output protocol: {error}"),
                     };
                     value.stop = StopReason::Error(message);
-                    value.proposal = None;
+                    value.proposals.clear();
                 }
                 value
             }
@@ -584,7 +584,7 @@ fn run_turn(
         fallback(stop)
     };
     if !matches!(completion.stop, StopReason::Eos { .. }) {
-        completion.proposal = None;
+        completion.proposals.clear();
     }
     if !matches!(completion.stop, StopReason::Budget) {
         limit = None;

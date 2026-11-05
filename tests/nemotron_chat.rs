@@ -237,7 +237,15 @@ fn fixture(case: &Value) -> (History, RenderOptions) {
             "assistant" => history.messages.push(Message::Assistant {
                 reasoning: msg["reasoning_content"].as_str().unwrap_or_default().into(),
                 answer: text,
-                tool_call: msg["command"].as_str().map(exec_invocation),
+                tool_calls: match msg["tool_calls"].as_array() {
+                    Some(calls) => calls.iter().map(|call| {
+                        let function = &call["function"];
+                        Invocation::new(function["name"].as_str().unwrap(),
+                            function["arguments"].as_object().unwrap().clone(),
+                            &Tools::exec_only()).unwrap()
+                    }).collect(),
+                    None => msg["command"].as_str().map(exec_invocation).into_iter().collect(),
+                },
             }),
             "tool" => history.messages.push(result(&text)),
             _ => unreachable!(),
@@ -336,7 +344,7 @@ fn more_than_4096_messages_preserve_complete_history_and_reasoning() -> Result<(
         history.messages.push(Message::Assistant {
             reasoning: format!("reasoning {i}"),
             answer: format!("answer {i}"),
-            tool_call: None,
+            tool_calls: Vec::new(),
         });
         // Independent complete publisher text, not another renderer result.
         expected.push_str(&format!(
@@ -395,7 +403,7 @@ fn safety_checks(codec: &ChatCodec, native: &tokenizers::Tokenizer) -> Result<()
     let mut ids = codec.encode_content(text)?;
     ids.push(11);
     let done = complete(codec, &ids, StopReason::Eos { id: 11 });
-    assert!(done.proposal.is_none());
+    assert!(done.proposals.is_empty());
     assert_eq!(done.partial.answer, text);
     assert!(done.partial.protocol_error.is_none());
     let tool_options = RenderOptions {
@@ -459,7 +467,7 @@ fn literal_marker_checks(codec: &ChatCodec, source: &tokenizers::Tokenizer) -> R
             Message::Assistant {
                 reasoning: "reason".into(),
                 answer: "answer".into(),
-                tool_call: None,
+                tool_calls: Vec::new(),
             },
             result("result"),
         ],
@@ -550,7 +558,7 @@ fn eos_only_proposals_preserve_command_bytes() -> Result<()> {
         assert_eq!(parser.snapshot()?.reasoning, "consider café 🐈");
         parser.push(&[eos]);
         let done = parser.finish(StopReason::Eos { id: eos })?;
-        assert_eq!(done.proposal.unwrap().arguments()["command"], command);
+        assert_eq!(done.proposals.into_iter().next().unwrap().arguments()["command"], command);
         assert_eq!(done.partial.answer, "I'll check.\n");
         assert!(done.partial.protocol_error.is_none());
     }
@@ -559,8 +567,7 @@ fn eos_only_proposals_preserve_command_bytes() -> Result<()> {
     ids.push(11);
     assert!(
         complete(&codec, &ids, StopReason::Eos { id: 11 })
-            .proposal
-            .is_some()
+            .proposals.len() == 1
     );
     let literal = "printf '<think></think> �'";
     assert_eq!(
@@ -569,8 +576,7 @@ fn eos_only_proposals_preserve_command_bytes() -> Result<()> {
             &call(&codec, literal, Some(11)),
             StopReason::Eos { id: 11 }
         )
-        .proposal
-        .unwrap()
+        .proposals.into_iter().next().unwrap()
         .arguments()["command"],
         literal
     );
@@ -588,7 +594,7 @@ fn interruptions_and_terminal_mismatches_never_propose() -> Result<()> {
             StopReason::Error("mock".into()),
         ] {
             let done = complete(&codec, &ids[..end], stop.clone());
-            assert!(done.proposal.is_none());
+            assert!(done.proposals.is_empty());
             assert_eq!(done.stop, stop);
             assert!(!done.partial.raw_text.is_empty());
         }
@@ -599,23 +605,23 @@ fn interruptions_and_terminal_mismatches_never_propose() -> Result<()> {
             &call(&codec, "pwd", terminal),
             StopReason::Eos { id: reported },
         );
-        assert!(done.proposal.is_none());
+        assert!(done.proposals.is_empty());
         assert!(done.partial.protocol_error.is_some());
     }
     let mut parser = OutputParser::new(&codec, true, 1000);
     parser.push(&[13]);
-    assert!(parser.finish(StopReason::Budget)?.proposal.is_none());
+    assert!(parser.finish(StopReason::Budget)?.proposals.is_empty());
     let done = complete(
         &codec,
         &call(&codec, "pwd", Some(11)),
         StopReason::Cancelled,
     );
-    assert!(done.proposal.is_none());
+    assert!(done.proposals.is_empty());
     Ok(())
 }
 
 #[test]
-fn malformed_unknown_duplicate_multiple_and_suffix_are_errors() -> Result<()> {
+fn malformed_unknown_duplicate_unseparated_calls_and_suffix_are_errors() -> Result<()> {
     let (codec, _) = bound(&synthetic())?;
     let bodies = [
         "\n<function=other>\n<parameter=command>\npwd\n</parameter>\n</function>\n",
@@ -658,7 +664,7 @@ fn malformed_unknown_duplicate_multiple_and_suffix_are_errors() -> Result<()> {
     cases.push(invalid_utf8);
     for ids in cases {
         let done = complete(&codec, &ids, StopReason::Eos { id: 11 });
-        assert!(done.proposal.is_none(), "{ids:?}");
+        assert!(done.proposals.is_empty(), "{ids:?}");
         assert!(done.partial.protocol_error.is_some(), "{ids:?}");
     }
     let mut parser = OutputParser::new(&codec, false, 2);
@@ -666,8 +672,7 @@ fn malformed_unknown_duplicate_multiple_and_suffix_are_errors() -> Result<()> {
     assert!(
         parser
             .finish(StopReason::Eos { id: 11 })?
-            .proposal
-            .is_none()
+            .proposals.is_empty()
     );
     Ok(())
 }
@@ -706,7 +711,7 @@ fn first_fault_preserves_control_phase_position_source_and_suppression() -> Resu
         assert!(parser.push(&[12, 11, 14]));
         let done = parser.finish(StopReason::Eos { id: 11 })?;
         assert_eq!(done.partial.protocol_error.as_deref(), Some(first.as_str()));
-        assert!(done.proposal.is_none());
+        assert!(done.proposals.is_empty());
     }
     Ok(())
 }
@@ -720,7 +725,7 @@ fn first_fault_distinguishes_unknown_bound_and_finalization() -> Result<()> {
     let error = done.partial.protocol_error.unwrap();
     assert!(error.starts_with("unknown token ID [token_id=4294967295 phase=Answer emitted_index=1 emitted_count=2 retained_count=2 "));
     assert!(error.contains("spelling=null spelling_status=non-control-or-unknown"));
-    assert!(done.proposal.is_none());
+    assert!(done.proposals.is_empty());
 
     let mut bounded = OutputParser::new(&codec, true, 2);
     assert!(!bounded.push(&[13, 14, 15]));
@@ -728,7 +733,7 @@ fn first_fault_distinguishes_unknown_bound_and_finalization() -> Result<()> {
     let error = done.partial.protocol_error.unwrap();
     assert!(error.starts_with("generated token bound exceeded [token_id=15 phase=Call emitted_index=2 emitted_count=3 retained_count=2 "));
     assert_eq!(done.partial.raw_text, "</think><tool_call>");
-    assert!(done.proposal.is_none());
+    assert!(done.proposals.is_empty());
 
     let ids = call(&codec, "pwd", None);
     let done = complete(&codec, &ids, StopReason::Eos { id: 11 });
@@ -736,7 +741,7 @@ fn first_fault_distinguishes_unknown_bound_and_finalization() -> Result<()> {
     assert!(error.starts_with("stop reason does not match an observed terminal EOS [token_id=none phase=AfterCall emitted_index=none "));
     assert!(error.contains(&format!("emitted_count={} retained_count={}", ids.len(), ids.len())));
     assert!(error.contains("spelling=null spelling_status=no-token"));
-    assert!(done.proposal.is_none());
+    assert!(done.proposals.is_empty());
     Ok(())
 }
 
@@ -762,7 +767,7 @@ fn first_fault_spelling_is_bounded_escaped_metadata_not_content() -> Result<()> 
         assert!(error.contains(&expected), "{error}");
         assert!(!error.contains('\n'));
         assert!(!error.contains(&oversized));
-        assert!(done.proposal.is_none());
+        assert!(done.proposals.is_empty());
     }
     // A known ordinary token after EOS is a fault, but its vocabulary text is
     // generated content, not reserved control metadata.
@@ -772,7 +777,7 @@ fn first_fault_spelling_is_bounded_escaped_metadata_not_content() -> Result<()> 
     let error = done.partial.protocol_error.unwrap();
     assert!(error.starts_with(&format!("tokens after EOS [token_id={ordinary} phase=End emitted_index=1 emitted_count=2 retained_count=2 ")));
     assert!(error.contains("spelling=null spelling_status=non-control-or-unknown"));
-    assert!(done.proposal.is_none());
+    assert!(done.proposals.is_empty());
     Ok(())
 }
 
@@ -790,7 +795,7 @@ fn retained_real_tokenizer_content_policy() -> Result<()> {
         &call(&codec, command, Some(11)),
         StopReason::Eos { id: 11 },
     );
-    assert_eq!(done.proposal.unwrap().arguments()["command"], command);
+    assert_eq!(done.proposals.into_iter().next().unwrap().arguments()["command"], command);
     Ok(())
 }
 
@@ -820,6 +825,207 @@ fn body_ids(codec: &ChatCodec, body: &str) -> Result<Vec<u32>> {
     ids.extend(codec.encode_content(body)?);
     ids.extend([15, 11]);
     Ok(ids)
+}
+
+fn batch_ids(codec: &ChatCodec, bodies: &[&str], eos: Option<u32>) -> Result<Vec<u32>> {
+    let mut ids = Vec::new();
+    for body in bodies {
+        ids.push(14);
+        ids.extend(codec.encode_content(body)?);
+        ids.push(15);
+        ids.extend(codec.encode_content("\n")?);
+    }
+    ids.extend(eos);
+    Ok(ids)
+}
+
+#[test]
+fn ordered_calls_stay_private_until_eos_and_replay_exact_bodies() -> Result<()> {
+    let (codec, native) = bound(&synthetic())?;
+    let codec = codec.with_tools(registered_tools()?);
+    let first = exec_invocation("  printf '東京 🐈'\n\t pwd  \n");
+    // Original parameter order, JSON spacing and numeric lexeme must survive
+    // rendering; typed argument reserialization would lose these bytes.
+    let second = concat!("\n<function=fixture_apply>\n",
+        "<parameter=ratio>\n1.250e+0\n</parameter>\n",
+        "<parameter=object>\n{ \"z\": [2, 1] }\n</parameter>\n",
+        "<parameter=text>\n  second 🐈 \n</parameter>\n</function>\n");
+    for eos in [2, 11] {
+        let mut ids = codec.encode_content("consider 東京")?;
+        ids.push(13);
+        ids.extend(codec.encode_content("I'll check both.\n")?);
+        ids.extend(batch_ids(&codec, &[first.body(), second], Some(eos))?);
+        let mut parser = OutputParser::new(&codec, true, ids.len());
+        for (index, &id) in ids.iter().enumerate() {
+            assert!(parser.push(&[id]));
+            // PartialOutput deliberately has no proposal field, even after
+            // a complete first body, a second opener, or the closing EOS.
+            let PartialOutput { reasoning: _, answer: _, raw_text, protocol_error } = parser.snapshot()?;
+            assert_eq!(raw_text, codec.decode(&ids[..=index])?);
+            assert!(protocol_error.is_none());
+        }
+        let done = parser.finish(StopReason::Eos { id: eos })?;
+        assert!(done.partial.protocol_error.is_none());
+        assert_eq!(done.partial.reasoning, "consider 東京");
+        assert_eq!(done.partial.answer, "I'll check both.\n");
+        assert_eq!(done.proposals.len(), 2);
+        assert_eq!(done.proposals[0], first);
+        assert_eq!(done.proposals[1].name(), "fixture_apply");
+        assert_eq!(done.proposals[1].body(), second);
+        assert_eq!(done.proposals[1].arguments()["ratio"], json!(1.25));
+        assert_eq!(done.proposals[1].arguments()["text"], "  second 🐈 ");
+        let history = History { messages: vec![Message::Assistant {
+            reasoning: done.partial.reasoning, answer: done.partial.answer,
+            tool_calls: done.proposals,
+        }], ..History::default() };
+        let expected = format!(concat!("<|im_start|>system\n<|im_end|>\n",
+            "<|im_start|>assistant\n<think>\nconsider 東京</think>I'll check both.\n",
+            "<tool_call>{}</tool_call>\n<tool_call>{second}</tool_call>\n<|im_end|>\n"), first.body(), second = second);
+        let policy = RenderOptions { add_generation_prompt: false, ..options(false) };
+        let rendered = codec.render_adapted(&history, policy)?;
+        assert_eq!(rendered.text, expected);
+        assert_eq!(rendered.token_ids, native.encode(expected.as_str(), false).unwrap().get_ids());
+        assert_eq!(codec.decode(&rendered.token_ids)?, expected);
+    }
+    Ok(())
+}
+
+#[test]
+fn repeated_identical_calls_keep_each_position_and_second_opener_is_incomplete() -> Result<()> {
+    let (codec, _) = bound(&synthetic())?;
+    let invocation = exec_invocation("pwd");
+    let ids = batch_ids(&codec, &[invocation.body(), invocation.body()], Some(11))?;
+    let second_opener = ids.iter().rposition(|&id| id == 14).unwrap();
+    let mut parser = OutputParser::new(&codec, false, ids.len());
+    assert!(parser.push(&ids[..=second_opener]));
+    let partial = parser.snapshot()?;
+    assert!(partial.protocol_error.is_none());
+    assert!(partial.raw_text.ends_with("</tool_call>\n<tool_call>"));
+    let incomplete = parser.finish(StopReason::Budget)?;
+    assert!(incomplete.proposals.is_empty());
+    assert_eq!(incomplete.partial, partial);
+    let done = complete(&codec, &ids, StopReason::Eos { id: 11 });
+    assert_eq!(done.proposals, vec![invocation.clone(), invocation.clone()]);
+    for split in 0..=ids.len() {
+        let mut parser = OutputParser::new(&codec, false, ids.len());
+        assert!(parser.push(&ids[..split]));
+        assert!(parser.push(&ids[split..]));
+        assert_eq!(parser.finish(StopReason::Eos { id: 11 })?, done);
+    }
+    let history = History { messages: vec![Message::Assistant {
+        reasoning: String::new(), answer: String::new(), tool_calls: done.proposals,
+    }], ..History::default() };
+    let rendered = codec.render_adapted(&history, options(false))?;
+    let envelope = format!("<tool_call>{}</tool_call>", invocation.body());
+    assert_eq!(rendered.text.matches(envelope.as_str()).count(), 2);
+    Ok(())
+}
+
+#[test]
+fn later_malformed_call_or_interruption_suppresses_the_entire_batch() -> Result<()> {
+    let (codec, _) = bound(&synthetic())?;
+    let first = exec_invocation("pwd");
+    let second = exec_invocation("printf second");
+    let ids = batch_ids(&codec, &[first.body(), second.body()], Some(11))?;
+    let second_opener = ids.iter().rposition(|&id| id == 14).unwrap();
+    // No EOS: even complete bodies never release an earlier invocation.
+    for end in 0..ids.len() {
+        let done = complete(&codec, &ids[..end], StopReason::Eos { id: 11 });
+        assert!(done.proposals.is_empty(), "prefix {end}");
+        assert!(done.partial.protocol_error.is_some());
+        assert_eq!(done.partial.raw_text, codec.decode(&ids[..end])?);
+    }
+    for stop in [StopReason::Budget, StopReason::Cancelled,
+        StopReason::Error("fixture".into()), StopReason::Eos { id: 2 }, StopReason::Eos { id: 12 }] {
+        for end in [second_opener + 1, ids.len() - 1, ids.len()] {
+            let done = complete(&codec, &ids[..end], stop.clone());
+            assert!(done.proposals.is_empty());
+            assert_eq!(done.stop, stop);
+            assert_eq!(done.partial.raw_text, codec.decode(&ids[..end])?);
+        }
+    }
+    // Observed EOS while the later body is still open is also invalid.
+    let second_closer = ids.iter().rposition(|&id| id == 15).unwrap();
+    for end in second_opener + 1..=second_closer {
+        let mut truncated = ids[..end].to_vec();
+        truncated.push(11);
+        let done = complete(&codec, &truncated, StopReason::Eos { id: 11 });
+        assert!(done.proposals.is_empty());
+        let error = done.partial.protocol_error.unwrap();
+        assert!(error.starts_with("EOS before protocol completion [token_id=11 phase=Call "));
+    }
+    for bad in ["", "\n<function=absent>\n</function>\n",
+        "\n<function=exec>\n</function>\n",
+        "\n<function=exec>\n<parameter=command>\nx\n</parameter>\n<parameter=command>\ny\n</parameter>\n</function>\n"] {
+        let malformed = batch_ids(&codec, &[first.body(), bad], Some(11))?;
+        let done = complete(&codec, &malformed, StopReason::Eos { id: 11 });
+        assert!(done.proposals.is_empty());
+        assert!(done.partial.protocol_error.unwrap().starts_with("invalid registered tool call:"));
+        assert_eq!(done.partial.raw_text, codec.decode(&malformed)?);
+    }
+    for limit in [second_opener, second_opener + 1, ids.len() - 1] {
+        let mut parser = OutputParser::new(&codec, false, limit);
+        assert!(!parser.push(&ids));
+        let done = parser.finish(StopReason::Eos { id: 11 })?;
+        assert!(done.proposals.is_empty());
+        assert_eq!(done.partial.raw_text, codec.decode(&ids[..limit])?);
+        let error = done.partial.protocol_error.unwrap();
+        assert!(error.starts_with("generated token bound exceeded"));
+        assert!(error.contains(&format!("emitted_index={limit} emitted_count={} retained_count={limit}", limit + 1)));
+    }
+    Ok(())
+}
+
+#[test]
+fn call_list_separators_and_later_controls_remain_exact() -> Result<()> {
+    let (codec, _) = bound(&synthetic())?;
+    for separator in ["", " ", "\n\n", "\r\n", "\t", "\ntext\n"] {
+        let mut ids = call(&codec, "first", None);
+        ids.extend(codec.encode_content(separator)?);
+        let index = ids.len();
+        ids.extend(call(&codec, "second", Some(11)));
+        let done = complete(&codec, &ids, StopReason::Eos { id: 11 });
+        assert!(done.proposals.is_empty());
+        let error = done.partial.protocol_error.unwrap();
+        assert!(error.starts_with(&format!("expected one LF between tool calls [token_id=14 phase=AfterCall emitted_index={index} ")));
+    }
+    let first = exec_invocation("first");
+    let mut ids = batch_ids(&codec, &[first.body()], None)?;
+    ids.push(14);
+    let index = ids.len();
+    ids.extend([999, 15, 11]);
+    let done = complete(&codec, &ids, StopReason::Eos { id: 11 });
+    assert!(done.proposals.is_empty());
+    assert!(done.partial.protocol_error.unwrap().starts_with(&format!(
+        "unexpected control token [token_id=999 phase=Call emitted_index={index} ")));
+    let mut invalid_utf8 = batch_ids(&codec, &[first.body()], None)?;
+    invalid_utf8.push(14);
+    invalid_utf8.extend(codec.encode_content("\n<function=exec>\n<parameter=command>\n")?);
+    invalid_utf8.push(codec.encode_content("🐈")?[0]);
+    invalid_utf8.extend(codec.encode_content("\n</parameter>\n</function>\n")?);
+    invalid_utf8.extend([15, 11]);
+    let done = complete(&codec, &invalid_utf8, StopReason::Eos { id: 11 });
+    assert!(done.proposals.is_empty());
+    assert!(done.partial.protocol_error.unwrap().contains("incomplete or invalid command UTF-8"));
+
+    for suffix in [" ", "\n\n", "\ntext"] {
+        let mut ids = batch_ids(&codec, &[first.body(), first.body()], None)?;
+        ids.extend(codec.encode_content(suffix)?);
+        ids.push(11);
+        let done = complete(&codec, &ids, StopReason::Eos { id: 11 });
+        assert!(done.proposals.is_empty());
+        assert!(done.partial.protocol_error.unwrap().starts_with("suffix after tool call"));
+    }
+    for extra in [11, 14, codec.encode_content("x")?[0]] {
+        let mut ids = batch_ids(&codec, &[first.body(), first.body()], Some(11))?;
+        let index = ids.len();
+        ids.push(extra);
+        let done = complete(&codec, &ids, StopReason::Eos { id: 11 });
+        assert!(done.proposals.is_empty());
+        assert!(done.partial.protocol_error.unwrap().starts_with(&format!(
+            "tokens after EOS [token_id={extra} phase=End emitted_index={index} ")));
+    }
+    Ok(())
 }
 
 #[test]
@@ -854,7 +1060,7 @@ fn registered_typed_arguments_preserve_exact_body_and_unicode_boundaries() -> Re
     assert!(done.partial.protocol_error.is_none());
     assert_eq!(done.partial.reasoning, "consider 🐈");
     assert_eq!(done.partial.answer, "I'll apply it.");
-    let invocation = done.proposal.unwrap();
+    let invocation = done.proposals.into_iter().next().unwrap();
     assert_eq!(invocation.name(), "fixture_apply");
     assert_eq!(invocation.body(), body);
     assert_eq!(
@@ -871,7 +1077,7 @@ fn registered_typed_arguments_preserve_exact_body_and_unicode_boundaries() -> Re
         messages: vec![Message::Assistant {
             reasoning: done.partial.reasoning,
             answer: done.partial.answer,
-            tool_call: Some(invocation),
+            tool_calls: vec![invocation],
         }],
     };
     let rendered = codec.render_adapted(&history, options(true))?;
@@ -928,7 +1134,7 @@ fn registered_discriminator_preserves_string_true_and_publisher_false() -> Resul
             &body_ids(&codec, &body)?,
             StopReason::Eos { id: 11 },
         );
-        let invocation = done.proposal.unwrap();
+        let invocation = done.proposals.into_iter().next().unwrap();
         assert_eq!(invocation.arguments()["value"], expected);
         assert_eq!(invocation.body(), body);
     }
@@ -965,7 +1171,7 @@ fn registered_ambiguous_or_unmatched_types_never_propose() -> Result<()> {
             &body_ids(&codec, &body)?,
             StopReason::Eos { id: 11 },
         );
-        assert!(done.proposal.is_none());
+        assert!(done.proposals.is_empty());
         assert!(done.partial.protocol_error.is_some());
     }
     let tools = Tools::new(vec![ToolDefinition {
@@ -988,20 +1194,19 @@ fn registered_calls_require_known_complete_typed_envelope_and_matching_eos() -> 
     let body = "\n<function=fixture_empty>\n</function>\n";
     let ids = body_ids(&codec, body)?;
     let done = complete(&codec, &ids, StopReason::Eos { id: 11 });
-    assert_eq!(done.proposal.unwrap().arguments().len(), 0);
+    assert_eq!(done.proposals.into_iter().next().unwrap().arguments().len(), 0);
     for stop in [
         StopReason::Budget,
         StopReason::Cancelled,
         StopReason::Error("fixture".into()),
         StopReason::Eos { id: 2 },
     ] {
-        assert!(complete(&codec, &ids, stop).proposal.is_none());
+        assert!(complete(&codec, &ids, stop).proposals.is_empty());
     }
     for end in 0..ids.len() {
         assert!(
             complete(&codec, &ids[..end], StopReason::Eos { id: 11 })
-                .proposal
-                .is_none()
+                .proposals.is_empty()
         );
     }
     for bad in [
@@ -1011,7 +1216,7 @@ fn registered_calls_require_known_complete_typed_envelope_and_matching_eos() -> 
         "\n<function=fixture_apply>\n<parameter=text>\nx</parameter>y\n</parameter>\n</function>\n",
     ] {
         let done = complete(&codec, &body_ids(&codec, bad)?, StopReason::Eos { id: 11 });
-        assert!(done.proposal.is_none());
+        assert!(done.proposals.is_empty());
         assert!(done.partial.protocol_error.is_some());
     }
     Ok(())
@@ -1026,7 +1231,7 @@ fn registered_integer_bounds_and_original_numeric_lexemes_are_distinct() -> Resu
             "\n<function=fixture_apply>\n<parameter=text>\nx\n</parameter>\n<parameter=count>\n{integer}\n</parameter>\n</function>\n"
         );
         let done = complete(&codec, &body_ids(&codec, &body)?, StopReason::Eos { id: 11 });
-        assert!(done.proposal.is_none(), "{integer}");
+        assert!(done.proposals.is_empty(), "{integer}");
         assert!(done.partial.protocol_error.is_some(), "{integer}");
     }
     for integer in ["18446744073709551615", "-9223372036854775808"] {
@@ -1065,7 +1270,7 @@ fn registered_tools_leave_speech_free_and_change_actual_prompt_tokens() -> Resul
     let mut ids = codec.encode_content("I can answer in ordinary speech. 🐈")?;
     ids.push(11);
     let done = complete(&codec, &ids, StopReason::Eos { id: 11 });
-    assert!(done.proposal.is_none());
+    assert!(done.proposals.is_empty());
     assert!(done.partial.protocol_error.is_none());
     assert_eq!(done.partial.answer, "I can answer in ordinary speech. 🐈");
     let o = RenderOptions {
@@ -1152,7 +1357,7 @@ fn registered_schema_and_host_history_match_publisher_reference_cases() -> Resul
             messages: vec![Message::Assistant {
                 reasoning: String::new(),
                 answer: String::new(),
-                tool_call: Some(invocation),
+                tool_calls: vec![invocation],
             }],
         };
         let text = render_reference_text(

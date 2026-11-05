@@ -162,16 +162,16 @@ impl Decoder for DecodeScript {
         if self.protocol_finish {
             partial.protocol_error = Some("scripted malformed finish".into());
         }
-        // Deliberately offer on every stop to check the owner's unconditional
-        // suppression. This is not OutputParser grammar behavior.
+        // Deliberately offer two calls on every stop to check the owner's
+        // whole-batch suppression. This is not OutputParser grammar behavior.
         Ok(Completion {
             partial,
             stop,
-            proposal: Some(Invocation::new(
+            proposals: vec![Invocation::new(
                 "exec",
                 serde_json::from_value(serde_json::json!({"command":"mock, never executed"}))?,
                 &Tools::exec_only(),
-            )?),
+            )?; 2],
         })
     }
 }
@@ -187,7 +187,7 @@ fn run(script: &mut Script, prompt: &[u32], budget: usize, decoder: DecodeScript
 }
 fn errored(out: &TurnOutput, needle: &str) {
     assert!(matches!(&out.completion.stop, StopReason::Error(message) if message.contains(needle)));
-    assert!(out.completion.proposal.is_none());
+    assert!(out.completion.proposals.is_empty());
 }
 
 #[derive(Default)]
@@ -535,6 +535,7 @@ fn generation_eos_is_retained_at_budget_boundary_not_attended() {
         assert_eq!(s.committed, [1, 5]);
         assert_eq!(s.appends, [vec![1], vec![5]]);
         assert_eq!(out.completion.partial.raw_text, format!("5,{eos}"));
+        assert_eq!(out.completion.proposals.len(), 2);
         assert!(out.decoded_complete && out.limit.is_none());
     }
 }
@@ -547,7 +548,7 @@ fn generation_zero_budget_does_not_reset_or_append() {
     let out = run(&mut s, &[1], 0, DecodeScript::default());
     assert_eq!(out.completion.stop, StopReason::Budget);
     assert_eq!(out.limit, Some(LimitCause::TokenBudget));
-    assert!(out.emitted_ids.is_empty() && out.completion.proposal.is_none());
+    assert!(out.emitted_ids.is_empty() && out.completion.proposals.is_empty());
     assert_eq!(out.session_status, Status::Poisoned);
     assert_eq!(s.committed, [9]);
     assert!(s.appends.is_empty() && s.resets == 0);
@@ -563,7 +564,7 @@ fn generation_context_limit_is_budget_not_eos_and_does_not_overflow() {
     assert_eq!(out.limit, Some(LimitCause::Context));
     assert_eq!(s.committed, [1, 5, 6]);
     assert_eq!(out.committed_tokens, 3);
-    assert!(out.completion.proposal.is_none());
+    assert!(out.completion.proposals.is_empty());
 }
 
 #[test]
@@ -597,7 +598,7 @@ fn generation_cancel_before_work_and_during_private_prefill() {
     assert_eq!(out.session_status, Status::Poisoned);
     assert_eq!(s.appends.len(), 1);
     assert_eq!(s.resets, 1);
-    assert!(out.emitted_ids.is_empty() && out.completion.proposal.is_none());
+    assert!(out.emitted_ids.is_empty() && out.completion.proposals.is_empty());
 }
 
 #[test]
@@ -620,7 +621,7 @@ fn generation_cancel_after_emission_retains_unattended_id() {
     assert_eq!(out.emitted_ids, [5]);
     assert_eq!(out.committed_tokens, 1);
     assert_eq!(out.completion.partial.raw_text, "5");
-    assert!(out.completion.proposal.is_none());
+    assert!(out.completion.proposals.is_empty());
 }
 
 #[test]
@@ -760,7 +761,7 @@ fn generation_whole_prompt_preflight_preserves_old_state() {
         s.committed = vec![9];
         let out = run(&mut s, &prompt, 1, DecodeScript::default());
         assert!(matches!(out.completion.stop, StopReason::Error(_)));
-        assert!(out.completion.proposal.is_none());
+        assert!(out.completion.proposals.is_empty());
         assert_eq!(s.committed, [9]);
         assert_eq!(out.session_status, Status::Ready);
         assert!(s.appends.is_empty() && s.resets == 0);

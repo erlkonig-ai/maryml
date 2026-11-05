@@ -20,7 +20,7 @@ pub enum Message {
     Assistant {
         reasoning: String,
         answer: String,
-        tool_call: Option<Invocation>,
+        tool_calls: Vec<Invocation>,
     },
     /// Selected model-visible text. Result identity/status remain host-side.
     ToolResult {
@@ -216,7 +216,7 @@ fn render_parts(
             Message::Assistant {
                 reasoning,
                 answer,
-                tool_call,
+                tool_calls,
             } => {
                 open(&mut parts, "assistant");
                 control(&mut parts, 12);
@@ -227,9 +227,11 @@ fn render_parts(
                 // Reference trims the combined body, whose first bytes are
                 // always <think>; thus only the answer's trailing space goes.
                 content(&mut parts, answer.trim_end());
-                if let Some(invocation) = tool_call {
-                    invocation.validate(tools)?;
+                if !tool_calls.is_empty() {
                     content(&mut parts, "\n");
+                }
+                for invocation in tool_calls {
+                    invocation.validate(tools)?;
                     control(&mut parts, 14);
                     content(&mut parts, invocation.body());
                     control(&mut parts, 15);
@@ -536,7 +538,8 @@ pub struct PartialOutput {
 pub struct Completion {
     pub partial: PartialOutput,
     pub stop: StopReason,
-    pub proposal: Option<Invocation>,
+    /// Ordered, complete batch; empty unless every call and terminal validate.
+    pub proposals: Vec<Invocation>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -566,10 +569,10 @@ pub struct OutputParser<'a> {
     reasoning: Vec<u32>,
     answer: Vec<u32>,
     call: Vec<u32>,
+    calls: Vec<Vec<u32>>,
     suffix: Vec<u32>,
     terminal: Option<u32>,
     error: Option<String>,
-    call_closed: bool,
 }
 
 #[cfg(feature = "tokenizer")]
@@ -589,10 +592,10 @@ impl<'a> OutputParser<'a> {
             reasoning: Vec::new(),
             answer: Vec::new(),
             call: Vec::new(),
+            calls: Vec::new(),
             suffix: Vec::new(),
             terminal: None,
             error: None,
-            call_closed: false,
         }
     }
 
@@ -654,8 +657,17 @@ impl<'a> OutputParser<'a> {
                 }
                 13 if self.phase == Phase::Reasoning => self.phase = Phase::Answer,
                 14 if self.phase == Phase::Answer => self.phase = Phase::Call,
+                14 if self.phase == Phase::AfterCall => {
+                    // The pinned publisher loops over envelopes with exactly
+                    // one LF between them. No whitespace trimming or prose.
+                    if !matches!(self.codec.decode_command(&self.suffix).as_deref(), Ok("\n")) {
+                        self.fail("expected one LF between tool calls", token);
+                    }
+                    self.suffix.clear();
+                    self.phase = Phase::Call;
+                }
                 15 if self.phase == Phase::Call => {
-                    self.call_closed = true;
+                    self.calls.push(std::mem::take(&mut self.call));
                     self.phase = Phase::AfterCall;
                 }
                 _ if self.codec.forbidden.contains(&id) => self.fail("unexpected control token", token),
@@ -684,35 +696,43 @@ impl<'a> OutputParser<'a> {
     }
 
     pub fn finish(mut self, stop: StopReason) -> Result<Completion> {
-        let mut proposal = None;
+        let mut proposals = Vec::new();
         if let StopReason::Eos { id } = stop {
             if !matches!(id, 2 | 11) || self.terminal != Some(id) {
                 self.fail("stop reason does not match an observed terminal EOS", None);
             }
-            if self.call_closed {
-                let suffix = self.codec.decode(&self.suffix)?;
+            if !self.calls.is_empty() {
+                let suffix = self.codec.decode_command(&self.suffix);
                 // One LF is the official template's call terminator, not a
-                // natural-language suffix. All other suffix bytes are errors.
-                if !suffix.is_empty() && suffix != "\n" {
+                // natural-language suffix. Preserve the accepted single-call
+                // EOS immediately after the closer; no other suffix is valid.
+                if !matches!(suffix.as_deref(), Ok("" | "\n")) {
                     self.fail("suffix after tool call", None);
                 }
-                match self
-                    .codec
-                    .decode_command(&self.call)
-                    .and_then(|body| self.codec.tools.parse_call(&body))
-                {
-                    Ok(invocation) => proposal = Some(invocation),
-                    Err(error) => self.fail(&format!("invalid registered tool call: {error:#}"), None),
+                // No invocation leaves this parser until every body validates
+                // and the observed EOS matches. A bad later call voids all.
+                if self.error.is_none() {
+                    for call in std::mem::take(&mut self.calls) {
+                        match self.codec.decode_command(&call)
+                            .and_then(|body| self.codec.tools.parse_call(&body))
+                        {
+                            Ok(invocation) => proposals.push(invocation),
+                            Err(error) => {
+                                self.fail(&format!("invalid registered tool call: {error:#}"), None);
+                                break;
+                            }
+                        }
+                    }
                 }
             }
         }
         if self.error.is_some() || !matches!(stop, StopReason::Eos { .. }) {
-            proposal = None;
+            proposals.clear();
         }
         Ok(Completion {
             partial: self.snapshot()?,
             stop,
-            proposal,
+            proposals,
         })
     }
 }
