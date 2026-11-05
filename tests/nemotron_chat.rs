@@ -673,6 +673,110 @@ fn malformed_unknown_duplicate_multiple_and_suffix_are_errors() -> Result<()> {
 }
 
 #[test]
+fn first_fault_preserves_control_phase_position_source_and_suppression() -> Result<()> {
+    let (codec, _) = bound(&synthetic())?;
+    let source = codec.renderer_definition()?.codec;
+    // Prefixes are valid transitions. Each next token is wrong in the stated
+    // phase, including a repeated opener/closer and a second call envelope.
+    let cases: &[(&[u32], u32, &str, &str)] = &[
+        (&[], 12, "Reasoning", "<think>"),
+        (&[], 14, "Reasoning", "<tool_call>"),
+        (&[], 15, "Reasoning", "</tool_call>"),
+        (&[], 2, "Reasoning", "</s>"),
+        (&[13], 13, "Answer", "</think>"),
+        (&[13], 15, "Answer", "</tool_call>"),
+        (&[13], 16, "Answer", "<tool_response>"),
+        (&[13], 17, "Answer", "</tool_response>"),
+        (&[13], 999, "Answer", "<SPECIAL_999>"),
+        (&[13, 14], 14, "Call", "<tool_call>"),
+        (&[13, 14], 11, "Call", "<|im_end|>"),
+        (&[13, 14, 15], 14, "AfterCall", "<tool_call>"),
+        (&[13, 11], 11, "End", "<|im_end|>"),
+    ];
+    for &(prefix, id, phase, spelling) in cases {
+        let mut parser = OutputParser::new(&codec, true, 100);
+        assert!(parser.push(prefix));
+        assert!(parser.snapshot()?.protocol_error.is_none());
+        assert!(parser.push(&[id]));
+        let first = parser.snapshot()?.protocol_error.unwrap();
+        let expected = format!("[token_id={id} phase={phase} emitted_index={} emitted_count={} retained_count={} spelling={} spelling_status=known codec={source:?}]",
+            prefix.len(), prefix.len() + 1, prefix.len() + 1, serde_json::to_string(spelling)?);
+        assert!(first.ends_with(&expected), "{first}");
+        // Later bad input and finish() errors cannot replace the FIRST tuple.
+        assert!(parser.push(&[12, 11, 14]));
+        let done = parser.finish(StopReason::Eos { id: 11 })?;
+        assert_eq!(done.partial.protocol_error.as_deref(), Some(first.as_str()));
+        assert!(done.proposal.is_none());
+    }
+    Ok(())
+}
+
+#[test]
+fn first_fault_distinguishes_unknown_bound_and_finalization() -> Result<()> {
+    let (codec, _) = bound(&synthetic())?;
+    let mut unknown = OutputParser::new(&codec, true, 10);
+    assert!(unknown.push(&[13, u32::MAX, 11]));
+    let done = unknown.finish(StopReason::Eos { id: 11 })?;
+    let error = done.partial.protocol_error.unwrap();
+    assert!(error.starts_with("unknown token ID [token_id=4294967295 phase=Answer emitted_index=1 emitted_count=2 retained_count=2 "));
+    assert!(error.contains("spelling=null spelling_status=non-control-or-unknown"));
+    assert!(done.proposal.is_none());
+
+    let mut bounded = OutputParser::new(&codec, true, 2);
+    assert!(!bounded.push(&[13, 14, 15]));
+    let done = bounded.finish(StopReason::Eos { id: 11 })?;
+    let error = done.partial.protocol_error.unwrap();
+    assert!(error.starts_with("generated token bound exceeded [token_id=15 phase=Call emitted_index=2 emitted_count=3 retained_count=2 "));
+    assert_eq!(done.partial.raw_text, "</think><tool_call>");
+    assert!(done.proposal.is_none());
+
+    let ids = call(&codec, "pwd", None);
+    let done = complete(&codec, &ids, StopReason::Eos { id: 11 });
+    let error = done.partial.protocol_error.unwrap();
+    assert!(error.starts_with("stop reason does not match an observed terminal EOS [token_id=none phase=AfterCall emitted_index=none "));
+    assert!(error.contains(&format!("emitted_count={} retained_count={}", ids.len(), ids.len())));
+    assert!(error.contains("spelling=null spelling_status=no-token"));
+    assert!(done.proposal.is_none());
+    Ok(())
+}
+
+#[test]
+fn first_fault_spelling_is_bounded_escaped_metadata_not_content() -> Result<()> {
+    let mut definition: Value = serde_json::from_slice(&synthetic())?;
+    let escaped = "<reserved\n\"東京\">";
+    let oversized = "界".repeat(33); // 99 UTF-8 bytes, over the 96-byte limit.
+    for (id, spelling) in [(998, escaped), (999, oversized.as_str())] {
+        definition["model"]["vocab"].as_object_mut().unwrap()
+            .remove(&format!("<SPECIAL_{id}>"));
+        definition["model"]["vocab"][spelling] = json!(id);
+        definition["added_tokens"][id]["content"] = json!(spelling);
+    }
+    let (codec, source) = bound(&serde_json::to_vec(&definition)?)?;
+    for (id, expected) in [
+        (998, format!("spelling={} spelling_status=known", serde_json::to_string(escaped)?)),
+        (999, "spelling=null spelling_status=over-limit".into()),
+    ] {
+        assert_eq!(source.id_to_token(id).as_deref(), Some(if id == 998 { escaped } else { oversized.as_str() }));
+        let done = complete(&codec, &[id, 11], StopReason::Eos { id: 11 });
+        let error = done.partial.protocol_error.unwrap();
+        assert!(error.contains(&expected), "{error}");
+        assert!(!error.contains('\n'));
+        assert!(!error.contains(&oversized));
+        assert!(done.proposal.is_none());
+    }
+    // A known ordinary token after EOS is a fault, but its vocabulary text is
+    // generated content, not reserved control metadata.
+    let ordinary = codec.encode_content("private")?[0];
+    assert!(ordinary >= 1000);
+    let done = complete(&codec, &[11, ordinary], StopReason::Eos { id: 11 });
+    let error = done.partial.protocol_error.unwrap();
+    assert!(error.starts_with(&format!("tokens after EOS [token_id={ordinary} phase=End emitted_index=1 emitted_count=2 retained_count=2 ")));
+    assert!(error.contains("spelling=null spelling_status=non-control-or-unknown"));
+    assert!(done.proposal.is_none());
+    Ok(())
+}
+
+#[test]
 #[ignore = "explicit retained full-tokenizer gate; set NEMOTRON_TOKENIZER_JSON"]
 fn retained_real_tokenizer_content_policy() -> Result<()> {
     let bytes = std::fs::read(std::env::var("NEMOTRON_TOKENIZER_JSON")?)?;

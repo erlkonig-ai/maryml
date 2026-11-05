@@ -390,11 +390,18 @@ impl ChatCodec {
         &self.tools
     }
 
-    pub fn renderer_definition(&self) -> Result<RendererDefinition> {
+    // Share the compiled-source identity with first-fault diagnostics. This
+    // path never serializes the held tokenizer or includes generated content.
+    fn renderer_source() -> (String, String) {
         let template = format!("// maryml/src/models/nemotron_h/chat.rs\n{}\n// maryml/src/models/nemotron_h/chat_tools.rs\n{}",
             include_str!("chat.rs"), include_str!("chat_tools.rs"));
         let codec = format!("maryml::models::nemotron_h::chat source-blake3:{}",
             blake3::hash(template.as_bytes()).to_hex());
+        (template, codec)
+    }
+
+    pub fn renderer_definition(&self) -> Result<RendererDefinition> {
+        let (template, codec) = Self::renderer_source();
         let tokenizer = self.tokenizer.to_string(false)
             .map_err(|error| anyhow::anyhow!("serialize held native tokenizer: {error}"))?;
         Ok(RendererDefinition { template, tokenizer, codec })
@@ -542,6 +549,15 @@ enum Phase {
 }
 
 #[cfg(feature = "tokenizer")]
+#[derive(Clone, Copy)]
+struct FaultToken {
+    id: u32,
+    phase: Phase,
+    /// Zero-based emitted position, including a token refused by max_tokens.
+    index: usize,
+}
+
+#[cfg(feature = "tokenizer")]
 pub struct OutputParser<'a> {
     codec: &'a ChatCodec,
     phase: Phase,
@@ -580,9 +596,34 @@ impl<'a> OutputParser<'a> {
         }
     }
 
-    fn fail(&mut self, message: &str) {
+    fn fail(&mut self, message: &str, token: Option<FaultToken>) {
         if self.error.is_none() {
-            self.error = Some(message.to_owned());
+            // Only exact, bounded reserved-vocabulary spellings are metadata.
+            // Never expose an ordinary BPE piece or truncate it into evidence.
+            let (id, index, phase, count, spelling, spelling_status) = match token {
+                Some(token) => {
+                    let known = if token.id < 1000 {
+                        self.codec.tokenizer.id_to_token(token.id)
+                    } else {
+                        None
+                    };
+                    let (spelling, status) = match known {
+                        Some(text) if text.len() <= 96 =>
+                            (serde_json::to_string(&text).expect("serialize vocabulary text"), "known"),
+                        Some(_) => ("null".into(), "over-limit"),
+                        None if self.codec.forbidden.contains(&token.id) => ("null".into(), "unavailable"),
+                        None => ("null".into(), "non-control-or-unknown"),
+                    };
+                    (token.id.to_string(), token.index.to_string(), token.phase,
+                        token.index + 1, spelling, status)
+                }
+                // finish() can reject a complete call or a claimed stop without
+                // knowing one offending token. Do not blame the last emission.
+                None => ("none".into(), "none".into(), self.phase, self.ids.len(),
+                    "null".into(), "no-token"),
+            };
+            let (_, codec) = ChatCodec::renderer_source();
+            self.error = Some(format!("{message} [token_id={id} phase={phase:?} emitted_index={index} emitted_count={count} retained_count={} spelling={spelling} spelling_status={spelling_status} codec={codec:?}]", self.ids.len()));
         }
     }
 
@@ -590,23 +631,24 @@ impl<'a> OutputParser<'a> {
     /// input is retained for diagnostics. Returns false when the bound is hit.
     pub fn push(&mut self, ids: &[u32]) -> bool {
         for &id in ids {
+            let token = Some(FaultToken { id, phase: self.phase, index: self.ids.len() });
             if self.ids.len() >= self.max_tokens {
-                self.fail("generated token bound exceeded");
+                self.fail("generated token bound exceeded", token);
                 return false;
             }
             self.ids.push(id);
             if self.codec.tokenizer.id_to_token(id).is_none() {
-                self.fail("unknown token ID");
+                self.fail("unknown token ID", token);
             }
             if self.phase == Phase::End {
-                self.fail("tokens after EOS");
+                self.fail("tokens after EOS", token);
                 continue;
             }
             match id {
                 2 | 11 => {
                     self.terminal = Some(id);
                     if matches!(self.phase, Phase::Reasoning | Phase::Call) {
-                        self.fail("EOS before protocol completion");
+                        self.fail("EOS before protocol completion", token);
                     }
                     self.phase = Phase::End;
                 }
@@ -616,7 +658,7 @@ impl<'a> OutputParser<'a> {
                     self.call_closed = true;
                     self.phase = Phase::AfterCall;
                 }
-                _ if self.codec.forbidden.contains(&id) => self.fail("unexpected control token"),
+                _ if self.codec.forbidden.contains(&id) => self.fail("unexpected control token", token),
                 _ => match self.phase {
                     Phase::Reasoning => self.reasoning.push(id),
                     Phase::Answer => self.answer.push(id),
@@ -645,14 +687,14 @@ impl<'a> OutputParser<'a> {
         let mut proposal = None;
         if let StopReason::Eos { id } = stop {
             if !matches!(id, 2 | 11) || self.terminal != Some(id) {
-                self.fail("stop reason does not match an observed terminal EOS");
+                self.fail("stop reason does not match an observed terminal EOS", None);
             }
             if self.call_closed {
                 let suffix = self.codec.decode(&self.suffix)?;
                 // One LF is the official template's call terminator, not a
                 // natural-language suffix. All other suffix bytes are errors.
                 if !suffix.is_empty() && suffix != "\n" {
-                    self.fail("suffix after tool call");
+                    self.fail("suffix after tool call", None);
                 }
                 match self
                     .codec
@@ -660,7 +702,7 @@ impl<'a> OutputParser<'a> {
                     .and_then(|body| self.codec.tools.parse_call(&body))
                 {
                     Ok(invocation) => proposal = Some(invocation),
-                    Err(error) => self.fail(&format!("invalid registered tool call: {error:#}")),
+                    Err(error) => self.fail(&format!("invalid registered tool call: {error:#}"), None),
                 }
             }
         }

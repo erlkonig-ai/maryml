@@ -14,6 +14,13 @@
   and long key prefixes. This diagnostic does not establish an adaptive key
   threshold or whole-model performance/numerical equivalence.
 
+- Native output-protocol failures retain the first offending token ID, parser
+  phase before transition and emitted position/count in the existing error.
+  Reserved vocabulary spellings are bounded and escaped; ordinary token text
+  is omitted. Diagnostics share the compiled renderer's source identity, and
+  finalization-only faults do not invent an offending token. Grammar, first
+  fault latching and proposal suppression are unchanged.
+
 - Native Nemotron's codec accepts an explicit immutable selection of registered
   function schemas, with typed arguments and exact generated call bodies in
   history. Schemas participate in prompt rendering and token admission before
