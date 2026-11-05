@@ -148,10 +148,21 @@ pub fn admission(
     start: usize,
     tokens: usize,
 ) -> Result<PrefillAllocation> {
-    admission_with_prefix(c, l, start, tokens, 0)
+    admission_with_profile(c, l, start, tokens, attention::Profile::default())
 }
+pub fn admission_with_profile(c: &TextConfig, l: Limits, start: usize,
+    tokens: usize, profile: attention::Profile) -> Result<PrefillAllocation>
+{
+    admission_with_prefix_profile(c, l, start, tokens, 0, profile)
+}
+#[cfg(test)]
 pub(super) fn admission_with_prefix(c: &TextConfig, l: Limits, start: usize,
     tokens: usize, prefix: usize) -> Result<PrefillAllocation>
+{
+    admission_with_prefix_profile(c, l, start, tokens, prefix, attention::Profile::default())
+}
+pub(super) fn admission_with_prefix_profile(c: &TextConfig, l: Limits, start: usize,
+    tokens: usize, prefix: usize, profile: attention::Profile) -> Result<PrefillAllocation>
 {
     validate_config(c, l)?;
     let end = start
@@ -159,7 +170,7 @@ pub(super) fn admission_with_prefix(c: &TextConfig, l: Limits, start: usize,
         .filter(|&n| tokens > 0 && n <= l.capacity)
         .ok_or("prefill empty suffix or capacity exceeded")?;
     if tokens <= MAX_CHUNK {
-        let working = planned_prefix_chunk_bytes(c, l, start, tokens, prefix)?;
+        let working = planned_prefix_chunk_bytes(c, l, start, tokens, prefix, profile)?;
         return Ok(PrefillAllocation {
             tokens,
             layer_major: false,
@@ -207,7 +218,17 @@ pub(super) fn admission_with_prefix(c: &TextConfig, l: Limits, start: usize,
     for width in 1..=MAX_CHUNK {
         for kind in &c.layers_block_type {
             mixer_peak =
-                mixer_peak.max(layer_prefix_working_bytes(c, unbounded, end - width, width, kind, prefix)?);
+                mixer_peak.max(layer_prefix_working_bytes(c, unbounded, end - width, width, kind, prefix, profile)?);
+        }
+    }
+    // Preserve the existing conservative width envelope, but do not assume
+    // split rounding is monotone for prefix/private runs. Check every actual
+    // attention tile endpoint, including the profile's B4/B8 boundary.
+    if c.layers_block_type.iter().any(|kind| matches!(kind, LayerKind::Attention)) {
+        for offset in (0..tokens).step_by(MAX_CHUNK) {
+            let width = (tokens - offset).min(MAX_CHUNK);
+            mixer_peak = mixer_peak.max(layer_prefix_working_bytes(c, unbounded,
+                start + offset, width, &LayerKind::Attention, prefix, profile)?);
         }
     }
     // Copied tile, normalized input, mixer output, residual; tile IDs; the
@@ -569,9 +590,9 @@ impl<S: BlobStoreGet> Session<S> {
             }
             // Admit BOTH actual spans before changing either. The suffix uses
             // two key runs even though its prefix has not yet been published.
-            if count > 0 { admission(&self.model.config, self.limits, start, count)?; }
+            if count > 0 { admission_with_profile(&self.model.config, self.limits, start, count, self.attention_profile())?; }
             if count < ids.len() {
-                admission_with_prefix(&self.model.config, self.limits, seed.len(), ids.len() - count, seed.len())?;
+                admission_with_prefix_profile(&self.model.config, self.limits, seed.len(), ids.len() - count, seed.len(), self.attention_profile())?;
             }
             if cancelled() { return Ok(PrefillOutcome::Cancelled); }
             if count > 0 && self.prefill_span(&ids[..count], cancelled)? == PrefillOutcome::Cancelled {
@@ -598,12 +619,13 @@ impl<S: BlobStoreGet> Session<S> {
         {
             return Err("prefill unavailable session or invalid token ID".into());
         }
-        let plan = admission_with_prefix(
+        let plan = admission_with_prefix_profile(
             &self.model.config,
             self.limits,
             self.committed.len(),
             ids.len(),
             self.prefix.as_ref().map_or(0, |p| p.ids.len()),
+            self.attention_profile(),
         )?;
         self.check_boundary(self.committed.len())?;
         if cancelled() {

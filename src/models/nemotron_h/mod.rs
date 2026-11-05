@@ -10,6 +10,8 @@ pub mod fp8;
 #[cfg(feature = "nemotron-cuda")]
 pub mod attention;
 #[cfg(feature = "nemotron-cuda")]
+pub mod attention_mma;
+#[cfg(feature = "nemotron-cuda")]
 pub mod moe;
 #[cfg(feature = "nemotron-cuda")]
 pub mod session;

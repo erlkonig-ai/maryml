@@ -77,15 +77,20 @@ fn ownership(c: &TextConfig, l: Limits, prefix: usize) -> Result<PrefixOwnership
 /// The existing complete-model resident allowance still determines private
 /// expert quota. Retaining Mamba for restore is additional shared payload.
 pub fn prefix_admission(c: &TextConfig, l: Limits, prompt: usize, prefix: usize) -> Result<PrefixAllocation> {
+    prefix_admission_with_profile(c, l, prompt, prefix, attention::Profile::default())
+}
+pub fn prefix_admission_with_profile(c: &TextConfig, l: Limits, prompt: usize, prefix: usize,
+    profile: attention::Profile) -> Result<PrefixAllocation>
+{
     validate_config(c, l)?;
     resident_ownership(c, l)?;
     if prefix == 0 || prefix > prompt || prompt > l.capacity {
         return Err("prefix/prompt outside context capacity".into());
     }
     Ok(PrefixAllocation {
-        seed: prefill::admission(c, l, 0, prefix)?,
+        seed: prefill::admission_with_profile(c, l, 0, prefix, profile)?,
         suffix: if prompt == prefix { None } else {
-            Some(prefill::admission_with_prefix(c, l, prefix, prompt - prefix, prefix)?)
+            Some(prefill::admission_with_prefix_profile(c, l, prefix, prompt - prefix, prefix, profile)?)
         },
         after_advance: ownership(c, l, prefix)?,
     })
@@ -118,10 +123,16 @@ impl<S: BlobStoreGet> Session<S> {
     pub fn from_snapshot_seed(snapshot: Arc<ModelSnapshot<S>>, source: Source,
         layers: &[Id], device: CudaDevice, limits: Limits, ids: &[u32]) -> Result<Self>
     {
+        Self::from_snapshot_seed_with_attention_profile(snapshot, source, layers, device,
+            limits, ids, attention::Profile::default())
+    }
+    pub fn from_snapshot_seed_with_attention_profile(snapshot: Arc<ModelSnapshot<S>>, source: Source,
+        layers: &[Id], device: CudaDevice, limits: Limits, ids: &[u32], profile: attention::Profile) -> Result<Self>
+    {
         if ids.is_empty() || ids.len() > limits.capacity {
             return Err("empty/oversized prepared prefix".into());
         }
-        source::load(snapshot, source, layers, device, limits, Some(Arc::from(ids)),
+        source::load(snapshot, source, layers, device, limits, Some(Arc::from(ids)), profile,
             #[cfg(test)] |_, _, _| {},
         )
     }

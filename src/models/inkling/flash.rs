@@ -505,7 +505,7 @@ impl CachedAttentionPolicy {
 /// Negative infinity as the softmax's identity, spelled the way the rest of
 /// this module tree spells it: a large FINITE constant, so every guard against
 /// it has to be explicit rather than riding on infinity's algebra.
-const NEG_INF: f32 = -3.4028235e38;
+pub(crate) const NEG_INF: f32 = -3.4028235e38;
 
 /// The shared floats one cube of this shape needs.
 ///
@@ -923,7 +923,7 @@ fn flash_kernel<KV: Numeric>(
 /// `exp(m_s - M)` puts them all on the same exponent and the sum of the
 /// likewise-weighted `l` is the denominator.
 #[cube(launch_unchecked)]
-fn flash_combine_kernel(
+pub(crate) fn flash_combine_kernel(
     po: &Array<f32>,
     pml: &Array<f32>,
     out: &mut Array<f32>,
@@ -1037,7 +1037,7 @@ pub struct Gaps<'a> {
 /// Splitting to roughly this many is what fills it. Multi-query batches can
 /// supply that parallelism on the query axis alone; wider query tiles may
 /// reduce their grid enough to require key splits again.
-const TARGET_CUBES: usize = 1024;
+pub(crate) const TARGET_CUBES: usize = 1024;
 
 /// The fewest keys worth giving a split.
 ///

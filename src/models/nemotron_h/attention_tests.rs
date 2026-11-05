@@ -14,6 +14,79 @@ fn limits(capacity: usize) -> Limits {
 }
 
 #[test]
+fn attention_profile_default_dispatch_and_exact_budget() {
+    assert_eq!(Profile::default(), Profile::ScalarF32V1);
+    assert!("automatic".parse::<Profile>().is_err());
+    let l = Limits { max_working_bytes: usize::MAX, ..limits(1 << 20) };
+    for profile in [Profile::ScalarF32V1, Profile::MmaBf16PV1, Profile::MmaHiLoPV1] {
+        assert_eq!(profile.as_str().parse::<Profile>().unwrap(), profile);
+        for (start, t, prefix) in [(0, 1, 0), (0, 3, 0), (65535 - 256, 256, 8192),
+            (65536 - 256, 256, 8192), (130560, 256, 8192), (131072, 17, 8192)] {
+            let p = plan_with_profile(start, t, l, prefix, profile).unwrap();
+            assert!(plan_with_profile(start, t,
+                Limits { max_working_bytes: p.working_bytes - 1, ..l }, prefix, profile).is_err());
+            assert!(plan_with_profile(start, t,
+                Limits { max_working_bytes: p.working_bytes, ..l }, prefix, profile).is_ok());
+            assert_eq!(p.mma.is_some(), t > 1 && profile != Profile::ScalarF32V1);
+            if t == 1 {
+                assert_eq!(p.working_bytes, plan(start, t, l).unwrap().working_bytes);
+            }
+        }
+    }
+    assert_eq!(Profile::MmaBf16PV1.mma_choice(256, 65535), Some((4, PMode::Bf16)));
+    assert_eq!(Profile::MmaBf16PV1.mma_choice(256, 65536), Some((8, PMode::Bf16)));
+    assert_eq!(Profile::MmaHiLoPV1.mma_choice(2, 65536), Some((8, PMode::HiLo)));
+}
+
+#[test]
+#[ignore = "reserved GPU: opt-in MMA owner, prefix/private append and poison/reset; named operands under 128MiB"]
+fn gpu_attention_mma_profile_prefix_and_pending_ownership() {
+    let mut evidence = Evidence::new("NEMOTRON_MMA_INTEGRATION_EVIDENCE");
+    let named = 2 * admission(limits(5)).unwrap().resident_bytes
+        + 2 * plan_with_profile(3, 2, limits(5), 3, Profile::MmaHiLoPV1).unwrap().working_bytes;
+    assert!(named < 128 << 20); // before any upload; runtime overhead is external
+    let weights: [Vec<u8>; 4] = std::array::from_fn(|i| {
+        let [n, k] = SHAPES[i];
+        let mut bytes = vec![0; n * k];
+        for row in 0..n { bytes[row * k + row % k] = 0x38; }
+        bytes
+    });
+    let operations = || std::array::from_fn(|i| Operation {
+        e4m3fn: weights[i].as_slice(), input_scale: 0.125, weight_scale: 0.5,
+    });
+    let device = CudaDevice { index: 0 };
+    for profile in [Profile::MmaBf16PV1, Profile::MmaHiLoPV1] {
+        let mut seed = Attention::upload_with_profile(device.clone(), source(), operations(), limits(3), profile).unwrap();
+        let client = seed.weights.client.clone();
+        let input = tensor(&client, &device, &vec![0.25; 3 * HIDDEN], &[1, 3, HIDDEN]);
+        seed.enqueue(&input, 0).unwrap();
+        assert!(seed.has_pending());
+        seed.commit().unwrap();
+        let prefix = seed.seal_kv().unwrap();
+        let mut fork = Attention::from_prefix(seed.weights.clone(), prefix.clone(), limits(5)).unwrap();
+        assert_eq!(fork.profile(), profile);
+        let other = Attention::upload_with_profile(device.clone(), source(), operations(), limits(5), Profile::ScalarF32V1).unwrap();
+        assert!(Attention::from_prefix(other.weights.clone(), prefix, limits(5)).is_err());
+        let suffix = tensor(&client, &device, &vec![0.5; 2 * HIDDEN], &[1, 2, HIDDEN]);
+        let output = fork.enqueue(&suffix, 3).unwrap();
+        assert_eq!(fork.attended(), 3, "queued is not committed");
+        fork.commit().unwrap();
+        let values = evidence.tensor(&format!("{}-suffix.bf16", profile.as_str()), &output.values);
+        assert!(values.iter().all(|v| v.is_finite()));
+        assert_eq!((seed.attended(), fork.attended()), (3, 5));
+        fork.reset_capacity(5).unwrap();
+        fork.enqueue(&suffix, 0).unwrap();
+        fork.invalidate(); // logical cancellation never means device drain
+        assert!(fork.enqueue(&suffix, 0).is_err());
+        fork.reset().unwrap();
+        assert_eq!(fork.attended(), 0);
+        assert!(!fork.is_poisoned());
+        cubecl::future::block_on(client.sync()).unwrap();
+    }
+    evidence.finish(serde_json::json!({"scope":"ownership and finite outputs, not capability", "named_bytes":named}));
+}
+
+#[test]
 fn attention_geometry_budgets_and_positions_before_device() {
     let a = admission(limits(1024)).unwrap();
     assert_eq!(a.weight_bytes, 35_651_584);

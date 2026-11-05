@@ -76,7 +76,7 @@ fn session_host_prefix_admission_counts_shared_boundary_and_only_private_suffix(
     assert_eq!(p.after_advance.private_mamba_bytes, 171_048_960);
     assert_eq!(resident_ownership(&c, l).unwrap().expert_cache_pairs_per_moe, 36);
     assert_eq!(p.suffix.unwrap().device_working_bytes,
-        planned_prefix_chunk_bytes(&c, l, 786_432, 17, 786_432).unwrap());
+        planned_prefix_chunk_bytes(&c, l, 786_432, 17, 786_432, attention::Profile::default()).unwrap());
     // Scalar diagnostic from the actual planner, not a measured allocation.
     // Reset retains the prefix while replacing private buffers; 2C bounds KV
     // overlap including an old tensor during replacement, before pool overhead.
@@ -144,7 +144,7 @@ fn session_host_full_tile_rows48_chunk_and_span_budgets() {
         (0, 60_634_112, 59_845_632, 57_740_288),
         (524_032, 64_893_952, 64_105_472, 62_000_128),
     ] {
-        assert_eq!(planned_prefix_chunk_bytes(&c, l, 524_032, 256, prefix).unwrap(), chunk_bytes);
+        assert_eq!(planned_prefix_chunk_bytes(&c, l, 524_032, 256, prefix, attention::Profile::default()).unwrap(), chunk_bytes);
         let short = prefill::admission_with_prefix(&c, l, 524_032, 256, prefix).unwrap();
         assert!(!short.layer_major);
         assert_eq!(short.device_working_bytes, chunk_bytes);
@@ -159,6 +159,30 @@ fn session_host_full_tile_rows48_chunk_and_span_budgets() {
             assert!(prefill::admission_with_prefix(&c,
                 Limits { max_chunk_bytes: exact - 1, ..l }, 524_032, tokens, prefix).is_err());
         }
+    }
+}
+
+#[test]
+fn session_host_profile_prefill_covers_actual_prefix_tile_peak() {
+    let mut c = full_config(131072);
+    c.layers_block_type = vec![LayerKind::Attention];
+    let l = Limits { max_chunk_bytes: usize::MAX, ..full_limits(131072) };
+    for profile in [attention::Profile::MmaBf16PV1, attention::Profile::MmaHiLoPV1] {
+        let earlier = layer_prefix_working_bytes(&c, l, 130560, 256, &LayerKind::Attention, 8192, profile).unwrap();
+        let final_width_peak = (1..=256).map(|t| layer_prefix_working_bytes(&c, l,
+            131072 - t, t, &LayerKind::Attention, 8192, profile).unwrap()).max().unwrap();
+        assert!(earlier > final_width_peak, "actual earlier tile must not be hidden by final-width scan");
+        let a = prefill::admission_with_prefix_profile(&c, l, 8192, 131072 - 8192, 8192, profile).unwrap();
+        let outer = bytes(&[MAX_CHUNK, H], 8).unwrap() + bytes(&[MAX_CHUNK], 12).unwrap();
+        assert!(a.tile_workspace_bytes >= outer + earlier);
+        assert!(prefill::admission_with_prefix_profile(&c,
+            Limits { max_chunk_bytes: a.device_working_bytes - 1, ..l },
+            8192, 131072 - 8192, 8192, profile).is_err());
+        let whole = prefix_admission_with_profile(&c, l, 131072, 8192, profile).unwrap();
+        assert_eq!(whole.suffix.unwrap().device_working_bytes, a.device_working_bytes);
+        let cold = admission_with_profile(&c, l, 4096, profile).unwrap();
+        assert_eq!(cold.prefill.device_working_bytes,
+            prefill_admission_with_profile(&c, l, 0, 4096, profile).unwrap().device_working_bytes);
     }
 }
 
@@ -978,7 +1002,7 @@ fn session_gpu_shared_model_rejects_origin_upload_error() {
     assert_ne!(caller, origin);
     let device = CudaDevice { index: 0 };
     let error = origin.executes(|| source::load(
-        snapshot, source, &ids, device.clone(), limits(), None,
+        snapshot, source, &ids, device.clone(), limits(), None, attention::Profile::default(),
         |client, device, embedding| {
             assert_eq!(StreamId::current(), origin);
             // A real ordinary CUDA-server write Err, on a real fixed operand's
