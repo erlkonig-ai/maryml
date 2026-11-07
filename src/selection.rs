@@ -590,6 +590,56 @@ pub fn fold_input_scales(
     Ok(names.len())
 }
 
+/// The parts that complete `root`'s identity besides its weights (see
+/// [`crate::ingest::RootParts`]): its tokenizer entity, its configuration's
+/// root node and its chat template. Each is absent when the root's core has
+/// none, which is every root built before 2026-11-07.
+///
+/// This reads edges, it does not check them: nothing here recomputes the root
+/// id from the parts. An annotation can add a second edge of the same
+/// attribute to a root; then which one the model means is not decidable from
+/// the facts, and that is refused as ambiguous rather than chosen by
+/// iteration order.
+pub fn model_root_parts(
+    tribles: &TribleSet,
+    root: Id,
+) -> anyhow::Result<crate::ingest::RootParts> {
+    let at_most_one = |values: BTreeSet<Id>, what: &str| -> anyhow::Result<Option<Id>> {
+        let mut values = values.into_iter();
+        let first = values.next();
+        if values.next().is_some() {
+            bail!("model root {root:X} names more than one {what}");
+        }
+        Ok(first)
+    };
+    let tokenizer = at_most_one(
+        find!((t: Id), pattern!(tribles, [{ root @ crate::tokenizer::attrs::tokenizer: ?t }]))
+            .map(|(t,)| t)
+            .collect(),
+        "tokenizer",
+    )?;
+    let config = at_most_one(
+        find!((c: Id), pattern!(tribles, [{ root @ attrs::config: ?c }]))
+            .map(|(c,)| c)
+            .collect(),
+        "config",
+    )?;
+    let templates: BTreeSet<_> = find!(
+        (h: Inline<inlineencodings::Handle<blobencodings::UTF8String>>),
+        pattern!(tribles, [{ root @ attrs::chat_template: ?h }])
+    )
+    .map(|(h,)| h.raw)
+    .collect();
+    if templates.len() > 1 {
+        bail!("model root {root:X} names more than one chat template");
+    }
+    Ok(crate::ingest::RootParts {
+        tokenizer,
+        config,
+        chat_template: templates.into_iter().next().map(Inline::new),
+    })
+}
+
 fn tokenizer_roots(tribles: &TribleSet) -> BTreeSet<Id> {
     crate::tokenizer::find_tokenizers(tribles).collect()
 }

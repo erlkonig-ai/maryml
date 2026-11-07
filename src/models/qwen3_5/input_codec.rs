@@ -24,24 +24,33 @@ impl Tokens {
     }
 }
 
+#[derive(Clone)]
 pub struct InputCodec {
     tokenizer: tokenizers::Tokenizer,
 }
 impl InputCodec {
-    /// Assets may be exact-fetched typed blobs; no file/model discovery here.
-    /// The tokenizer JSON retains the postprocessor that the older tokenizer
-    /// graph reader explicitly does not reconstruct. No graph fallback.
+    /// From the checkpoint's own `tokenizer.json` bytes, pinned by
+    /// [`TOKENIZER_SHA256`] (the behavior fixtures' path). No discovery here.
     pub fn from_assets(tokenizer_json: &[u8], chat_template: &[u8]) -> Result<Self, String> {
-        for (label, bytes, want) in [
-            ("tokenizer", tokenizer_json, TOKENIZER_SHA256),
-            ("template", chat_template, TEMPLATE_SHA256),
-        ] {
-            if format!("{:x}", Sha256::digest(bytes)) != want {
-                return Err(format!("unsupported WeMM {label} asset bytes"));
-            }
+        if format!("{:x}", Sha256::digest(tokenizer_json)) != TOKENIZER_SHA256 {
+            return Err("unsupported WeMM tokenizer asset bytes".into());
         }
         let tokenizer =
             tokenizers::Tokenizer::from_bytes(tokenizer_json).map_err(|e| e.to_string())?;
+        Self::from_tokenizer(tokenizer, chat_template)
+    }
+
+    /// From a tokenizer the caller already holds: the one rebuilt from a
+    /// model root's tokenizer facts (`crate::tokenizer::build_tokenizer`),
+    /// which restores the checkpoint's post-processor and so appends the
+    /// terminal `<embedding>` itself. The template is pinned by its bytes.
+    pub fn from_tokenizer(
+        tokenizer: tokenizers::Tokenizer,
+        chat_template: &[u8],
+    ) -> Result<Self, String> {
+        if format!("{:x}", Sha256::digest(chat_template)) != TEMPLATE_SHA256 {
+            return Err("unsupported WeMM template asset bytes".into());
+        }
         if tokenizer.get_truncation().is_some() || tokenizer.get_padding().is_some() {
             return Err("pinned tokenizer unexpectedly enables padding/truncation".into());
         }

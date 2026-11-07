@@ -123,6 +123,15 @@ pub mod attrs {
         "3F46CDE630964D78D62DA32F4A8558C1" as model_root: GenId;
         /// A model's module (repeated edge model → module entities).
         "B4B6EC08A0CD70DE63A690168EE78F0F" as member: GenId;
+        /// A model root → the root node of its `config.json`, stored as facts
+        /// by [`crate::jsonfacts::save_json`]. CORE: part of the root's
+        /// identity (see [`crate::ingest::build_model_root_with`]). Minted
+        /// 2026-11-07 with `trible genid` → 60262A3E561D8B660AC440F9ADB7B0A3.
+        "60262A3E561D8B660AC440F9ADB7B0A3" as config: GenId;
+        /// A model root → its chat template (`chat_template.jinja`), verbatim.
+        /// CORE. Minted 2026-11-07 with `trible genid` →
+        /// 66DB52F9A6D19DACB8519E088256BD91.
+        "66DB52F9A6D19DACB8519E088256BD91" as chat_template: Handle<blobencodings::UTF8String>;
         /// A training/derivation BASE root, not the previously saved snapshot.
         /// Repeated for multiple contributing roots; absent for an import whose
         /// base is not represented. NON-core annotation on the resulting root.

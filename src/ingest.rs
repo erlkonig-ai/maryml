@@ -261,17 +261,10 @@ pub fn ingest_tensors(
 }
 
 /// Build a content-addressed model-ROOT entity over already-ingested member
-/// modules — "identity IS content" for a model. The root id is derived by
-/// `entity!` from the CORE attr ALONE:
-///   - `member*` — the tensor-leaf modules (already content-addressed, so the
-///                 weight CONTENT flows into the id).
-/// so the id is the PURE content-address of the weight set:
-/// `entity!{ _ @ member* }`. Importing the same weights twice yields the SAME
-/// root id (dedup across piles); a genuinely different model has different member
-/// leaves, so a different id. `member*` is a set: shard/order/duplicates don't
-/// move the id. Native vs fp4 differ by their actual weight bytes → different
-/// members → different ids automatically, which is why `quantization` need NOT
-/// be core.
+/// modules, with nothing but the weights in its core. This is
+/// [`build_model_root_with`] with an empty [`RootParts`]: the root id is the
+/// pure content address of the weight set, `entity!{ _ @ member* }`, exactly
+/// the shape every root had before 2026-11-07.
 ///
 /// `quantization` (the weight-format tag), `source` (the HF id it came from, or a
 /// `--name` for a local dir), and `provenance` (the shard file names, as
@@ -281,7 +274,6 @@ pub fn ingest_tensors(
 /// `quantization` labels resolve to the SAME entity id — the label rides on the
 /// weights' identity.) Returns the root Fragment carrying the member facts plus
 /// the root's own core + label facts.
-#[cfg(feature = "import")]
 pub fn build_model_root(
     blobs: &mut impl BlobStorePut,
     source: &str,
@@ -289,10 +281,90 @@ pub fn build_model_root(
     members: Vec<Id>,
     member_facts: TribleSet,
     provenance: &[String],
-) -> Result<Fragment, Err> {
+) -> Result<Fragment, Box<dyn std::error::Error>> {
+    build_model_root_with(
+        blobs,
+        source,
+        quantization,
+        members,
+        member_facts,
+        provenance,
+        RootParts::default(),
+    )
+}
+
+/// The parts of a model besides its weights that are part of WHAT the model
+/// is, and so of its root's identity: the tokenizer it reads text with, the
+/// configuration its weights are laid out by, and the chat template its input
+/// is framed with. Two checkpoints with the same weights and a different
+/// tokenizer or template are different models: they map the same text to
+/// different inputs. Each part is optional, because not every model has all
+/// three; a root with none of them has today's member-only core.
+///
+/// The representations, chosen deliberately:
+///   - `tokenizer`: the tokenizer ENTITY that
+///     [`crate::tokenizer::save_tokenizer_json`] returns, as facts. Its id is
+///     itself content-derived (vocab, merges, added tokens and their options,
+///     normalizer, pre-tokenizer, post-processor, decoder), so its content
+///     flows into the root id, and a reader rebuilds it with
+///     [`crate::tokenizer::build_tokenizer`]; no `tokenizer.json` is kept.
+///   - `config`: the root node of the `config.json` facts that
+///     [`crate::jsonfacts::save_json`] writes. Mary already stores checkpoint
+///     sidecars as facts that way, with an exact round trip (integers stay
+///     integers, keys are part of node identity), so a field is a query, not
+///     a substring of a blob. A reader loads it with
+///     [`crate::jsonfacts::load_json`].
+///   - `chat_template`: a `UTF8String` blob handle of the template, verbatim.
+///     It is Jinja source, not structured data; its bytes are what a codec
+///     pins (`qwen3_5::input_codec`), and any re-encoding would change them.
+///
+/// The facts these ids stand on are the caller's (the `Fragment`s the savers
+/// return); this function only links them from the root.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RootParts {
+    pub tokenizer: Option<Id>,
+    pub config: Option<Id>,
+    pub chat_template: Option<Inline<inlineencodings::Handle<UTF8String>>>,
+}
+
+/// The root entity's CORE alone, with no labels: `member*` plus the
+/// [`RootParts`]. [`build_model_root_with`] is this plus its labels; a tool
+/// that completes an existing root and carries that root's own annotations
+/// over unchanged uses it directly.
+pub fn model_root_core(members: &[Id], parts: RootParts) -> Fragment {
+    entity! { _ @
+        attrs::member*: members.iter(),
+        crate::tokenizer::attrs::tokenizer?: parts.tokenizer,
+        attrs::config?: parts.config,
+        attrs::chat_template?: parts.chat_template,
+    }
+}
+
+/// Build a content-addressed model-ROOT entity over already-ingested member
+/// modules and the [`RootParts`] that complete it — "identity IS content" for
+/// a model. The root id is derived by `entity!` from the CORE attrs:
+///   - `member*` — the tensor-leaf modules (already content-addressed, so the
+///                 weight CONTENT flows into the id);
+///   - `tokenizer?`, `config?`, `chat_template?` — see [`RootParts`].
+///
+/// Importing the same weights and parts twice yields the SAME root id (dedup
+/// across piles and collections); changing any weight, the tokenizer, the
+/// configuration or the template yields a different one. `member*` is a set:
+/// shard/order/duplicates don't move the id. Native vs fp4 differ by their
+/// actual weight bytes → different members → different ids automatically,
+/// which is why `quantization` need NOT be core. The labels are as in
+/// [`build_model_root`].
+pub fn build_model_root_with(
+    blobs: &mut impl BlobStorePut,
+    source: &str,
+    quantization: &str,
+    members: Vec<Id>,
+    member_facts: TribleSet,
+    provenance: &[String],
+    parts: RootParts,
+) -> Result<Fragment, Box<dyn std::error::Error>> {
     let mut facts = member_facts;
-    // CORE: the id is the PURE content-address of the weight set (members alone).
-    let root = entity! { _ @ attrs::member*: members.iter() };
+    let root = model_root_core(&members, parts);
     let root_id = root.root().expect("model root");
     facts += root.into_facts();
     // NON-core labels on the (content-derived) root id — queryable, no id
@@ -384,4 +456,160 @@ pub fn read_shape(
         .iter()
         .map(|&d| d as usize)
         .collect()
+}
+
+#[cfg(test)]
+mod root_parts_tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+    use triblespace::core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};
+    use triblespace::core::repo::SnapshotSource;
+    use triblespace::core::repo::memoryrepo::MemoryRepo;
+
+    const TOKENIZER: &str = r###"{"version": "1.0", "added_tokens": [
+        {"id": 3, "content": "<e>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}],
+      "normalizer": null, "pre_tokenizer": {"type": "BertPreTokenizer"},
+      "post_processor": {"type": "TemplateProcessing",
+        "single": [{"Sequence": {"id": "A", "type_id": 0}}, {"SpecialToken": {"id": "<e>", "type_id": 0}}],
+        "pair": [{"Sequence": {"id": "A", "type_id": 0}}, {"Sequence": {"id": "B", "type_id": 1}}],
+        "special_tokens": {"<e>": {"id": "<e>", "ids": [3], "tokens": ["<e>"]}}},
+      "decoder": null,
+      "model": {"type": "WordPiece", "unk_token": "[UNK]", "continuing_subword_prefix": "##",
+        "max_input_chars_per_word": 100, "vocab": {"[UNK]": 0, "a": 1, "b": 2}}}"###;
+    const TEMPLATE: &str = "{{ messages }}";
+
+    fn config() -> serde_json::Value {
+        serde_json::json!({"hidden_size": 8})
+    }
+
+    /// A stand-in model put into `blobs`: one module naming a leaf, a
+    /// tokenizer, a configuration and a template.
+    fn model(
+        blobs: &mut impl BlobStorePut,
+        weight: &str,
+        tokenizer: &str,
+        config: serde_json::Value,
+        template: &str,
+    ) -> (Vec<Id>, TribleSet, RootParts) {
+        let mut facts = TribleSet::new();
+        let path = blobs.put::<UTF8String, _>("w".to_owned()).ok().unwrap();
+        let kind = blobs.put::<UTF8String, _>(weight.to_owned()).ok().unwrap();
+        let leaf = entity! { _ @ attrs::kind: kind };
+        let leaf_id = leaf.root().unwrap();
+        facts += leaf.into_facts();
+        let module = entity! { _ @ attrs::safetensor_path: path, attrs::weight: leaf_id };
+        let members = vec![module.root().unwrap()];
+        facts += module.into_facts();
+        let tok = crate::tokenizer::save_tokenizer_json(tokenizer.as_bytes(), "t", blobs).unwrap();
+        let tokenizer = tok.root();
+        facts += tok.into_facts();
+        let config = Some(crate::jsonfacts::save_json(&config, blobs, &mut facts).unwrap());
+        let chat_template = Some(blobs.put::<UTF8String, _>(template.to_owned()).ok().unwrap());
+        (members, facts, RootParts { tokenizer, config, chat_template })
+    }
+
+    fn root_of(
+        blobs: &mut impl BlobStorePut,
+        weight: &str,
+        tokenizer: &str,
+        config: serde_json::Value,
+        template: &str,
+    ) -> Fragment {
+        let (members, facts, parts) = model(blobs, weight, tokenizer, config, template);
+        build_model_root_with(blobs, "org/m", "native", members, facts, &[], parts).unwrap()
+    }
+
+    #[test]
+    fn every_part_of_the_core_moves_the_root_and_labels_do_not() {
+        let mut blobs = MemoryBlobStore::new();
+        let base = root_of(&mut blobs, "weights", TOKENIZER, config(), TEMPLATE).root().unwrap();
+        let again = root_of(&mut blobs, "weights", TOKENIZER, config(), TEMPLATE).root().unwrap();
+        assert_eq!(base, again, "same content, same root");
+        let no_post = TOKENIZER.replace(
+            r#", {"SpecialToken": {"id": "<e>", "type_id": 0}}],"#,
+            "],",
+        );
+        let other_vocab = TOKENIZER.replace(r#""b": 2"#, r#""c": 2"#);
+        assert!(no_post != TOKENIZER && other_vocab != TOKENIZER);
+        for (what, other) in [
+            ("weights", root_of(&mut blobs, "other weights", TOKENIZER, config(), TEMPLATE)),
+            ("tokenizer", root_of(&mut blobs, "weights", &other_vocab, config(), TEMPLATE)),
+            ("post-processor", root_of(&mut blobs, "weights", &no_post, config(), TEMPLATE)),
+            ("config", root_of(&mut blobs, "weights", TOKENIZER, serde_json::json!({"hidden_size": 9}), TEMPLATE)),
+            ("template", root_of(&mut blobs, "weights", TOKENIZER, config(), "{{ messages }} ")),
+        ] {
+            assert_ne!(other.root().unwrap(), base, "a changed {what} must give another root");
+        }
+        let (members, facts, parts) = model(&mut blobs, "weights", TOKENIZER, config(), TEMPLATE);
+        let relabelled = build_model_root_with(
+            &mut blobs, "another/source", "fp4", members, facts, &["x".into()], parts,
+        )
+        .unwrap();
+        assert_eq!(relabelled.root().unwrap(), base, "labels annotate, they never move the id");
+    }
+
+    #[test]
+    fn a_root_without_parts_keeps_the_member_only_core() {
+        let mut blobs = MemoryBlobStore::new();
+        let (members, facts, _) = model(&mut blobs, "weights", TOKENIZER, config(), TEMPLATE);
+        let plain = build_model_root(&mut blobs, "org/m", "native", members.clone(), facts, &[]).unwrap();
+        let member_only = entity! { _ @ attrs::member*: members.iter() };
+        assert_eq!(plain.root(), member_only.root());
+    }
+
+    #[test]
+    fn the_same_model_in_two_collections_is_one_root_with_the_same_parts() {
+        let mut roots = Vec::new();
+        let mut handles = Vec::new();
+        let mut all_parts = Vec::new();
+        for seed in [0x11u8, 0x22] {
+            let mut repo = MemoryRepo::default();
+            let fragment = root_of(&mut repo, "weights", TOKENIZER, config(), TEMPLATE);
+            let key = SigningKey::from_bytes(&[seed; 32]);
+            let policy = CollectionPolicy::new(
+                AdmissionPolicy::direct(key.verifying_key()),
+                AdmissionPolicy::direct(key.verifying_key()),
+            );
+            let collection = repo.collection("models", policy).unwrap();
+            repo.commit(collection, &key, fragment).unwrap();
+            let store = SnapshotSource::snapshot(&mut repo).unwrap();
+            let snapshot =
+                crate::model_collection::snapshot_model_collection_for(&store, collection).unwrap();
+            let root = crate::selection::select_model_root(
+                snapshot.facts(),
+                &store,
+                crate::selection::ModelSelector::Only,
+            )
+            .unwrap();
+            all_parts.push(crate::selection::model_root_parts(snapshot.facts(), root).unwrap());
+            roots.push(root);
+            handles.push(collection.handle());
+        }
+        assert_ne!(handles[0], handles[1], "two different collections");
+        assert_eq!(roots[0], roots[1], "one model");
+        assert_eq!(all_parts[0], all_parts[1]);
+        assert!(all_parts[0].tokenizer.is_some() && all_parts[0].config.is_some());
+    }
+
+    #[cfg(feature = "tokenizer")]
+    #[test]
+    fn the_tokenizer_named_by_the_root_rebuilds_with_its_post_processor() {
+        let mut blobs = MemoryBlobStore::new();
+        let fragment = root_of(&mut blobs, "weights", TOKENIZER, config(), TEMPLATE);
+        let reader = SnapshotSource::snapshot(&mut blobs).unwrap();
+        let root = fragment.root().unwrap();
+        let parts = crate::selection::model_root_parts(fragment.facts(), root).unwrap();
+        let tok = crate::tokenizer::build_tokenizer(fragment.facts(), &reader, parts.tokenizer.unwrap())
+            .unwrap();
+        let json = tokenizers::Tokenizer::from_bytes(TOKENIZER.as_bytes()).unwrap();
+        for text in ["a b", "a <e> b", ""] {
+            assert_eq!(
+                tok.encode(text, true).unwrap().get_ids(),
+                json.encode(text, true).unwrap().get_ids()
+            );
+        }
+        assert_eq!(tok.encode("a", true).unwrap().get_ids(), &[1, 3]);
+        let config = crate::jsonfacts::load_json(fragment.facts(), &reader, parts.config.unwrap()).unwrap();
+        assert_eq!(config, self::config());
+    }
 }

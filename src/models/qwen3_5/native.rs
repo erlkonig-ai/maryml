@@ -19,9 +19,8 @@ use std::fmt;
 use cubecl::cuda::CudaDevice;
 use sha2::{Digest, Sha256};
 use triblespace::{
-    core::blob::{Blob, encodings::rawbytes::RawBytes},
     core::repo::BlobStoreGet,
-    prelude::{Id, Inline, TribleSet, inlineencodings::Handle},
+    prelude::{Id, TribleSet},
 };
 
 use super::{
@@ -36,6 +35,13 @@ use crate::nn::cuda_bf16_alias::{AliasStats, CudaBf16Aliases};
 /// Exact WeMM checkpoint configuration used by the native behavior fixtures.
 /// This is an asset checksum, not a collection or mapping identity.
 pub const CONFIG_SHA256: &str = "34abd67be4bab3d749ba7b3ad2daa5fc0a09ab12064a64f053fa244fa26c6004";
+/// The same configuration read back from facts: the SHA-256 of its
+/// [`crate::jsonfacts::canonical_string`], which is what the checkpoint's
+/// `config.json` (sha256 [`CONFIG_SHA256`]) canonicalizes to. A configuration
+/// stored as facts has no file bytes left to hash, and its canonical text is
+/// independent of map order and whitespace, so this pins the same values.
+pub const CONFIG_FACTS_SHA256: &str =
+    "719264c54581f878babd2d13317ffb1e23f5943dd424e3594a8d107fbd36d4d6";
 
 /// Validated owned assets. Bytes may be exact-fetched by the caller; this
 /// type neither opens files nor discovers asset/model records. Construct it
@@ -44,18 +50,10 @@ pub const CONFIG_SHA256: &str = "34abd67be4bab3d749ba7b3ad2daa5fc0a09ab12064a64f
 pub struct Assets {
     config: Qwen3_5Config,
     codec: InputCodec,
-    handles: AssetHandles,
-}
-
-/// Content identities of the exact validated bytes, not caller-supplied labels.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AssetHandles {
-    pub config: Inline<Handle<RawBytes>>,
-    pub tokenizer_json: Inline<Handle<RawBytes>>,
-    pub chat_template: Inline<Handle<RawBytes>>,
 }
 
 impl Assets {
+    /// From the checkpoint's own files, as the behavior fixtures use them.
     pub fn from_bytes(config: &[u8], tokenizer: &[u8], template: &[u8]) -> Result<Self, String> {
         if format!("{:x}", Sha256::digest(config)) != CONFIG_SHA256 {
             return Err("unsupported WeMM configuration asset bytes".into());
@@ -64,17 +62,60 @@ impl Assets {
             Qwen3_5Config::from_json(std::str::from_utf8(config).map_err(|e| e.to_string())?)?;
         multimodal_layout::validate_model(&parsed_config)?;
         let codec = InputCodec::from_assets(tokenizer, template)?;
-        let handle = |bytes: &[u8]| Blob::<RawBytes>::new(bytes.to_vec().into()).get_handle();
-        let handles = AssetHandles {
-            config: handle(config),
-            tokenizer_json: handle(tokenizer),
-            chat_template: handle(template),
-        };
         Ok(Self {
             config: parsed_config,
             codec,
-            handles,
         })
+    }
+
+    /// From the model root itself: the tokenizer, configuration and chat
+    /// template that are part of `root`'s identity
+    /// ([`crate::ingest::RootParts`]), read from the same frozen facts and
+    /// reader the weights come from. No file is opened and nothing is
+    /// discovered; a root without all three parts is refused.
+    ///
+    /// The tokenizer is rebuilt from facts ([`crate::tokenizer::build_tokenizer`])
+    /// and so has no file bytes to pin. It is the root's own: selecting the
+    /// root selected it, and the root id is derived from its content, so it
+    /// cannot be paired with another model's weights the way a side-file
+    /// could. The configuration is pinned by [`CONFIG_FACTS_SHA256`] and the
+    /// template by its exact bytes, as before.
+    pub fn from_model_root<R: BlobStoreGet>(
+        facts: &TribleSet,
+        reader: &R,
+        root: Id,
+    ) -> Result<Self, String> {
+        let parts = crate::selection::model_root_parts(facts, root).map_err(|e| e.to_string())?;
+        let missing = |what: &str| format!("WeMM model root {root:X} has no {what} in its core");
+        let tokenizer = parts.tokenizer.ok_or_else(|| missing("tokenizer"))?;
+        let config = parts.config.ok_or_else(|| missing("config"))?;
+        let template = parts
+            .chat_template
+            .ok_or_else(|| missing("chat template"))?;
+        let config = crate::jsonfacts::load_json(facts, reader, config)
+            .map_err(|e| format!("read the WeMM configuration facts: {e}"))?;
+        let config = crate::jsonfacts::canonical_string(&config);
+        if format!("{:x}", Sha256::digest(config.as_bytes())) != CONFIG_FACTS_SHA256 {
+            return Err("unsupported WeMM configuration facts".into());
+        }
+        let parsed_config = Qwen3_5Config::from_json(&config)?;
+        multimodal_layout::validate_model(&parsed_config)?;
+        let tokenizer = crate::tokenizer::build_tokenizer(facts, reader, tokenizer)
+            .map_err(|e| format!("rebuild the WeMM tokenizer from facts: {e}"))?;
+        let template: anybytes::View<str> = reader
+            .get(template)
+            .map_err(|e| format!("read the WeMM chat template: {e}"))?;
+        let codec = InputCodec::from_tokenizer(tokenizer, template.as_bytes())?;
+        Ok(Self {
+            config: parsed_config,
+            codec,
+        })
+    }
+
+    /// The codec these assets frame input with, for a caller that also cuts
+    /// text into windows with it.
+    pub fn codec(&self) -> &InputCodec {
+        &self.codec
     }
 }
 
@@ -107,7 +148,6 @@ pub struct NativeWemm {
     codec: InputCodec,
     pixels: GpuPreparer,
     root: Id,
-    assets: AssetHandles,
     device: CudaDevice,
 }
 
@@ -164,7 +204,6 @@ impl NativeWemm {
             codec: assets.codec,
             pixels,
             root,
-            assets: assets.handles,
             device: aliases.device().clone(),
         })
     }
@@ -173,10 +212,6 @@ impl NativeWemm {
     /// provenance and must be established separately by the caller.
     pub fn model_root(&self) -> Id {
         self.root
-    }
-
-    pub fn asset_handles(&self) -> AssetHandles {
-        self.assets
     }
 
     pub fn device(&self) -> &CudaDevice {
@@ -331,7 +366,6 @@ mod tests {
         )
         .unwrap();
         assert!(assets.codec.text(&"x ".repeat(1024)).is_err());
-        let asset_handles = assets.handles;
         let model = crate::persist::read_model_pile_read_only(&path("WEMM_FACADE_MODEL")).unwrap();
         let root = Id::from_hex(&std::env::var("WEMM_FACADE_ROOT").unwrap()).unwrap();
         assert_eq!(expected["model_root"], format!("{root:?}"));
@@ -374,7 +408,6 @@ mod tests {
         }
         .unwrap();
         assert_eq!(native.model_root(), root);
-        assert_eq!(native.asset_handles(), asset_handles);
         assert_eq!(native.device(), aliases.device());
         assert_eq!(
             native.device_identity().unwrap(),

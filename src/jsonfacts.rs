@@ -281,6 +281,47 @@ macro_rules! long_field {
     };
 }
 
+/// A canonical serialization of `v`: compact, with every object's keys in
+/// byte order, so equal values have equal text whatever the map's own order
+/// and whatever features `serde_json` was built with (`preserve_order` would
+/// keep insertion order, and [`load_json`] inserts in query order). Scalars
+/// are `serde_json`'s own spelling; integers stay integers, as they are
+/// stored. Use it to hash or compare a document read back from facts.
+pub fn canonical_string(v: &Value) -> String {
+    fn write(v: &Value, out: &mut String) {
+        match v {
+            Value::Array(items) => {
+                out.push('[');
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    write(item, out);
+                }
+                out.push(']');
+            }
+            Value::Object(map) => {
+                let mut keys: Vec<&String> = map.keys().collect();
+                keys.sort();
+                out.push('{');
+                for (i, key) in keys.into_iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    out.push_str(&Value::String(key.clone()).to_string());
+                    out.push(':');
+                    write(&map[key], out);
+                }
+                out.push('}');
+            }
+            scalar => out.push_str(&scalar.to_string()),
+        }
+    }
+    let mut out = String::new();
+    write(v, &mut out);
+    out
+}
+
 /// Rebuild a `serde_json::Value` from a node.
 pub fn load_json(tribles: &TribleSet, blobs: &impl BlobStoreGet, node: Id) -> Result<Value, Err> {
     let tags = crate::tokenizer::node_tags(tribles, node);
@@ -353,6 +394,38 @@ fn members(tribles: &TribleSet, node: Id) -> Vec<Id> {
 
 #[cfg(test)]
 mod tests {
+    /// Writes the canonical text of `WEMM_CONFIG_JSON` read back from facts
+    /// to `WEMM_CANONICAL_OUT`, for pinning its digest.
+    #[test]
+    #[ignore = "set WEMM_CONFIG_JSON and WEMM_CANONICAL_OUT"]
+    fn canonical_text_of_a_config_read_back_from_facts() {
+        let json = std::fs::read(std::env::var("WEMM_CONFIG_JSON").unwrap()).unwrap();
+        let parsed: Value = serde_json::from_slice(&json).unwrap();
+        let mut blobs = MemoryBlobStore::new();
+        let mut facts = TribleSet::new();
+        let root = save_json(&parsed, &mut blobs, &mut facts).unwrap();
+        let reader = blobs.snapshot().unwrap();
+        let loaded = load_json(&facts, &reader, root).unwrap();
+        assert_eq!(loaded, parsed);
+        assert_eq!(canonical_string(&loaded), canonical_string(&parsed));
+        std::fs::write(
+            std::env::var("WEMM_CANONICAL_OUT").unwrap(),
+            canonical_string(&loaded),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn canonical_text_sorts_keys_and_keeps_integers() {
+        let v: Value =
+            serde_json::from_str(r#"{"b": [1, 2.5, null], "a": {"z": true, "y": "q\"x"}}"#)
+                .unwrap();
+        assert_eq!(
+            canonical_string(&v),
+            r#"{"a":{"y":"q\"x","z":true},"b":[1,2.5,null]}"#
+        );
+    }
+
     use super::*;
 
     fn roundtrip(src: &str) -> String {

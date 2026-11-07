@@ -2193,9 +2193,10 @@ impl<B: Backend> NomicTextModel<B> {
 /// Warm nomic-embed-text-v1.5 handle: the encoder + a BERT WordPiece tokenizer.
 ///
 /// Sentinel framing is done BY HAND here ([CLS] body [SEP] via the resolved
-/// `cls_id`/`sep_id`), never by a tokenizer.json post-processor: a graph-built
-/// tokenizer (`crate::tokenizer::build_tokenizer`) has no post-processor, and
-/// the json-built one is encoded with `add_special_tokens=false`, so both
+/// `cls_id`/`sep_id`), never by a tokenizer post-processor: both the
+/// graph-built tokenizer (`crate::tokenizer::build_tokenizer`, which restores
+/// a post-processor when its graph stores one) and the json-built one are
+/// encoded with `add_special_tokens=false`, which never runs it, so both
 /// substrates produce byte-identical sequences.
 pub struct NomicTextEmbedder<B: Backend> {
     model: NomicTextModel<B>,

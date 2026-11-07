@@ -1,6 +1,12 @@
-//! Give an existing model pile its one `models` collection.
+//! Give an existing model pile its one `models` collection, or carry one
+//! model from another pile into a pile's `models` collection.
 //!
 //!   model_collection_migrate <model.pile> <signing-key>
+//!   model_collection_migrate <target.pile> <signing-key> --from <source.pile>
+//!       --archive <64-hex fact archive> --assets <dir> [--root <32-hex root>]
+//!
+//! The second form is described under [`carry`]. The rest of this text is the
+//! first form.
 //!
 //! Before mary had one model collection it had two shapes. `mary-model-graph`
 //! held model fact archives directly. `mary-model-bundles` held one signed
@@ -428,14 +434,446 @@ fn migrate_open(pile: &mut Pile, key: &SigningKey) -> Result<(Outcome, TribleSet
     ))
 }
 
+/// One model to carry from another pile (see [`carry`]).
+struct Carry {
+    /// The pile the model lives in now. Opened read-only, never written.
+    source: std::path::PathBuf,
+    /// The model's fact archive in `source`, named by handle. The source's
+    /// own COMMIT need not be readable: the dedicated WeMM pile's is in a
+    /// retired framing current readers skip, while the archive it names is an
+    /// ordinary resident blob.
+    archive: Archive,
+    /// `tokenizer.json`, `config.json` and `chat_template.jinja` of the model.
+    assets: std::path::PathBuf,
+    /// The member-only root to complete; by default the archive's only root.
+    root: Option<Id>,
+}
+
+#[derive(Debug, PartialEq)]
+struct Carried {
+    collection: ModelCollection,
+    source_blobs: usize,
+    blobs_copied: usize,
+    bytes_copied: u64,
+    blobs_already: usize,
+    commits_appended: usize,
+    old_root: Id,
+    new_root: Id,
+    archive: Archive,
+    facts: usize,
+    tensors: usize,
+    projected_aliases: usize,
+    carried_annotations: usize,
+}
+
+fn parse_archive(text: &str) -> Result<Archive> {
+    let handle = model_collection::parse_collection_handle(text)
+        .with_context(|| format!("--archive {text:?}"))?;
+    Ok(Inline::new(handle.raw))
+}
+
+/// Carry one model from a dedicated model pile into `target`'s existing
+/// `models` collection, and complete its root.
+///
+/// 1. Every resident blob of the source pile is put into the target through
+///    the ordinary pile writer. Copying all of them, rather than walking the
+///    model's facts for the handles it names, preserves every reference the
+///    facts make, including ones no schema here knows about, which is what
+///    makes it safe for a pile that holds one model. A blob the target already
+///    holds is not appended again (the writer returns the resident handle;
+///    the copy also checks first, to count). Source records other than blobs
+///    (its descriptor's COMMIT) are not copied: the model joins the target's
+///    collection instead.
+/// 2. The model's facts are read from `archive`, its member-only root is
+///    selected (`--root`, or the archive's only model root), and the root is
+///    rebuilt as a COMPLETE root ([`mary::ingest::build_model_root_with`]):
+///    the same members, the tokenizer from `tokenizer.json` stored as facts,
+///    the configuration from `config.json` stored as facts, and the chat
+///    template as a `UTF8String` blob; every other fact the old root stated
+///    (its labels, whatever they are) is carried over onto the new root
+///    unchanged. The old root's
+///    own facts are left out of the new archive, so `models` holds one root
+///    for this model; they stay in the old archive, which step 1 copied.
+/// 3. That archive is appended as one COMMIT to the target's sole `models`
+///    collection, signed by `key`, which its WRITE policy must admit; it is
+///    never founded here. An admitted COMMIT of the same archive already
+///    present is not appended again.
+/// 4. The result is proven from a fresh snapshot: every source blob is
+///    resident, there is still one `models` descriptor, its facts are its
+///    facts before plus the new archive, the new root names all three parts
+///    and every one of its tensor leaves resolves, and the old root is not a
+///    root in `models`.
+///
+/// Every refusal (unreadable source or archive, no or several `models`, an
+/// unadmitted signer, a missing asset, an ambiguous root, the old root
+/// already being a root in `models`) happens before anything is written.
+fn carry(target: &Path, key: &SigningKey, request: &Carry) -> Result<Carried> {
+    let source = mary::persist::read_model_pile_snapshot_read_only(&request.source)
+        .with_context(|| format!("open the source pile {:?} read-only", request.source))?;
+    let stored = archive_facts(&source, request.archive, "source archive")?;
+    // A pile written before the anchored-attribute epoch states historical
+    // attribute ids. The new archive is written in canonical spellings only.
+    let projection = model_collection::project_legacy_model_attributes(&stored);
+    let projected_aliases = projection.aliases_added;
+    let facts = if projected_aliases == 0 {
+        stored
+    } else {
+        mary::persist::strip_projected_legacy_attributes(&projection.facts)?.0
+    };
+    let old_root = match request.root {
+        Some(root) => mary::selection::select_model_root(
+            &facts,
+            &source,
+            mary::selection::ModelSelector::Root(root),
+        )?,
+        None => mary::selection::select_model_root(
+            &facts,
+            &source,
+            mary::selection::ModelSelector::Only,
+        )
+        .context("select the archive's model root (name one with --root)")?,
+    };
+    let members: Vec<Id> = find!(
+        (m: Id),
+        pattern!(&facts, [{ old_root @ attrs::member: ?m }])
+    )
+    .map(|(m,)| m)
+    .collect();
+    // The label the tokenizer is saved under: the old root's `source`, when
+    // it has exactly one (it is an annotation of the tokenizer, not identity).
+    let sources: Vec<String> = find!((h,), pattern!(&facts, [{ old_root @ attrs::source: ?h }]))
+        .filter_map(|(h,)| {
+            source
+                .get::<anybytes::View<str>, blobencodings::UTF8String>(h)
+                .ok()
+                .map(|v| v.to_string())
+        })
+        .collect();
+    let source_label = match sources.as_slice() {
+        [one] => one.clone(),
+        _ => "tokenizer.json".to_owned(),
+    };
+    let read = |name: &str| {
+        std::fs::read(request.assets.join(name))
+            .with_context(|| format!("read asset {:?}", request.assets.join(name)))
+    };
+    let tokenizer_json = read("tokenizer.json")?;
+    let config: serde_json::Value =
+        serde_json::from_slice(&read("config.json")?).context("parse config.json")?;
+    let template = String::from_utf8(read("chat_template.jinja")?)
+        .context("chat_template.jinja is not UTF-8")?;
+    // Parse the tokenizer before writing anything: an unsupported one refuses here.
+    mary::tokenizer::save_tokenizer_json(
+        &tokenizer_json,
+        &source_label,
+        &mut triblespace::core::blob::MemoryBlobStore::new(),
+    )
+    .map_err(|e| anyhow::anyhow!("tokenizer.json: {e}"))?;
+
+    let before_len = std::fs::metadata(target)?.len();
+    let mut pile =
+        Pile::open(target).map_err(|error| anyhow::anyhow!("open {target:?}: {error}"))?;
+    let result = carry_open(
+        &mut pile,
+        key,
+        &source,
+        facts,
+        old_root,
+        members,
+        &source_label,
+        &tokenizer_json,
+        &config,
+        template,
+        request.archive,
+    );
+    let close = pile
+        .close()
+        .map_err(|error| anyhow::anyhow!("close {target:?}: {error}"));
+    let mut outcome = result?;
+    close?;
+    ensure!(
+        std::fs::metadata(target)?.len() >= before_len,
+        "the pile shrank"
+    );
+    outcome.projected_aliases = projected_aliases;
+    Ok(outcome)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn carry_open(
+    pile: &mut Pile,
+    key: &SigningKey,
+    source: &triblespace::core::repo::pile::PileSnapshot,
+    facts: TribleSet,
+    old_root: Id,
+    members: Vec<Id>,
+    source_label: &str,
+    tokenizer_json: &[u8],
+    config: &serde_json::Value,
+    template: String,
+    source_archive: Archive,
+) -> Result<Carried> {
+    use triblespace::core::blob::Blob;
+    use triblespace::core::blob::encodings::UnknownBlob;
+    use triblespace::core::repo::{BlobStoreList, BlobStorePut};
+
+    pile.refresh().context("refresh the target")?;
+    let before = pile.snapshot().context("freeze the target")?;
+    let collection = sole(&before, model_collection::model_collection_name())?.with_context(
+        || "the target has no models collection; carry joins an existing one and never founds it",
+    )?;
+    let signer = key.verifying_key();
+    ensure!(
+        collection
+            .writer_is_admitted(&before, signer)
+            .map_err(|error| anyhow::anyhow!("check WRITE admission: {error:?}"))?,
+        "signer {} is not admitted by the WRITE policy of the models collection {}; nothing written",
+        hex(&signer.to_bytes()),
+        hex(&collection.handle().raw)
+    );
+    let held = model_collection::snapshot_model_collection_for(&before, collection)?;
+    let facts_before = held.into_facts();
+    let done = admitted_commits(&before, &[collection])?;
+    // The old member-only root already in `models` would leave two roots for
+    // one model once the complete one joins (the collection is append-only);
+    // refuse before writing anything.
+    ensure!(
+        mary::selection::select_model_root(
+            &facts_before,
+            &before,
+            mary::selection::ModelSelector::Root(old_root),
+        )
+        .is_err(),
+        "the old member-only root {old_root:X} is already a root in the models collection {}; \
+         adding its complete root would leave two roots for one model. Nothing written",
+        hex(&collection.handle().raw)
+    );
+
+    // 1. Every resident source blob.
+    let mut source_blobs = 0usize;
+    let mut blobs_copied = 0usize;
+    let mut bytes_copied = 0u64;
+    let mut blobs_already = 0usize;
+    for info in source.blobs() {
+        let info = info.map_err(|e| anyhow::anyhow!("list source blobs: {e}"))?;
+        source_blobs += 1;
+        if before
+            .contains_blob(info.handle)
+            .map_err(|e| anyhow::anyhow!("check target residency: {e}"))?
+        {
+            blobs_already += 1;
+            continue;
+        }
+        let blob: Blob<UnknownBlob> = source
+            .get(info.handle)
+            .map_err(|e| anyhow::anyhow!("read source blob {}: {e}", hex(&info.handle.raw)))?;
+        let length = blob.bytes.len() as u64;
+        let put: Inline<inlineencodings::Handle<UnknownBlob>> = pile
+            .put(blob)
+            .map_err(|e| anyhow::anyhow!("copy blob {}: {e}", hex(&info.handle.raw)))?;
+        ensure!(
+            put == info.handle,
+            "blob {} changed handle when copied",
+            hex(&info.handle.raw)
+        );
+        blobs_copied += 1;
+        bytes_copied += length;
+    }
+    drop(before);
+
+    // 2. The complete root: the old root's members and the three parts in
+    // its core, and every other fact the old root stated (its labels, open
+    // world: whatever they are) carried over unchanged onto the new root.
+    let (annotations, mut facts): (Vec<_>, Vec<_>) = facts
+        .iter()
+        .copied()
+        .partition(|trible| trible.e() == &old_root);
+    let mut facts: TribleSet = facts.drain(..).collect();
+    let tokenizer = mary::tokenizer::save_tokenizer_json(tokenizer_json, source_label, pile)
+        .map_err(|e| anyhow::anyhow!("store the tokenizer: {e}"))?;
+    let tokenizer_id = tokenizer.root();
+    facts += tokenizer.into_facts();
+    let config_id = mary::jsonfacts::save_json(config, pile, &mut facts)
+        .map_err(|e| anyhow::anyhow!("store the configuration: {e}"))?;
+    let template = pile
+        .put::<blobencodings::UTF8String, _>(template)
+        .map_err(|e| anyhow::anyhow!("store the chat template: {e}"))?;
+    let core = mary::ingest::model_root_core(
+        &members,
+        mary::ingest::RootParts {
+            tokenizer: tokenizer_id,
+            config: Some(config_id),
+            chat_template: Some(template),
+        },
+    );
+    let new_root = core.root().expect("model root");
+    facts += core.into_facts();
+    let mut carried_annotations = 0usize;
+    for trible in &annotations {
+        if trible.a() == &attrs::member.id() {
+            continue;
+        }
+        let value: &Inline<triblespace::core::inline::encodings::UnknownInline> = trible.v();
+        facts.insert(&triblespace::core::trible::Trible::force(
+            &new_root,
+            trible.a(),
+            value,
+        ));
+        carried_annotations += 1;
+    }
+
+    // 3. One COMMIT of the archive, unless an admitted one is present.
+    let archive: Archive = pile
+        .put::<SimpleArchive, _>(facts.clone().to_blob())
+        .map_err(|e| anyhow::anyhow!("store the model archive: {e}"))?;
+    let present = done
+        .get(&(collection.handle().raw, archive.raw))
+        .is_some_and(|metas| metas.contains(&empty_metadata_handle()));
+    let mut commits_appended = 0;
+    if !present {
+        let data = inlineencodings::Handle::<SimpleArchive>::to_hash(archive);
+        pile.insert(CollectionRecord::Commit(CollectionCommit::sign(
+            key,
+            collection.handle(),
+            data,
+            empty_metadata_handle(),
+        )))
+        .map_err(|error| anyhow::anyhow!("append the models commit: {error}"))?;
+        commits_appended = 1;
+    }
+
+    // 4. The proof, from a fresh observation.
+    pile.refresh().context("refresh after appending")?;
+    let after = pile.snapshot().context("freeze the result")?;
+    for info in source.blobs() {
+        let info = info.map_err(|e| anyhow::anyhow!("list source blobs: {e}"))?;
+        ensure!(
+            after
+                .contains_blob(info.handle)
+                .map_err(|e| anyhow::anyhow!("check target residency: {e}"))?,
+            "source blob {} is not resident in the target",
+            hex(&info.handle.raw)
+        );
+    }
+    ensure!(
+        after
+            .contains_blob(source_archive)
+            .map_err(|e| anyhow::anyhow!("{e}"))?,
+        "the source archive is not resident in the target"
+    );
+    ensure!(
+        model_collection::collections_named_in(&after, model_collection::model_collection_name())?
+            == vec![collection],
+        "the target no longer has exactly one models collection"
+    );
+    let new = model_collection::snapshot_model_collection_for(&after, collection)?;
+    ensure!(
+        new.support().members().any(|member| member == archive),
+        "the new archive is not a member of models; rerun to complete"
+    );
+    ensure!(
+        new.facts() == &(facts_before + facts.clone()),
+        "models facts differ from its facts before plus the new archive (a concurrent write?); rerun"
+    );
+    let parts = mary::selection::model_root_parts(new.facts(), new_root)?;
+    ensure!(
+        parts.tokenizer.is_some() && parts.config.is_some() && parts.chat_template.is_some(),
+        "the new root does not state all three parts"
+    );
+    let index = mary::selection::index_keymap_for_root(new.facts(), &after, new_root)
+        .context("index the new root's tensors")?;
+    let tensors = index.len();
+    ensure!(tensors > 0, "the new root indexes no tensors");
+    let old = mary::selection::select_model_root(
+        new.facts(),
+        &after,
+        mary::selection::ModelSelector::Root(old_root),
+    );
+    ensure!(
+        old.is_err(),
+        "the old member-only root {old_root:X} is still a root in models"
+    );
+    Ok(Carried {
+        collection,
+        source_blobs,
+        blobs_copied,
+        bytes_copied,
+        blobs_already,
+        commits_appended,
+        old_root,
+        new_root,
+        archive,
+        facts: facts.len(),
+        tensors,
+        projected_aliases: 0,
+        carried_annotations,
+    })
+}
+
 fn main() -> Result<()> {
-    let usage = "usage: model_collection_migrate <model.pile> <signing-key>";
+    let usage = "usage: model_collection_migrate <model.pile> <signing-key>\n       \
+        model_collection_migrate <target.pile> <signing-key> --from <source.pile> \
+        --archive <64-hex> --assets <dir> [--root <32-hex>]";
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let [pile, key] = args.as_slice() else {
-        bail!("{usage}")
+    let (pile, key, rest) = match args.as_slice() {
+        [pile, key, rest @ ..] => (pile, key, rest),
+        _ => bail!("{usage}"),
     };
     let key = signing_key_file::load_existing(Path::new(key))
         .with_context(|| format!("load existing signing key {key:?}"))?;
+    if !rest.is_empty() {
+        let mut from = None;
+        let mut archive = None;
+        let mut assets = None;
+        let mut root = None;
+        let mut flags = rest.iter();
+        while let Some(flag) = flags.next() {
+            let value = flags
+                .next()
+                .with_context(|| format!("{flag} needs a value\n{usage}"))?;
+            match flag.as_str() {
+                "--from" => from = Some(Path::new(value).to_path_buf()),
+                "--archive" => archive = Some(parse_archive(value)?),
+                "--assets" => assets = Some(Path::new(value).to_path_buf()),
+                "--root" => {
+                    root = Some(Id::from_hex(value).with_context(|| format!("--root {value:?}"))?)
+                }
+                other => bail!("unknown flag {other}\n{usage}"),
+            }
+        }
+        let request = Carry {
+            source: from.with_context(|| format!("--from is required\n{usage}"))?,
+            archive: archive.with_context(|| format!("--archive is required\n{usage}"))?,
+            assets: assets.with_context(|| format!("--assets is required\n{usage}"))?,
+            root,
+        };
+        let outcome = carry(Path::new(pile), &key, &request)?;
+        println!(
+            "models {} source_blobs {} blobs_copied {} bytes_copied {} blobs_already_resident {} \
+             commits_appended {} old_root {:X} new_root {:X} archive {} facts {} tensors {} \
+             projected_aliases {} carried_annotations {}",
+            hex(&outcome.collection.handle().raw),
+            outcome.source_blobs,
+            outcome.blobs_copied,
+            outcome.bytes_copied,
+            outcome.blobs_already,
+            outcome.commits_appended,
+            outcome.old_root,
+            outcome.new_root,
+            hex(&outcome.archive.raw),
+            outcome.facts,
+            outcome.tensors,
+            outcome.projected_aliases,
+            outcome.carried_annotations,
+        );
+        println!(
+            "proof: every source blob resident in the target; models (one descriptor) facts == \
+             its facts before + the new archive; new root states tokenizer, config and chat \
+             template and indexes {} tensors with resident leaves; old root not in models",
+            outcome.tensors
+        );
+        return Ok(());
+    }
     let outcome = migrate(Path::new(pile), &key)?;
     println!(
         "models {} members {} facts {} commits_appended {} skipped_token_rows {}",
@@ -849,5 +1287,161 @@ mod tests {
             (1, 1),
             "one admitted pair"
         );
+    }
+
+    const CARRY_TOKENIZER: &str = r###"{"version": "1.0", "added_tokens": [
+        {"id": 3, "content": "<embedding>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}],
+      "normalizer": null, "pre_tokenizer": {"type": "BertPreTokenizer"},
+      "post_processor": {"type": "TemplateProcessing",
+        "single": [{"Sequence": {"id": "A", "type_id": 0}}, {"SpecialToken": {"id": "<embedding>", "type_id": 0}}],
+        "pair": [{"Sequence": {"id": "A", "type_id": 0}}, {"Sequence": {"id": "B", "type_id": 1}}],
+        "special_tokens": {"<embedding>": {"id": "<embedding>", "ids": [3], "tokens": ["<embedding>"]}}},
+      "decoder": null,
+      "model": {"type": "WordPiece", "unk_token": "[UNK]", "continuing_subword_prefix": "##",
+        "max_input_chars_per_word": 100, "vocab": {"[UNK]": 0, "a": 1, "b": 2}}}"###;
+
+    /// A dedicated source pile with one member-only model in a graph
+    /// collection; returns its archive handle and root.
+    fn carry_source(path: &Path, key: &SigningKey) -> (Archive, Id) {
+        let mut pile = Pile::open(path).unwrap();
+        let leaf = mary::format::put_raw(&mut pile, &[1.0, 2.0, 3.0], &[3]).unwrap();
+        let leaf_id = leaf.root().unwrap();
+        let mut facts = leaf.into_facts();
+        let kind = pile
+            .put::<blobencodings::UTF8String, _>("vector".to_owned())
+            .unwrap();
+        let name = pile
+            .put::<blobencodings::UTF8String, _>("w.bias".to_owned())
+            .unwrap();
+        let module =
+            entity! { _ @ attrs::kind: kind, attrs::safetensor_path: name, attrs::weight: leaf_id };
+        let members = vec![module.root().unwrap()];
+        facts += module.into_facts();
+        let root = mary::ingest::build_model_root(
+            &mut pile,
+            "org/carry",
+            "native",
+            members,
+            facts,
+            &["model.safetensors".into()],
+        )
+        .unwrap();
+        let root_id = root.root().unwrap();
+        let (_, facts, _, _) = root.into_parts();
+        let archive: Archive = facts.clone().to_blob().get_handle();
+        // An unrelated blob no fact names: carried anyway.
+        pile.put::<blobencodings::UTF8String, _>("unreferenced".to_owned())
+            .unwrap();
+        let graph = pile.collection(LEGACY_GRAPH, policy(key)).unwrap();
+        pile.commit(graph, key, Fragment::rooted(root_id, facts))
+            .unwrap();
+        pile.close().unwrap();
+        (archive, root_id)
+    }
+
+    fn carry_assets(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "model-collection-carry-{label}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("tokenizer.json"), CARRY_TOKENIZER).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"hidden_size": 4, "eps": 1e-06}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("chat_template.jinja"), "{{ messages }}\n").unwrap();
+        dir
+    }
+
+    #[test]
+    fn carry_copies_every_blob_and_completes_the_root_in_the_target_models() {
+        let source = TempPile::new("carry-source");
+        let target = TempPile::new("carry-target");
+        let author = SigningKey::from_bytes(&[0x61; 32]);
+        let operator = SigningKey::from_bytes(&[0x62; 32]);
+        let (archive, old_root) = carry_source(&source.0, &author);
+        // The target's models collection, admitting the operator, with another model in it.
+        let mut pile = Pile::open(&target.0).unwrap();
+        let models = pile.collection("models", policy(&operator)).unwrap();
+        pile.commit(models, &operator, model("resident")).unwrap();
+        pile.close().unwrap();
+        let assets = carry_assets("ok");
+        let request = Carry {
+            source: source.0.clone(),
+            archive,
+            assets: assets.clone(),
+            root: None,
+        };
+        let source_bytes = std::fs::read(&source.0).unwrap();
+
+        let outcome = carry(&target.0, &operator, &request).unwrap();
+        assert_eq!(
+            std::fs::read(&source.0).unwrap(),
+            source_bytes,
+            "the source is never written"
+        );
+        assert_eq!(outcome.collection, models);
+        assert_eq!(outcome.commits_appended, 1);
+        assert_eq!(outcome.old_root, old_root);
+        assert_ne!(outcome.new_root, old_root);
+        assert_eq!(outcome.tensors, 1);
+        assert!(
+            outcome.blobs_copied > 0
+                && outcome.blobs_copied == outcome.source_blobs - outcome.blobs_already
+        );
+        let after = std::fs::read(&target.0).unwrap();
+
+        // The ordinary reader sees one complete root for the model, with its parts.
+        let loaded = mary::persist::read_model_pile(&target.0).unwrap();
+        assert_eq!(loaded.collection, models);
+        let parts = mary::selection::model_root_parts(&loaded.facts, outcome.new_root).unwrap();
+        let config =
+            mary::jsonfacts::load_json(&loaded.facts, &loaded.store, parts.config.unwrap())
+                .unwrap();
+        assert_eq!(config, serde_json::json!({"hidden_size": 4, "eps": 1e-06}));
+        let template: anybytes::View<str> = loaded.store.get(parts.chat_template.unwrap()).unwrap();
+        assert_eq!(&*template, "{{ messages }}\n");
+        assert!(parts.tokenizer.is_some());
+        let roots = mary::selection::select_model_roots(
+            &loaded.facts,
+            &loaded.store,
+            mary::selection::ModelSelector::Source {
+                source: "org/carry",
+                quantization: "native",
+            },
+        )
+        .unwrap();
+        assert_eq!(roots, vec![outcome.new_root], "one root for the model");
+
+        // A rerun copies nothing, appends nothing, and proves the same.
+        let again = carry(&target.0, &operator, &request).unwrap();
+        assert_eq!((again.blobs_copied, again.commits_appended), (0, 0));
+        assert_eq!(again.new_root, outcome.new_root);
+        assert_eq!(std::fs::read(&target.0).unwrap(), after);
+
+        // Refusals write nothing: an unadmitted signer, a target without models.
+        assert!(carry(&target.0, &author, &request).is_err());
+        assert_eq!(std::fs::read(&target.0).unwrap(), after);
+        // A target whose models already holds the old member-only root.
+        let doubled = TempPile::new("carry-doubled");
+        let mut pile = Pile::open(&doubled.0).unwrap();
+        let models = pile.collection("models", policy(&operator)).unwrap();
+        let old = mary::persist::read_model_pile_snapshot_read_only(&source.0).unwrap();
+        let old: TribleSet = old.get::<TribleSet, SimpleArchive>(archive).unwrap();
+        pile.commit(models, &operator, Fragment::rooted(old_root, old))
+            .unwrap();
+        pile.close().unwrap();
+        let doubled_bytes = std::fs::read(&doubled.0).unwrap();
+        let refused = carry(&doubled.0, &operator, &request)
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("already a root"), "{refused}");
+        assert_eq!(std::fs::read(&doubled.0).unwrap(), doubled_bytes);
+        let bare = TempPile::new("carry-bare");
+        assert!(carry(&bare.0, &operator, &request).is_err());
+        assert_eq!(std::fs::metadata(&bare.0).unwrap().len(), 0);
+        let _ = std::fs::remove_dir_all(assets);
     }
 }

@@ -12,12 +12,31 @@
 //!   - **the bulk** — `vocab` (token↔id), `merges` (ordered BPE pairs), and
 //!     `added_tokens`. Uniform, content-addressed, dedups across shared vocabs.
 //!     Represented here as proper tribles (this module).
-//!   - **the config tail** — normalizer / pre-tokenizer / decoder: a small
-//!     typed AST whose nodes each map 1:1 to a `tokenizers` constructor call.
-//!     Types and boolean options are `metadata::tag` discriminants; regex /
-//!     behaviour / prefix are flat attrs; `Sequence` children are ordered
-//!     `member` edges. (No post-processor is stored: mary hand-frames its
-//!     sentinels — `[CLS]`/`[SEP]`, bos/eos — itself, see `embed.rs`.)
+//!   - **the config tail** — normalizer / pre-tokenizer / post-processor /
+//!     decoder: a small typed AST whose nodes each map 1:1 to a `tokenizers`
+//!     constructor call. Types and boolean options are `metadata::tag`
+//!     discriminants; regex / behaviour / prefix are flat attrs; `Sequence`
+//!     children are ordered `member` edges.
+//!
+//! The post-processor is stored since 2026-11-07. It used to be left out on
+//! the grounds that mary hand-frames its sentinels (`[CLS]`/`[SEP]`, bos/eos,
+//! see `embed.rs`), and every caller that does so encodes with
+//! `add_special_tokens = false`, which never runs it. WeMM is the model that
+//! made that false: its checkpoint's own `TemplateProcessing` appends the
+//! terminal `<embedding>` token, and its codec relies on the tokenizer, not on
+//! hand framing, to put it there. A tokenizer rebuilt without it encodes
+//! WeMM's input one token short. Graphs written before this carry no
+//! post-processor edge and rebuild exactly as before.
+//!
+//! Added tokens carry their `tokenizers::AddedToken` options as flags since
+//! the same date: `flag::NOT_SPECIAL`, `flag::NORMALIZED`, `flag::LSTRIP`,
+//! `flag::RSTRIP`, `flag::SINGLE_WORD`. `NOT_SPECIAL` is inverted on purpose.
+//! Every reader before it rebuilt every added token as special, so the absent
+//! flag has always meant "special", on graphs old and new alike; a positive
+//! `SPECIAL` flag read with presence semantics would have turned every
+//! existing graph's sentinels into ordinary added tokens. The other four
+//! default to false in `AddedToken::from(content, true)`, which is what old
+//! graphs rebuilt with, so their absence means the same thing in both.
 //!
 //! Load is **construct-from-graph, no JSON**: [`build_tokenizer`] (feature
 //! `tokenizer`) queries the graph and feeds the parts into `tokenizers`'
@@ -140,6 +159,20 @@ pub(crate) mod ty {
     pub const PIECE_USER_DEFINED: Id = id_hex!("9796A2F548F7C646D1798EFE7E8B4001");
     pub const PIECE_BYTE: Id = id_hex!("9D9E4D16DD83083B49D34056344FD082");
     pub const PIECE_UNUSED: Id = id_hex!("DD28C23E8DE557BC00F0451A8ED7C1C6");
+
+    // ── minted 2026-11-07 (`trible genid`) — the post-processor ──
+    /// Post-processor type: `TemplateProcessing` (single/pair templates over
+    /// named special tokens). WeMM's appends its terminal `<embedding>`.
+    pub const TEMPLATE_PROCESSING: Id = id_hex!("854D0F97FEDB6F34009FF057E2EA484D");
+    /// Post-processor type: `BertProcessing` (`cls` / `sep`).
+    pub const BERT_PROCESSING: Id = id_hex!("B279B90BA3274C4EE7E9D4A09FB01C69");
+    /// Post-processor type: `RobertaProcessing` (`cls` / `sep` plus the
+    /// `TRIM_OFFSETS` / `ADD_PREFIX_SPACE` flags).
+    pub const ROBERTA_PROCESSING: Id = id_hex!("4E302695D7A6B275C7D661FE3D62CC38");
+    /// A template piece standing for the first input sequence (`$A`).
+    pub const TEMPLATE_SEQUENCE_A: Id = id_hex!("6DD021538BCBF99B3391BE505706B5DF");
+    /// A template piece standing for the pair sequence (`$B`).
+    pub const TEMPLATE_SEQUENCE_B: Id = id_hex!("AC31755BE75895B0CBDB1F32CB5518C1");
 }
 #[allow(dead_code)]
 pub(crate) mod flag {
@@ -180,6 +213,17 @@ pub(crate) mod flag {
     /// table re-derives pieces the vocab already names, and long tokens come
     /// back as several short ones.
     pub const IGNORE_MERGES: Id = id_hex!("22B7385E0FFC80CFAB80AE750557F784");
+
+    // ── minted 2026-11-07 (`trible genid`) — added-token options ──
+    /// An added token that is NOT special (`"special": false`). Inverted on
+    /// purpose; see the module docs: absent has always meant special.
+    pub const NOT_SPECIAL: Id = id_hex!("61F8739136328B8CEB56432FABB9EDC6");
+    /// An added token's `lstrip`.
+    pub const LSTRIP: Id = id_hex!("FEA8C6D2BA219D902B36BE3B3BEA4779");
+    /// An added token's `rstrip`.
+    pub const RSTRIP: Id = id_hex!("CA5EB59A3C74737199FAE9F9F02134B5");
+    /// An added token's `single_word`.
+    pub const SINGLE_WORD: Id = id_hex!("A7106FCBE378A206F008841680A82251");
 }
 
 pub mod attrs {
@@ -269,6 +313,27 @@ pub mod attrs {
         "3AC7574C07D02D389B4E7AD3B3B084D9" as replace_content: Handle<blobencodings::UTF8String>;
         /// A Split node's SplitDelimiterBehavior name ("Removed"/"Isolated"/…).
         "964B4FCF7477E7E4436F0325F89B7CB5" as behavior: Handle<blobencodings::UTF8String>;
+
+        // ── minted 2026-11-07 (`trible genid`) — post-processor fields ──
+        /// A `TemplateProcessing` node → a piece of its `single` template
+        /// (repeated; each piece carries its own `index`).
+        "14C8B939E24FCFA70C12306A6BEBB1BE" as template_single: GenId;
+        /// A `TemplateProcessing` node → a piece of its `pair` template.
+        "D4B4725EE0AFDFDCEA32D44A76E25FB6" as template_pair: GenId;
+        /// A `TemplateProcessing` node → one of its named special tokens.
+        "2405C3D496A57180031ED8C9A10D2B56" as special_token: GenId;
+        /// The name a template uses for a special token (`"<embedding>"`,
+        /// `"[CLS]"`), on a special-token entity and on a template piece that
+        /// refers to it. A name, not token content: one name may stand for
+        /// several tokens, which are the special token's `member*`.
+        "B4883B40536FB49585FA2FC05063FFF9" as special_id: Handle<blobencodings::UTF8String>;
+        /// A template piece's `type_id`.
+        "4A59C61D63E2F178979BC4C568C536DC" as type_id: U256BE;
+        /// A `BertProcessing`/`RobertaProcessing` node → its `sep` token
+        /// (an entity with `piece` and `token_id`).
+        "699FCBD65442CF7EDDFD7490361751ED" as sep: GenId;
+        /// A `BertProcessing`/`RobertaProcessing` node → its `cls` token.
+        "D21DEA042491B27AF5B6929A00BAF193" as cls: GenId;
     }
 }
 
@@ -292,9 +357,8 @@ fn merge_pair(m: &serde_json::Value) -> Option<(String, String)> {
 /// the tokenizer entity (link it to a model root with `attrs::tokenizer`).
 ///
 /// Alongside the bulk it writes the flat model knobs (`unk_token`, …) and the
-/// normalizer / pre-tokenizer / decoder config subtrees ([`save_config_node`]).
-/// The post-processor is deliberately NOT stored — mary hand-frames sentinels
-/// itself (see `embed.rs`), so a reconstructed tokenizer needs none.
+/// normalizer / pre-tokenizer / decoder config subtrees ([`save_config_node`])
+/// and the post-processor ([`save_post_processor`]).
 pub fn save_tokenizer_json(
     json: &[u8],
     source_name: &str,
@@ -367,19 +431,32 @@ pub fn save_tokenizer_json(
         }
     }
 
-    // ── added / special tokens: { piece, token_id, index=order } ──
-    // (the boolean flags — special/single_word/lstrip/rstrip/normalized — are
-    //  config-tail; deferred with the rest of the field schema.)
+    // ── added / special tokens: { piece, token_id, index=order, options } ──
+    // The options are part of the token (a non-special `<think>` is not the
+    // same added token as a special one), so they are in its identity.
     let mut added_ids: Vec<Id> = Vec::new();
     if let Some(added) = v["added_tokens"].as_array() {
         for (order, t) in added.iter().enumerate() {
             let content = t["content"].as_str().ok_or("added token missing content")?;
             let id = t["id"].as_u64().ok_or("added token id not an integer")?;
             let ch = intern!(blobs, content);
+            let set = |field: &str| t[field].as_bool() == Some(true);
+            let options: Vec<Id> = [
+                // `special` absent from the JSON is HuggingFace's false.
+                (!set("special"), flag::NOT_SPECIAL),
+                (set("normalized"), flag::NORMALIZED),
+                (set("lstrip"), flag::LSTRIP),
+                (set("rstrip"), flag::RSTRIP),
+                (set("single_word"), flag::SINGLE_WORD),
+            ]
+            .into_iter()
+            .filter_map(|(on, tag)| on.then_some(tag))
+            .collect();
             let e = entity! { _ @
                 attrs::piece: ch,
                 attrs::token_id: id,
                 attrs::index: order as u64,
+                metadata::tag*: options.iter(),
             };
             added_ids.push(e.root().expect("added token root"));
             facts += e.into_facts();
@@ -405,9 +482,12 @@ pub fn save_tokenizer_json(
         model_tags.push(flag::IGNORE_MERGES);
     }
 
-    // ── config tail: normalizer / pre-tokenizer / decoder subtrees. The
-    //    post-processor is deliberately omitted — mary hand-frames [CLS]/[SEP]
-    //    (nomic) and bos/eos (clip) itself, like embed.rs already does. ──
+    // ── config tail: normalizer / pre-tokenizer / post-processor / decoder
+    //    subtrees (see the module docs for why the post-processor is here). ──
+    let post_id = match v.get("post_processor").filter(|x| !x.is_null()) {
+        Some(n) => Some(save_post_processor(n, blobs, &mut facts)?),
+        None => None,
+    };
     let norm_id = match v.get("normalizer").filter(|x| !x.is_null()) {
         Some(n) => Some(save_config_node(n, blobs, &mut facts)?),
         None => None,
@@ -429,6 +509,7 @@ pub fn save_tokenizer_json(
         metadata::tag*: model_tags.iter(),
         attrs::normalizer?: norm_id,
         attrs::pre_tokenizer?: pretok_id,
+        attrs::post_processor?: post_id,
         attrs::decoder?: dec_id,
         attrs::unk_token?: unk,
         attrs::continuing_subword_prefix?: csp,
@@ -650,6 +731,161 @@ fn save_config_node(
     let id = node.root().expect("config node root");
     *facts += node.into_facts();
     Ok(id)
+}
+
+/// Ingest a post-processor subtree into `facts`, returning its node id.
+///
+/// `TemplateProcessing` stores its two templates as pieces, each carrying its
+/// position (`index`) and `type_id` in its own identity, so `$A:0` at index 0
+/// and `$A:0` at index 2 are two pieces rather than one entity with two
+/// indices; a piece names the first or pair sequence by a type tag, or a
+/// special token by its `special_id`. The named special tokens are entities
+/// of their own, their tokens ordered `member`s. `Bert`/`RobertaProcessing`
+/// carry `cls`/`sep` token entities; `ByteLevel` is the same node a
+/// pre-tokenizer uses ([`save_config_node`]); `Sequence` orders its children
+/// like every other sequence here.
+fn save_post_processor(
+    v: &serde_json::Value,
+    blobs: &mut impl BlobStorePut,
+    facts: &mut TribleSet,
+) -> Result<Id, Err> {
+    let node_type = v["type"].as_str().ok_or("post-processor missing type")?;
+    let node = match node_type {
+        "ByteLevel" => return save_config_node(v, blobs, facts),
+        "Sequence" => {
+            let children = v["processors"]
+                .as_array()
+                .ok_or("post-processor Sequence missing processors array")?;
+            let mut members = Vec::with_capacity(children.len());
+            for (i, child) in children.iter().enumerate() {
+                let cid = save_post_processor(child, blobs, facts)?;
+                *facts +=
+                    entity! { ExclusiveId::force_ref(&cid) @ attrs::index: i as u64 }.into_facts();
+                members.push(cid);
+            }
+            entity! { _ @ metadata::tag: ty::SEQUENCE, attrs::member*: members.iter() }
+        }
+        "BertProcessing" | "RobertaProcessing" => {
+            let sep = save_cls_sep(&v["sep"], blobs, facts)?;
+            let cls = save_cls_sep(&v["cls"], blobs, facts)?;
+            let mut tags = Vec::new();
+            if node_type == "BertProcessing" {
+                tags.push(ty::BERT_PROCESSING);
+            } else {
+                tags.push(ty::ROBERTA_PROCESSING);
+                // Both default to true in `tokenizers`.
+                if v["trim_offsets"].as_bool().unwrap_or(true) {
+                    tags.push(flag::TRIM_OFFSETS);
+                }
+                if v["add_prefix_space"].as_bool().unwrap_or(true) {
+                    tags.push(flag::ADD_PREFIX_SPACE);
+                }
+            }
+            entity! { _ @ metadata::tag*: tags.iter(), attrs::sep: sep, attrs::cls: cls }
+        }
+        "TemplateProcessing" => {
+            let single = save_template(&v["single"], blobs, facts)?;
+            let pair = save_template(&v["pair"], blobs, facts)?;
+            let mut specials = Vec::new();
+            if let Some(map) = v["special_tokens"].as_object() {
+                for special in map.values() {
+                    let name = special["id"].as_str().ok_or("special token id")?;
+                    let ids = special["ids"].as_array().ok_or("special token ids")?;
+                    let tokens = special["tokens"].as_array().ok_or("special token tokens")?;
+                    if ids.len() != tokens.len() {
+                        return Err(format!(
+                            "special token {name:?}: ids and tokens differ in length"
+                        )
+                        .into());
+                    }
+                    let mut members = Vec::with_capacity(ids.len());
+                    for (index, (id, content)) in ids.iter().zip(tokens).enumerate() {
+                        let id = id.as_u64().ok_or("special token id not an integer")?;
+                        let content = content.as_str().ok_or("special token content")?;
+                        let piece =
+                            blobs.put::<blobencodings::UTF8String, _>(content.to_owned())?;
+                        let e = entity! { _ @
+                            attrs::piece: piece,
+                            attrs::token_id: id,
+                            attrs::index: index as u64,
+                        };
+                        members.push(e.root().expect("special token member root"));
+                        *facts += e.into_facts();
+                    }
+                    let name = blobs.put::<blobencodings::UTF8String, _>(name.to_owned())?;
+                    let e = entity! { _ @ attrs::special_id: name, attrs::member*: members.iter() };
+                    specials.push(e.root().expect("special token root"));
+                    *facts += e.into_facts();
+                }
+            }
+            entity! { _ @
+                metadata::tag: ty::TEMPLATE_PROCESSING,
+                attrs::template_single*: single.iter(),
+                attrs::template_pair*: pair.iter(),
+                attrs::special_token*: specials.iter(),
+            }
+        }
+        other => return Err(format!("unsupported post-processor type: {other:?}").into()),
+    };
+    let id = node.root().expect("post-processor root");
+    *facts += node.into_facts();
+    Ok(id)
+}
+
+/// A `BertProcessing`/`RobertaProcessing` `cls`/`sep`: `["[SEP]", 102]`.
+fn save_cls_sep(
+    pair: &serde_json::Value,
+    blobs: &mut impl BlobStorePut,
+    facts: &mut TribleSet,
+) -> Result<Id, Err> {
+    let content = pair[0].as_str().ok_or("cls/sep token missing content")?;
+    let id = pair[1].as_u64().ok_or("cls/sep token id not an integer")?;
+    let piece = blobs.put::<blobencodings::UTF8String, _>(content.to_owned())?;
+    let e = entity! { _ @ attrs::piece: piece, attrs::token_id: id };
+    let root = e.root().expect("cls/sep token root");
+    *facts += e.into_facts();
+    Ok(root)
+}
+
+/// One `TemplateProcessing` template's pieces, each carrying its position.
+fn save_template(
+    template: &serde_json::Value,
+    blobs: &mut impl BlobStorePut,
+    facts: &mut TribleSet,
+) -> Result<Vec<Id>, Err> {
+    let template = template
+        .as_array()
+        .ok_or("TemplateProcessing template is not an array")?;
+    let mut ids = Vec::with_capacity(template.len());
+    for (index, piece) in template.iter().enumerate() {
+        let e = if let Some(seq) = piece.get("Sequence") {
+            let tag = match seq["id"].as_str() {
+                Some("A") => ty::TEMPLATE_SEQUENCE_A,
+                Some("B") => ty::TEMPLATE_SEQUENCE_B,
+                other => return Err(format!("template sequence id {other:?}").into()),
+            };
+            let type_id = seq["type_id"].as_u64().ok_or("piece type_id")?;
+            entity! { _ @
+                metadata::tag: tag,
+                attrs::type_id: type_id,
+                attrs::index: index as u64,
+            }
+        } else if let Some(special) = piece.get("SpecialToken") {
+            let name = special["id"].as_str().ok_or("template special id")?;
+            let type_id = special["type_id"].as_u64().ok_or("piece type_id")?;
+            let name = blobs.put::<blobencodings::UTF8String, _>(name.to_owned())?;
+            entity! { _ @
+                attrs::special_id: name,
+                attrs::type_id: type_id,
+                attrs::index: index as u64,
+            }
+        } else {
+            return Err(format!("unknown template piece {piece}").into());
+        };
+        ids.push(e.root().expect("template piece root"));
+        *facts += e.into_facts();
+    }
+    Ok(ids)
 }
 
 /// Store optional text as a `UTF8String` blob and return its handle.
@@ -991,7 +1227,7 @@ fn load_added_strict(
     tribles: &TribleSet,
     blobs: &impl BlobStoreGet,
     tok_id: Id,
-) -> Result<Vec<(String, u64)>, Err> {
+) -> Result<Vec<(String, u64, Vec<Id>)>, Err> {
     use std::collections::{BTreeMap, BTreeSet};
 
     let added: BTreeSet<Id> = find!(
@@ -1026,7 +1262,8 @@ fn load_added_strict(
             added,
             "index",
         )?;
-        if ordered.insert(index, (piece, token_id)).is_some() {
+        let options = node_tags(tribles, added);
+        if ordered.insert(index, (piece, token_id, options)).is_some() {
             return Err(
                 format!("tokenizer {tok_id} has duplicate added-token index {index}").into(),
             );
@@ -1065,9 +1302,9 @@ macro_rules! edge_field {
 /// the dual of [`save_tokenizer_json`], and the whole point of the module:
 /// model (vocab/merges + knobs), normalizer, pre-tokenizer, decoder, and
 /// added tokens are all queried from the graph and fed to the `tokenizers`
-/// builders. No post-processor is reconstructed (none is stored): callers
-/// hand-frame their sentinels (`[CLS]`/`[SEP]`, bos/eos) themselves, as
-/// `embed.rs` does.
+/// builders, and so is the post-processor when the graph stores one (graphs
+/// written before 2026-11-07 do not; callers that hand-frame their sentinels
+/// encode with `add_special_tokens = false`, which never runs it).
 #[cfg(feature = "tokenizer")]
 pub fn build_tokenizer(
     tribles: &TribleSet,
@@ -1172,20 +1409,180 @@ pub fn build_tokenizer_with_added(
     if let Some(d) = edge_field!(tribles, tok_id, attrs::decoder) {
         tok.with_decoder(Some(build_decoder(tribles, blobs, d)?));
     }
+    if let Some(p) = edge_field!(tribles, tok_id, attrs::post_processor) {
+        tok.with_post_processor(Some(build_post_processor(tribles, blobs, p)?));
+    }
 
-    // Added tokens: their boolean flags (special/lstrip/…) are config-tail and
-    // not yet persisted; every added token of our tokenizers (nomic's BERT
-    // sentinels, CLIP's <|startoftext|>/<|endoftext|>) is `special: true`, so
-    // reconstruct them as special. Ids resolve against the vocab (all our
-    // added tokens are also vocab entries), so no id drift is possible.
-    let added: Vec<tokenizers::AddedToken> = load_added_strict(tribles, blobs, tok_id)?
-        .into_iter()
-        .map(|(content, _id)| tokenizers::AddedToken::from(content, true))
-        .collect();
-    if with_added && !added.is_empty() {
-        tok.add_special_tokens(&added);
+    // Added tokens, in their original order and with their options (absent
+    // options are the pre-2026-11-07 reconstruction: special, nothing else).
+    // `tokenizers` assigns an id to a token the vocab lacks by appending it
+    // after the vocab and the tokens added before it, so the stored order is
+    // what makes the ids come out right; each is checked against the stored
+    // id, because a graph whose added ids are not contiguous after the vocab
+    // would otherwise rebuild with silently different ids.
+    if with_added {
+        for (content, id, options) in load_added_strict(tribles, blobs, tok_id)? {
+            let special = !options.contains(&flag::NOT_SPECIAL);
+            let token = tokenizers::AddedToken::from(content.clone(), special)
+                .normalized(options.contains(&flag::NORMALIZED))
+                .lstrip(options.contains(&flag::LSTRIP))
+                .rstrip(options.contains(&flag::RSTRIP))
+                .single_word(options.contains(&flag::SINGLE_WORD));
+            if special {
+                tok.add_special_tokens(&[token]);
+            } else {
+                tok.add_tokens(&[token]);
+            }
+            let assigned = tok.token_to_id(&content);
+            if assigned != Some(id as u32) {
+                return Err(format!(
+                    "added token {content:?} has id {id} in tokenizer {tok_id}, \
+                     but rebuilding assigns {assigned:?}"
+                )
+                .into());
+            }
+        }
     }
     Ok(tok)
+}
+
+/// Reconstruct one post-processor node (recursing through `Sequence`).
+#[cfg(feature = "tokenizer")]
+fn build_post_processor(
+    tribles: &TribleSet,
+    blobs: &impl BlobStoreGet,
+    node: Id,
+) -> Result<tokenizers::PostProcessorWrapper, Err> {
+    use tokenizers::processors as pp;
+    let tags = node_tags(tribles, node);
+    let has = |id: Id| tags.contains(&id);
+    let token = |edge: Id| -> Result<(String, u32), Err> {
+        let piece = long_field!(tribles, blobs, edge, attrs::piece)
+            .ok_or_else(|| format!("cls/sep token {edge} has no piece"))?;
+        let id = required_one(
+            find!((i: u64), pattern!(tribles, [{ edge @ attrs::token_id: ?i }])).map(|(i,)| i),
+            edge,
+            "token_id",
+        )?;
+        Ok((piece, id as u32))
+    };
+    if has(ty::TEMPLATE_PROCESSING) {
+        let single = build_template(tribles, blobs, node, true)?;
+        let pair = build_template(tribles, blobs, node, false)?;
+        let mut specials = Vec::new();
+        for (special,) in find!(
+            (s: Id),
+            pattern!(tribles, [{ node @ attrs::special_token: ?s }])
+        ) {
+            let name = long_field!(tribles, blobs, special, attrs::special_id)
+                .ok_or_else(|| format!("special token {special} has no special_id"))?;
+            let mut ids = Vec::new();
+            let mut contents = Vec::new();
+            for member in ordered_members_strict(tribles, special)? {
+                let (content, id) = token(member)?;
+                contents.push(content);
+                ids.push(id);
+            }
+            specials.push(
+                pp::template::SpecialToken::new(name, ids, contents)
+                    .map_err(|e| format!("special token: {e}"))?,
+            );
+        }
+        let processor = pp::template::TemplateProcessing::builder()
+            .try_single(single)
+            .map_err(|e| format!("single template: {e}"))?
+            .try_pair(pair)
+            .map_err(|e| format!("pair template: {e}"))?
+            .special_tokens(specials)
+            .build()
+            .map_err(|e| format!("build TemplateProcessing: {e}"))?;
+        Ok(processor.into())
+    } else if has(ty::BERT_PROCESSING) || has(ty::ROBERTA_PROCESSING) {
+        let sep =
+            token(edge_field!(tribles, node, attrs::sep).ok_or("processing node has no sep")?)?;
+        let cls =
+            token(edge_field!(tribles, node, attrs::cls).ok_or("processing node has no cls")?)?;
+        if has(ty::BERT_PROCESSING) {
+            Ok(pp::bert::BertProcessing::new(sep, cls).into())
+        } else {
+            Ok(pp::roberta::RobertaProcessing::new(sep, cls)
+                .trim_offsets(has(flag::TRIM_OFFSETS))
+                .add_prefix_space(has(flag::ADD_PREFIX_SPACE))
+                .into())
+        }
+    } else if has(ty::BYTE_LEVEL) {
+        Ok(tokenizers::pre_tokenizers::byte_level::ByteLevel::new(
+            has(flag::ADD_PREFIX_SPACE),
+            has(flag::TRIM_OFFSETS),
+            has(flag::USE_REGEX),
+        )
+        .into())
+    } else if has(ty::SEQUENCE) {
+        let kids = ordered_members_strict(tribles, node)?
+            .into_iter()
+            .map(|k| build_post_processor(tribles, blobs, k))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(pp::sequence::Sequence::new(kids).into())
+    } else {
+        Err(format!("post-processor node {node:?} has no known type tag").into())
+    }
+}
+
+/// One `TemplateProcessing` template in `tokenizers`' piece syntax
+/// (`$A:0`, `<embedding>:0`), the one public constructor it has. That syntax
+/// splits on spaces and colons and reads a leading `$` as a sequence, so a
+/// special-token name containing either, or starting with `$`, is refused
+/// rather than parsed into something else.
+#[cfg(feature = "tokenizer")]
+fn build_template(
+    tribles: &TribleSet,
+    blobs: &impl BlobStoreGet,
+    node: Id,
+    single: bool,
+) -> Result<Vec<String>, Err> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let pieces: BTreeSet<Id> = if single {
+        find!((p: Id), pattern!(tribles, [{ node @ attrs::template_single: ?p }]))
+            .map(|(p,)| p)
+            .collect()
+    } else {
+        find!((p: Id), pattern!(tribles, [{ node @ attrs::template_pair: ?p }]))
+            .map(|(p,)| p)
+            .collect()
+    };
+    let mut ordered = BTreeMap::new();
+    for piece in pieces {
+        let index = required_one(
+            find!((i: u64), pattern!(tribles, [{ piece @ attrs::index: ?i }])).map(|(i,)| i),
+            piece,
+            "index",
+        )?;
+        let type_id = required_one(
+            find!((t: u64), pattern!(tribles, [{ piece @ attrs::type_id: ?t }])).map(|(t,)| t),
+            piece,
+            "type_id",
+        )?;
+        let tags = node_tags(tribles, piece);
+        let name = if tags.contains(&ty::TEMPLATE_SEQUENCE_A) {
+            "$A".to_owned()
+        } else if tags.contains(&ty::TEMPLATE_SEQUENCE_B) {
+            "$B".to_owned()
+        } else {
+            let name = long_field!(tribles, blobs, piece, attrs::special_id)
+                .ok_or_else(|| format!("template piece {piece} names no sequence or token"))?;
+            if name.is_empty() || name.starts_with('$') || name.contains([' ', ':']) {
+                return Err(format!(
+                    "special token name {name:?} cannot be spelled in tokenizers' template syntax"
+                )
+                .into());
+            }
+            name
+        };
+        if ordered.insert(index, format!("{name}:{type_id}")).is_some() {
+            return Err(format!("template of {node} has duplicate piece index {index}").into());
+        }
+    }
+    Ok(ordered.into_values().collect())
 }
 
 /// Reconstruct one normalizer node (recursing through `Sequence`).
@@ -1749,6 +2146,208 @@ mod tests {
     // file:
     //   TOK_JSON=<path> cargo test --features tokenizer --lib \
     //     tokenizer::tests::real_graph_parity -- --ignored --nocapture
+    /// A tokenizer whose added tokens lie beyond its vocab, one of them not
+    /// special, with a post-processor: the shape WeMM's has.
+    #[cfg(feature = "tokenizer")]
+    fn with_post_processor(post: &str) -> String {
+        format!(
+            r###"{{
+          "version": "1.0",
+          "added_tokens": [
+            {{"id": 5, "content": "<|im_start|>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}},
+            {{"id": 6, "content": "<think>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": false}},
+            {{"id": 7, "content": "<embedding>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}}
+          ],
+          "normalizer": {{"type": "BertNormalizer", "clean_text": true, "handle_chinese_chars": true, "strip_accents": null, "lowercase": true}},
+          "pre_tokenizer": {{"type": "BertPreTokenizer"}},
+          "post_processor": {post},
+          "decoder": {{"type": "WordPiece", "prefix": "##", "cleanup": true}},
+          "model": {{ "type": "WordPiece", "unk_token": "[UNK]",
+            "continuing_subword_prefix": "##", "max_input_chars_per_word": 100, "vocab": {{
+            "[UNK]": 0, "hello": 1, "world": 2, "##ing": 3, "[SEP]": 4 }} }}
+        }}"###
+        )
+    }
+
+    #[cfg(feature = "tokenizer")]
+    fn assert_full_parity(json: &str, texts: &[&str]) {
+        let mut blobs = MemoryBlobStore::new();
+        let frag = save_tokenizer_json(json.as_bytes(), "test/post", &mut blobs).unwrap();
+        let tok_id = frag.root().expect("root");
+        let tribles: TribleSet = frag.into();
+        let reader = SnapshotSource::snapshot(&mut blobs).unwrap();
+        let graph = build_tokenizer(&tribles, &reader, tok_id).expect("build from graph");
+        let json = tokenizers::Tokenizer::from_bytes(json.as_bytes()).expect("from_bytes");
+        for text in texts {
+            for specials in [false, true] {
+                let g = graph.encode(*text, specials).expect("graph encode");
+                let j = json.encode(*text, specials).expect("json encode");
+                assert_eq!(g.get_ids(), j.get_ids(), "{text:?} specials={specials}");
+                assert_eq!(g.get_type_ids(), j.get_type_ids(), "{text:?}");
+                assert_eq!(
+                    g.get_special_tokens_mask(),
+                    j.get_special_tokens_mask(),
+                    "{text:?}"
+                );
+                for skip in [false, true] {
+                    assert_eq!(
+                        graph.decode(g.get_ids(), skip).unwrap(),
+                        json.decode(j.get_ids(), skip).unwrap(),
+                        "decode {text:?} skip={skip}"
+                    );
+                }
+            }
+            let g = graph.encode((*text, "world hello"), true).unwrap();
+            let j = json.encode((*text, "world hello"), true).unwrap();
+            assert_eq!(g.get_ids(), j.get_ids(), "pair {text:?}");
+            assert_eq!(g.get_type_ids(), j.get_type_ids(), "pair {text:?}");
+        }
+    }
+
+    const POST_TEXTS: &[&str] = &[
+        "hello world",
+        "<|im_start|>hello<think>worlding",
+        "hello <embedding> world",
+        "",
+    ];
+
+    #[cfg(feature = "tokenizer")]
+    #[test]
+    fn template_post_processor_and_added_options_rebuild_exactly() {
+        let template = r#"{"type": "TemplateProcessing",
+            "single": [{"Sequence": {"id": "A", "type_id": 0}}, {"SpecialToken": {"id": "<embedding>", "type_id": 0}}],
+            "pair": [{"Sequence": {"id": "A", "type_id": 0}}, {"SpecialToken": {"id": "<embedding>", "type_id": 0}}, {"Sequence": {"id": "B", "type_id": 1}}],
+            "special_tokens": {"<embedding>": {"id": "<embedding>", "ids": [7], "tokens": ["<embedding>"]}}}"#;
+        assert_full_parity(&with_post_processor(template), POST_TEXTS);
+    }
+
+    #[cfg(feature = "tokenizer")]
+    #[test]
+    fn bert_roberta_bytelevel_and_sequence_post_processors_rebuild_exactly() {
+        let bert = r#"{"type": "BertProcessing", "sep": ["[SEP]", 4], "cls": ["<|im_start|>", 5]}"#;
+        let roberta = r#"{"type": "RobertaProcessing", "sep": ["[SEP]", 4], "cls": ["<|im_start|>", 5], "trim_offsets": false, "add_prefix_space": true}"#;
+        let sequence = r#"{"type": "Sequence", "processors": [
+            {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false, "use_regex": false},
+            {"type": "BertProcessing", "sep": ["[SEP]", 4], "cls": ["<|im_start|>", 5]}]}"#;
+        for post in [bert, roberta, sequence] {
+            assert_full_parity(&with_post_processor(post), POST_TEXTS);
+        }
+    }
+
+    /// A graph written before the options existed (no flags on its added
+    /// tokens) still rebuilds every added token as special.
+    #[cfg(feature = "tokenizer")]
+    #[test]
+    fn added_tokens_without_options_rebuild_as_special() {
+        let mut blobs = MemoryBlobStore::new();
+        let frag = save_tokenizer_json(WP.as_bytes(), "test/legacy", &mut blobs).unwrap();
+        let tok_id = frag.root().expect("root");
+        let mut tribles: TribleSet = frag.into();
+        let options = [
+            flag::NOT_SPECIAL,
+            flag::NORMALIZED,
+            flag::LSTRIP,
+            flag::RSTRIP,
+            flag::SINGLE_WORD,
+        ];
+        let legacy: TribleSet = tribles
+            .iter()
+            .filter(|t| {
+                !(t.a() == &metadata::tag.id()
+                    && options.iter().any(|o| {
+                        let tag: Inline<inlineencodings::GenId> = (*o).to_inline();
+                        t.v::<inlineencodings::GenId>().raw == tag.raw
+                    }))
+            })
+            .copied()
+            .collect();
+        tribles = legacy;
+        let reader = SnapshotSource::snapshot(&mut blobs).unwrap();
+        let graph = build_tokenizer(&tribles, &reader, tok_id).unwrap();
+        let ids = graph
+            .encode("[CLS] hello", false)
+            .unwrap()
+            .get_ids()
+            .to_vec();
+        assert_eq!(graph.decode(&ids, true).unwrap(), "hello");
+    }
+
+    /// WeMM's real tokenizer: the graph-built tokenizer encodes like the
+    /// checkpoint's `tokenizer.json`, with and without its post-processor,
+    /// on chat-template framing, the image placeholder run and every added
+    /// token spelled literally.
+    #[cfg(feature = "tokenizer")]
+    #[test]
+    #[ignore = "set WEMM_TOKENIZER_JSON to WeMM's tokenizer.json"]
+    fn wemm_graph_tokenizer_encodes_like_its_json() {
+        let path = std::env::var("WEMM_TOKENIZER_JSON").expect("WEMM_TOKENIZER_JSON");
+        let json = std::fs::read(&path).unwrap();
+        let mut blobs = MemoryBlobStore::new();
+        let frag = save_tokenizer_json(&json, "wemm", &mut blobs).unwrap();
+        let tok_id = frag.root().expect("root");
+        let tribles: TribleSet = frag.into();
+        let reader = SnapshotSource::snapshot(&mut blobs).unwrap();
+        let graph = build_tokenizer(&tribles, &reader, tok_id).unwrap();
+        let reference = tokenizers::Tokenizer::from_bytes(&json).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        let added: Vec<String> = parsed["added_tokens"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["content"].as_str().unwrap().to_owned())
+            .collect();
+        let mut texts: Vec<String> = [
+            "hello",
+            "The quick brown fox jumps over the lazy dog.",
+            "  leading spaces, trailing newline\n",
+            "line one\nline two\r\n\r\nline four\n\n",
+            "naïve façade coöperation, Ünïcödé and NFC: e\u{301} vs \u{e9}",
+            "数字 123 4567 and 漢字かなカナ 한국어",
+            "emoji 🦀🧪 👩‍👩‍👧 zero\u{200b}width",
+            "can't won't I'll we've they're it's",
+            "fn main() { println!(\"{}\", 1 + 2); } // code\ttabs",
+            "<think>reasoning</think><tool_call>{\"a\": 1}</tool_call>",
+            "<|fim_prefix|>x<|fim_suffix|>y<|fim_middle|>",
+            "text with a literal <embedding> inside",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        // The codec's framing (input_codec.rs) around plain and tricky text.
+        for content in ["hello", "a red crab with claws", "  spaced \n", ""] {
+            texts.push(format!("<|im_start|>user\n{content}<|im_end|>\n"));
+        }
+        texts.push(format!(
+            "<|im_start|>user\n<|vision_start|>{}<|vision_end|><|im_end|>\n",
+            "<|image_pad|>".repeat(64)
+        ));
+        texts.push(added.concat());
+        texts.push(added.join(" plain "));
+        for text in &texts {
+            for specials in [false, true] {
+                let g = graph.encode(text.as_str(), specials).unwrap();
+                let j = reference.encode(text.as_str(), specials).unwrap();
+                assert_eq!(g.get_ids(), j.get_ids(), "{text:?} specials={specials}");
+                assert_eq!(g.get_special_tokens_mask(), j.get_special_tokens_mask());
+                for skip in [false, true] {
+                    assert_eq!(
+                        graph.decode(g.get_ids(), skip).unwrap(),
+                        reference.decode(j.get_ids(), skip).unwrap()
+                    );
+                }
+            }
+        }
+        for content in &added {
+            assert_eq!(graph.token_to_id(content), reference.token_to_id(content));
+        }
+        assert_eq!(graph.get_vocab_size(true), reference.get_vocab_size(true));
+        eprintln!(
+            "[wemm parity] {} texts x2 identical, {} added tokens",
+            texts.len(),
+            added.len()
+        );
+    }
+
     #[cfg(feature = "tokenizer")]
     #[test]
     #[ignore]
