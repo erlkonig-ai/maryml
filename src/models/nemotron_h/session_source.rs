@@ -293,7 +293,7 @@ pub(super) fn load<S: BlobStoreGet>(
     let client = CudaRuntime::client(&device);
     // Every model buffer at its own size. A refused load gives back what it
     // uploaded before it returns its error.
-    let uploaded = moe::exact(&client, || -> Result<_> {
+    let uploaded = crate::nn::exact_alloc::exact(&client, || -> Result<_> {
     let embedding = bf16_aux::<2, S>(
         &snapshot,
         source.root,

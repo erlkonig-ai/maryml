@@ -552,7 +552,7 @@ impl<S: BlobStoreGet> Session<S> {
         let stream = prefix.as_ref().map_or_else(StreamId::current, |p| p.stream);
         stream.executes(|| {
         // KV and state at their own sizes, not in quarter-device pages.
-        let layers = moe::exact(&model.client, || -> Result<Vec<Layer>> {
+        let layers = crate::nn::exact_alloc::exact(&model.client, || -> Result<Vec<Layer>> {
         let mut layers = Vec::with_capacity(model.layers.len());
         for (index, layer) in model.layers.iter().enumerate() {
             let mixer = match &layer.mixer {

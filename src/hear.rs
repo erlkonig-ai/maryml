@@ -85,7 +85,28 @@ impl Ears {
         Self::load_weights(models, model, weights, lane)
     }
 
+    /// On CUDA every device buffer the load allocates is allocated at its own
+    /// size: in the default pool the two 805 MB vocabulary-sized buffers take
+    /// an 8.16 GB page on GB10.
     fn load_weights<R: triblespace::core::repo::BlobStoreGet>(
+        models: &ModelSnapshot<R>,
+        model: VoxtralNvfp4,
+        weights: Weights,
+        lane: PromptLane,
+    ) -> anyhow::Result<Self> {
+        #[cfg(feature = "voxtral-cuda")]
+        {
+            use cubecl::Runtime;
+            let client = cubecl::cuda::CudaRuntime::client(&cubecl::cuda::CudaDevice { index: 0 });
+            crate::nn::exact_alloc::exact(&client, || {
+                Self::load_inner(models, model, weights, lane)
+            })
+        }
+        #[cfg(not(feature = "voxtral-cuda"))]
+        Self::load_inner(models, model, weights, lane)
+    }
+
+    fn load_inner<R: triblespace::core::repo::BlobStoreGet>(
         models: &ModelSnapshot<R>,
         model: VoxtralNvfp4,
         weights: Weights,

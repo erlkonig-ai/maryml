@@ -353,24 +353,6 @@ pub(super) fn trim_host_heap() {
         libc::malloc_trim(0);
     }
 }
-/// Run `f` with this thread's stream allocating every buffer at its own size
-/// (CubeCL's persistent pool). The default pool packs buffers into pages sized
-/// from cuDeviceTotalMem/4: a 0.5-4 GB buffer takes an 8.16 GB page on GB10.
-/// Freed exact buffers are reused for the same size until memory_cleanup.
-/// Not reentrant: the inner scope would end the outer one.
-pub(super) fn exact<T>(client: &ComputeClient<CudaRuntime>, f: impl FnOnce() -> T) -> T {
-    struct Restore<'a>(&'a ComputeClient<CudaRuntime>);
-    impl Drop for Restore<'_> {
-        fn drop(&mut self) {
-            // SAFETY: the mode belongs to this thread's stream only.
-            unsafe { self.0.allocation_mode(cubecl::MemoryAllocationMode::Auto) }
-        }
-    }
-    // SAFETY: as above; Restore returns the stream to Auto, also on unwind.
-    unsafe { client.allocation_mode(cubecl::MemoryAllocationMode::Persistent) }
-    let _restore = Restore(client);
-    f()
-}
 fn finish<T>(result: Result<T>, completion: Result<()>) -> Result<T> {
     match (result, completion) {
         (Ok(value), Ok(())) => Ok(value),

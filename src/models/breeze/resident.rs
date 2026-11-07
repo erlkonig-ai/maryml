@@ -6,7 +6,10 @@
 //! codec state, and no decoder state is carried between hops. No request
 //! can inject precomputed reference codes, a checkpoint path or a CPU LLM.
 use anyhow::{Result, ensure};
-use cubecl::cuda::CudaDevice;
+use cubecl::{
+    Runtime,
+    cuda::{CudaDevice, CudaRuntime},
+};
 use std::{
     path::PathBuf,
     sync::atomic::{AtomicUsize, Ordering},
@@ -27,7 +30,7 @@ use super::{
 use crate::{
     model_collection::ModelSnapshot,
     models::qwen3tts::{codec::CodecDecoder, config::SAMPLES_PER_FRAME, encoder::CodecEncoder},
-    nn::{backend::speak::Fused, weight_loader::WeightLoader},
+    nn::{backend::speak::Fused, exact_alloc::exact, weight_loader::WeightLoader},
 };
 
 /// Explicit per-resident inputs. The model is not named here: it is the
@@ -144,8 +147,18 @@ impl BreezeResident {
     /// and the CPU encoder are discarded after one real native encoding.
     ///
     /// Every weight is copied to the device, so the store's bytes are not
-    /// needed once this returns.
+    /// needed once this returns. Every device buffer the load allocates is
+    /// allocated at its own size: in the default pool the 604 MB embedding
+    /// alone takes an 8.16 GB page on GB10.
     pub fn load<R: BlobStoreGet>(
+        models: &ModelSnapshot<R>,
+        config: BreezeVoiceConfig,
+    ) -> Result<Self> {
+        let client = CudaRuntime::client(&CudaDevice { index: 0 });
+        exact(&client, || Self::load_inner(models, config))
+    }
+
+    fn load_inner<R: BlobStoreGet>(
         models: &ModelSnapshot<R>,
         config: BreezeVoiceConfig,
     ) -> Result<Self> {

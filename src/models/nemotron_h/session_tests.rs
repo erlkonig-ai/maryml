@@ -1210,7 +1210,7 @@ fn session_gpu_refused_load_releases_memory() {
     assert!(error.contains("missing complete native expert 511"), "{error}");
     let after = (client.memory_usage().unwrap().bytes_reserved, rss_anon_bytes());
     // Contrast: a dropped exact buffer stays reserved until a cleanup.
-    drop(moe::exact(&client, || client.empty(64 << 20)));
+    drop(crate::nn::exact_alloc::exact(&client, || client.empty(64 << 20)));
     let dropped = client.memory_usage().unwrap().bytes_reserved;
     client.memory_cleanup();
     let cleaned = client.memory_usage().unwrap().bytes_reserved;
@@ -1234,7 +1234,7 @@ fn session_gpu_physical_matches_logical() {
         std::thread::spawn(move || {
             let client = CudaRuntime::client(&device);
             let base = client.memory_usage().unwrap().bytes_reserved;
-            let handle = if exact { moe::exact(&client, || client.empty(bytes)) } else { client.empty(bytes) };
+            let handle = if exact { crate::nn::exact_alloc::exact(&client, || client.empty(bytes)) } else { client.empty(bytes) };
             let grown = client.memory_usage().unwrap().bytes_reserved - base;
             drop(handle);
             client.memory_cleanup();

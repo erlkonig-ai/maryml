@@ -308,7 +308,7 @@ fn tensor(
         client.clone(),
         device.clone(),
         [1, rows, cols].into(),
-        moe::exact(client, || client.empty(bytes)),
+        crate::nn::exact_alloc::exact(client, || client.empty(bytes)),
         dtype,
     ))
 }

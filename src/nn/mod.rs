@@ -12,6 +12,9 @@ pub mod alias;
 pub mod backend;
 #[cfg(feature = "cuda-bf16-alias")]
 pub mod cuda_bf16_alias;
+/// Allocation at each buffer's own size, for model weights.
+#[cfg(any(feature = "breeze-cuda", feature = "voxtral-cuda", feature = "nemotron-cuda"))]
+pub(crate) mod exact_alloc;
 pub mod mxfp4;
 pub mod norm;
 pub mod npy;
