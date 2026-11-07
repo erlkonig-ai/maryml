@@ -8,11 +8,10 @@ fn session_gpu_prefix_forks_restore_and_keep_independent_suffixes() {
     let (snapshot, source, layers) = fixture();
     let l = limits();
     let o = resident_ownership(&config(), l).unwrap();
-    // Conservative logical live payload bound: two fixed uploads, six private
-    // quotas/states, one extra saved state, and one active chunk. Runtime/JIT
-    // pool reservation and host source bytes are outside this assertion.
-    assert!(2 * o.fixed_model_bytes + 7 * o.private_state_bytes
-        + 6 * o.private_expert_cache_bytes + l.max_chunk_bytes < 1 << 30);
+    // Conservative logical live payload bound: two fixed uploads (each with its
+    // expert bank), six private states, one extra saved state, and one active
+    // chunk. Runtime/JIT pool reservation and host source bytes are outside.
+    assert!(2 * o.fixed_model_bytes + 7 * o.private_state_bytes + l.max_chunk_bytes < 4 << 30);
     let mut parent = Session::from_snapshot_seed(snapshot.clone(), source, &layers,
         CudaDevice { index: 0 }, l, &[1, 5, 7]).unwrap();
     assert_eq!(parent.prefix_ownership().unwrap().private_kv_bytes, 3 * 1024);
@@ -119,8 +118,7 @@ fn session_gpu_prefix_never_publishes_partial_or_failed_completion() {
     let mut c = config();
     c.max_position_embeddings = 512;
     let o = resident_ownership(&c, l).unwrap();
-    assert!(o.fixed_model_bytes + 2 * o.private_state_bytes + o.private_expert_cache_bytes
-        + l.max_chunk_bytes < 512 << 20);
+    assert!(o.fixed_model_bytes + 2 * o.private_state_bytes + l.max_chunk_bytes < 2 << 30);
     let (snapshot, source, layers) = fixture_capacity(512);
     let ids: Vec<_> = (0..257).map(|i| (i % 31) as u32).collect();
     let mut session = Session::from_snapshot_seed(snapshot, source, &layers,

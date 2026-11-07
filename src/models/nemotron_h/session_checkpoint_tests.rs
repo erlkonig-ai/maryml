@@ -167,8 +167,7 @@ fn checkpoint_roundtrip(seed: &[u32], l: Limits, export_rows: usize) {
     let mut c = config();
     c.max_position_embeddings = l.capacity;
     let o = resident_ownership(&c, l).unwrap();
-    assert!(2 * o.fixed_model_bytes + 5 * o.private_state_bytes
-        + 4 * o.private_expert_cache_bytes + l.max_chunk_bytes < 1 << 30);
+    assert!(2 * o.fixed_model_bytes + 5 * o.private_state_bytes + l.max_chunk_bytes < 4 << 30);
     let mut producer = Session::from_snapshot_seed(snapshot.clone(), source, &ids, CudaDevice { index: 0 }, l, seed).unwrap();
     assert!(producer.saved_prefix().is_none(), "partial seed has no exportable Prefix");
     producer.append_ids(seed).unwrap();

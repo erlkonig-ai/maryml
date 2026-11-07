@@ -22,6 +22,8 @@ pub struct PrefillAllocation {
     pub latent_bytes: usize,
     pub accumulator_bytes: usize,
     pub tile_workspace_bytes: usize,
+    /// Always 0: experts are resident in the model, none is staged per span.
+    /// Kept for existing readers.
     pub pending_expert_bytes: usize,
     pub device_working_bytes: usize,
     pub host_routing_bytes: usize,
@@ -228,15 +230,7 @@ pub(super) fn admission_with_prefix(c: &TextConfig, l: Limits, start: usize,
         bytes(&[1, H], 6)?,
         super::super::fp8::working_bytes(1, [c.vocab_size, H])?,
     )?);
-    let expert = if has_moe {
-        moe::admission(moe_limits(unbounded))?.expert_bytes
-    } else {
-        0
-    };
-    let device = add(
-        add(add(hidden, latent)?, accumulator)?,
-        add(tile_workspace, expert)?,
-    )?;
+    let device = add(add(add(hidden, latent)?, accumulator)?, tile_workspace)?;
     if device > l.max_chunk_bytes {
         return Err(format!(
             "prefill logical transient budget exceeded: requires {device}, allowance {}",
@@ -270,7 +264,7 @@ pub(super) fn admission_with_prefix(c: &TextConfig, l: Limits, start: usize,
         latent_bytes: latent,
         accumulator_bytes: accumulator,
         tile_workspace_bytes: tile_workspace,
-        pending_expert_bytes: expert,
+        pending_expert_bytes: 0,
         device_working_bytes: device,
         host_routing_bytes: host_routing,
         host_tile_bytes: host_tile,
@@ -294,6 +288,9 @@ impl Pending {
     }
 }
 
+/// Span scratch (hidden pages, latent, accumulator) at its own size: up to
+/// 4 GiB at 1M, which the default pool would put in 8 or 32 GB pages.
+/// prefill_span gives it back when the span ends.
 fn tensor(
     client: &cubecl::client::ComputeClient<CudaRuntime>,
     device: &CudaDevice,
@@ -311,7 +308,7 @@ fn tensor(
         client.clone(),
         device.clone(),
         [1, rows, cols].into(),
-        client.empty(bytes),
+        moe::exact(client, || client.empty(bytes)),
         dtype,
     ))
 }
@@ -626,6 +623,13 @@ impl<S: BlobStoreGet> Session<S> {
         self.status = Status::Poisoned;
         self.span_pending = Some(Pending::empty());
         let result = self.stream.executes(|| self.run_prefill(ids, cancelled));
+        let outcome = self.finish_span(ids, result);
+        // Exact scratch is only reused at an equal size; free what was dropped.
+        self.stream.executes(|| self.model.client.memory_cleanup());
+        outcome
+    }
+
+    fn finish_span(&mut self, ids: &[u32], result: Result<Option<Vec<f32>>>) -> Result<PrefillOutcome> {
         match result {
             Ok(Some(logits)) => {
                 self.committed.extend_from_slice(ids);
@@ -885,27 +889,15 @@ impl<S: BlobStoreGet> Session<S> {
                 return Ok(false);
             }
             let mut rows = routes.rows(expert).peekable();
-            if rows.peek().is_none() {
-                continue;
-            }
-            if let Mixer::Moe(m) = &mut self.layers[index].mixer {
-                m.prefill_stage(expert)?;
-            }
             while rows.peek().is_some() {
                 if cancelled() {
                     return Ok(false);
                 }
                 let tile: Vec<_> = rows.by_ref().take(MAX_CHUNK).collect();
                 if let Mixer::Moe(m) = &self.layers[index].mixer {
-                    m.prefill_expert_tile(&latent, &accumulator, &tile, &mut self.pending)?;
+                    m.prefill_expert_tile(expert, &latent, &accumulator, &tile, &mut self.pending)?;
                 }
-                let completion = self.fence();
-                if completion.is_err() || rows.peek().is_none() {
-                    if let Mixer::Moe(m) = &mut self.layers[index].mixer {
-                        m.prefill_complete_expert(&completion, completion.is_ok());
-                    }
-                }
-                completion?;
+                self.fence()?;
                 self.pending.clear();
                 completed_rows += tile.len();
                 progress.completed(index, "expert_rows", completed_rows, tokens, start, false);

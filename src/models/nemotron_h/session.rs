@@ -30,7 +30,6 @@ use triblespace::{core::collection::CollectionHandle, prelude::*};
 
 #[path = "session_source.rs"]
 mod source;
-use source::NativeExperts;
 
 #[path = "session_prefix.rs"]
 mod prefix;
@@ -62,9 +61,10 @@ pub struct Source {
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
     pub capacity: usize,
-    /// Fixed weights/KV, one committed Mamba state per Mamba layer, and routed
-    /// expert planes. Remaining room sets a uniform per-MoE cache quota (0..512).
-    /// Logical payload bytes, not allocator reservation or host staging.
+    /// Fixed weights including every routed expert of every MoE layer, KV,
+    /// and one committed Mamba state per Mamba layer. Logical payload bytes,
+    /// not allocator reservation or host staging; loading separately checks
+    /// the device's actual free memory.
     pub max_resident_bytes: usize,
     /// Per-call logical transient allowance: short append OR an entire known
     /// prefill span, including its full-span buffers and tile workspace.
@@ -78,10 +78,15 @@ pub struct Limits {
 /// they are neither a physical peak estimate nor a whole-device reservation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Admission {
-    /// Immutable weights/KV plus one committed state per Mamba layer.
+    /// Immutable weights/KV plus one committed state per Mamba layer,
+    /// excluding the expert bank.
     pub base_resident_bytes: usize,
+    /// Resident experts per MoE layer: all of them (512), or 0 without MoE.
+    /// The name predates the bank; it is kept for existing readers.
     pub expert_cache_pairs_per_moe: usize,
+    /// The whole expert bank, every pair of every MoE layer, counted once.
     pub expert_cache_bytes: usize,
+    /// base_resident_bytes + expert_cache_bytes.
     pub resident_bytes: usize,
     /// Actual ordinary prompt path, including full-span slabs when >256.
     pub prefill: PrefillAllocation,
@@ -121,15 +126,15 @@ struct Mamba {
     committed: Option<Arc<gpu::State<CudaRuntime>>>,
     staged: Option<gpu::State<CudaRuntime>>,
 }
-enum Mixer<S> {
+enum Mixer {
     Mamba(Mamba),
     Attention(attention::Attention),
-    Moe(moe::Moe<NativeExperts<S>>),
+    Moe(moe::Moe),
 }
-struct Layer<S> {
+struct Layer {
     id: Id,
     norm: CudaTensor,
-    mixer: Mixer<S>,
+    mixer: Mixer,
 }
 
 enum MixerWeights {
@@ -143,10 +148,9 @@ struct LayerWeights {
     mixer: MixerWeights,
 }
 
-/// Immutable uploaded fixed operands and their exact held source observation.
-/// Shared only within this process/device. Expert caches and all sequence state
-/// belong to Sessions; this owner neither schedules them nor admits physical
-/// whole-device memory. Construction observes successful upload completion on
+/// Immutable uploaded operands, every MoE layer's whole expert bank included,
+/// and their exact held source observation. Shared only within this
+/// process/device. All sequence state belongs to Sessions. Construction observes successful upload completion on
 /// the origin stream before this owner can escape. This is not a certificate of
 /// future device health. No raw mutable weight handles are exposed.
 pub struct DeviceModel<S> {
@@ -169,7 +173,7 @@ pub struct Session<S> {
     // on one thread share its stream; this is not a new concurrent scheduler.
     stream: StreamId,
     limits: Limits,
-    layers: Vec<Layer<S>>,
+    layers: Vec<Layer>,
     status: Status,
     committed: Vec<u32>,
     logits: Vec<f32>,
@@ -238,8 +242,7 @@ fn attention_limits(c: &TextConfig, l: Limits) -> attention::Limits {
 }
 fn moe_limits(l: Limits) -> moe::Limits {
     moe::Limits {
-        max_fixed_bytes: l.max_resident_bytes,
-        max_expert_bytes: l.max_chunk_bytes,
+        max_resident_bytes: l.max_resident_bytes,
         max_working_bytes: l.max_chunk_bytes,
     }
 }
@@ -302,25 +305,39 @@ fn validate_config(c: &TextConfig, l: Limits) -> Result<()> {
 /// Pure admission before upload, so a later layer cannot exceed the global
 /// logical budget after earlier layers have already reserved their weights.
 fn resident_bytes(c: &TextConfig, l: Limits) -> Result<usize> {
-    Ok(resident_payload(c, l)?.0)
+    Ok(resident_payload(c, l)?.total)
 }
 
-// Keep the original total's checked-add order and error strings. The second
-// result only separates already-counted private state from that same total.
-fn resident_payload(c: &TextConfig, l: Limits) -> Result<(usize, usize)> {
+/// One resident total, with two parts of it named: the per-Session private
+/// state and the shared expert bank. Neither is counted twice. `window` is
+/// the most bytes uploaded between two releases of their host copies (one
+/// per MoE layer and one at the end of loading).
+struct ResidentPayload {
+    total: usize,
+    private: usize,
+    bank: usize,
+    window: usize,
+}
+fn resident_payload(c: &TextConfig, l: Limits) -> Result<ResidentPayload> {
     let mut private = 0;
+    let mut bank = 0;
     let mut total = add(bytes(&[c.vocab_size, H], 3)?, bytes(&[H], 2)?)?;
+    let (mut window, mut largest) = (total, 0);
     for kind in &c.layers_block_type {
         total = add(total, bytes(&[H], 2)?)?;
-        total = add(
-            total,
-            match kind {
+        window = add(window, bytes(&[H], 2)?)?;
+        let state_before = private;
+        let term = match kind {
                 LayerKind::Attention => {
                     let a = attention::admission(attention_limits(c, l))?;
                     private = add(private, a.kv_bytes)?;
                     a.resident_bytes
                 }
-                LayerKind::Moe => moe::admission(moe_limits(l))?.fixed_bytes,
+                LayerKind::Moe => {
+                    let a = moe::admission(moe_limits(l))?;
+                    bank = add(bank, a.bank_bytes)?;
+                    add(a.fixed_bytes, a.bank_bytes)?
+                }
                 LayerKind::Mamba => {
                     let m = mamba_config(c);
                     let g = m.layout()?;
@@ -341,59 +358,66 @@ fn resident_payload(c: &TextConfig, l: Limits) -> Result<(usize, usize)> {
                     private = add(private, add(bytes(&[e.conv], 2)?, bytes(&[e.recurrent], 4)?)?)?;
                     n
                 }
-            },
-        )?;
+            };
+        total = add(total, term)?;
+        // KV and Mamba state are allocated, not uploaded.
+        window = add(window, term - (private - state_before))?;
+        if matches!(kind, LayerKind::Moe) {
+            largest = largest.max(window);
+            window = 0;
+        }
     }
     if total > l.max_resident_bytes {
         return Err("session aggregate resident budget exceeded".into());
     }
-    Ok((total, private))
+    Ok(ResidentPayload { total, private, bank, window: largest.max(window) })
 }
 
-/// Logical ownership breakdown for ONE Session using the unchanged complete-
-/// model Limits/quota calculation. For multiple sessions of the same exact
-/// DeviceModel, count fixed_model_bytes once and each private field separately.
-/// This is not physical admission; active or failed chunks retain extra owners.
+/// The largest working set one call may hold: the cold prefill of the whole
+/// capacity, or the widest late decode chunk, within the caller's allowance.
+fn transient_bytes(c: &TextConfig, l: Limits) -> Result<usize> {
+    let a = admission(c, Limits { max_chunk_bytes: usize::MAX, ..l }, l.capacity)?;
+    Ok(a.prefill.device_working_bytes.max(a.max_capacity_chunk_bytes).min(l.max_chunk_bytes))
+}
+
+/// Allocatable memory a load needs: every resident byte, the largest working
+/// set, the host copies of the largest upload window (the same memory on an
+/// integrated GPU), and, when seeded, the sealed Mamba boundary kept beside
+/// the advancing state.
+fn load_requirement(c: &TextConfig, l: Limits, seeded: bool) -> Result<usize> {
+    let p = resident_payload(c, l)?;
+    let n = add(add(p.total, transient_bytes(c, l)?)?, p.window)?;
+    if seeded { add(n, prefix::mamba_bytes(c)?) } else { Ok(n) }
+}
+
+/// What one more Session of a loaded model needs: its private state and its
+/// working set, plus the sealed boundary when seeded.
+fn session_requirement(c: &TextConfig, l: Limits, seeded: bool) -> Result<usize> {
+    let n = add(resident_payload(c, l)?.private, transient_bytes(c, l)?)?;
+    if seeded { add(n, prefix::mamba_bytes(c)?) } else { Ok(n) }
+}
+
+/// Logical ownership breakdown for ONE Session. For multiple sessions of the
+/// same exact DeviceModel, count fixed_model_bytes once and each Session's
+/// private_state_bytes separately. This is not physical admission; active or
+/// failed chunks retain extra owners.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResidentOwnership {
+    /// Shared by every Session of the model, the expert bank included.
     pub fixed_model_bytes: usize,
+    /// The part of fixed_model_bytes that is the expert bank.
+    pub expert_bank_bytes: usize,
     pub private_state_bytes: usize,
-    pub expert_cache_pairs_per_moe: usize,
-    pub private_expert_cache_bytes: usize,
 }
 
 pub fn resident_ownership(config: &TextConfig, limits: Limits) -> Result<ResidentOwnership> {
     validate_config(config, limits)?;
-    let (base, private_state_bytes) = resident_payload(config, limits)?;
-    let moe_layers = config.layers_block_type.iter()
-        .filter(|kind| matches!(kind, LayerKind::Moe)).count();
-    let expert_cache_pairs_per_moe = expert_cache_pairs(base, limits.max_resident_bytes, moe_layers)?;
-    let private_expert_cache_bytes = moe::expert_device_bytes()?.checked_mul(moe_layers)
-        .and_then(|n| n.checked_mul(expert_cache_pairs_per_moe))
-        .ok_or("session expert cache byte sum overflow")?;
+    let payload = resident_payload(config, limits)?;
     Ok(ResidentOwnership {
-        fixed_model_bytes: base - private_state_bytes,
-        private_state_bytes, expert_cache_pairs_per_moe, private_expert_cache_bytes,
+        fixed_model_bytes: payload.total - payload.private,
+        expert_bank_bytes: payload.bank,
+        private_state_bytes: payload.private,
     })
-}
-
-/// Reserve the full uniform cache quota before any fixed upload. A miss still
-/// has one extra pending pair in chunk_bytes, including when the cache is full.
-fn expert_cache_pairs(resident: usize, limit: usize, moe_layers: usize) -> Result<usize> {
-    let remaining = limit.checked_sub(resident)
-        .ok_or("session aggregate resident budget exceeded")?;
-    if moe_layers == 0 {
-        return Ok(0);
-    }
-    let one_per_layer = moe::expert_device_bytes()?.checked_mul(moe_layers)
-        .ok_or("session expert cache byte sum overflow")?;
-    let pairs = (remaining / one_per_layer).min(moe::EXPERTS);
-    let cached = one_per_layer.checked_mul(pairs)
-        .ok_or("session expert cache byte sum overflow")?;
-    if add(resident, cached)? > limit {
-        return Err("session aggregate cached resident budget exceeded".into());
-    }
-    Ok(pairs)
 }
 
 /// Validate the native configuration and the cold prompt's resident/chunk
@@ -405,16 +429,8 @@ pub fn admission(config: &TextConfig, limits: Limits, prompt_tokens: usize) -> R
     if prompt_tokens == 0 || prompt_tokens > limits.capacity {
         return Err("empty prompt or prompt exceeds session capacity".into());
     }
-    let base_resident_bytes = resident_bytes(config, limits)?;
-    let moe_layers = config.layers_block_type.iter()
-        .filter(|kind| matches!(kind, LayerKind::Moe)).count();
-    let expert_cache_pairs_per_moe = expert_cache_pairs(
-        base_resident_bytes, limits.max_resident_bytes, moe_layers,
-    )?;
-    let expert_cache_bytes = moe::expert_device_bytes()?.checked_mul(moe_layers)
-        .and_then(|n| n.checked_mul(expert_cache_pairs_per_moe))
-        .ok_or("session expert cache byte sum overflow")?;
-    let resident_bytes = add(base_resident_bytes, expert_cache_bytes)?;
+    let payload = resident_payload(config, limits)?;
+    let expert_cache_pairs_per_moe = if payload.bank == 0 { 0 } else { moe::EXPERTS };
     let prefill = prefill_admission(config, limits, 0, prompt_tokens)?;
     let comparison = Limits { max_chunk_bytes: usize::MAX, ..limits };
     let first_chunk_tokens = prompt_tokens.min(MAX_CHUNK);
@@ -445,7 +461,10 @@ pub fn admission(config: &TextConfig, limits: Limits, prompt_tokens: usize) -> R
             )?))
         })?;
     Ok(Admission {
-        base_resident_bytes, expert_cache_pairs_per_moe, expert_cache_bytes, resident_bytes,
+        base_resident_bytes: payload.total - payload.bank,
+        expert_cache_pairs_per_moe,
+        expert_cache_bytes: payload.bank,
+        resident_bytes: payload.total,
         prefill,
         first_chunk_tokens, first_chunk_bytes, max_prompt_chunk_bytes, max_capacity_chunk_bytes,
     })
@@ -469,15 +488,10 @@ fn planned_prefix_chunk_bytes(c: &TextConfig, l: Limits, start: usize, t: usize,
     let mut total = add(bytes(&[t], 4)?, bytes(&[t, H], 4)?)?;
     total = add(total, bytes(&[H], 2)?)?;
     total = add(total, super::fp8::working_bytes(1, [c.vocab_size, H])?)?;
-    let mut expert_peak = 0;
     for kind in &c.layers_block_type {
         total = add(total, bytes(&[t, H], 6)?)?;
-        if matches!(kind, LayerKind::Moe) {
-            expert_peak = expert_peak.max(moe::admission(moe_limits(l))?.expert_bytes);
-        }
         total = add(total, layer_prefix_working_bytes(c, l, start, t, kind, prefix)?)?;
     }
-    total = add(total, expert_peak)?;
     if total > l.max_chunk_bytes {
         return Err("session aggregate chunk budget exceeded".into());
     }
@@ -521,9 +535,8 @@ impl<S: BlobStoreGet> Session<S> {
     pub fn device_model(&self) -> &Arc<DeviceModel<S>> { &self.model }
 
     /// Fresh private state on this thread's stream over the SAME uploaded
-    /// operands. No fixed source lookup/upload, provider rebinding or implicit
-    /// device selection. Limits retain their old complete-model meaning: fixed
-    /// weight savings do not silently enlarge the private expert-cache quota.
+    /// operands and expert bank. No source lookup/upload or implicit device
+    /// selection. Limits keep their complete-model meaning.
     /// Sharing does not certify CUDA health or drain another failed Session;
     /// a lost device context may affect every Session using this model.
     pub fn from_device_model(model: Arc<DeviceModel<S>>, limits: Limits) -> Result<Self> {
@@ -534,14 +547,12 @@ impl<S: BlobStoreGet> Session<S> {
     {
         validate_config(&model.config, limits)?;
         prefix::validate_initial(&model, limits, seed.as_deref(), prefix.as_deref())?;
-        let cache_pairs = expert_cache_pairs(
-            resident_bytes(&model.config, limits)?,
-            limits.max_resident_bytes,
-            model.config.layers_block_type.iter()
-                .filter(|kind| matches!(kind, LayerKind::Moe)).count(),
-        )?;
+        source::fits(session_requirement(&model.config, limits, seed.is_some())?,
+            source::allocatable_bytes(&model.device)?)?;
         let stream = prefix.as_ref().map_or_else(StreamId::current, |p| p.stream);
         stream.executes(|| {
+        // KV and state at their own sizes, not in quarter-device pages.
+        let layers = moe::exact(&model.client, || -> Result<Vec<Layer>> {
         let mut layers = Vec::with_capacity(model.layers.len());
         for (index, layer) in model.layers.iter().enumerate() {
             let mixer = match &layer.mixer {
@@ -557,15 +568,13 @@ impl<S: BlobStoreGet> Session<S> {
                     } else { attention::Attention::from_weights(weights.clone(), al)? })
                 }
                 MixerWeights::Moe(weights) => Mixer::Moe(moe::Moe::from_weights(
-                    weights.clone(),
-                    NativeExperts::new(model.snapshot.clone(), moe::SourceBinding {
-                        model_root: model.source.root, layer: layer.id,
-                    }),
-                    moe_limits(limits), cache_pairs,
+                    weights.clone(), moe_limits(limits),
                 )?),
             };
             layers.push(Layer { id: layer.id, norm: layer.norm.clone(), mixer });
         }
+        Ok(layers)
+        })?;
         let committed = prefix.as_ref().map_or_else(Vec::new, |p| p.ids.to_vec());
         let logits = prefix.as_ref().map_or_else(Vec::new, |p| p.logits.to_vec());
         let session = Self {
@@ -586,9 +595,9 @@ impl<S: BlobStoreGet> Session<S> {
     /// remain legal. Fixed FP8/aux operands choose the first typed tuple and
     /// hold its values. NVFP4 uses the minimum opaque joined tuple, including
     /// complete typed expert pairs at each requested index, stable on repeated
-    /// queries of this snapshot.
-    /// Only on-demand immutable device operands are cached; no expert catalog
-    /// or source payloads are retained beside the frozen snapshot.
+    /// queries of this snapshot. Every expert of every MoE layer is uploaded
+    /// here, once, after a check of the device's actual free memory; no source
+    /// payloads are retained beside the frozen snapshot.
     /// After the original ordered source checks/uploads, completion is observed
     /// on the upload stream before publishing a shareable model. Deferred CUDA
     /// upload errors therefore return here, before any Session can use it.
@@ -880,7 +889,7 @@ impl<S: BlobStoreGet> Session<S> {
 
 // Both ordinary short append and span prefill share this exact layer dispatch.
 // Caller owns publication and chooses when a successful tile may be retired.
-fn enqueue_layer_tile<S: BlobStoreGet>(layer: &mut Layer<S>, x: &CudaTensor,
+fn enqueue_layer_tile(layer: &mut Layer, x: &CudaTensor,
     start: usize, limits: Limits, epsilon: f32, pending: &mut Vec<CudaTensor>,
     #[cfg(feature = "nemotron-timing")] mut timing: Option<&mut super::host_timing::Timings>,
 ) -> Result<CudaTensor> {

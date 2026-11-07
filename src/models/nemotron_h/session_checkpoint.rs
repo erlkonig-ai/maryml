@@ -22,7 +22,7 @@ pub enum PrefixExecution {
 
 /// Exact loader selections, not an authenticated portable operand fingerprint.
 /// DeviceModel retains a frozen ModelSnapshot; it does not retain a portable
-/// descriptor of every lazily selected expert. IDs are opaque lookup keys.
+/// descriptor of every uploaded expert. IDs are opaque lookup keys.
 #[derive(Clone)]
 pub struct PrefixProvenance {
     pub source: Source,
@@ -227,7 +227,7 @@ impl<S: BlobStoreGet> Session<S> {
     ///
     /// Old context overlaps imported P rows. After successful import fencing,
     /// attention layers replace old buffers one at a time with C-P rows; no
-    /// second full-C context or second expert cache is constructed. Limits keep
+    /// second full-C context or second expert bank is constructed. Limits keep
     /// their logical meaning, not physical admission for temporary overlap.
     pub fn restore_checkpoint<B: BlobStoreGet>(&mut self, checkpoint: &PrefixCheckpoint,
         store: &B, expected_tokens: &[u32],
@@ -308,7 +308,7 @@ impl<S: BlobStoreGet> Session<S> {
                 logits: Arc::from(logits), layers });
             // Retain imported operands even if private suffix allocation fails
             // or unwinds. Replace one layer at a time, not a second full-C
-            // Session. Existing private expert residency/quotas stay owned.
+            // Session. The model's shared expert bank is untouched.
             self.prefix = Some(prefix.clone());
             for (index, layer) in self.layers.iter_mut().enumerate() {
                 match &mut layer.mixer {

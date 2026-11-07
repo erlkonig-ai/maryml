@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- Native Nemotron loads every routed expert (40 x 512 NVFP4 pairs, 63.4 GB)
+  into device memory once, into one bank in the shared model weights that every
+  Session uses. The per-Session expert cache, its miss/stage/complete path and
+  the per-call expert lookup are removed; routing order and arithmetic are
+  unchanged. Admission counts the bank once in the shared resident bytes, and
+  chunks no longer reserve a pending expert pair. Each MoE layer frees its host
+  upload copies before the next one starts (two drop-queue flushes, then a
+  fence), and a failed load drains, cleans up and trims what it allocated.
+  Model, KV/state and prefill-span buffers use exact (persistent) allocation, so
+  physical reservation matches logical size instead of rounding to
+  quarter-device pool pages. Loading refuses up front when resident bytes plus
+  the prefill working set plus the largest upload window (plus the sealed Mamba
+  boundary when seeded) exceed what the device can allocate (host MemAvailable
+  on an integrated GPU, where cuMemGetInfo's free figure leaves out page cache);
+  each further Session is checked the same way.
+
 - Native Nemotron attention selects 48 rows for full 256-query blocks, with
   split/scratch admission and launch using the same plan. Decode and short
   tails retain the existing shared Inkling selection. Same-recipe full-tile

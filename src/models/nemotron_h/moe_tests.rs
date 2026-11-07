@@ -79,8 +79,7 @@ fn moe_gpu_prefill_ordered_tiles_match_scatter() {
 }
 fn limits() -> Limits {
     Limits {
-        max_fixed_bytes: 48 << 20,
-        max_expert_bytes: 4 << 20,
+        max_resident_bytes: 2 << 30,
         max_working_bytes: 64 << 20,
     }
 }
@@ -99,21 +98,12 @@ fn record(t: usize) -> Vec<f32> {
 fn moe_host_admission_calibrated_scales_and_finite_operands() {
     let a = admission(limits()).unwrap();
     assert_eq!(a.fixed_bytes, 45_746_184);
-    assert_eq!(a.expert_bytes, 3_096_584);
-    assert!(
-        admission(Limits {
-            max_fixed_bytes: a.fixed_bytes - 1,
-            ..limits()
-        })
-        .is_err()
-    );
-    assert!(
-        admission(Limits {
-            max_expert_bytes: a.expert_bytes - 1,
-            ..limits()
-        })
-        .is_err()
-    );
+    // 512 pairs of four device planes: 2 * (2688 * 1024 / 2 + 2688 * 1024 / 16).
+    assert_eq!(expert_device_bytes().unwrap(), 3_096_576);
+    assert_eq!(a.bank_bytes, 1_585_446_912);
+    let exact = a.fixed_bytes + a.bank_bytes;
+    assert!(admission(Limits { max_resident_bytes: exact, ..limits() }).is_ok());
+    assert!(admission(Limits { max_resident_bytes: exact - 1, ..limits() }).is_err());
     for t in [1, 3, 16, 17, 256] {
         assert!(working_bytes(t).unwrap() < limits().max_working_bytes);
     }
@@ -494,7 +484,8 @@ fn moe_gpu_scaled_w4a4_and_unit_scale_fixture() {
 struct TestProvider {
     binding: SourceBinding,
     up: Vec<u8>,
-    down: Vec<u8>,
+    // One shared payload, or one per expert.
+    down: Vec<Vec<u8>>,
     operations: Vec<[Id; 2]>,
     calls: Cell<usize>,
     fail: Cell<Option<usize>>,
@@ -517,7 +508,7 @@ impl ExpertProvider for TestProvider {
             },
             down: PackedOperation {
                 operation: self.operations[index][1],
-                payload: &self.down,
+                payload: &self.down[index % self.down.len()],
                 input_scale: 1.0 / 4096.0,
             },
         })
@@ -595,35 +586,46 @@ fn moe_gpu_full_geometry_stages_for_stock_reference() {
     let provider = TestProvider {
         binding,
         up,
-        down,
+        down: vec![down],
         operations: (0..EXPERTS).map(|_| [*genid(), *genid()]).collect(),
         calls: Cell::new(0),
         fail: Cell::new(None),
     };
+    let fixed = || FixedOperands {
+        operations: [*genid(), *genid(), *genid(), *genid()],
+        router_bf16: &router,
+        correction_bias: &bias,
+        fc1_bf16: &fc1,
+        fc2_bf16: &fc2,
+        shared_up: PackedOperation {
+            operation: *genid(),
+            payload: &shared_up,
+            input_scale: 1.0 / 256.0,
+        },
+        shared_down: PackedOperation {
+            operation: *genid(),
+            payload: &shared_down,
+            input_scale: 1.0 / 4096.0,
+        },
+    };
+    // A source failure on any expert refuses the whole bank at upload.
+    provider.fail.set(Some(1));
+    let refused = Moe::upload(device.clone(), binding, fixed(), &provider, limits()).err().unwrap();
+    assert!(refused.contains("injected"), "{refused}");
+    assert_eq!(provider.calls.get(), 2);
+    provider.fail.set(None);
+    provider.calls.set(0);
     let mut moe = Moe::upload(
         device.clone(),
         binding,
-        FixedOperands {
-            operations: [*genid(), *genid(), *genid(), *genid()],
-            router_bf16: &router,
-            correction_bias: &bias,
-            fc1_bf16: &fc1,
-            fc2_bf16: &fc2,
-            shared_up: PackedOperation {
-                operation: *genid(),
-                payload: &shared_up,
-                input_scale: 1.0 / 256.0,
-            },
-            shared_down: PackedOperation {
-                operation: *genid(),
-                payload: &shared_down,
-                input_scale: 1.0 / 4096.0,
-            },
-        },
-        provider,
+        fixed(),
+        &provider,
         limits(),
     )
     .unwrap();
+    // Every expert was read exactly once, at upload, and never again below.
+    assert_eq!(provider.calls.get(), EXPERTS);
+    assert_eq!(moe.weights.experts.len(), EXPERTS);
     let x: Vec<f32> = (0..3 * HIDDEN)
         .map(|i| ((i * 17 % 101) as f32 - 50.0) / 64.0)
         .collect();
@@ -665,7 +667,6 @@ fn moe_gpu_full_geometry_stages_for_stock_reference() {
     assert!(moe.forward(&full).is_err());
     assert!(!moe.is_poisoned());
     moe.limits.max_working_bytes = saved_limit;
-    let calls = moe.provider.calls.get();
     let mut bad = x[..HIDDEN].to_vec();
     bad[0] = f32::NAN;
     assert!(
@@ -673,7 +674,6 @@ fn moe_gpu_full_geometry_stages_for_stock_reference() {
             .is_err()
     );
     assert!(moe.is_poisoned());
-    assert_eq!(moe.provider.calls.get(), calls);
     assert!(moe.forward(&full).is_err());
     moe.reset().unwrap();
     // The span owner retains dispatch/readback payloads even when a helper
@@ -695,13 +695,11 @@ fn moe_gpu_full_geometry_stages_for_stock_reference() {
     assert!(held.iter().any(|t| t.meta.shape().as_slice() == [1, 3, 1] && t.dtype == DType::U32));
     moe.reset().unwrap();
     held.clear();
-    moe.provider.fail.set(Some(1)); // Expert0 already ran; failure must drain and poison.
-    let failure = moe.forward(&full).err().unwrap();
-    assert!(failure.contains("injected"));
-    assert!(moe.is_poisoned());
-    moe.provider.fail.set(None);
-    moe.reset().unwrap();
+    // The provider is not consulted after upload: a source that now fails
+    // changes nothing about forward.
+    provider.fail.set(Some(1));
     let again = moe.forward(&full).unwrap();
+    assert_eq!(provider.calls.get(), EXPERTS);
     saved.tensor("reset-output.bf16", &again.values);
     assert!(numbers(&again.values).iter().all(|v| v.is_finite()));
     fence(&client).unwrap();
@@ -709,10 +707,193 @@ fn moe_gpu_full_geometry_stages_for_stock_reference() {
         "source_binding":"synthetic immutable fixture, not checkpoint provenance",
         "selected_ids":all.routing.ids,"selected_weights":all.routing.weights,
         "cutoff_margins":all.routing.cutoff_margins,"max_abs_partition":max,
-        "fixed_bytes":moe.admission.fixed_bytes,"one_expert_bytes":moe.admission.expert_bytes,
+        "fixed_bytes":moe.admission.fixed_bytes,"bank_bytes":moe.admission.bank_bytes,
         "working_bytes":all.working_bytes,"expert_input_scales":(0..TOP_K).map(expert_scale).collect::<Vec<_>>(),
         "expert_down_input_scale":1.0/4096.0,"shared_up_input_scale":1.0/256.0,
         "shared_down_input_scale":1.0/4096.0,"independent_stock_comparison":"pending",
-        "control":"preflight, nonfinite input, partial expert failure, poison/refusal/reset observed",
+        "control":"preflight, nonfinite input, upload source failure, poison/refusal/reset observed",
         "numeric_gate":"none: finite output and router contract only; partition error is diagnostic"}));
+}
+
+/// Owned synthetic fixed operands for the bank tests.
+struct FixedData {
+    router: Vec<u8>,
+    bias: Vec<f32>,
+    fc1: Vec<u8>,
+    fc2: Vec<u8>,
+    shared_up: Vec<u8>,
+    shared_down: Vec<u8>,
+}
+impl FixedData {
+    fn new() -> Self {
+        Self {
+            router: bf16_matrix(EXPERTS, HIDDEN, 3, 0.125),
+            bias: (0..EXPERTS).map(|e| if e < TOP_K { (TOP_K - e) as f32 * 0.25 } else { -1.0 }).collect(),
+            fc1: bf16_matrix(LATENT, HIDDEN, 1, 0.5),
+            fc2: bf16_matrix(HIDDEN, LATENT, 1, 0.5),
+            shared_up: packed(SHARED, HIDDEN, 0.25),
+            shared_down: packed(HIDDEN, SHARED, 0.125),
+        }
+    }
+    fn operands(&self) -> FixedOperands<'_> {
+        FixedOperands {
+            operations: [*genid(), *genid(), *genid(), *genid()],
+            router_bf16: &self.router,
+            correction_bias: &self.bias,
+            fc1_bf16: &self.fc1,
+            fc2_bf16: &self.fc2,
+            shared_up: operation(&self.shared_up, 1.0 / 256.0),
+            shared_down: operation(&self.shared_down, 1.0 / 4096.0),
+        }
+    }
+}
+fn shared_provider(binding: SourceBinding, down: Vec<Vec<u8>>) -> TestProvider {
+    TestProvider {
+        binding,
+        up: packed(INTERMEDIATE, LATENT, 0.25),
+        down,
+        operations: (0..EXPERTS).map(|_| [*genid(), *genid()]).collect(),
+        calls: Cell::new(0),
+        fail: Cell::new(None),
+    }
+}
+
+#[test]
+#[ignore = "reserved CUDA: all 512 experts resident after upload and each run from the bank"]
+fn moe_gpu_bank_every_expert_resident_without_source_reads() {
+    let device = CudaDevice { index: 0 };
+    let client = CudaRuntime::client(&device);
+    let binding = source();
+    let fixed = FixedData::new();
+    // Each expert's down projection has its own weight global, 1% apart: more
+    // than one BF16 step, so every expert's output is distinct if and only if
+    // each index runs its own resident pair.
+    let down = packed(LATENT, INTERMEDIATE, 1.0);
+    let globals: Vec<f32> = (0..EXPERTS).map(|e| 0.0625 * 1.01f32.powi(e as i32)).collect();
+    let downs = globals.iter().map(|g| {
+        let mut d = down.clone();
+        let at = d.len() - 4;
+        d[at..].copy_from_slice(&g.to_le_bytes());
+        d
+    }).collect();
+    let provider = shared_provider(binding, downs);
+    let moe = Moe::upload(device.clone(), binding, fixed.operands(), &provider, limits()).unwrap();
+    assert_eq!(provider.calls.get(), EXPERTS);
+    assert_eq!(moe.weights.experts.len(), EXPERTS);
+    // The source now refuses every read; nothing below may consult it.
+    provider.fail.set(Some(usize::MAX));
+    let latent: Vec<f32> = (0..LATENT).map(|i| ((i * 13 % 47) as f32 - 23.0) / 32.0).collect();
+    let latent = input(&client, &device, &latent, 1, LATENT);
+    let mut outputs = std::collections::HashSet::new();
+    for expert in 0..EXPERTS {
+        let accumulator = moe.tensor(
+            client.create_from_slice(f32::as_bytes(&vec![0.0f32; LATENT])), 1, LATENT, DType::F32);
+        let mut held = Vec::new();
+        moe.prefill_expert_tile(expert, &latent, &accumulator, &[(0, 1.0)], &mut held).unwrap();
+        fence(&client).unwrap();
+        let values = numbers(&accumulator);
+        assert!(values.iter().all(|v| v.is_finite()), "expert {expert}");
+        assert!(values.iter().any(|&v| v != 0.0), "expert {expert}");
+        assert!(outputs.insert(raw(&accumulator)), "expert {expert} repeats another's output");
+    }
+    assert!(moe.prefill_expert_tile(EXPERTS, &latent, &latent, &[(0, 1.0)], &mut Vec::new()).is_err());
+    assert_eq!(outputs.len(), EXPERTS);
+    assert_eq!(provider.calls.get(), EXPERTS);
+    println!("BANK_RESIDENT {}", serde_json::json!({
+        "experts": EXPERTS, "source_reads": provider.calls.get(),
+        "distinct_outputs": outputs.len(), "bank_bytes": moe.admission.bank_bytes,
+    }));
+}
+
+fn rss_anon() -> usize {
+    let status = fs::read_to_string("/proc/self/status").unwrap();
+    let line = status.lines().find(|l| l.starts_with("RssAnon:")).unwrap();
+    line.split_whitespace().nth(1).unwrap().parse::<usize>().unwrap() * 1024
+}
+
+#[test]
+#[ignore = "reserved CUDA: host copies of a layer's uploads are freed when the layer completes"]
+fn moe_gpu_bank_upload_releases_host_staging() {
+    // glibc keeps freed ~1.4 MB plane copies in its heap rather than returning
+    // them, so a release shows as REUSE: the next upload does not grow
+    // RssAnon. Buffers past its mmap threshold (the trailing case) go back.
+    const LAYERS: usize = 4;
+    let device = CudaDevice { index: 0 };
+    let client = CudaRuntime::client(&device);
+    let binding = source();
+    let fixed = FixedData::new();
+    let provider = shared_provider(binding, vec![packed(LATENT, INTERMEDIATE, 0.125)]);
+    // Warm the context and allocator before the first observation.
+    fence(&client).unwrap();
+    let bank = admission(limits()).unwrap().bank_bytes;
+    let observe = |label: &str, at: &mut Vec<serde_json::Value>| {
+        let rss = rss_anon();
+        at.push(serde_json::json!({"at": label, "rss_anon": rss}));
+        rss
+    };
+
+    // 1. Each layer through Moe::upload, which releases at its end, the last
+    // included. Only the first layer may grow the heap.
+    let mut layers = Vec::new();
+    let mut moe = Vec::new();
+    let mut growth = Vec::new();
+    for layer in 0..LAYERS {
+        let before = observe(&format!("layer{layer}_before"), &mut moe);
+        layers.push(Moe::upload(device.clone(), binding, fixed.operands(), &provider, limits()).unwrap());
+        let after = observe(&format!("layer{layer}_after_upload_and_release"), &mut moe);
+        growth.push(after as i64 - before as i64);
+    }
+
+    // 2. Contrast: the same layer's uploads, fenced and NOT released, twice.
+    // The heap freed above serves at most one; the second grows it again.
+    let raw_layer = || -> Vec<_> {
+        let held = (0..EXPERTS).map(|e| load_expert(&provider, e,
+            |op, n, k| PackedWeight::upload(op, n, k, &device)).unwrap()).collect();
+        fence(&client).unwrap();
+        held
+    };
+    let mut contrast = Vec::new();
+    let start = observe("start", &mut contrast);
+    let first = raw_layer();
+    observe("first_fenced", &mut contrast);
+    let second = raw_layer();
+    let fenced = observe("second_fenced", &mut contrast);
+    release_uploads(&client).unwrap();
+    observe("released", &mut contrast);
+    drop((first, second));
+    let third = raw_layer();
+    let reused = observe("third_fenced", &mut contrast);
+    release_uploads(&client).unwrap();
+    observe("third_released", &mut contrast);
+
+    // 3. A trailing non-MoE upload after the last layer, as the loader's final
+    // release handles: fenced alone it stays, released it is returned.
+    let trailing = vec![7u8; 256 << 20];
+    let mut tail = Vec::new();
+    let tail_start = observe("start", &mut tail);
+    let handle = client.create_from_slice(&trailing);
+    fence(&client).unwrap();
+    let tail_fenced = observe("fenced", &mut tail);
+    release_uploads(&client).unwrap();
+    let tail_released = observe("released", &mut tail);
+    // 4. What the loader does last: hand the heap glibc kept back to the OS.
+    let mut trim = Vec::new();
+    let untrimmed = observe("before_trim", &mut trim);
+    trim_host_heap();
+    let trimmed = observe("after_trim", &mut trim);
+    println!("RSS_RELEASE {}", serde_json::json!({
+        "scope": "RssAnon of this process from /proc/self/status, bytes",
+        "layer_bank_bytes": bank, "moe_upload": moe, "moe_upload_growth": growth,
+        "contrast_fence_only": contrast, "trailing_256MiB": tail, "malloc_trim": trim,
+    }));
+    assert!(growth[0] < (bank + bank / 10) as i64, "{growth:?}");
+    for (layer, &g) in growth.iter().enumerate().skip(1) {
+        assert!(g < (bank / 4) as i64, "layer {layer} grew {g}");
+    }
+    assert!(fenced >= start + bank * 9 / 10, "two fenced layers grew {start} -> {fenced}");
+    assert!(reused < fenced + bank / 4, "released memory was not reused: {fenced} -> {reused}");
+    assert!(tail_fenced >= tail_start + trailing.len() * 9 / 10);
+    assert!(tail_released + trailing.len() / 2 <= tail_fenced);
+    assert!(trimmed + bank <= untrimmed, "trim gave back only {untrimmed} -> {trimmed}");
+    drop((handle, third, layers));
 }

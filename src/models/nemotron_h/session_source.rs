@@ -7,16 +7,17 @@ use triblespace::core::blob::encodings::tensor::{
     elements::{BF16, F32, NVFP4},
 };
 
-pub(super) struct NativeExperts<S> {
-    snapshot: Arc<ModelSnapshot<S>>,
+/// The bank loader's view of one layer's experts in the held snapshot, used
+/// once per expert index while the layer uploads, then dropped.
+pub(super) struct NativeExperts<'a, S> {
+    snapshot: &'a ModelSnapshot<S>,
     source: moe::SourceBinding,
-    // The two schema operands are invariant for this immutable provider's
-    // lifetime. Queries still derive each expert tuple from the held snapshot.
+    // The two schema operands are invariant across this layer's 512 queries.
     weight_leaf: Attribute<inlineencodings::Handle<Tensor<NVFP4, 2>>>,
     scale_leaf: Attribute<inlineencodings::Handle<Tensor<F32, 0>>>,
 }
-impl<S> NativeExperts<S> {
-    pub(super) fn new(snapshot: Arc<ModelSnapshot<S>>, source: moe::SourceBinding) -> Self {
+impl<'a, S> NativeExperts<'a, S> {
+    pub(super) fn new(snapshot: &'a ModelSnapshot<S>, source: moe::SourceBinding) -> Self {
         Self {
             snapshot, source,
             weight_leaf: leaf::leaf::<NVFP4, 2>(),
@@ -24,7 +25,7 @@ impl<S> NativeExperts<S> {
         }
     }
 }
-impl<S: BlobStoreGet> moe::ExpertProvider for NativeExperts<S> {
+impl<S: BlobStoreGet> moe::ExpertProvider for NativeExperts<'_, S> {
     fn source(&self) -> moe::SourceBinding {
         self.source
     }
@@ -33,35 +34,11 @@ impl<S: BlobStoreGet> moe::ExpertProvider for NativeExperts<S> {
         index: usize,
         use_pair: impl FnOnce(moe::ExpertPair<'_>) -> Result<T>,
     ) -> Result<T> {
-        self.with_expert_detail(index, use_pair, #[cfg(feature = "nemotron-timing")] None)
-    }
-
-    #[cfg(feature = "nemotron-timing")]
-    fn with_expert_timed<T>(
-        &self,
-        index: usize,
-        use_pair: impl FnOnce(moe::ExpertPair<'_>) -> Result<T>,
-        timing: &mut moe::LookupTimings,
-    ) -> Result<T> {
-        self.with_expert_detail(index, use_pair, Some(timing))
-    }
-}
-impl<S: BlobStoreGet> NativeExperts<S> {
-    fn with_expert_detail<T>(
-        &self,
-        index: usize,
-        use_pair: impl FnOnce(moe::ExpertPair<'_>) -> Result<T>,
-        #[cfg(feature = "nemotron-timing")] timing: Option<&mut moe::LookupTimings>,
-    ) -> Result<T> {
         // Choose only among complete typed expert/up/down/scale tuples. Missing
         // typed facts are negative matches; a selected missing blob is an error.
-        #[cfg(feature = "nemotron-timing")]
-        let started = moe::LookupTimings::clock(timing.as_deref());
         let (_, up, down) = pile::nvfp4_expert_minimum_with_attributes(
-            &self.snapshot, self.source.layer, index as u64,
+            self.snapshot, self.source.layer, index as u64,
             &self.weight_leaf, &self.scale_leaf,
-            #[cfg(feature = "nemotron-timing")] timing,
-            #[cfg(feature = "nemotron-timing")] started,
         ).ok_or_else(|| format!("missing complete native expert {index}"))?
             .map_err(|e| e.to_string())?;
         shape(&up.weight, &[2688, 1024], "moe.up_proj")?;
@@ -300,11 +277,7 @@ pub(super) fn load<S: BlobStoreGet>(
     .map_err(|e| e.to_string())?;
     validate_config(&config, limits)?;
     prefix::validate_seed(&config, limits, seed.as_deref())?;
-    let cache_pairs = expert_cache_pairs(
-        resident_bytes(&config, limits)?,
-        limits.max_resident_bytes,
-        config.layers_block_type.iter().filter(|kind| matches!(kind, LayerKind::Moe)).count(),
-    )?;
+    let requirement = load_requirement(&config, limits, seed.is_some())?;
     if layer_ids.len() != config.layers_block_type.len() {
         return Err("selected layer sequence length differs from config".into());
     }
@@ -313,8 +286,14 @@ pub(super) fn load<S: BlobStoreGet>(
             return Err(format!("selected layer is not at native position {i}"));
         }
     }
+    // Physical preflight, after every source selection check and before any
+    // upload: the whole model is copied into device memory once, here.
+    fits(requirement, allocatable_bytes(&device)?)?;
     let stream = StreamId::current();
     let client = CudaRuntime::client(&device);
+    // Every model buffer at its own size. A refused load gives back what it
+    // uploaded before it returns its error.
+    let uploaded = moe::exact(&client, || -> Result<_> {
     let embedding = bf16_aux::<2, S>(
         &snapshot,
         source.root,
@@ -420,7 +399,7 @@ pub(super) fn load<S: BlobStoreGet>(
                     model_root: source.root,
                     layer: id,
                 };
-                Mixer::Moe(moe::Moe::upload_with_expert_cache(
+                Mixer::Moe(moe::Moe::upload(
                     device.clone(),
                     binding,
                     moe::FixedOperands {
@@ -432,9 +411,8 @@ pub(super) fn load<S: BlobStoreGet>(
                         shared_up: packed_op(&up)?,
                         shared_down: packed_op(&down)?,
                     },
-                    NativeExperts::new(snapshot.clone(), binding),
+                    &NativeExperts::new(&snapshot, binding),
                     moe_limits(limits),
-                    cache_pairs,
                 )?)
             }
         };
@@ -447,8 +425,20 @@ pub(super) fn load<S: BlobStoreGet>(
     // any DeviceModel can escape. Every uploaded operand remains owned by the
     // locals below until this fence resolves. An Err is not a drain: dropping
     // those owners still uses the runtime's normal stream-ordered allocator.
-    stream.executes(|| cubecl::future::block_on(client.sync()))
+    // The same release as each MoE layer's frees the host copies of whatever
+    // was uploaded after the last of them.
+    stream.executes(|| moe::release_uploads(&client))
         .map_err(|e| format!("session CUDA completion: {e:?}"))?;
+    Ok((embedding, final_norm, head, layers))
+    });
+    let (embedding, final_norm, head, layers) = match uploaded {
+        Ok(parts) => parts,
+        Err(error) => {
+            stream.executes(|| moe::abandon_uploads(&client));
+            return Err(error);
+        }
+    };
+    moe::trim_host_heap();
     // Cloning these handles/Arcs neither reselects source operands nor copies
     // device payloads. No source/upload/failure ordering changed before fence.
     let fixed_layers = layers.iter().map(|layer| LayerWeights {
@@ -479,4 +469,58 @@ pub(super) fn load<S: BlobStoreGet>(
         #[cfg(test)]
         fault: None,
     })
+}
+
+/// Bytes a load can still allocate on `device`, and where the figure comes
+/// from. An integrated GPU (GB10) allocates from system memory, and there
+/// cuMemGetInfo's free figure is MemFree: it leaves out the page cache that
+/// an allocation reclaims. Measured on sky, 2026-11-07: free 17.18 GB beside
+/// MemAvailable 73.39 GB, and 22.55 GB then allocated without error. So the
+/// kernel's MemAvailable is the bound there; only a discrete device's own
+/// free figure is read (on its primary context, the one CubeCL uses).
+pub(super) fn allocatable_bytes(device: &CudaDevice) -> Result<(usize, &'static str)> {
+    use cudarc::driver::{result, sys::CUdevice_attribute};
+    let failed = |e: result::DriverError| format!("CUDA memory query: {e}");
+    result::init().map_err(failed)?;
+    let ordinal = i32::try_from(device.index).map_err(|e| e.to_string())?;
+    let handle = result::device::get(ordinal).map_err(failed)?;
+    // SAFETY: `handle` is a valid device from the initialized driver.
+    let integrated = unsafe {
+        result::device::get_attribute(handle, CUdevice_attribute::CU_DEVICE_ATTRIBUTE_INTEGRATED)
+    }.map_err(failed)? != 0;
+    if integrated {
+        let info = std::fs::read_to_string("/proc/meminfo").map_err(|e| format!("/proc/meminfo: {e}"))?;
+        let kib = info.lines()
+            .find_map(|line| line.strip_prefix("MemAvailable:"))
+            .and_then(|value| value.trim().strip_suffix("kB"))
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .ok_or("/proc/meminfo has no MemAvailable")?;
+        return Ok((kib.checked_mul(1024).ok_or("MemAvailable overflow")?,
+            "host MemAvailable (integrated GPU)"));
+    }
+    let previous = result::ctx::get_current().map_err(failed)?;
+    // SAFETY: the retained primary context is current only for the query and
+    // released; the calling thread's current context is restored.
+    unsafe {
+        let context = result::primary_ctx::retain(handle).map_err(failed)?;
+        let info = result::ctx::set_current(context).and_then(|()| result::mem_get_info());
+        let restored = result::ctx::set_current(previous.unwrap_or(std::ptr::null_mut()));
+        let released = result::primary_ctx::release(handle);
+        let (free, _) = info.map_err(failed)?;
+        restored.map_err(failed)?;
+        released.map_err(failed)?;
+        Ok((free, "the device's free memory (cuMemGetInfo)"))
+    }
+}
+
+/// Refuse what cannot be held, before anything is uploaded or allocated.
+pub(super) fn fits(required: usize, (allocatable, from): (usize, &str)) -> Result<()> {
+    if required > allocatable {
+        return Err(format!(
+            "native model does not fit: needs {required} bytes (resident weights, every \
+             expert, KV and state, the largest working set and upload window) but only \
+             {allocatable} bytes are allocatable, per {from}"
+        ));
+    }
+    Ok(())
 }

@@ -41,7 +41,7 @@ pub(super) fn config() -> TextConfig {
 pub(in crate::models::nemotron_h) fn limits() -> Limits {
     Limits {
         capacity: 8,
-        max_resident_bytes: 192 << 20,
+        max_resident_bytes: 2 << 30,
         max_chunk_bytes: 128 << 20,
     }
 }
@@ -62,19 +62,22 @@ fn full_config(capacity: usize) -> TextConfig {
 }
 
 fn full_limits(capacity: usize) -> Limits {
-    Limits { capacity, max_resident_bytes: 12 << 30, max_chunk_bytes: 6 << 30 }
+    Limits { capacity, max_resident_bytes: 96 << 30, max_chunk_bytes: 6 << 30 }
 }
 
 #[test]
 fn session_host_prefix_admission_counts_shared_boundary_and_only_private_suffix() {
     let c = full_config(1 << 20);
-    let l = Limits { capacity: 1 << 20, max_resident_bytes: 21_334_315_328, max_chunk_bytes: usize::MAX };
+    // The exact minimum resident allowance at 1M: the whole model, bank included.
+    let l = Limits { capacity: 1 << 20, max_resident_bytes: 80_293_122_368, max_chunk_bytes: usize::MAX };
+    assert!(prefix_admission(&c, Limits { max_resident_bytes: l.max_resident_bytes - 1, ..l },
+        786_432 + 17, 786_432).is_err());
     let p = prefix_admission(&c, l, 786_432 + 17, 786_432).unwrap();
     assert_eq!(p.after_advance.shared_kv_bytes, 6 << 30);
     assert_eq!(p.after_advance.private_kv_bytes, 2 << 30);
     assert_eq!(p.after_advance.shared_mamba_bytes, 171_048_960);
     assert_eq!(p.after_advance.private_mamba_bytes, 171_048_960);
-    assert_eq!(resident_ownership(&c, l).unwrap().expert_cache_pairs_per_moe, 36);
+    assert_eq!(resident_ownership(&c, l).unwrap().expert_bank_bytes, 63_417_876_480);
     assert_eq!(p.suffix.unwrap().device_working_bytes,
         planned_prefix_chunk_bytes(&c, l, 786_432, 17, 786_432).unwrap());
     // Diagnostic from the actual planner, not a measured allocation.
@@ -104,11 +107,12 @@ fn session_host_prefix_admission_counts_shared_boundary_and_only_private_suffix(
 #[test]
 fn session_host_prefill_full_window_pages_and_allocation_inventory() {
     let c = full_config(1 << 20);
-    let l = Limits { capacity: 1 << 20, max_resident_bytes: 21_334_315_328,
+    let l = Limits { capacity: 1 << 20, max_resident_bytes: 80_293_122_368,
         max_chunk_bytes: usize::MAX };
+    // No pending expert pair: each total is 3_096_584 below its cached-era figure.
     for (tokens, pages, hidden, latent, accumulator, total) in [
-        (785_039, 3, 6_431_039_488, 1_607_759_872, 3_215_519_744, 11_357_819_912),
-        (1_048_576, 4, 8_589_934_592, 2_147_483_648, 4_294_967_296, 15_135_886_344),
+        (785_039, 3, 6_431_039_488, 1_607_759_872, 3_215_519_744, 11_354_723_328),
+        (1_048_576, 4, 8_589_934_592, 2_147_483_648, 4_294_967_296, 15_132_789_760),
     ] {
         let a = prefill_admission(&c, l, 0, tokens).unwrap();
         assert!(a.layer_major);
@@ -116,7 +120,7 @@ fn session_host_prefill_full_window_pages_and_allocation_inventory() {
             (pages, hidden, latent, accumulator));
         assert_eq!(a.largest_hidden_page_bytes, 1 << 31);
         assert_eq!(a.tile_workspace_bytes, 100_404_224);
-        assert_eq!(a.pending_expert_bytes, 3_096_584);
+        assert_eq!(a.pending_expert_bytes, 0);
         assert_eq!(a.device_working_bytes, total);
         assert_eq!(a.host_routing_bytes, tokens * 272 + tokens.div_ceil(64) * 512 * 8);
         assert!(prefill_admission(&c, Limits { max_chunk_bytes: total, ..l }, 0, tokens).is_ok());
@@ -185,37 +189,32 @@ fn session_host_prefill_covers_actual_prefix_tile_peak() {
 }
 
 #[test]
-fn session_host_shared_ownership_preserves_admission_and_private_quotas() {
+fn session_host_shared_ownership_counts_the_bank_once() {
     let c = full_config(1 << 20);
     let small = resident_ownership(&c, full_limits(2048)).unwrap();
     let large = resident_ownership(&c, full_limits(262144)).unwrap();
-    assert_eq!(small.fixed_model_bytes, 8_114_262_336);
+    // 40 MoE layers x 512 pairs x 3_096_576 device bytes.
+    assert_eq!(small.expert_bank_bytes, 63_417_876_480);
+    assert_eq!(large.expert_bank_bytes, small.expert_bank_bytes);
+    // 8_114_262_336 fixed operands without experts, plus the bank.
+    assert_eq!(small.fixed_model_bytes, 71_532_138_816);
     assert_eq!(large.fixed_model_bytes, small.fixed_model_bytes);
     assert_eq!(small.private_state_bytes, 187_826_176);
     assert_eq!(large.private_state_bytes, 2_318_532_608);
-    assert_eq!(small.expert_cache_pairs_per_moe, 36);
-    assert_eq!(large.expert_cache_pairs_per_moe, 19);
-    assert_eq!(small.private_expert_cache_bytes, 4_459_069_440);
     for (capacity, ownership) in [(2048, small), (262144, large)] {
         let admitted = admission(&c, full_limits(capacity), 1).unwrap();
+        assert_eq!(admitted.expert_cache_pairs_per_moe, moe::EXPERTS);
+        assert_eq!(admitted.expert_cache_bytes, ownership.expert_bank_bytes);
+        assert_eq!(ownership.fixed_model_bytes - ownership.expert_bank_bytes
+            + ownership.private_state_bytes, admitted.base_resident_bytes);
         assert_eq!(ownership.fixed_model_bytes + ownership.private_state_bytes,
-            admitted.base_resident_bytes);
-        assert_eq!(ownership.private_expert_cache_bytes, admitted.expert_cache_bytes);
-        assert_eq!(ownership.expert_cache_pairs_per_moe, admitted.expert_cache_pairs_per_moe);
-        assert_eq!(ownership.fixed_model_bytes + ownership.private_state_bytes
-            + ownership.private_expert_cache_bytes, admitted.resident_bytes);
+            admitted.resident_bytes);
     }
-    // Unequal contexts share only fixed operands. No saved bytes enter q.
-    let combined = small.fixed_model_bytes + small.private_state_bytes
-        + small.private_expert_cache_bytes + large.private_state_bytes
-        + large.private_expert_cache_bytes;
-    assert_eq!(combined, 17_433_088_320);
+    // Two Sessions of unequal context share the fixed operands and the bank.
+    let combined = small.fixed_model_bytes + small.private_state_bytes + large.private_state_bytes;
+    assert_eq!(combined, 74_038_497_600);
     let base = resident_bytes(&c, full_limits(2048)).unwrap();
-    let no_cache = resident_ownership(&c, Limits {
-        max_resident_bytes: base, ..full_limits(2048)
-    }).unwrap();
-    assert_eq!(no_cache.expert_cache_pairs_per_moe, 0);
-    assert_eq!(no_cache.private_expert_cache_bytes, 0);
+    assert_eq!(base, 71_719_964_992);
     let rejected = Limits { max_resident_bytes: base - 1, ..full_limits(2048) };
     assert_eq!(resident_ownership(&c, rejected).unwrap_err(),
         admission(&c, rejected, 1).unwrap_err());
@@ -290,7 +289,8 @@ fn session_host_geometry_and_aggregate_admission() {
     let c = config();
     validate_config(&c, limits()).unwrap();
     let n = resident_bytes(&c, limits()).unwrap();
-    assert!(n > 100 << 20 && n < 192 << 20);
+    // 132_574_040 without experts, plus one layer's bank of 1_585_446_912.
+    assert_eq!(n, 1_718_020_952);
     let mut l = limits();
     l.max_resident_bytes = n - 1;
     assert!(resident_bytes(&c, l).is_err());
@@ -310,36 +310,14 @@ fn session_host_geometry_and_aggregate_admission() {
 }
 
 #[test]
-fn session_host_expert_cache_budget_boundaries_and_overflow() {
-    let base = resident_bytes(&config(), limits()).unwrap();
-    let pair = moe::expert_device_bytes().unwrap();
-    assert_eq!(pair, 3_096_576);
-    assert_eq!(expert_cache_pairs(base, base, 1).unwrap(), 0);
-    assert_eq!(expert_cache_pairs(base, base + pair - 1, 1).unwrap(), 0);
-    assert_eq!(expert_cache_pairs(base, base + pair, 1).unwrap(), 1);
-    assert_eq!(expert_cache_pairs(base, base + 2 * pair - 1, 2).unwrap(), 0);
-    assert_eq!(expert_cache_pairs(base, base + 2 * pair, 2).unwrap(), 1);
-    assert_eq!(expert_cache_pairs(base, usize::MAX, 0).unwrap(), 0);
-    assert_eq!(expert_cache_pairs(base, usize::MAX, 1).unwrap(), moe::EXPERTS);
-    assert!(expert_cache_pairs(base, base - 1, 0).is_err());
-    assert!(expert_cache_pairs(base, usize::MAX, usize::MAX).is_err());
-}
-
-#[test]
-fn session_host_expert_cache_full_geometry_uses_caller_resident_limit() {
-    let c = full_config(2048);
-    let mut l = Limits { capacity: 2048, max_resident_bytes: 8 << 30, max_chunk_bytes: 6 << 30 };
-    validate_config(&c, l).unwrap();
-    let base = resident_bytes(&c, l).unwrap();
-    assert_eq!(base, 8_302_088_512);
-    assert_eq!(expert_cache_pairs(base, l.max_resident_bytes, 40).unwrap(), 2);
-    l.max_resident_bytes = 12 << 30;
-    let pairs = expert_cache_pairs(base, l.max_resident_bytes, 40).unwrap();
-    assert_eq!(pairs, 36);
-    let resident = base + 40 * pairs * moe::expert_device_bytes().unwrap();
-    assert_eq!(resident, 12_761_157_952);
-    assert!(resident <= l.max_resident_bytes);
-    assert!(resident + 40 * moe::expert_device_bytes().unwrap() > l.max_resident_bytes);
+fn session_host_bank_full_geometry_minimum_resident_limit() {
+    for (capacity, minimum) in [(2048, 71_719_964_992), (1 << 20, 80_293_122_368)] {
+        let c = full_config(capacity);
+        let l = Limits { capacity, max_resident_bytes: minimum, max_chunk_bytes: 6 << 30 };
+        validate_config(&c, l).unwrap();
+        assert_eq!(resident_bytes(&c, l).unwrap(), minimum);
+        assert!(resident_bytes(&c, Limits { max_resident_bytes: minimum - 1, ..l }).is_err());
+    }
 }
 
 #[test]
@@ -347,24 +325,26 @@ fn session_host_admission_full_geometry_matches_existing_accounting() {
     // Arithmetic witnesses from the pre-extraction formulas, attention terms
     // from the tensor-core plan; not a device measurement or an assertion
     // about allocator/host/runtime overhead.
+    // Chunks no longer carry a pending expert pair: 3_096_584 below the
+    // cached-era figures. Resident adds the whole bank, 63_417_876_480.
     let a = admission(&full_config(2048), full_limits(2048), 88).unwrap();
     assert_eq!(a.base_resident_bytes, 8_302_088_512);
-    assert_eq!(a.expert_cache_pairs_per_moe, 36);
-    assert_eq!(a.expert_cache_bytes, 4_459_069_440);
-    assert_eq!(a.resident_bytes, 12_761_157_952);
+    assert_eq!(a.expert_cache_pairs_per_moe, 512);
+    assert_eq!(a.expert_cache_bytes, 63_417_876_480);
+    assert_eq!(a.resident_bytes, 71_719_964_992);
     assert_eq!(a.first_chunk_tokens, 88);
-    assert_eq!(a.first_chunk_bytes, 1_797_485_928);
-    assert_eq!(a.max_prompt_chunk_bytes, 1_797_485_928);
-    assert_eq!(a.max_capacity_chunk_bytes, 5_095_486_472);
+    assert_eq!(a.first_chunk_bytes, 1_794_389_344);
+    assert_eq!(a.max_prompt_chunk_bytes, 1_794_389_344);
+    assert_eq!(a.max_capacity_chunk_bytes, 5_092_389_888);
 
     let a = admission(&full_config(262144), full_limits(262144), 513).unwrap();
     assert_eq!(a.base_resident_bytes, 10_432_794_944);
-    assert_eq!(a.expert_cache_pairs_per_moe, 19);
-    assert_eq!(a.resident_bytes, 12_786_192_704);
+    assert_eq!(a.expert_cache_pairs_per_moe, 512);
+    assert_eq!(a.resident_bytes, 73_850_671_424);
     assert_eq!(a.first_chunk_tokens, MAX_CHUNK);
-    assert_eq!(a.first_chunk_bytes, 4_891_014_152);
-    assert_eq!(a.max_prompt_chunk_bytes, 4_959_171_592);
-    assert_eq!(a.max_capacity_chunk_bytes, 5_368_116_232);
+    assert_eq!(a.first_chunk_bytes, 4_887_917_568);
+    assert_eq!(a.max_prompt_chunk_bytes, 4_956_075_008);
+    assert_eq!(a.max_capacity_chunk_bytes, 5_365_019_648);
 }
 
 #[test]
@@ -374,19 +354,19 @@ fn session_host_admission_partial_last_chunk_and_attention_split_boundaries() {
     // A late 255-token remainder can be larger than the first 256-token
     // chunk because its attention split count has grown from two to four.
     for (tokens, expected) in [
-        (1, 217_809_292),
-        (255, 4_874_230_404),
-        (256, 4_891_014_152),
-        (257, 4_891_014_152),
-        (300, 4_891_014_152),
-        (511, 4_942_121_604),
-        (512, 4_959_171_592),
-        (513, 4_959_171_592),
+        (1, 214_712_708),
+        (255, 4_871_133_820),
+        (256, 4_887_917_568),
+        (257, 4_887_917_568),
+        (300, 4_887_917_568),
+        (511, 4_939_025_020),
+        (512, 4_956_075_008),
+        (513, 4_956_075_008),
     ] {
         assert_eq!(admission(&c, l, tokens).unwrap().max_prompt_chunk_bytes, expected);
     }
     // Max-capacity accounting considers decode too, at its latest start.
-    assert_eq!(planned_chunk_bytes(&c, l, 2047, 1).unwrap(), 219_806_092);
+    assert_eq!(planned_chunk_bytes(&c, l, 2047, 1).unwrap(), 216_709_508);
     let short = admission(&full_config(1), full_limits(1), 1).unwrap();
     assert_eq!(short.max_capacity_chunk_bytes, short.first_chunk_bytes);
 }
@@ -395,16 +375,16 @@ fn session_host_admission_partial_last_chunk_and_attention_split_boundaries() {
 fn session_host_admission_budget_boundaries_precede_any_session() {
     let c = full_config(2048);
     let mut l = full_limits(2048);
-    let base = 8_302_088_512;
+    let base = 71_719_964_992;
     l.max_resident_bytes = base;
     let exact = admission(&c, l, 256).unwrap();
-    assert_eq!(exact.expert_cache_pairs_per_moe, 0);
-    assert_eq!(exact.expert_cache_bytes, 0);
+    assert_eq!(exact.expert_cache_pairs_per_moe, 512);
+    assert_eq!(exact.expert_cache_bytes, 63_417_876_480);
     assert_eq!(exact.resident_bytes, base);
     l.max_resident_bytes -= 1;
     assert!(admission(&c, l, 256).is_err());
     l = full_limits(2048);
-    l.max_chunk_bytes = 4_891_014_152;
+    l.max_chunk_bytes = 4_887_917_568;
     let first = admission(&c, l, 256).unwrap();
     assert_eq!(first.first_chunk_bytes, l.max_chunk_bytes);
     assert!(first.max_capacity_chunk_bytes > l.max_chunk_bytes);
@@ -419,7 +399,8 @@ fn session_host_admission_budget_boundaries_precede_any_session() {
     assert!(admission(&c, Limits { max_chunk_bytes: span_exact.max_chunk_bytes - 1, ..l }, 511).is_err());
     l.max_chunk_bytes -= 1;
     assert!(admission(&c, l, 256).is_err());
-    assert!(admission(&full_config(1048576), full_limits(1048576), 1).is_err());
+    assert!(admission(&full_config(1048576), Limits { max_resident_bytes: 80_293_122_367,
+        ..full_limits(1048576) }, 1).is_err());
 }
 
 #[test]
@@ -516,10 +497,10 @@ fn session_host_complete_typed_expert_survives_merged_alternatives() {
     assert_eq!(up.weight.dims(), &[2688, 1024]);
     assert_eq!(down.weight.dims(), &[1024, 2688]);
     assert!(pile::nvfp4_expert_minimum(&snapshot, *layer, 8).is_none());
-    // The retained provider borrows its attributes across repeated lookups;
-    // compare its selected operands with the standalone fresh-attribute path.
+    // The bank loader's provider holds its attributes across lookups; compare
+    // its selected operands with the standalone fresh-attribute path.
     let binding = moe::SourceBinding { model_root: *layer, layer: *layer };
-    let provider = NativeExperts::new(Arc::new(snapshot.clone()), binding);
+    let provider = source::NativeExperts::new(&snapshot, binding);
     for _ in 0..2 {
         moe::ExpertProvider::with_expert(&provider, 7, |pair| {
             assert_eq!(pair.index, 7);
@@ -532,32 +513,6 @@ fn session_host_complete_typed_expert_survives_merged_alternatives() {
         }).unwrap();
     }
     assert!(moe::ExpertProvider::with_expert(&provider, 8, |_| Ok(())).is_err());
-    #[cfg(feature = "nemotron-timing")]
-    {
-        let mut detail = moe::LookupTimings::default();
-        let (observed_expert, observed_up, observed_down) =
-            pile::nvfp4_expert_minimum_observed(&snapshot, *layer, 7, Some(&mut detail))
-                .unwrap().unwrap();
-        assert_eq!(observed_expert, expert);
-        for (observed, original) in [(&observed_up, &up), (&observed_down, &down)] {
-            assert_eq!(observed.operation, original.operation);
-            assert_eq!(observed.weight.dims(), original.weight.dims());
-            assert_eq!(&observed.weight.payload()[..], &original.weight.payload()[..]);
-            assert_eq!(&observed.input_scale.payload()[..], &original.input_scale.payload()[..]);
-        }
-        assert_eq!(detail.counts(), [(1, 1), (1, 1), (4, 4)]);
-        let mut reused = moe::LookupTimings::default();
-        moe::ExpertProvider::with_expert_timed(&provider, 7, |pair| {
-            assert_eq!((pair.up.operation, pair.down.operation), (up.operation, down.operation));
-            Ok(())
-        }, &mut reused).unwrap();
-        assert_eq!(reused.counts(), detail.counts());
-        let mut missing = moe::LookupTimings::default();
-        assert!(pile::nvfp4_expert_minimum_observed(
-            &snapshot, *layer, 8, Some(&mut missing),
-        ).is_none());
-        assert_eq!(missing.counts(), [(1, 1), (1, 1), (0, 0)]);
-    }
 
     // A fully typed selected tuple whose blob is absent must still report an
     // error. It must not silently fall through to a different observation.
@@ -592,21 +547,10 @@ fn session_host_complete_typed_expert_survives_merged_alternatives() {
             .unwrap()
             .is_err()
     );
-    let provider = NativeExperts::new(Arc::new(snapshot.clone()), binding);
+    let provider = source::NativeExperts::new(&snapshot, binding);
     let reused_error = moe::ExpertProvider::with_expert(&provider, 8, |_| Ok(())).unwrap_err();
     let fresh_error = pile::nvfp4_expert_minimum(&snapshot, *layer, 8).unwrap().err().unwrap();
     assert_eq!(reused_error, fresh_error.to_string());
-    #[cfg(feature = "nemotron-timing")]
-    {
-        let mut detail = moe::LookupTimings::default();
-        let observed = pile::nvfp4_expert_minimum_observed(
-            &snapshot, *layer, 8, Some(&mut detail),
-        ).unwrap().err().unwrap();
-        let original = pile::nvfp4_expert_minimum(&snapshot, *layer, 8)
-            .unwrap().err().unwrap();
-        assert_eq!(observed.to_string(), original.to_string());
-        assert_eq!(detail.counts(), [(1, 1), (1, 1), (1, 0)]);
-    }
 }
 
 fn tensor<T: TensorElement, const R: usize>(
@@ -678,6 +622,10 @@ pub(in crate::models::nemotron_h) fn fixture() -> (Arc<ModelSnapshot<impl BlobSt
     fixture_capacity(8)
 }
 pub(in crate::models::nemotron_h) fn fixture_capacity(capacity: usize) -> (Arc<ModelSnapshot<impl BlobStoreGet + Send + Sync>>, Source, Vec<Id>) {
+    fixture_experts(capacity, 512)
+}
+/// `experts` below 512 leaves the bank incomplete, so loading must refuse.
+fn fixture_experts(capacity: usize, experts: u64) -> (Arc<ModelSnapshot<impl BlobStoreGet + Send + Sync>>, Source, Vec<Id>) {
     let mut repo = MemoryRepo::default();
     let key = SigningKey::generate(&mut rand::rngs::OsRng);
     let policy = CollectionPolicy::new(
@@ -763,11 +711,12 @@ pub(in crate::models::nemotron_h) fn fixture_capacity(capacity: usize) -> (Arc<M
                 );
                 ops += packed(&mut repo, "moe.shared.up_proj", 5376, H);
                 ops += packed(&mut repo, "moe.shared.down_proj", H, 5376);
-                // Only the selected experts are present: constructor must NOT
-                // inventory/require a complete expert bank. Router picks 0..21.
-                for index in 0..22u64 {
-                    let expert = packed(&mut repo, "moe.up_proj", 2688, 1024)
-                        + packed(&mut repo, "moe.down_proj", 1024, 2688);
+                // The whole bank: every index loads at construction. One pair of
+                // payloads serves all 512; the router picks 0..21.
+                let expert = packed(&mut repo, "moe.up_proj", 2688, 1024)
+                    + packed(&mut repo, "moe.down_proj", 1024, 2688);
+                for index in 0..experts {
+                    let expert = expert.clone();
                     ops +=
                         entity! {attrs::kind:pile::EXPERT,attrs::index:index,attrs::member*:expert};
                 }
@@ -995,7 +944,7 @@ fn session_gpu_shared_model_rejects_origin_upload_error() {
     let ownership = resident_ownership(&config(), limits()).unwrap();
     // One constructor only, no append/expert load or second context. Include
     // the logical committed state although Mamba state is still unallocated.
-    assert_eq!(ownership.fixed_model_bytes + ownership.private_state_bytes, 132_574_040);
+    assert_eq!(ownership.fixed_model_bytes + ownership.private_state_bytes, 1_718_020_952);
     let caller = StreamId::current();
     let origin = std::thread::spawn(StreamId::current).join().unwrap();
     assert_ne!(caller, origin);
@@ -1034,17 +983,15 @@ fn session_gpu_shared_model_rejects_origin_upload_error() {
 #[ignore = "reserved CUDA: two synthetic Sessions, shared fixed weights/private state and stream movement"]
 fn session_gpu_shared_model_private_state_and_streams() {
     // Only two sessions alive, capacity8 and at most ONE synchronous append at
-    // a time. Logical bound: shared W + 2*(private state/cache) + 128MiB chunk.
+    // a time. Logical bound: shared W and bank + 2*private state + 128MiB chunk.
     // Fixture source only; no checkpoint, tokenizer, external provider or pile.
     let (snapshot, source, ids) = fixture();
     let ownership = resident_ownership(&config(), limits()).unwrap();
-    assert_eq!(ownership.fixed_model_bytes, 132_483_896);
+    assert_eq!(ownership.fixed_model_bytes, 1_717_930_808);
+    assert_eq!(ownership.expert_bank_bytes, 1_585_446_912);
     assert_eq!(ownership.private_state_bytes, 90_144);
-    assert_eq!(ownership.expert_cache_pairs_per_moe, 22);
-    assert_eq!(ownership.private_expert_cache_bytes, 68_124_672);
-    assert_eq!(ownership.fixed_model_bytes
-        + 2 * (ownership.private_state_bytes + ownership.private_expert_cache_bytes)
-        + limits().max_chunk_bytes, 403_131_256);
+    assert_eq!(ownership.fixed_model_bytes + 2 * ownership.private_state_bytes
+        + limits().max_chunk_bytes, 1_852_328_824);
     let mut a = Session::from_snapshot(snapshot, source, &ids, CudaDevice { index: 0 }, limits()).unwrap();
     let model = a.device_model().clone();
     assert_eq!(model.layer_ids().collect::<Vec<_>>(), ids);
@@ -1063,22 +1010,14 @@ fn session_gpu_shared_model_private_state_and_streams() {
         match (&left.mixer, &right.mixer) {
             (Mixer::Mamba(x), Mixer::Mamba(y)) => assert!(Arc::ptr_eq(&x.weights, &y.weights)),
             (Mixer::Attention(x), Mixer::Attention(y)) => assert!(Arc::ptr_eq(&x.weights, &y.weights)),
-            (Mixer::Moe(x), Mixer::Moe(y)) => {
-                assert!(Arc::ptr_eq(&x.weights, &y.weights));
-                assert_eq!(x.diagnostic_expert_owners(), (0, false));
-                assert_eq!(y.diagnostic_expert_owners(), (0, false));
-            }
+            // One expert bank, in the shared weights, for both Sessions.
+            (Mixer::Moe(x), Mixer::Moe(y)) => assert!(Arc::ptr_eq(&x.weights, &y.weights)),
             _ => panic!("shared model changed layer kind"),
         }
     }
     // B's first forward consumes weights whose upload completed on A's stream,
-    // before A has executed any chunk. Warming B must leave A's cache empty.
+    // before A has executed any chunk.
     let cold_b1 = b.append_ids(&[5]).unwrap().values.to_vec();
-    for layer in &a.layers {
-        if let Mixer::Moe(m) = &layer.mixer {
-            assert_eq!(m.diagnostic_expert_owners(), (0, false));
-        }
-    }
     // Exact comparisons below use the SAME append partitions as these isolated
     // reference schedules; no stronger partition/numerical parity is asserted.
     let expected_a2 = a.append_ids(&[1, 5]).unwrap().values.to_vec();
@@ -1102,8 +1041,7 @@ fn session_gpu_shared_model_private_state_and_streams() {
     assert_eq!(b.committed_ids(), [5, 3]);
 
     // This fault precedes the fixture's MoE layer. It covers retained outer
-    // outputs/Mamba staged state/attention state, NOT failed MoE completion or
-    // its expert-cache pending owner. That cache algorithm has separate tests.
+    // outputs/Mamba staged state/attention state, NOT failed MoE completion.
     a.fault = Some(Fault::AfterLayer(1));
     assert!(a.append_ids(&[1]).is_err());
     let held = a.pending.len();
@@ -1147,4 +1085,181 @@ fn session_gpu_shared_model_private_state_and_streams() {
     assert_eq!(b.append_ids(&[3]).unwrap().values, expected_b2);
     drop(b);
     assert!(weak.upgrade().is_none());
+}
+
+fn meminfo_kib(field: &str) -> usize {
+    let info = std::fs::read_to_string("/proc/meminfo").unwrap();
+    let line = info.lines().find(|l| l.starts_with(field) && l[field.len()..].starts_with(':')).unwrap();
+    line.split_whitespace().nth(1).unwrap().parse().unwrap()
+}
+
+#[test]
+#[ignore = "reserved CUDA: cuMemGetInfo against /proc/meminfo, with one probe allocation beyond the driver's free figure"]
+fn session_gpu_preflight_free_memory_measurement() {
+    use cudarc::driver::{result, sys};
+    let device = CudaDevice { index: 0 };
+    result::init().unwrap();
+    let snapshot = || {
+        // SAFETY: valid device; the primary context is current only for the query.
+        let (free, total) = unsafe {
+            let handle = result::device::get(0).unwrap();
+            let previous = result::ctx::get_current().unwrap();
+            result::ctx::set_current(result::primary_ctx::retain(handle).unwrap()).unwrap();
+            let info = result::mem_get_info().unwrap();
+            result::ctx::set_current(previous.unwrap_or(std::ptr::null_mut())).unwrap();
+            result::primary_ctx::release(handle).unwrap();
+            info
+        };
+        json!({"cu_free": free, "cu_total": total, "allocatable": source::allocatable_bytes(&device).unwrap().0,
+            "mem_total": meminfo_kib("MemTotal") * 1024, "mem_free": meminfo_kib("MemFree") * 1024,
+            "mem_available": meminfo_kib("MemAvailable") * 1024,
+            "cached": meminfo_kib("Cached") * 1024, "buffers": meminfo_kib("Buffers") * 1024})
+    };
+    let before = snapshot();
+    result::init().unwrap();
+    let handle = result::device::get(0).unwrap();
+    // SAFETY: valid device; the primary context is retained for this test and
+    // every allocation is freed before it is released.
+    let (integrated, probe) = unsafe {
+        let integrated = result::device::get_attribute(handle,
+            sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_INTEGRATED).unwrap();
+        let context = result::primary_ctx::retain(handle).unwrap();
+        result::ctx::set_current(context).unwrap();
+        // Allocate 4 GiB past the driver's free figure, one GiB at a time,
+        // only while the host keeps at least 40 GiB available afterwards.
+        let free = before["cu_free"].as_u64().unwrap() as usize;
+        let available = before["mem_available"].as_u64().unwrap() as usize;
+        let target = free + (4 << 30);
+        let mut probe = json!({"attempted": false});
+        if available > target + (40 << 30) {
+            let mut held = Vec::new();
+            let mut error = None;
+            while held.len() << 30 < target {
+                match result::malloc_sync(1 << 30) {
+                    Ok(ptr) => held.push(ptr),
+                    Err(e) => { error = Some(e.to_string()); break; }
+                }
+            }
+            let during = snapshot();
+            for ptr in held.iter().copied() {
+                result::free_sync(ptr).unwrap();
+            }
+            probe = json!({"attempted": true, "target_bytes": target,
+                "allocated_bytes": held.len() << 30, "error": error, "during": during});
+        }
+        result::primary_ctx::release(handle).unwrap();
+        (integrated, probe)
+    };
+    println!("PREFLIGHT {}", json!({"integrated": integrated, "before": before,
+        "probe": probe, "after": snapshot()}));
+    // What the preflight relies on: on an integrated device, allocation
+    // succeeds past the driver's free figure, up to what the host can reclaim.
+    if integrated != 0 && probe["attempted"] == true {
+        assert!(probe["error"].is_null(), "{probe}");
+        assert!(probe["allocated_bytes"].as_u64().unwrap() > before["cu_free"].as_u64().unwrap());
+    }
+}
+
+#[test]
+fn session_host_preflight_refuses_past_allocatable_with_its_source() {
+    source::fits(80_293_122_368, (80_293_122_368, "x")).unwrap();
+    let error = source::fits(80_293_122_368, (80_293_122_367, "host MemAvailable (integrated GPU)")).unwrap_err();
+    assert!(error.contains("needs 80293122368 bytes"), "{error}");
+    assert!(error.contains("only 80293122367 bytes are allocatable, per host MemAvailable"), "{error}");
+}
+
+#[test]
+fn session_host_physical_requirement_at_1m() {
+    // full_config is 40 Mamba, then 40 MoE, then 8 attention layers.
+    let c = full_config(1 << 20);
+    let l = Limits { capacity: 1 << 20, max_resident_bytes: 80_293_122_368,
+        max_chunk_bytes: 15_132_789_760 };
+    // Largest upload window: embedding, head and final norm 1_610_620_928,
+    // 40 x (norm 8_192 + Mamba weights 109_696_512), then the first MoE layer
+    // (norm 8_192 + fixed 45_746_184 + bank 1_585_446_912).
+    assert_eq!(resident_payload(&c, l).unwrap().window, 7_630_010_376);
+    assert_eq!(transient_bytes(&c, l).unwrap(), 15_132_789_760);
+    // 80_293_122_368 resident + 15_132_789_760 span + 7_630_010_376 window.
+    assert_eq!(load_requirement(&c, l, false).unwrap(), 103_055_922_504);
+    // A seed keeps a sealed boundary: 40 x 4_276_224 Mamba state.
+    assert_eq!(load_requirement(&c, l, true).unwrap(), 103_226_971_464);
+    // A further Session: KV 8_589_934_592 + Mamba 171_048_960 + span.
+    assert_eq!(session_requirement(&c, l, false).unwrap(), 23_893_773_312);
+    // A smaller allowance caps the working set it admits.
+    let small = Limits { max_chunk_bytes: 6 << 30, ..l };
+    assert_eq!(transient_bytes(&c, small).unwrap(), 6 << 30);
+}
+
+fn rss_anon_bytes() -> usize {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap();
+    let line = status.lines().find(|l| l.starts_with("RssAnon:")).unwrap();
+    line.split_whitespace().nth(1).unwrap().parse::<usize>().unwrap() * 1024
+}
+
+#[test]
+#[ignore = "reserved CUDA: a load refused at the last expert gives back its device pages and host copies"]
+fn session_gpu_refused_load_releases_memory() {
+    let device = CudaDevice { index: 0 };
+    let client = CudaRuntime::client(&device);
+    cubecl::future::block_on(client.sync()).unwrap();
+    // Built before the baseline: the source itself is not what is measured.
+    let (snapshot, source, ids) = fixture_experts(8, 511);
+    let (reserved, rss) = (client.memory_usage().unwrap().bytes_reserved, rss_anon_bytes());
+    let error = Session::from_snapshot(snapshot, source, &ids, device.clone(), limits())
+        .err().expect("an incomplete bank must refuse the load");
+    assert!(error.contains("missing complete native expert 511"), "{error}");
+    let after = (client.memory_usage().unwrap().bytes_reserved, rss_anon_bytes());
+    // Contrast: a dropped exact buffer stays reserved until a cleanup.
+    drop(moe::exact(&client, || client.empty(64 << 20)));
+    let dropped = client.memory_usage().unwrap().bytes_reserved;
+    client.memory_cleanup();
+    let cleaned = client.memory_usage().unwrap().bytes_reserved;
+    println!("REFUSED_LOAD {}", json!({"error": error,
+        "device_reserved_before": reserved, "device_reserved_after": after.0,
+        "rss_anon_before": rss, "rss_anon_after": after.1,
+        "contrast_64MiB_dropped_reserved": dropped, "contrast_after_cleanup": cleaned}));
+    assert!(dropped >= reserved + (64 << 20) && cleaned <= reserved, "{dropped} {cleaned}");
+    // 1.7 GB had been uploaded when the 512th expert was found missing.
+    assert!(after.0 <= reserved + (64 << 20), "device pages kept: {reserved} -> {}", after.0);
+    assert!(after.1 <= rss + (256 << 20), "host copies kept: {rss} -> {}", after.1);
+}
+
+#[test]
+#[ignore = "reserved CUDA, default memory configuration: model buffers allocated at their own size"]
+fn session_gpu_physical_matches_logical() {
+    let device = CudaDevice { index: 0 };
+    // A fresh thread is a fresh stream with its own empty pools.
+    let reserve = |exact: bool, bytes: usize| {
+        let device = device.clone();
+        std::thread::spawn(move || {
+            let client = CudaRuntime::client(&device);
+            let base = client.memory_usage().unwrap().bytes_reserved;
+            let handle = if exact { moe::exact(&client, || client.empty(bytes)) } else { client.empty(bytes) };
+            let grown = client.memory_usage().unwrap().bytes_reserved - base;
+            drop(handle);
+            client.memory_cleanup();
+            cubecl::future::block_on(client.sync()).unwrap();
+            grown
+        }).join().unwrap()
+    };
+    // A 600 MiB buffer, the size class of a 1M KV plane or the embedding.
+    let pooled = reserve(false, 600 << 20);
+    let exact = reserve(true, 600 << 20);
+    let (logical, physical) = std::thread::spawn(move || {
+        let (snapshot, source, ids) = fixture();
+        let session = Session::from_snapshot(snapshot, source, &ids, device, limits()).unwrap();
+        let usage = session.model.client.memory_usage().unwrap();
+        let logical = resident_bytes(&config(), limits()).unwrap();
+        drop(session);
+        (logical, usage)
+    }).join().unwrap();
+    println!("PHYSICAL {}", json!({
+        "memory_config": std::env::var("CUBECL_MEMORY_CONFIG").ok(),
+        "buffer_600MiB": {"logical": 600usize << 20, "default_pool_reserved": pooled, "exact_reserved": exact},
+        "synthetic_model": {"logical_resident": logical, "reserved": physical.bytes_reserved,
+            "in_use": physical.bytes_in_use, "padding": physical.bytes_padding,
+            "allocations": physical.number_allocs},
+    }));
+    assert!(exact < (600 << 20) + (1 << 20), "{exact}");
+    assert!(physical.bytes_reserved < logical as u64 + (logical as u64) / 50, "{physical:?} vs {logical}");
 }

@@ -49,12 +49,12 @@ pub struct PrefixOwnership {
 pub struct PrefixAllocation {
     pub seed: PrefillAllocation,
     pub suffix: Option<PrefillAllocation>,
-    /// Logical payload after private advancement; excludes fixed weights,
-    /// private experts, temporary allocations and allocator/runtime overhead.
+    /// Logical payload after private advancement; excludes fixed weights (the
+    /// expert bank included), temporary allocations and allocator/runtime overhead.
     pub after_advance: PrefixOwnership,
 }
 
-fn mamba_bytes(c: &TextConfig) -> Result<usize> {
+pub(super) fn mamba_bytes(c: &TextConfig) -> Result<usize> {
     let e = mamba_config(c).extents(1, 1)?;
     let one = add(bytes(&[e.conv], 2)?, bytes(&[e.recurrent], 4)?)?;
     one.checked_mul(c.layers_block_type.iter().filter(|k| matches!(k, LayerKind::Mamba)).count())
@@ -74,8 +74,8 @@ fn ownership(c: &TextConfig, l: Limits, prefix: usize) -> Result<PrefixOwnership
 }
 
 /// The two actual prefill spans, with exact multi-run scratch for the suffix.
-/// The existing complete-model resident allowance still determines private
-/// expert quota. Retaining Mamba for restore is additional shared payload.
+/// The complete-model resident allowance must still admit the model.
+/// Retaining Mamba for restore is additional shared payload.
 pub fn prefix_admission(c: &TextConfig, l: Limits, prompt: usize, prefix: usize) -> Result<PrefixAllocation> {
     validate_config(c, l)?;
     resident_ownership(c, l)?;
@@ -112,7 +112,7 @@ pub(super) fn validate_initial<S>(model: &Arc<DeviceModel<S>>, l: Limits,
 }
 
 impl<S: BlobStoreGet> Session<S> {
-    /// Cold source loading keeps original fixed upload order and quota. Only
+    /// Cold source loading keeps the original fixed upload order. Only
     /// P rows are reserved until that exact prefix completes; no eager full-C
     /// KV allocation or large device copy precedes sealing.
     pub fn from_snapshot_seed(snapshot: Arc<ModelSnapshot<S>>, source: Source,

@@ -42,7 +42,7 @@ const PROMPT_BYTES_CEILING: usize = 128 * 1024;
 const MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const LIMITS: Limits = Limits {
     capacity: CAPACITY,
-    max_resident_bytes: 8 * 1024 * 1024 * 1024,
+    max_resident_bytes: 96 * 1024 * 1024 * 1024, // fixed weights + every expert (63.4 GB) + KV + state
     max_chunk_bytes: 6 * 1024 * 1024 * 1024,
 };
 

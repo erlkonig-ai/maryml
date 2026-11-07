@@ -6,19 +6,18 @@
 //! Router BF16 operands use existing BF16 MMA with F32 accumulation/output:
 //! this is a reduction variant of HF's widened F32 dot, NOT bit parity.
 //! All arithmetic stays on GPU. Small routing metadata alone returns to host
-//! to select immutable native expert operands; no retained parameter catalog.
+//! to pick which of the already resident expert pairs run.
 //!
-//! Each selected expert pair is fenced before release, as is the final result.
-//! Native sessions may retain immutable pairs within their admitted budget;
-//! standalone upload keeps the original one-visit lifetime.
+//! Upload copies every one of the 512 expert pairs into device memory once,
+//! beside the fixed operands, and fences. Forward and prefill only read that
+//! bank; no expert is looked up, validated or uploaded per call.
+//! Each selected expert is fenced after its tile, as is the final result.
 //! After dispatch any error/panic poisons this owner until reset succeeds.
 //! An outer hybrid owner must also discard/reset attention AND Mamba history;
 //! resetting this stateless mixer alone cannot undo another layer's effects.
 
 #[cfg(feature = "nemotron-timing")]
 use super::host_timing::{self, Phase, Timings};
-#[cfg(feature = "nemotron-timing")]
-pub use super::host_timing::LookupTimings;
 use crate::{
     models::inkling::{bf16gemm, moegroup},
     nn::{nvfp4_gemm::calibrated_scale, nvfp4_gemv::Nvfp4},
@@ -34,9 +33,6 @@ use half::bf16;
 use std::sync::Arc;
 use triblespace::prelude::Id;
 
-#[path = "moe_cache.rs"]
-mod cache;
-
 pub type CudaTensor = CubeTensor<CudaRuntime>;
 pub type Result<T> = std::result::Result<T, String>;
 pub const HIDDEN: usize = 4096;
@@ -50,7 +46,7 @@ const ROUTE_WIDTH: usize = TOP_K * 2 + 3; // IDs, weights, two cutoff scores, er
 const THREADS: u32 = 256;
 
 /// Caller-selected provenance, not proof that arbitrary bytes are upstream
-/// weights. Fixed operands and the owned provider must use ONE held immutable
+/// weights. Fixed operands and the expert provider must use ONE held immutable
 /// ModelSnapshot. IDs do not replace that observation/descriptor lifetime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SourceBinding {
@@ -81,46 +77,32 @@ pub struct ExpertPair<'a> {
     pub down: PackedOperation<'a>,
 }
 
-/// Narrow on-demand native operand boundary. Own (or borrow for this owner's
-/// lifetime) the SAME frozen snapshot used to select FixedOperands. Query the
-/// selected EXPERT child and its joined operation/scale, not a loaded catalog.
-/// No provider replacement or runtime source rebinding is exposed by Moe.
+/// Source of the expert pairs, read once per index at upload. Use the SAME
+/// frozen snapshot that selected FixedOperands. Moe does not retain it.
 pub trait ExpertProvider {
     fn source(&self) -> SourceBinding;
-    /// The selected views need only live for this callback. A native provider
-    /// can query one immutable snapshot here without retaining an expert bank.
+    /// The selected views need only live for this callback.
     fn with_expert<T>(
         &self,
         index: usize,
         use_pair: impl FnOnce(ExpertPair<'_>) -> Result<T>,
     ) -> Result<T>;
-
-    /// Optional nested host-return timing. The default preserves standalone
-    /// providers and leaves detail unavailable; it does not invent zero cost.
-    #[cfg(feature = "nemotron-timing")]
-    fn with_expert_timed<T>(
-        &self,
-        index: usize,
-        use_pair: impl FnOnce(ExpertPair<'_>) -> Result<T>,
-        _timing: &mut LookupTimings,
-    ) -> Result<T> {
-        self.with_expert(index, use_pair)
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
-    pub max_fixed_bytes: usize,
-    pub max_expert_bytes: usize,
-    /// Conservative sum of logical temporary allocations for ONE call, with
-    /// one expert live. Excludes caller input, host staging, allocator/JIT and
-    /// runtime internals. This is not a whole-device or cgroup memory bound.
+    /// Fixed operands plus the whole expert bank, logical payload bytes.
+    pub max_resident_bytes: usize,
+    /// Conservative sum of logical temporary allocations for ONE call.
+    /// Excludes caller input, host staging, allocator/JIT and runtime
+    /// internals. This is not a whole-device or cgroup memory bound.
     pub max_working_bytes: usize,
 }
 #[derive(Clone, Copy, Debug)]
 pub struct Admission {
     pub fixed_bytes: usize,
-    pub expert_bytes: usize,
+    /// All EXPERTS pairs' device planes, resident from upload on.
+    pub bank_bytes: usize,
 }
 
 /// The tiny readback needed for scheduling, not an activation/weight export.
@@ -158,6 +140,9 @@ impl PackedWeight {
     }
 }
 
+/// Immutable device operands of one MoE layer, shared by every Session of a
+/// DeviceModel: the fixed operands and the bank of all EXPERTS (up, down)
+/// pairs, indexed by expert ID.
 pub(super) struct Weights {
     source: SourceBinding,
     fixed_operations: [Id; 6],
@@ -169,11 +154,11 @@ pub(super) struct Weights {
     fc2: Handle,
     shared_up: PackedWeight,
     shared_down: PackedWeight,
+    experts: Vec<(PackedWeight, PackedWeight)>,
 }
 
-pub struct Moe<P> {
+pub struct Moe {
     pub(super) weights: Arc<Weights>,
-    provider: P,
     limits: Limits,
     admission: Admission,
     // One in-flight recovery bit, not model history or a commit protocol. Set
@@ -182,9 +167,6 @@ pub struct Moe<P> {
     // errors conservatively require that same explicit acknowledgement even
     // when the attempted final fence succeeded. Cross-layer commit is external.
     poisoned: bool,
-    // Installed BEFORE projection dispatch. A failed sync is not a drain;
-    // retain these operands until a subsequent successful completion/reset.
-    expert_operands: cache::Operands<(PackedWeight, PackedWeight)>,
 }
 
 fn bytes(dims: &[usize], width: usize) -> Result<usize> {
@@ -218,13 +200,18 @@ pub(super) fn admission(limits: Limits) -> Result<Admission> {
         + bytes(&[EXPERTS], 4)?
         + 2 * bytes(&[HIDDEN, LATENT], 2)?
         + 2 * packed_bytes(HIDDEN, SHARED)?;
-    let expert_bytes = 2 * packed_bytes(INTERMEDIATE, LATENT)?;
-    if fixed_bytes > limits.max_fixed_bytes || expert_bytes > limits.max_expert_bytes {
-        return Err("MoE fixed/one-expert logical resident budget exceeded".into());
+    let bank_bytes = expert_device_bytes()?
+        .checked_mul(EXPERTS)
+        .ok_or("MoE expert bank byte overflow")?;
+    if fixed_bytes
+        .checked_add(bank_bytes)
+        .is_none_or(|n| n > limits.max_resident_bytes)
+    {
+        return Err("MoE fixed/expert-bank logical resident budget exceeded".into());
     }
     Ok(Admission {
         fixed_bytes,
-        expert_bytes,
+        bank_bytes,
     })
 }
 fn finite_bf16(data: &[u8], n: usize, k: usize) -> Result<()> {
@@ -260,69 +247,30 @@ fn validate_fixed(w: &FixedOperands<'_>) -> Result<()> {
     validate_packed(&w.shared_down, HIDDEN, SHARED)
 }
 
-/// The same miss path for standalone and cached owners. The uploader seam
-/// lets host tests check query/validation/materialization without CUDA calls.
+/// Read, validate and upload ONE pair at bank construction. Both operands
+/// are validated before either upload. The uploader seam lets host tests
+/// check query/validation/materialization without CUDA calls.
 fn load_expert<P: ExpertProvider, W>(
     provider: &P,
     index: usize,
     mut upload: impl FnMut(&PackedOperation<'_>, usize, usize) -> Result<W>,
-    #[cfg(feature = "nemotron-timing")] mut timing: Option<&mut Timings>,
 ) -> Result<(W, W)> {
-    #[cfg(feature = "nemotron-timing")]
-    let mut lookup = host_timing::Lookup::start(timing.as_deref());
-    #[cfg(feature = "nemotron-timing")]
-    let detailed = timing.is_some();
-    let use_pair = |pair: ExpertPair<'_>| {
-        #[cfg(feature = "nemotron-timing")]
-        lookup.entered(timing.as_deref_mut());
-        #[cfg(feature = "nemotron-timing")]
-        let started = host_timing::clock(timing.as_deref());
-        let validation = (|| {
-            if pair.index != index {
-                return Err("MoE selected expert index mismatch".into());
-            }
-            validate_packed(&pair.up, INTERMEDIATE, LATENT)?;
-            validate_packed(&pair.down, LATENT, INTERMEDIATE)
-        })();
-        #[cfg(feature = "nemotron-timing")]
-        host_timing::record(timing.as_deref_mut(), Phase::Validate, started, 0, validation.is_ok());
-        validation?;
-        #[cfg(feature = "nemotron-timing")]
-        let started = host_timing::clock(timing.as_deref());
-        let up = upload(&pair.up, INTERMEDIATE, LATENT);
-        #[cfg(feature = "nemotron-timing")]
-        host_timing::record(
-            timing.as_deref_mut(), Phase::Upload, started,
-            pair.up.payload.len() - 4, up.is_ok(),
-        );
-        let up = up?;
-        #[cfg(feature = "nemotron-timing")]
-        let started = host_timing::clock(timing.as_deref());
-        let down = upload(&pair.down, LATENT, INTERMEDIATE);
-        #[cfg(feature = "nemotron-timing")]
-        host_timing::record(
-            timing.as_deref_mut(), Phase::Upload, started,
-            pair.down.payload.len() - 4, down.is_ok(),
-        );
-        Ok((up, down?))
-    };
-    #[cfg(feature = "nemotron-timing")]
-    let (result, detail) = if detailed {
-        let mut detail = LookupTimings::default();
-        let result = provider.with_expert_timed(index, use_pair, &mut detail);
-        (result, Some(detail))
-    } else {
-        (provider.with_expert(index, use_pair), None)
-    };
-    #[cfg(not(feature = "nemotron-timing"))]
-    let result = provider.with_expert(index, use_pair);
-    #[cfg(feature = "nemotron-timing")]
-    lookup.returned(timing.as_deref_mut());
-    #[cfg(feature = "nemotron-timing")]
-    if let (Some(timing), Some(detail)) = (timing, detail) {
-        timing.merge_lookup(detail);
-    }
-    result
+    provider.with_expert(index, |pair| {
+        if pair.index != index {
+            return Err("MoE selected expert index mismatch".into());
+        }
+        validate_packed(&pair.up, INTERMEDIATE, LATENT)?;
+        validate_packed(&pair.down, LATENT, INTERMEDIATE)?;
+        let up = upload(&pair.up, INTERMEDIATE, LATENT)?;
+        Ok((up, upload(&pair.down, LATENT, INTERMEDIATE)?))
+    })
+}
+/// Every expert in ascending ID order; the first failure stops the bank.
+fn load_bank<P: ExpertProvider, W>(
+    provider: &P,
+    mut upload: impl FnMut(&PackedOperation<'_>, usize, usize) -> Result<W>,
+) -> Result<Vec<(W, W)>> {
+    (0..EXPERTS).map(|index| load_expert(provider, index, &mut upload)).collect()
 }
 
 pub(super) fn working_bytes(t: usize) -> Result<usize> {
@@ -370,6 +318,59 @@ pub(super) fn working_bytes(t: usize) -> Result<usize> {
 fn fence(client: &ComputeClient<CudaRuntime>) -> Result<()> {
     cubecl::future::block_on(client.sync()).map_err(|e| format!("MoE CUDA completion: {e:?}"))
 }
+/// Free the host copies that this thread's uploads left queued, then fence.
+/// create_from_slice copies each plane to a host buffer, and the stream's drop
+/// queue keeps it until a flush. A flush frees only the batch of the PREVIOUS
+/// flush (after syncing that batch's fence) and queues the current one, so
+/// the second flush frees everything uploaded before the first. sync() never
+/// flushes, and a load launches no kernels, so without this every uploaded
+/// byte would stay in host memory until loading ends. The fence observes
+/// completion and any queued upload error.
+pub(super) fn release_uploads(
+    client: &ComputeClient<CudaRuntime>,
+) -> std::result::Result<(), cubecl::server::ServerError> {
+    client.flush()?;
+    client.flush()?;
+    cubecl::future::block_on(client.sync())
+}
+/// After a failed upload whose owners are already dropped: drain, free the
+/// host copies, and give back the device memory, so a refused load holds
+/// nothing. The first drain may only report the stream's queued error; the
+/// second then completes. The caller keeps its original error.
+pub(super) fn abandon_uploads(client: &ComputeClient<CudaRuntime>) {
+    if release_uploads(client).is_err() {
+        let _ = release_uploads(client);
+    }
+    client.memory_cleanup();
+    trim_host_heap();
+}
+/// Return freed host memory to the system. glibc keeps the freed ~1.4 MB
+/// upload copies in its heap for reuse; once loading ends nothing reuses them.
+pub(super) fn trim_host_heap() {
+    // SAFETY: malloc_trim only gives back memory the allocator holds free.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+/// Run `f` with this thread's stream allocating every buffer at its own size
+/// (CubeCL's persistent pool). The default pool packs buffers into pages sized
+/// from cuDeviceTotalMem/4: a 0.5-4 GB buffer takes an 8.16 GB page on GB10.
+/// Freed exact buffers are reused for the same size until memory_cleanup.
+/// Not reentrant: the inner scope would end the outer one.
+pub(super) fn exact<T>(client: &ComputeClient<CudaRuntime>, f: impl FnOnce() -> T) -> T {
+    struct Restore<'a>(&'a ComputeClient<CudaRuntime>);
+    impl Drop for Restore<'_> {
+        fn drop(&mut self) {
+            // SAFETY: the mode belongs to this thread's stream only.
+            unsafe { self.0.allocation_mode(cubecl::MemoryAllocationMode::Auto) }
+        }
+    }
+    // SAFETY: as above; Restore returns the stream to Auto, also on unwind.
+    unsafe { client.allocation_mode(cubecl::MemoryAllocationMode::Persistent) }
+    let _restore = Restore(client);
+    f()
+}
 fn finish<T>(result: Result<T>, completion: Result<()>) -> Result<T> {
     match (result, completion) {
         (Ok(value), Ok(())) => Ok(value),
@@ -378,34 +379,19 @@ fn finish<T>(result: Result<T>, completion: Result<()>) -> Result<T> {
     }
 }
 
-impl<P: ExpertProvider> Moe<P> {
-    pub fn upload(
+impl Moe {
+    /// Upload the fixed operands, then every expert pair from `provider` in
+    /// ascending ID order, and fence. Completion (or the first queued upload
+    /// error) is observed here, so the bank is resident before this returns.
+    /// The provider is not retained: no later call can read or upload experts.
+    pub fn upload<P: ExpertProvider>(
         device: CudaDevice,
         source: SourceBinding,
         fixed: FixedOperands<'_>,
-        provider: P,
+        provider: &P,
         limits: Limits,
-    ) -> Result<Self> {
-        Self::upload_with_expert_cache(device, source, fixed, provider, limits, 0)
-    }
-    /// Only the native frozen-snapshot assembly enables retention, after
-    /// admitting all layer quotas against the aggregate resident limit.
-    pub(super) fn upload_with_expert_cache(
-        device: CudaDevice,
-        source: SourceBinding,
-        fixed: FixedOperands<'_>,
-        provider: P,
-        limits: Limits,
-        cache_pairs: usize,
     ) -> Result<Self> {
         let admission = admission(limits)?;
-        let expert_operands = cache::Operands::new(cache_pairs)?;
-        let resident = expert_device_bytes()?.checked_mul(cache_pairs)
-            .and_then(|n| n.checked_add(admission.fixed_bytes))
-            .ok_or("MoE cached resident byte overflow")?;
-        if resident > limits.max_fixed_bytes {
-            return Err("MoE cached resident budget exceeded".into());
-        }
         if provider.source() != source {
             return Err("MoE provider/source binding mismatch".into());
         }
@@ -419,37 +405,39 @@ impl<P: ExpertProvider> Moe<P> {
             fixed.shared_up.operation,
             fixed.shared_down.operation,
         ];
-        let weights = Arc::new(Weights {
-            source,
-            fixed_operations,
-            router: client.create_from_slice(fixed.router_bf16),
-            bias: client.create_from_slice(f32::as_bytes(fixed.correction_bias)),
-            fc1: client.create_from_slice(fixed.fc1_bf16),
-            fc2: client.create_from_slice(fixed.fc2_bf16),
-            shared_up: PackedWeight::upload(&fixed.shared_up, SHARED, HIDDEN, &device)?,
-            shared_down: PackedWeight::upload(&fixed.shared_down, HIDDEN, SHARED, &device)?,
-            client,
-            device,
-        });
-        Ok(Self { weights, provider, limits, admission, poisoned: false, expert_operands })
+        let uploaded = (|| -> Result<Weights> {
+            let weights = Weights {
+                source,
+                fixed_operations,
+                router: client.create_from_slice(fixed.router_bf16),
+                bias: client.create_from_slice(f32::as_bytes(fixed.correction_bias)),
+                fc1: client.create_from_slice(fixed.fc1_bf16),
+                fc2: client.create_from_slice(fixed.fc2_bf16),
+                shared_up: PackedWeight::upload(&fixed.shared_up, SHARED, HIDDEN, &device)?,
+                shared_down: PackedWeight::upload(&fixed.shared_down, HIDDEN, SHARED, &device)?,
+                experts: load_bank(provider, |op, n, k| PackedWeight::upload(op, n, k, &device))?,
+                client: client.clone(),
+                device,
+            };
+            // Bounds the host copies to one layer's uploads, and surfaces any
+            // queued upload error before the owner escapes.
+            release_uploads(&client).map_err(|e| format!("MoE CUDA completion: {e:?}"))?;
+            Ok(weights)
+        })();
+        match uploaded {
+            Ok(weights) => Ok(Self { weights: Arc::new(weights), limits, admission, poisoned: false }),
+            // Every owner made above is already dropped.
+            Err(error) => {
+                abandon_uploads(&client);
+                Err(error)
+            }
+        }
     }
-    /// New private cache/recovery state over fixed operands. No expert pair is
-    /// inherited and no source payload is read or uploaded here.
-    pub(super) fn from_weights(
-        weights: Arc<Weights>, provider: P, limits: Limits, cache_pairs: usize,
-    ) -> Result<Self> {
+    /// New private recovery state over the SAME resident operands and bank.
+    /// No source payload is read or uploaded here.
+    pub(super) fn from_weights(weights: Arc<Weights>, limits: Limits) -> Result<Self> {
         let admission = admission(limits)?;
-        let expert_operands = cache::Operands::new(cache_pairs)?;
-        let resident = expert_device_bytes()?.checked_mul(cache_pairs)
-            .and_then(|n| n.checked_add(admission.fixed_bytes))
-            .ok_or("MoE cached resident byte overflow")?;
-        if resident > limits.max_fixed_bytes {
-            return Err("MoE cached resident budget exceeded".into());
-        }
-        if provider.source() != weights.source {
-            return Err("MoE provider/source binding mismatch".into());
-        }
-        Ok(Self { weights, provider, limits, admission, poisoned: false, expert_operands })
+        Ok(Self { weights, limits, admission, poisoned: false })
     }
     pub fn source(&self) -> SourceBinding {
         self.weights.source
@@ -463,20 +451,15 @@ impl<P: ExpertProvider> Moe<P> {
     pub fn is_poisoned(&self) -> bool {
         self.poisoned
     }
-    #[cfg(test)]
-    pub(super) fn diagnostic_expert_owners(&self) -> (u64, bool) {
-        self.expert_operands.diagnostic_owners()
-    }
     pub fn invalidate(&mut self) {
         self.poisoned = true;
     }
     /// Drain uncertain work and clear the recovery bit. There is no MoE token
-    /// history to clear; weights/provider are unchanged. The owning hybrid
+    /// history to clear; the resident weights are unchanged. The owning hybrid
     /// decides how to recover its separate attention/Mamba state.
     pub fn reset(&mut self) -> Result<()> {
         self.poisoned = true;
         fence(&self.weights.client)?;
-        self.expert_operands.complete(&Ok(()), false);
         self.poisoned = false;
         Ok(())
     }
@@ -496,9 +479,6 @@ impl<P: ExpertProvider> Moe<P> {
         self.check_input(x)
     }
     fn check_input(&self, x: &CudaTensor) -> Result<(usize, usize)> {
-        if self.provider.source() != self.weights.source {
-            return Err("MoE provider binding changed".into());
-        }
         let dims = x.meta.shape().as_slice();
         if dims.len() != 3
             || dims[0] != 1
@@ -613,7 +593,6 @@ impl<P: ExpertProvider> Moe<P> {
             0,
             completion.is_ok(),
         );
-        self.expert_operands.complete(&completion, false);
         let result = finish(result, completion);
         if result.is_ok() {
             self.poisoned = false;
@@ -643,25 +622,6 @@ impl<P: ExpertProvider> Moe<P> {
             // This immediate closure only collects Result returns for timing;
             // the existing per-expert and final fences remain on the same paths.
             let selected_result = (|| -> Result<()> {
-                if self.provider.source() != self.weights.source {
-                    return Err("MoE selected expert/source binding mismatch".into());
-                }
-                let mut hit = true;
-                let staged = self.expert_operands.stage(index, || {
-                    hit = false;
-                    load_expert(
-                        &self.provider,
-                        index,
-                        |op, n, k| PackedWeight::upload(op, n, k, &self.weights.device),
-                        #[cfg(feature = "nemotron-timing")]
-                        timing.as_deref_mut(),
-                    )
-                });
-                #[cfg(feature = "nemotron-timing")]
-                if (staged.is_ok() || !hit) && let Some(timing) = timing.as_deref_mut() {
-                    timing.cache_access(hit);
-                }
-                staged?;
                 #[cfg(feature = "nemotron-timing")]
                 let enqueue_started = host_timing::clock(timing.as_deref());
                 let result = (|| {
@@ -676,7 +636,7 @@ impl<P: ExpertProvider> Moe<P> {
                         LATENT,
                     );
                     let gathered = self.tensor(gathered, rows.len(), LATENT, DType::BF16);
-                    let (high, active, low) = self.project_pending(&gathered, None)?;
+                    let (high, active, low) = self.project_expert(index, &gathered, None)?;
                     observe(&format!("expert{index}_input"), &gathered)?;
                     observe(&format!("expert{index}_up"), &high)?;
                     observe(&format!("expert{index}_relu2"), &active)?;
@@ -703,8 +663,8 @@ impl<P: ExpertProvider> Moe<P> {
                     0,
                     result.is_ok(),
                 );
-                // Keep both weight owners alive until their queued work completes,
-                // including setup/observer failures after the first projection.
+                // Retire this expert's scratch, including after setup/observer
+                // failures following the first projection.
                 #[cfg(feature = "nemotron-timing")]
                 let fence_started = host_timing::clock(timing.as_deref());
                 let completion = fence(&self.weights.client);
@@ -716,13 +676,6 @@ impl<P: ExpertProvider> Moe<P> {
                     0,
                     completion.is_ok(),
                 );
-                let evicted = self.expert_operands.complete(&completion, result.is_ok());
-                #[cfg(feature = "nemotron-timing")]
-                if evicted && let Some(timing) = timing.as_deref_mut() {
-                    timing.cache_eviction();
-                }
-                #[cfg(not(feature = "nemotron-timing"))]
-                let _ = (hit, evicted);
                 finish(result, completion)
             })();
             #[cfg(feature = "nemotron-timing")]
@@ -806,9 +759,9 @@ impl<P: ExpertProvider> Moe<P> {
         observe("latent", &latent)?;
         Ok((routing, latent))
     }
-    fn project_pending(&self, gathered: &CudaTensor, mut held: Option<&mut Vec<CudaTensor>>)
-        -> Result<(CudaTensor, CudaTensor, CudaTensor)> {
-        let (up, down) = self.expert_operands.pending();
+    fn project_expert(&self, index: usize, gathered: &CudaTensor,
+        mut held: Option<&mut Vec<CudaTensor>>) -> Result<(CudaTensor, CudaTensor, CudaTensor)> {
+        let (up, down) = &self.weights.experts[index];
         let high = up.project(gathered)?;
         if let Some(held) = held.as_deref_mut() { held.push(high.clone()); }
         let active = self.relu2(&high);
@@ -873,8 +826,8 @@ impl<P: ExpertProvider> Moe<P> {
     // The ordinary Session owns whole-span availability. These internal tile
     // seams run only while that Session and this mixer are unavailable.
     pub(super) fn prefill_begin(&mut self) -> Result<()> {
-        if self.poisoned || self.provider.source() != self.weights.source {
-            return Err("MoE prefill unavailable/source changed".into());
+        if self.poisoned {
+            return Err("MoE prefill unavailable".into());
         }
         self.poisoned = true;
         Ok(())
@@ -885,21 +838,11 @@ impl<P: ExpertProvider> Moe<P> {
         let (t, _) = self.check_input(x)?;
         self.route_tile(x, t, &mut |_, _| Ok(()), Some(held))
     }
-    pub(super) fn prefill_stage(&mut self, index: usize) -> Result<()> {
-        if self.provider.source() != self.weights.source {
-            return Err("MoE selected expert/source binding mismatch".into());
-        }
-        self.expert_operands.stage(index, || load_expert(
-            &self.provider, index,
-            |op, n, k| PackedWeight::upload(op, n, k, &self.weights.device),
-            #[cfg(feature = "nemotron-timing")] None,
-        ))
-    }
-    pub(super) fn prefill_expert_tile(&self, latent: &CudaTensor, accumulator: &CudaTensor,
-        rows: &[(i32, f32)], held: &mut Vec<CudaTensor>) -> Result<()>
+    pub(super) fn prefill_expert_tile(&self, expert: usize, latent: &CudaTensor,
+        accumulator: &CudaTensor, rows: &[(i32, f32)], held: &mut Vec<CudaTensor>) -> Result<()>
     {
         let shape = latent.meta.shape().as_slice();
-        if shape.len() != 3 || shape[0] != 1 || shape[2] != LATENT
+        if expert >= EXPERTS || shape.len() != 3 || shape[0] != 1 || shape[2] != LATENT
             || accumulator.meta.shape().as_slice() != shape || latent.dtype != DType::BF16
             || accumulator.dtype != DType::F32 || rows.is_empty() || rows.len() > MAX_CHUNK
             || latent.device != self.weights.device || accumulator.device != self.weights.device
@@ -921,7 +864,7 @@ impl<P: ExpertProvider> Moe<P> {
             &latent.handle, &idx.handle, shape[1], rows.len(), LATENT);
         let gathered = self.tensor(gathered, rows.len(), LATENT, DType::BF16);
         held.push(gathered.clone());
-        let (_high, _active, low) = self.project_pending(&gathered, Some(held))?;
+        let (_high, _active, low) = self.project_expert(expert, &gathered, Some(held))?;
         let len = rows.len() * LATENT;
         unsafe {
             ordered_update::launch_unchecked::<CudaRuntime>(&self.weights.client,
@@ -933,9 +876,6 @@ impl<P: ExpertProvider> Moe<P> {
             );
         }
         Ok(())
-    }
-    pub(super) fn prefill_complete_expert(&mut self, completion: &Result<()>, executed: bool) {
-        self.expert_operands.complete(completion, executed);
     }
     pub(super) fn prefill_finish(&self, x: &CudaTensor, accumulator: &CudaTensor,
         held: &mut Vec<CudaTensor>) -> Result<CudaTensor>
