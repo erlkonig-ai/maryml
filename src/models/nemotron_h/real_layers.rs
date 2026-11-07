@@ -347,10 +347,22 @@ fn actual_components_gpu() -> AnyResult<()> {
             }
             e.compare(&format!("{prefix}/residual"),&residual(&x,&got.values),&format!("{prefix}/residual"));start+=count;
         }
-        let [keys,values]=attn.diagnostic_kv().map_err(anyhow::Error::msg)?;
-        for (name,bytes) in [("keys",keys),("values",values)] {
-            let prefix=format!("attention/{arm}/{name}");let expected=e.expected(&prefix,&[1,start,256],"bf16");
-            e.save(&prefix,&[1,start,256],"bf16",&bytes);e.metric(&prefix,&bytes,&expected,"bf16");
+        let [key_codes,key_scales,value_codes,value_scales]=attn.diagnostic_kv().map_err(anyhow::Error::msg)?;
+        // Retain the actual cache representation, not packed bytes mislabeled
+        // as the retired BF16 reference. Forward-stage metrics above remain
+        // unchanged; these four planes are byte diagnostics, not a new oracle.
+        for (name,bytes,row_bytes,dtype) in [
+            ("key_codes",key_codes,attention::CODE_ROW_BYTES,"e2m1x2"),
+            ("key_scales",key_scales,attention::SCALE_ROW_BYTES,"e4m3fn"),
+            ("value_codes",value_codes,attention::CODE_ROW_BYTES,"e2m1x2"),
+            ("value_scales",value_scales,attention::SCALE_ROW_BYTES,"e4m3fn"),
+        ] {
+            assert_eq!(bytes.len(),start*row_bytes);
+            let prefix=format!("attention/{arm}/{name}");
+            e.save(&prefix,&[1,start,row_bytes],dtype,&bytes);
+            // Every E2M1 code is finite; E4M3 scale NaNs are the only
+            // nonfinite representation. Keep failure after evidence retention.
+            if dtype=="e4m3fn" {assert!(bytes.iter().all(|b|!matches!(*b,0x7f|0xff)),"nonfinite retained; no retry");}
         }
     }
     e.flush(); Ok(())
