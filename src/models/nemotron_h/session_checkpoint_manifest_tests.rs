@@ -49,15 +49,8 @@ fn encode_fixture(checkpoint: &PrefixCheckpoint, store: &mut MemoryBlobStore,
 fn decode(reader: &MemoryBlobStoreSnapshot, facts: &TribleSet, root: Id,
     image: Inline<Handle<SimpleArchive>>) -> Vec<Result<PrefixCheckpoint>>
 {
-    decode_with_execution(reader, facts, root, image,
-        PrefixExecution::NativeB1Bf16KvF32Mamba { attention: attention::Profile::default() })
-}
-
-fn decode_with_execution(reader: &MemoryBlobStoreSnapshot, facts: &TribleSet, root: Id,
-    image: Inline<Handle<SimpleArchive>>, execution: PrefixExecution) -> Vec<Result<PrefixCheckpoint>>
-{
     let mut results = Vec::new();
-    let flow = visit_selected(reader, facts, root, limits(), execution, |actual_image, result| {
+    let flow = visit_selected(reader, facts, root, limits(), |actual_image, result| {
         assert_eq!(actual_image, image);
         results.push(result);
         ControlFlow::Continue(())
@@ -120,42 +113,32 @@ fn manifest_host_le_tokens_are_exact_ordered_bounded_and_framed() {
 }
 
 #[test]
-fn manifest_host_roundtrip_profiles_tokens_ranges_and_typed_handles() {
-    for attention in [attention::Profile::ScalarF32V1, attention::Profile::MmaBf16PV1,
-        attention::Profile::MmaHiLoPV1] {
-        let (mut checkpoint, mut store, image) = fixture();
-        checkpoint.provenance.execution = PrefixExecution::NativeB1Bf16KvF32Mamba { attention };
-        let fragment = encode_fixture(&checkpoint, &mut store, image);
-        let root = fragment.root().unwrap();
-        let archive = store.put::<SimpleArchive, _>(fragment.facts()).unwrap();
-        let reader = store.snapshot().unwrap();
-        let facts: TribleSet = reader.get(archive).unwrap();
-        let results = decode_with_execution(&reader, &facts, root, image, checkpoint.provenance.execution);
-        assert_eq!(results.len(), 1);
-        assert_checkpoint(results[0].as_ref().unwrap(), &checkpoint);
-        let PrefixLayer::Mamba { recurrent, .. } = &checkpoint.layers[0] else { panic!() };
-        let blob: Blob<Tensor<F32, 4>> = reader.get(*recurrent).unwrap();
-        let view = leaf::read_leaf(blob).unwrap();
-        assert!(view.payload().chunks_exact(4).all(|b| b == 0x3f80_0001u32.to_le_bytes()));
-        let PrefixLayer::Attention(chunks) = &checkpoint.layers[1] else { panic!() };
-        let blob: Blob<Tensor<BF16, 3>> = reader.get(chunks[0].keys).unwrap();
-        let view = leaf::read_leaf(blob).unwrap();
-        assert_eq!(&view.payload()[..4], &[0, 128, 1, 128]);
-        let blob: Blob<Tensor<BF16, 3>> = reader.get(chunks[0].values).unwrap();
-        let view = leaf::read_leaf(blob).unwrap();
-        assert_eq!(&view.payload()[..4], &[0, 64, 1, 64]);
-        let empty = MemoryBlobStore::new().snapshot().unwrap();
-        for target in [attention::Profile::ScalarF32V1, attention::Profile::MmaBf16PV1,
-            attention::Profile::MmaHiLoPV1] {
-            if target != attention {
-                let actual = results[0].as_ref().unwrap();
-                assert_eq!(actual.validate(&empty, &actual.provenance.config,
-                    &actual.provenance.layers, limits(), &actual.tokens,
-                    PrefixExecution::NativeB1Bf16KvF32Mamba { attention: target }).unwrap_err(),
-                    "checkpoint execution profile differs");
-            }
-        }
-    }
+fn manifest_host_roundtrip_execution_tokens_ranges_and_typed_handles() {
+    let (checkpoint, mut store, image) = fixture();
+    let fragment = encode_fixture(&checkpoint, &mut store, image);
+    let root = fragment.root().unwrap();
+    let archive = store.put::<SimpleArchive, _>(fragment.facts()).unwrap();
+    let reader = store.snapshot().unwrap();
+    let facts: TribleSet = reader.get(archive).unwrap();
+    let profiles: Vec<_> = find!(profile: Inline<Handle<UTF8String>>,
+        pattern!(&facts, [{ root @ schema::execution_profile: ?profile }])).collect();
+    assert_eq!(profiles.len(), 1);
+    let text: anybytes::View<str> = reader.get(profiles[0]).unwrap();
+    assert_eq!(&*text, "native-b1-bf16-kv-f32-mamba/mma-hilo-p-t1-v1");
+    let results = decode(&reader, &facts, root, image);
+    assert_eq!(results.len(), 1);
+    assert_checkpoint(results[0].as_ref().unwrap(), &checkpoint);
+    let PrefixLayer::Mamba { recurrent, .. } = &checkpoint.layers[0] else { panic!() };
+    let blob: Blob<Tensor<F32, 4>> = reader.get(*recurrent).unwrap();
+    let view = leaf::read_leaf(blob).unwrap();
+    assert!(view.payload().chunks_exact(4).all(|b| b == 0x3f80_0001u32.to_le_bytes()));
+    let PrefixLayer::Attention(chunks) = &checkpoint.layers[1] else { panic!() };
+    let blob: Blob<Tensor<BF16, 3>> = reader.get(chunks[0].keys).unwrap();
+    let view = leaf::read_leaf(blob).unwrap();
+    assert_eq!(&view.payload()[..4], &[0, 128, 1, 128]);
+    let blob: Blob<Tensor<BF16, 3>> = reader.get(chunks[0].values).unwrap();
+    let view = leaf::read_leaf(blob).unwrap();
+    assert_eq!(&view.payload()[..4], &[0, 64, 1, 64]);
 }
 
 #[test]
@@ -277,7 +260,7 @@ fn manifest_host_profile_alternatives_are_visited_and_can_stop() {
     assert_eq!(results.iter().filter(|r| r.as_ref().err().is_some_and(|e|
         e == "checkpoint execution profile differs")).count(), 1);
     let mut calls = 0;
-    let flow = visit_selected(&reader, &facts, root, limits(), checkpoint.provenance.execution, |_, _| {
+    let flow = visit_selected(&reader, &facts, root, limits(), |_, _| {
         calls += 1;
         ControlFlow::Break(())
     });
@@ -286,16 +269,22 @@ fn manifest_host_profile_alternatives_are_visited_and_can_stop() {
 }
 
 #[test]
-fn manifest_host_profile_mismatch_precedes_other_payload_reads() {
+fn manifest_host_retired_profiles_are_refused_before_other_payload_reads() {
     let (checkpoint, mut store, image) = fixture();
     let fragment = encode_fixture(&checkpoint, &mut store, image);
-    let mut profile_only = MemoryBlobStore::new();
-    profile_only.put::<UTF8String, _>("native-b1-bf16-kv-f32-mamba/scalar-f32-v1").unwrap();
-    let reader = profile_only.snapshot().unwrap();
-    let results = decode_with_execution(&reader, fragment.facts(), fragment.root().unwrap(), image,
-        PrefixExecution::NativeB1Bf16KvF32Mamba { attention: attention::Profile::MmaHiLoPV1 });
-    assert_eq!(results.len(), 1);
-    assert_eq!(results[0].as_ref().err().unwrap(), "checkpoint execution profile differs");
+    let root = fragment.root().unwrap();
+    // Every profile this execution replaced, scalar T1 decode included. The
+    // store holds ONLY the profile text: any further read would fail first.
+    for retired in ["scalar-f32-v1", "mma-bf16-p-v1", "mma-hilo-p-v1"] {
+        let mut profile_only = MemoryBlobStore::new();
+        let text = profile_only.put::<UTF8String, _>(
+            format!("native-b1-bf16-kv-f32-mamba/{retired}")).unwrap();
+        let facts = replace(fragment.facts(), root, &schema::execution_profile, text);
+        let reader = profile_only.snapshot().unwrap();
+        let results = decode(&reader, &facts, root, image);
+        assert_eq!(results.len(), 1, "{retired}");
+        assert_eq!(results[0].as_ref().err().unwrap(), "checkpoint execution profile differs");
+    }
 }
 
 #[test]
@@ -398,8 +387,7 @@ fn manifest_host_branching_kv_paths_are_complete_and_stoppable() {
     paths.sort(); // operation-local test comparison, not a reader selection policy
     assert_eq!(paths, vec![vec![(0, 1), (1, 3)], vec![(0, 2), (2, 3)]]);
     let mut calls = 0;
-    let flow = visit_selected(&reader, &changed, fragment.root().unwrap(), limits(),
-        checkpoint.provenance.execution, |_, result| {
+    let flow = visit_selected(&reader, &changed, fragment.root().unwrap(), limits(), |_, result| {
             assert!(result.is_ok());
             calls += 1;
             ControlFlow::Break(())
@@ -414,8 +402,8 @@ fn manifest_host_old_snapshot_survives_new_manifest() {
     let first = encode_fixture(&checkpoint, &mut store, image);
     let first_handle = store.put::<SimpleArchive, _>(first.facts()).unwrap();
     let old = store.snapshot().unwrap();
-    checkpoint.provenance.execution = PrefixExecution::NativeB1Bf16KvF32Mamba {
-        attention: attention::Profile::MmaBf16PV1 };
+    let first_base = checkpoint.provenance.source.tokenizer_base;
+    checkpoint.provenance.source.tokenizer_base = *genid();
     let second = encode_fixture(&checkpoint, &mut store, image);
     let second_handle = store.put::<SimpleArchive, _>(second.facts()).unwrap();
     assert_ne!(first_handle, second_handle);
@@ -424,90 +412,81 @@ fn manifest_host_old_snapshot_survives_new_manifest() {
     let facts: TribleSet = old.get(first_handle).unwrap();
     let results = decode(&old, &facts, first.root().unwrap(), image);
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0].as_ref().unwrap().provenance.execution,
-        PrefixExecution::NativeB1Bf16KvF32Mamba { attention: attention::Profile::ScalarF32V1 });
+    assert_eq!(results[0].as_ref().unwrap().provenance.source.tokenizer_base, first_base);
 }
 
 #[test]
-fn manifest_host_pile_reopen_preserves_profiles_payloads_and_opaque_alternatives() {
-    for attention in [attention::Profile::ScalarF32V1, attention::Profile::MmaBf16PV1,
-        attention::Profile::MmaHiLoPV1] {
-        let path = ManifestTestPile::new();
-        let mut pile = Pile::open(&path.0).unwrap();
-        let signer = ed25519_dalek::SigningKey::from_bytes(&[0x51; 32]);
-        let policy = CollectionPolicy::new(AdmissionPolicy::direct(signer.verifying_key()),
-            AdmissionPolicy::direct(signer.verifying_key()));
-        let collection = pile.collection("manifest CPU reopen fixture", policy).unwrap();
-        let (mut checkpoint, mut memory, image) = fixture();
-        checkpoint.provenance.execution = PrefixExecution::NativeB1Bf16KvF32Mamba { attention };
-        // Synthetic host fixture only: append dependencies individually, as
-        // export does. Do not stage the tensor payloads in a publication Fragment.
-        for (handle, blob) in memory.snapshot().unwrap().iter() {
-            assert_eq!(pile.put(blob).unwrap(), handle);
-        }
-        let reader = pile.snapshot().unwrap();
-        let fragment = encode(&reader, &mut pile, &checkpoint, image, limits()).unwrap();
-        let derived_root = fragment.root().unwrap();
-        let opaque_root = *genid();
-        let (_, original, metafacts, blobs) = fragment.into_parts();
-        let mut changed = TribleSet::new();
-        for row in original.iter() {
-            let subject = if row.e() == &derived_root { opaque_root } else { *row.e() };
-            changed.insert(&Trible::force(&subject, row.a(),
-                row.v::<triblespace::core::inline::encodings::UnknownInline>()));
-        }
-        let other = if attention == attention::Profile::ScalarF32V1 {
-            attention::Profile::MmaHiLoPV1
-        } else { attention::Profile::ScalarF32V1 };
-        let other_profile = pile.put::<UTF8String, _>(
-            format!("native-b1-bf16-kv-f32-mamba/{}", other.as_str())).unwrap();
-        let future_profile = pile.put::<UTF8String, _>("unknown-future-profile").unwrap();
-        let extra = entity! { ExclusiveId::force_ref(&opaque_root) @
-            metadata::tag: *genid(),
-            schema::execution_profile*: [other_profile, future_profile]
-        };
-        changed.union(extra.facts().clone());
-        changed.union(changed.clone());
-        let expected_facts = changed.clone();
-        pile.commit(collection, &signer, Fragment::from_parts(changed, metafacts, blobs)).unwrap();
-        pile.flush().unwrap();
-        drop(reader);
-        drop(memory);
-        pile.close().unwrap();
-
-        let mut reopened = Pile::open(&path.0).unwrap();
-        let reader = reopened.snapshot().unwrap();
-        let observed = reader.collection(collection).unwrap();
-        let facts = observed.view::<TribleSet>().unwrap();
-        assert_eq!(facts, expected_facts);
-        let mut success = 0;
-        let mut refused = 0;
-        let flow = visit_selected(&reader, &facts, opaque_root, limits(),
-            checkpoint.provenance.execution, |actual_image, result| {
-                assert_eq!(actual_image, image);
-                match result {
-                    Ok(actual) => { assert_checkpoint(&actual, &checkpoint); success += 1; }
-                    Err(error) => {
-                        assert_eq!(error, "checkpoint execution profile differs");
-                        refused += 1;
-                    }
-                }
-                ControlFlow::Continue(())
-            });
-        assert!(flow.is_continue());
-        assert_eq!((success, refused), (1, 1)); // unsupported profile is skipped
-        let PrefixLayer::Attention(chunks) = &checkpoint.layers[1] else { panic!() };
-        for chunk in chunks {
-            let keys: Blob<Tensor<BF16, 3>> = reader.get(chunk.keys).unwrap();
-            let values: Blob<Tensor<BF16, 3>> = reader.get(chunk.values).unwrap();
-            assert_ne!(keys.bytes, values.bytes);
-            assert_eq!(&leaf::read_leaf(keys).unwrap().payload()[..4], &[0, 128, 1, 128]);
-            assert_eq!(&leaf::read_leaf(values).unwrap().payload()[..4], &[0, 64, 1, 64]);
-        }
-        drop(observed);
-        drop(reader);
-        reopened.close().unwrap();
+fn manifest_host_pile_reopen_preserves_execution_payloads_and_opaque_alternatives() {
+    let path = ManifestTestPile::new();
+    let mut pile = Pile::open(&path.0).unwrap();
+    let signer = ed25519_dalek::SigningKey::from_bytes(&[0x51; 32]);
+    let policy = CollectionPolicy::new(AdmissionPolicy::direct(signer.verifying_key()),
+        AdmissionPolicy::direct(signer.verifying_key()));
+    let collection = pile.collection("manifest CPU reopen fixture", policy).unwrap();
+    let (checkpoint, mut memory, image) = fixture();
+    // Synthetic host fixture only: append dependencies individually, as
+    // export does. Do not stage the tensor payloads in a publication Fragment.
+    for (handle, blob) in memory.snapshot().unwrap().iter() {
+        assert_eq!(pile.put(blob).unwrap(), handle);
     }
+    let reader = pile.snapshot().unwrap();
+    let fragment = encode(&reader, &mut pile, &checkpoint, image, limits()).unwrap();
+    let derived_root = fragment.root().unwrap();
+    let opaque_root = *genid();
+    let (_, original, metafacts, blobs) = fragment.into_parts();
+    let mut changed = TribleSet::new();
+    for row in original.iter() {
+        let subject = if row.e() == &derived_root { opaque_root } else { *row.e() };
+        changed.insert(&Trible::force(&subject, row.a(),
+            row.v::<triblespace::core::inline::encodings::UnknownInline>()));
+    }
+    let other_profile = pile.put::<UTF8String, _>(
+        "native-b1-bf16-kv-f32-mamba/scalar-f32-v1").unwrap();
+    let future_profile = pile.put::<UTF8String, _>("unknown-future-profile").unwrap();
+    let extra = entity! { ExclusiveId::force_ref(&opaque_root) @
+        metadata::tag: *genid(),
+        schema::execution_profile*: [other_profile, future_profile]
+    };
+    changed.union(extra.facts().clone());
+    changed.union(changed.clone());
+    let expected_facts = changed.clone();
+    pile.commit(collection, &signer, Fragment::from_parts(changed, metafacts, blobs)).unwrap();
+    pile.flush().unwrap();
+    drop(reader);
+    drop(memory);
+    pile.close().unwrap();
+
+    let mut reopened = Pile::open(&path.0).unwrap();
+    let reader = reopened.snapshot().unwrap();
+    let observed = reader.collection(collection).unwrap();
+    let facts = observed.view::<TribleSet>().unwrap();
+    assert_eq!(facts, expected_facts);
+    let mut success = 0;
+    let mut refused = 0;
+    let flow = visit_selected(&reader, &facts, opaque_root, limits(), |actual_image, result| {
+            assert_eq!(actual_image, image);
+            match result {
+                Ok(actual) => { assert_checkpoint(&actual, &checkpoint); success += 1; }
+                Err(error) => {
+                    assert_eq!(error, "checkpoint execution profile differs");
+                    refused += 1;
+                }
+            }
+            ControlFlow::Continue(())
+        });
+    assert!(flow.is_continue());
+    assert_eq!((success, refused), (1, 1)); // unsupported profile is skipped
+    let PrefixLayer::Attention(chunks) = &checkpoint.layers[1] else { panic!() };
+    for chunk in chunks {
+        let keys: Blob<Tensor<BF16, 3>> = reader.get(chunk.keys).unwrap();
+        let values: Blob<Tensor<BF16, 3>> = reader.get(chunk.values).unwrap();
+        assert_ne!(keys.bytes, values.bytes);
+        assert_eq!(&leaf::read_leaf(keys).unwrap().payload()[..4], &[0, 128, 1, 128]);
+        assert_eq!(&leaf::read_leaf(values).unwrap().payload()[..4], &[0, 64, 1, 64]);
+    }
+    drop(observed);
+    drop(reader);
+    reopened.close().unwrap();
 }
 
 #[test]
@@ -560,7 +539,7 @@ fn manifest_host_pile_precommit_failure_preserves_completed_manifest() {
     assert_eq!(facts, expected_facts);
     let _: Blob<Tensor<F32, 1>> = reader.get(newer.last_logits).unwrap();
     let mut successes = 0;
-    let flow = visit_selected(&reader, &facts, root, limits(), checkpoint.provenance.execution,
+    let flow = visit_selected(&reader, &facts, root, limits(),
         |actual_image, result| {
             assert_eq!(actual_image, image);
             assert_checkpoint(&result.unwrap(), &checkpoint);
@@ -569,8 +548,7 @@ fn manifest_host_pile_precommit_failure_preserves_completed_manifest() {
         });
     assert!(flow.is_continue());
     assert_eq!(successes, 1);
-    let flow = visit_selected(&reader, &facts, abandoned_root.unwrap(), limits(),
-        checkpoint.provenance.execution, |_, _| panic!("uncommitted manifest was exposed"));
+    let flow = visit_selected(&reader, &facts, abandoned_root.unwrap(), limits(), |_, _| panic!("uncommitted manifest was exposed"));
     assert!(flow.is_continue());
     drop(observed);
     drop(reader);

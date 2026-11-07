@@ -275,7 +275,6 @@ pub(super) fn load<S: BlobStoreGet>(
     device: CudaDevice,
     limits: Limits,
     seed: Option<Arc<[u32]>>,
-    profile: attention::Profile,
     #[cfg(test)] before_upload_completion: impl FnOnce(
         &ComputeClient<CudaRuntime>, &CudaDevice, &CudaTensor,
     ),
@@ -392,7 +391,7 @@ pub(super) fn load<S: BlobStoreGet>(
                 let k = fp8(&snapshot, id, "attention.k_proj", [256, H])?;
                 let v = fp8(&snapshot, id, "attention.v_proj", [256, H])?;
                 let o = fp8(&snapshot, id, "attention.o_proj", [H, H])?;
-                Mixer::Attention(attention::Attention::upload_with_profile(
+                Mixer::Attention(attention::Attention::upload(
                     device.clone(),
                     attention::SourceBinding {
                         model_root: source.root,
@@ -408,7 +407,6 @@ pub(super) fn load<S: BlobStoreGet>(
                     attention_limits(&config, Limits {
                         capacity: seed.as_ref().map_or(limits.capacity, |ids| ids.len()), ..limits
                     }),
-                    profile,
                 )?)
             }
             LayerKind::Moe => {
@@ -463,7 +461,6 @@ pub(super) fn load<S: BlobStoreGet>(
         },
     }).collect();
     let model = Arc::new(DeviceModel {
-        attention_profile: profile,
         snapshot, source, client, device, config, embedding, final_norm, head,
         layers: fixed_layers,
     });

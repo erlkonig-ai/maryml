@@ -1,7 +1,8 @@
 //! Bounded native Nemotron attention mixer, not an assembled hybrid session.
 //!
 //! Normalized BF16 [1,T,4096] -> four separately scaled static FP8 projections
-//! -> existing F32 online attention over plain BF16 KV -> BF16 mixer output.
+//! -> tensor-core online attention (BF16 Q/K/V, F32 accumulation) over plain
+//! BF16 KV -> BF16 mixer output.
 //! No RoPE, Q/K norm, gate, sink, outer norm or residual. F32 online reduction
 //! is a declared native choice, not bitwise eager-BF16 attention parity.
 //!
@@ -13,8 +14,8 @@
 //! count must be reset together; this component cannot enforce that externally.
 
 use super::fp8::{CudaTensor, Projection};
-use super::attention_mma::{self, PMode};
-use crate::models::inkling::flash::{self, KeyRun, KvElem};
+use super::attention_mma;
+use crate::models::inkling::flash::KeyRun;
 use burn::tensor::DType;
 use cubecl::{
     cuda::{CudaDevice, CudaRuntime},
@@ -39,46 +40,19 @@ const SHAPES: [[usize; 2]; 4] = [
     [HIDDEN, HIDDEN],
 ];
 
-/// Immutable execution choice, NOT a capability or cross-build parity claim.
-/// V1 MMA uses NK64, scalar T1 decode, B4 below live end 65536 and B8 above.
-/// The threshold is a measured-context heuristic, not a proven crossover.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Profile {
-    #[default]
-    ScalarF32V1,
-    MmaBf16PV1,
-    MmaHiLoPV1,
-}
-impl Profile {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::ScalarF32V1 => "scalar-f32-v1",
-            Self::MmaBf16PV1 => "mma-bf16-p-v1",
-            Self::MmaHiLoPV1 => "mma-hilo-p-v1",
-        }
-    }
-    fn mma_choice(self, tokens: usize, end: usize) -> Option<(usize, PMode)> {
-        let mode = match self {
-            Self::ScalarF32V1 => return None,
-            Self::MmaBf16PV1 => PMode::Bf16,
-            Self::MmaHiLoPV1 => PMode::HiLo,
-        };
-        (tokens > 1).then_some((if end < 65536 { 4 } else { 8 }, mode))
-    }
-}
-impl std::fmt::Display for Profile {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(self.as_str()) }
-}
-impl std::str::FromStr for Profile {
-    type Err = String;
-    fn from_str(value: &str) -> Result<Self> {
-        match value {
-            "scalar-f32-v1" => Ok(Self::ScalarF32V1),
-            "mma-bf16-p-v1" => Ok(Self::MmaBf16PV1),
-            "mma-hilo-p-v1" => Ok(Self::MmaHiLoPV1),
-            _ => Err("unknown attention profile".into()),
-        }
-    }
+/// The one attention algorithm this owner runs, as checkpoint provenance
+/// records it: tensor-core MMA at NK64 with P split into BF16 hi + lo, at
+/// every T including T1 decode. A fixed identity, not a choice. It differs
+/// from every retired profile (`scalar-f32-v1`, `mma-bf16-p-v1`, and
+/// `mma-hilo-p-v1`, whose T1 decode was scalar), so state recorded under any
+/// of them is refused.
+pub const EXECUTION: &str = "mma-hilo-p-t1-v1";
+
+/// Query planes per cube: B4 for T1 (one live plane) and below live end
+/// 65536, B8 above. The threshold is a measured-context heuristic, not a
+/// proven crossover.
+fn warps(tokens: usize, end: usize) -> usize {
+    if tokens == 1 || end < 65536 { 4 } else { 8 }
 }
 
 /// Caller-selected provenance, not an assertion about an upstream checkpoint.
@@ -165,7 +139,6 @@ impl Sequence {
 }
 
 pub(super) struct Weights {
-    profile: Profile,
     source: SourceBinding,
     client: ComputeClient<CudaRuntime>,
     device: CudaDevice,
@@ -268,19 +241,14 @@ pub(super) fn admission(limits: Limits) -> Result<Admission> {
 struct Plan {
     end: usize,
     tokens: usize,
-    rows: usize,
-    mma: Option<attention_mma::Plan>,
+    mma: attention_mma::Plan,
     working_bytes: usize,
 }
 #[cfg(test)]
 fn plan(start: usize, tokens: usize, limits: Limits) -> Result<Plan> {
     plan_with_prefix(start, tokens, limits, 0)
 }
-#[cfg(test)]
 fn plan_with_prefix(start: usize, tokens: usize, limits: Limits, prefix: usize) -> Result<Plan> {
-    plan_with_profile(start, tokens, limits, prefix, Profile::default())
-}
-fn plan_with_profile(start: usize, tokens: usize, limits: Limits, prefix: usize, profile: Profile) -> Result<Plan> {
     if !(1..=MAX_CHUNK).contains(&tokens) {
         return Err("attention requires B1 and T in 1..=256".into());
     }
@@ -291,34 +259,11 @@ fn plan_with_profile(start: usize, tokens: usize, limits: Limits, prefix: usize,
         return Err("attention append exceeds reserved capacity/position range".into());
     }
     if prefix > start { return Err("attention prefix exceeds committed position".into()); }
-    let rows = if tokens == 1 {
-        flash::decode_rows(16)
-    } else if tokens == MAX_CHUNK {
-        // Native full query blocks only. Short tails keep the shared policy;
-        // split geometry, admission and enqueue all consume this same choice.
-        48
-    } else {
-        flash::prefill_rows(16)
-    };
-    if !flash::applies(HEADS, KV_HEADS, HEAD_DIM, rows) {
-        return Err("unsupported online attention tile".into());
-    }
-    // Use the launcher's actual per-run split rounding, including the extra
+    // The launcher's actual per-run split rounding, including the extra
     // partial slot a second run can require. No full-capacity tail is counted.
-    let q_tiles = tokens.div_ceil(rows / 16);
     let spans = if prefix == 0 { vec![end] } else { vec![prefix, end - prefix] };
-    let mma = profile.mma_choice(tokens, end).map(|(warps, mode)|
-        attention_mma::Plan::new(&spans, tokens, start, warps, mode)).transpose()?;
-    let mut working = if let Some(plan) = &mma {
-        plan.working_bytes
-    } else {
-        let slots: usize = flash::key_run_splits(&spans, q_tiles, KV_HEADS).iter().sum();
-        let partial = checked_elements(&[slots, tokens, HEADS, HEAD_DIM], 4)? * 4;
-        let stats = checked_elements(&[slots, tokens, HEADS, 2], 4)? * 4;
-        let q = checked_elements(&[tokens, HIDDEN], 4)?;
-        partial.checked_add(stats).and_then(|n| n.checked_add(q * 10))
-            .ok_or("attention scratch sum overflow")?
-    };
+    let mma = attention_mma::Plan::new(&spans, tokens, start, warps(tokens, end))?;
+    let mut working = mma.working_bytes;
     for [n, k] in SHAPES {
         // Peer Projection::working_bytes = FP8 input + F32 accumulator + BF16 output.
         let bytes = checked_elements(&[tokens, k], 2)?
@@ -334,7 +279,6 @@ fn plan_with_profile(start: usize, tokens: usize, limits: Limits, prefix: usize,
     Ok(Plan {
         end,
         tokens,
-        rows,
         mma,
         working_bytes: working,
     })
@@ -358,8 +302,8 @@ fn validate_operations(operations: &[Operation<'_>; 4]) -> Result<()> {
 }
 
 impl Attention {
-    pub(super) fn planned_prefix_working_bytes(start: usize, tokens: usize, limits: Limits, prefix: usize, profile: Profile) -> Result<usize> {
-        Ok(plan_with_profile(start, tokens, limits, prefix, profile)?.working_bytes)
+    pub(super) fn planned_prefix_working_bytes(start: usize, tokens: usize, limits: Limits, prefix: usize) -> Result<usize> {
+        Ok(plan_with_prefix(start, tokens, limits, prefix)?.working_bytes)
     }
     /// Upload each operation once onto ONE client/device and reserve KV once.
     /// All host geometry, scale and aggregate resident checks precede device
@@ -371,11 +315,6 @@ impl Attention {
         operations: [Operation<'_>; 4],
         limits: Limits,
     ) -> Result<Self> {
-        Self::upload_with_profile(device, source, operations, limits, Profile::default())
-    }
-    pub fn upload_with_profile(device: CudaDevice, source: SourceBinding,
-        operations: [Operation<'_>; 4], limits: Limits, profile: Profile) -> Result<Self>
-    {
         let admission = admission(limits)?;
         validate_operations(&operations)?;
         let [q, k, v, o] = operations;
@@ -399,7 +338,7 @@ impl Attention {
         let keys = client.empty(admission.kv_bytes / 2);
         let values = client.empty(admission.kv_bytes / 2);
         Ok(Self {
-            weights: Arc::new(Weights { profile, source, client, device, projections }),
+            weights: Arc::new(Weights { source, client, device, projections }),
             keys,
             values,
             private_rows: limits.capacity,
@@ -472,7 +411,6 @@ impl Attention {
     pub fn source(&self) -> SourceBinding {
         self.weights.source
     }
-    pub fn profile(&self) -> Profile { self.weights.profile }
     pub fn admission(&self) -> Admission {
         self.admission
     }
@@ -504,7 +442,7 @@ impl Attention {
                 "attention needs contiguous BF16 [1,T,4096] on its owning client/device".into(),
             );
         }
-        let p = plan_with_profile(expected_start, dims[1], self.limits, self.prefix_len(), self.profile())?;
+        let p = plan_with_prefix(expected_start, dims[1], self.limits, self.prefix_len())?;
         let elements = checked_elements(dims, 2)?;
         let mut stride = 1usize;
         if input.meta.strides().len() != 3 {
@@ -557,7 +495,6 @@ impl Attention {
                 (expected_start - self.prefix_len()) * KV_WIDTH,
             );
         }
-        let q_f32 = p.mma.is_none().then(|| burn_cubecl::kernel::cast(q.clone(), DType::F32));
         let mut runs = Vec::with_capacity(2);
         if let Some(prefix) = &self.prefix {
             runs.push(KeyRun { k: &prefix.keys, v: &prefix.values, k_scales: None, v_scales: None,
@@ -574,29 +511,8 @@ impl Attention {
             hi: p.end - self.prefix_len(),
             row0: 0,
         });
-        let handle = if let Some(plan) = &p.mma {
-            attention_mma::launch_planned(&self.weights.client, &q.handle, &runs,
-                1.0 / (HEAD_DIM as f32).sqrt(), plan)?
-        } else {
-            let q_f32 = q_f32.as_ref().expect("scalar Q cast");
-            flash::flash_attention_launch(
-                &self.weights.client,
-                &q_f32.handle,
-                &runs,
-                &q_f32.handle,
-                KvElem::Bf16,
-                p.tokens,
-                expected_start,
-                HEADS,
-                KV_HEADS,
-                HEAD_DIM,
-                0,
-                None,
-                1.0 / (HEAD_DIM as f32).sqrt(),
-                p.rows,
-                None,
-            )
-        };
+        let handle = attention_mma::launch_planned(&self.weights.client, &q.handle, &runs,
+            1.0 / (HEAD_DIM as f32).sqrt(), &p.mma)?;
         let attention = burn_cubecl::kernel::cast(
             CudaTensor::new_contiguous(
                 self.weights.client.clone(),
@@ -684,7 +600,3 @@ fn append_tail(
 #[cfg(test)]
 #[path = "attention_tests.rs"]
 mod tests;
-
-#[cfg(test)]
-#[path = "attention_tile_tests.rs"]
-mod tile_tests;

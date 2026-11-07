@@ -32,34 +32,13 @@ pub(in crate::models::nemotron_h::session) fn host_checkpoint() -> (PrefixCheckp
     }
     let last_logits = put::<F32, 1, _>(&mut store, [c.vocab_size], zeros(&[c.vocab_size], 4)).unwrap();
     (PrefixCheckpoint { provenance: PrefixProvenance { source, config: c, layers: ids,
-        execution: PrefixExecution::NativeB1Bf16KvF32Mamba { attention: attention::Profile::default() } }, position: 3, tokens: Arc::from([1, 5, 7]),
+        execution: PrefixExecution::NativeB1Bf16KvF32Mamba }, position: 3, tokens: Arc::from([1, 5, 7]),
         last_logits, layers: vec![PrefixLayer::Mamba { position: 3, conv, recurrent },
             PrefixLayer::Attention(chunks), PrefixLayer::Stateless] }, store)
 }
 
 fn valid(c: &PrefixCheckpoint, store: &MemoryBlobStoreSnapshot) -> Result<()> {
-    c.validate(store, &config(), &c.provenance.layers, limits(), &[1, 5, 7],
-        PrefixExecution::NativeB1Bf16KvF32Mamba { attention: attention::Profile::default() })
-}
-
-#[test]
-fn checkpoint_host_execution_profiles_are_not_interchangeable() {
-    let (mut checkpoint, mut store) = host_checkpoint();
-    let snapshot = store.snapshot().unwrap();
-    let empty = MemoryBlobStore::new().snapshot().unwrap();
-    for source in [attention::Profile::ScalarF32V1, attention::Profile::MmaBf16PV1, attention::Profile::MmaHiLoPV1] {
-        checkpoint.provenance.execution = PrefixExecution::NativeB1Bf16KvF32Mamba { attention: source };
-        checkpoint.validate(&snapshot, &config(), &checkpoint.provenance.layers, limits(),
-            &[1, 5, 7], checkpoint.provenance.execution).unwrap();
-        for target in [attention::Profile::ScalarF32V1, attention::Profile::MmaBf16PV1, attention::Profile::MmaHiLoPV1] {
-            if source != target {
-                // Empty store would fail payload lookup; profile refusal wins first.
-                let error = checkpoint.validate(&empty, &config(), &checkpoint.provenance.layers,
-                    limits(), &[1, 5, 7], PrefixExecution::NativeB1Bf16KvF32Mamba { attention: target }).unwrap_err();
-                assert_eq!(error, "checkpoint execution profile differs");
-            }
-        }
-    }
+    c.validate(store, &config(), &c.provenance.layers, limits(), &[1, 5, 7])
 }
 
 #[test]
@@ -106,7 +85,7 @@ fn checkpoint_host_rejects_kv_gaps_overlaps_empty_and_overflow_ranges() {
 fn checkpoint_host_requires_exact_tokens_config_layers_and_hybrid_boundary() {
     let (checkpoint, mut store) = host_checkpoint();
     let snapshot = store.snapshot().unwrap();
-    assert!(checkpoint.validate(&snapshot, &config(), &checkpoint.provenance.layers, limits(), &[1, 5], checkpoint.provenance.execution).is_err());
+    assert!(checkpoint.validate(&snapshot, &config(), &checkpoint.provenance.layers, limits(), &[1, 5]).is_err());
     for change in 0..7 {
         let mut wrong = checkpoint.clone();
         match change {
@@ -119,7 +98,7 @@ fn checkpoint_host_requires_exact_tokens_config_layers_and_hybrid_boundary() {
             6 => if let PrefixLayer::Mamba { position, .. } = &mut wrong.layers[0] { *position = 2; },
             _ => unreachable!(),
         }
-        assert!(wrong.validate(&snapshot, &config(), &checkpoint.provenance.layers, limits(), &[1, 5, 7], checkpoint.provenance.execution).is_err());
+        assert!(wrong.validate(&snapshot, &config(), &checkpoint.provenance.layers, limits(), &[1, 5, 7]).is_err());
     }
     valid(&checkpoint, &snapshot).unwrap();
 }
@@ -173,35 +152,24 @@ fn checkpoint_host_new_tensor_preserves_previous_immutable_selection() {
 #[test]
 #[ignore = "reserved CUDA: typed prefix export/restore across two local model owners and private continuation"]
 fn checkpoint_gpu_restores_exact_state_and_independent_continuation() {
-    checkpoint_roundtrip(&[1, 5, 7], limits(), 2, attention::Profile::default());
+    checkpoint_roundtrip(&[1, 5, 7], limits(), 2);
 }
 
 #[test]
 #[ignore = "reserved CUDA: same-recipe full-256 ROW48 seed checkpoint and private continuation"]
 fn checkpoint_gpu_full_tile_restores_exact_state_and_independent_continuation() {
     let seed: Vec<_> = (0..MAX_CHUNK).map(|i| [1, 5, 7][i % 3]).collect();
-    checkpoint_roundtrip(&seed, Limits { capacity: 260, max_chunk_bytes: 256 << 20, ..limits() }, 128, attention::Profile::default());
+    checkpoint_roundtrip(&seed, Limits { capacity: 260, max_chunk_bytes: 256 << 20, ..limits() }, 128);
 }
 
-#[test]
-#[ignore = "reserved CUDA: same-profile MMA hybrid checkpoint roundtrip; no model capability claim"]
-fn checkpoint_gpu_mma_profiles_restore_and_reject_other_profiles() {
-    for profile in [attention::Profile::MmaBf16PV1, attention::Profile::MmaHiLoPV1] {
-        checkpoint_roundtrip(&[1, 5, 7], limits(), 2, profile);
-        let seed: Vec<_> = (0..MAX_CHUNK).map(|i| [1, 5, 7][i % 3]).collect();
-        checkpoint_roundtrip(&seed, Limits { capacity: 260, max_chunk_bytes: 256 << 20, ..limits() }, 128, profile);
-    }
-}
-
-fn checkpoint_roundtrip(seed: &[u32], l: Limits, export_rows: usize, profile: attention::Profile) {
+fn checkpoint_roundtrip(seed: &[u32], l: Limits, export_rows: usize) {
     let (snapshot, source, ids) = fixture_capacity(l.capacity);
     let mut c = config();
     c.max_position_embeddings = l.capacity;
     let o = resident_ownership(&c, l).unwrap();
     assert!(2 * o.fixed_model_bytes + 5 * o.private_state_bytes
         + 4 * o.private_expert_cache_bytes + l.max_chunk_bytes < 1 << 30);
-    let mut producer = Session::from_snapshot_seed_with_attention_profile(snapshot.clone(), source, &ids,
-        CudaDevice { index: 0 }, l, seed, profile).unwrap();
+    let mut producer = Session::from_snapshot_seed(snapshot.clone(), source, &ids, CudaDevice { index: 0 }, l, seed).unwrap();
     assert!(producer.saved_prefix().is_none(), "partial seed has no exportable Prefix");
     producer.append_ids(seed).unwrap();
     let prefix = producer.saved_prefix().unwrap().clone();
@@ -211,23 +179,9 @@ fn checkpoint_roundtrip(seed: &[u32], l: Limits, export_rows: usize, profile: at
     assert!(prefix.export(&mut blobs, 0).is_err());
     let checkpoint = prefix.export(&mut blobs, export_rows).unwrap();
     let blobs = blobs.snapshot().unwrap();
-    let mut other = Session::from_snapshot_with_attention_profile(snapshot, source, &ids,
-        CudaDevice { index: 0 }, l, profile).unwrap();
-    assert_eq!(other.attention_profile(), profile);
-    assert_eq!(checkpoint.provenance.execution, other.device_model().prefix_execution());
+    let mut other = Session::from_snapshot(snapshot, source, &ids, CudaDevice { index: 0 }, l).unwrap();
     let destination = other.device_model().clone();
     assert!(!prefix.compatible_with(&destination));
-    let mut wrong_profile = checkpoint.clone();
-    wrong_profile.provenance.execution = PrefixExecution::NativeB1Bf16KvF32Mamba {
-        attention: if profile == attention::Profile::ScalarF32V1 {
-            attention::Profile::MmaBf16PV1
-        } else { attention::Profile::ScalarF32V1 },
-    };
-    let denied = other.restore_checkpoint(&wrong_profile, &blobs, seed,
-        |_, _| panic!("caller cannot waive profile mismatch"));
-    assert_eq!(denied.unwrap_err(), "checkpoint execution profile differs");
-    assert_eq!(other.status(), Status::Ready);
-    assert!(other.committed_ids().is_empty() && other.pending.is_empty());
     let rejected = other.restore_checkpoint(&checkpoint, &blobs, seed, |_, _| Err("caller rejects arithmetic profile".into()));
     assert!(rejected.err().unwrap().contains("caller rejects"));
     assert_eq!(other.status(), Status::Ready);

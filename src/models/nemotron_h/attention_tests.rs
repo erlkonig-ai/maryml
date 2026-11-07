@@ -2,6 +2,7 @@
 //! directory; retain raw tensors for an independent stock GPU comparison.
 //! Native partition agreement alone is not acceptance of the attention model.
 use super::*;
+use crate::models::inkling::flash;
 use std::{fs, path::PathBuf};
 
 fn limits(capacity: usize) -> Limits {
@@ -13,37 +14,47 @@ fn limits(capacity: usize) -> Limits {
     }
 }
 
-#[test]
-fn attention_profile_default_dispatch_and_exact_budget() {
-    assert_eq!(Profile::default(), Profile::ScalarF32V1);
-    assert!("automatic".parse::<Profile>().is_err());
-    let l = Limits { max_working_bytes: usize::MAX, ..limits(1 << 20) };
-    for profile in [Profile::ScalarF32V1, Profile::MmaBf16PV1, Profile::MmaHiLoPV1] {
-        assert_eq!(profile.as_str().parse::<Profile>().unwrap(), profile);
-        for (start, t, prefix) in [(0, 1, 0), (0, 3, 0), (65535 - 256, 256, 8192),
-            (65536 - 256, 256, 8192), (130560, 256, 8192), (131072, 17, 8192)] {
-            let p = plan_with_profile(start, t, l, prefix, profile).unwrap();
-            assert!(plan_with_profile(start, t,
-                Limits { max_working_bytes: p.working_bytes - 1, ..l }, prefix, profile).is_err());
-            assert!(plan_with_profile(start, t,
-                Limits { max_working_bytes: p.working_bytes, ..l }, prefix, profile).is_ok());
-            assert_eq!(p.mma.is_some(), t > 1 && profile != Profile::ScalarF32V1);
-            if t == 1 {
-                assert_eq!(p.working_bytes, plan(start, t, l).unwrap().working_bytes);
-            }
-        }
-    }
-    assert_eq!(Profile::MmaBf16PV1.mma_choice(256, 65535), Some((4, PMode::Bf16)));
-    assert_eq!(Profile::MmaBf16PV1.mma_choice(256, 65536), Some((8, PMode::Bf16)));
-    assert_eq!(Profile::MmaHiLoPV1.mma_choice(2, 65536), Some((8, PMode::HiLo)));
+/// Peer projection working bytes for T tokens: FP8 input, F32 accumulator and
+/// BF16 output of the four fixed projections.
+fn projection_bytes(tokens: usize) -> usize {
+    SHAPES.iter().map(|[n, k]| tokens * k + tokens * n * 6).sum()
 }
 
 #[test]
-#[ignore = "reserved GPU: opt-in MMA owner, prefix/private append and poison/reset; named operands under 128MiB"]
-fn gpu_attention_mma_profile_prefix_and_pending_ownership() {
+fn attention_every_width_plans_tensor_cores_with_exact_budget() {
+    assert_eq!(EXECUTION, "mma-hilo-p-t1-v1");
+    for retired in ["scalar-f32-v1", "mma-bf16-p-v1", "mma-hilo-p-v1"] {
+        assert_ne!(EXECUTION, retired);
+    }
+    let l = Limits { max_working_bytes: usize::MAX, max_resident_bytes: 2 << 30, ..limits(1 << 20) };
+    for start in [0, 3, 257, 65_279, 65_280, 524_032, (1 << 20) - 256] {
+        for prefix in [0, start.min(8192), start] {
+            for tokens in 1..=MAX_CHUNK {
+                let p = plan_with_prefix(start, tokens, l, prefix).unwrap();
+                let end = start + tokens;
+                let expected = if tokens == 1 || end < 65536 { 4 } else { 8 };
+                assert_eq!((p.tokens, p.end, p.mma.warps), (tokens, end, expected),
+                    "start={start}, prefix={prefix}, tokens={tokens}");
+                let spans = if prefix == 0 { vec![end] } else { vec![prefix, end - prefix] };
+                assert_eq!(p.working_bytes, projection_bytes(tokens)
+                    + attention_mma::Plan::new(&spans, tokens, start, expected).unwrap().working_bytes);
+            }
+        }
+    }
+    for (start, t, prefix) in [(0, 1, 0), ((1 << 20) - 1, 1, 8192), (0, 3, 0), (65535 - 256, 256, 8192),
+        (65536 - 256, 256, 8192), (130560, 256, 8192), (131072, 17, 8192)] {
+        let p = plan_with_prefix(start, t, l, prefix).unwrap();
+        assert!(plan_with_prefix(start, t, Limits { max_working_bytes: p.working_bytes - 1, ..l }, prefix).is_err());
+        assert!(plan_with_prefix(start, t, Limits { max_working_bytes: p.working_bytes, ..l }, prefix).is_ok());
+    }
+}
+
+#[test]
+#[ignore = "reserved GPU: MMA owner at T1 and T>1, prefix/private append and poison/reset; named operands under 128MiB"]
+fn gpu_attention_mma_prefix_decode_and_pending_ownership() {
     let mut evidence = Evidence::new("NEMOTRON_MMA_INTEGRATION_EVIDENCE");
-    let named = 2 * admission(limits(5)).unwrap().resident_bytes
-        + 2 * plan_with_profile(3, 2, limits(5), 3, Profile::MmaHiLoPV1).unwrap().working_bytes;
+    let named = 2 * admission(limits(6)).unwrap().resident_bytes
+        + 2 * plan_with_prefix(3, 2, limits(6), 3).unwrap().working_bytes;
     assert!(named < 128 << 20); // before any upload; runtime overhead is external
     let weights: [Vec<u8>; 4] = std::array::from_fn(|i| {
         let [n, k] = SHAPES[i];
@@ -55,35 +66,40 @@ fn gpu_attention_mma_profile_prefix_and_pending_ownership() {
         e4m3fn: weights[i].as_slice(), input_scale: 0.125, weight_scale: 0.5,
     });
     let device = CudaDevice { index: 0 };
-    for profile in [Profile::MmaBf16PV1, Profile::MmaHiLoPV1] {
-        let mut seed = Attention::upload_with_profile(device.clone(), source(), operations(), limits(3), profile).unwrap();
-        let client = seed.weights.client.clone();
-        let input = tensor(&client, &device, &vec![0.25; 3 * HIDDEN], &[1, 3, HIDDEN]);
-        seed.enqueue(&input, 0).unwrap();
-        assert!(seed.has_pending());
-        seed.commit().unwrap();
-        let prefix = seed.seal_kv().unwrap();
-        let mut fork = Attention::from_prefix(seed.weights.clone(), prefix.clone(), limits(5)).unwrap();
-        assert_eq!(fork.profile(), profile);
-        let other = Attention::upload_with_profile(device.clone(), source(), operations(), limits(5), Profile::ScalarF32V1).unwrap();
-        assert!(Attention::from_prefix(other.weights.clone(), prefix, limits(5)).is_err());
-        let suffix = tensor(&client, &device, &vec![0.5; 2 * HIDDEN], &[1, 2, HIDDEN]);
-        let output = fork.enqueue(&suffix, 3).unwrap();
-        assert_eq!(fork.attended(), 3, "queued is not committed");
-        fork.commit().unwrap();
-        let values = evidence.tensor(&format!("{}-suffix.bf16", profile.as_str()), &output.values);
-        assert!(values.iter().all(|v| v.is_finite()));
-        assert_eq!((seed.attended(), fork.attended()), (3, 5));
-        fork.reset_capacity(5).unwrap();
-        fork.enqueue(&suffix, 0).unwrap();
-        fork.invalidate(); // logical cancellation never means device drain
-        assert!(fork.enqueue(&suffix, 0).is_err());
-        fork.reset().unwrap();
-        assert_eq!(fork.attended(), 0);
-        assert!(!fork.is_poisoned());
-        cubecl::future::block_on(client.sync()).unwrap();
-    }
-    evidence.finish(serde_json::json!({"scope":"ownership and finite outputs, not capability", "named_bytes":named}));
+    let mut seed = Attention::upload(device.clone(), source(), operations(), limits(3)).unwrap();
+    let client = seed.weights.client.clone();
+    let input = tensor(&client, &device, &vec![0.25; 3 * HIDDEN], &[1, 3, HIDDEN]);
+    seed.enqueue(&input, 0).unwrap();
+    assert!(seed.has_pending());
+    seed.commit().unwrap();
+    let prefix = seed.seal_kv().unwrap();
+    let mut fork = Attention::from_prefix(seed.weights.clone(), prefix.clone(), limits(6)).unwrap();
+    // Another owner of identical bytes is not this prefix's owner.
+    let other = Attention::upload(device.clone(), source(), operations(), limits(6)).unwrap();
+    assert!(Attention::from_prefix(other.weights.clone(), prefix, limits(6)).is_err());
+    let suffix = tensor(&client, &device, &vec![0.5; 2 * HIDDEN], &[1, 2, HIDDEN]);
+    let output = fork.enqueue(&suffix, 3).unwrap();
+    assert_eq!(fork.attended(), 3, "queued is not committed");
+    fork.commit().unwrap();
+    let values = evidence.tensor("suffix-t2.bf16", &output.values);
+    assert!(values.iter().all(|v| v.is_finite()));
+    // T1 decode over the prefix and private runs, on the same MMA route.
+    let token = tensor(&client, &device, &vec![0.75; HIDDEN], &[1, 1, HIDDEN]);
+    let decode = fork.enqueue(&token, 5).unwrap();
+    fork.commit().unwrap();
+    let values = evidence.tensor("decode-t1.bf16", &decode.values);
+    assert!(values.iter().all(|v| v.is_finite()));
+    assert_eq!((seed.attended(), fork.attended()), (3, 6));
+    fork.reset_capacity(6).unwrap();
+    fork.enqueue(&suffix, 0).unwrap();
+    fork.invalidate(); // logical cancellation never means device drain
+    assert!(fork.enqueue(&suffix, 0).is_err());
+    fork.reset().unwrap();
+    assert_eq!(fork.attended(), 0);
+    assert!(!fork.is_poisoned());
+    cubecl::future::block_on(client.sync()).unwrap();
+    evidence.finish(serde_json::json!({"scope":"ownership and finite outputs, not capability",
+        "execution":EXECUTION,"named_bytes":named}));
 }
 
 #[test]
@@ -138,49 +154,33 @@ fn attention_geometry_budgets_and_positions_before_device() {
             .is_ok()
         );
     }
-    assert!(flash::applies(32, 2, 128, flash::decode_rows(16)));
-    assert!(flash::applies(32, 2, 128, flash::prefill_rows(16)));
-    assert_eq!(flash::decode_rows(16), 16);
-    assert_eq!(flash::prefill_rows(16), 32);
 }
 
 #[test]
-fn attention_native_full_tile_rows_preserve_decode_and_short_tails() {
-    let l = Limits { max_resident_bytes: 2 << 30, ..limits(1 << 20) };
-    for start in [0, 257, 524_032] {
-        for prefix in [0, start] {
-            for tokens in 1..=MAX_CHUNK {
-                let p = plan_with_prefix(start, tokens, l, prefix).unwrap();
-                let expected = match tokens { 1 => 16, MAX_CHUNK => 48, _ => 32 };
-                assert_eq!(p.rows, expected, "start={start}, prefix={prefix}, tokens={tokens}");
-                assert_eq!((p.tokens, p.end), (tokens, start + tokens));
-            }
-        }
-    }
-    // The shared Inkling selection remains unchanged.
-    assert_eq!(flash::prefill_rows(16), 32);
-}
-
-#[test]
-fn attention_native_full_tile_budget_counts_prefix_and_private_run_rounding() {
-    let l = Limits { max_resident_bytes: 2 << 30, ..limits(1 << 20) };
-    // 256 rows: Q/casts + four FP8 projections = 28,049,408 B; every
-    // reduction slot adds 4,259,840 B of F32 partials and statistics.
-    for (prefix, start, expected_splits, expected_bytes) in [
-        (0, 0, vec![2], 36_569_088),
-        (0, 16_128, vec![5], 49_348_608),
-        (0, 524_032, vec![5], 49_348_608),
-        (257, 511, vec![2, 4], 53_608_448),
-        (524_032, 524_032, vec![5, 1], 53_608_448),
+fn attention_budget_counts_prefix_and_private_run_rounding_at_t1_and_full_tiles() {
+    let l = Limits { max_resident_bytes: 2 << 30, max_working_bytes: usize::MAX, ..limits(1 << 20) };
+    // T tokens: projections 68,608 T + Q 24,576 T = 93,184 T B; every
+    // reduction slot adds 16,640 T B of F32 partials and statistics.
+    // Splits: TARGET_CUBES 1024 over (query tiles x 2 KV heads), shared by
+    // span, at most one per 128 keys; B4 tiles are ceil(T/4), B8 ceil(T/8).
+    let last = (1 << 20) - 1;
+    for (prefix, start, tokens, expected_splits, expected_bytes) in [
+        (0, 0, 256, vec![2], 32_374_784),
+        (0, 16_128, 256, vec![8], 57_933_824),
+        (0, 524_032, 256, vec![16], 92_012_544),
+        (257, 511, 256, vec![3, 4], 53_673_984),
+        (524_032, 524_032, 256, vec![16, 1], 96_272_384),
+        (0, last, 1, vec![512], 8_612_864),
+        (1_048_560, last, 1, vec![512, 1], 8_629_504),
     ] {
-        let p = plan_with_prefix(start, MAX_CHUNK, l, prefix).unwrap();
-        assert_eq!(p.rows, 48);
+        let p = plan_with_prefix(start, tokens, l, prefix).unwrap();
         let spans = if prefix == 0 { vec![p.end] } else { vec![prefix, p.end - prefix] };
-        assert_eq!(flash::key_run_splits(&spans, MAX_CHUNK.div_ceil(p.rows / 16), KV_HEADS), expected_splits);
+        let tiles = attention_mma::query_tiles(tokens, p.mma.warps);
+        assert_eq!(flash::key_run_splits(&spans, tiles, KV_HEADS), expected_splits);
         assert_eq!(p.working_bytes, expected_bytes);
-        assert!(plan_with_prefix(start, MAX_CHUNK,
+        assert!(plan_with_prefix(start, tokens,
             Limits { max_working_bytes: expected_bytes - 1, ..l }, prefix).is_err());
-        assert!(plan_with_prefix(start, MAX_CHUNK,
+        assert!(plan_with_prefix(start, tokens,
             Limits { max_working_bytes: expected_bytes, ..l }, prefix).is_ok());
     }
 }
@@ -552,7 +552,6 @@ fn gpu_online_attention_514_keys() {
         .collect();
     let k = tensor(&client, &device, &k, &[capacity, KV_WIDTH]);
     let v = tensor(&client, &device, &v, &[capacity, KV_WIDTH]);
-    let q32 = burn_cubecl::kernel::cast(q.clone(), DType::F32);
     evidence.tensor("q.bf16", &q);
     evidence.tensor("k-reserved.bf16", &k); // Tail is explicit synthetic NaNs, not uninitialized memory.
     evidence.tensor("v-reserved.bf16", &v);
@@ -568,49 +567,40 @@ fn gpu_online_attention_514_keys() {
         row0: 0,
     };
     let mut reports = Vec::new();
-    for rows in [16, 32] {
-        let out = flash::flash_attention_launch(
-            &client,
-            &q32.handle,
-            &[run],
-            &q32.handle,
-            KvElem::Bf16,
-            2,
-            512,
-            HEADS,
-            KV_HEADS,
-            HEAD_DIM,
-            0,
-            None,
-            1.0 / (HEAD_DIM as f32).sqrt(),
-            rows,
-            None,
-        );
-        let out = CudaTensor::new_contiguous(
-            client.clone(),
-            device.clone(),
-            [1, 2, HIDDEN].into(),
-            out,
-            DType::F32,
-        );
-        let got = evidence.tensor(&format!("rows{rows}-output.f32"), &out);
-        let expected: Vec<f64> = (0..2 * HIDDEN)
-            .map(|i| {
-                let token = i / HIDDEN;
-                let kv = (i % HIDDEN) / HEAD_DIM / 16;
-                if token == 0 {
-                    128.0 * (kv + 1) as f64 / 513.0
-                } else {
-                    192.0 * (kv + 1) as f64 / 514.0
-                }
-            })
-            .collect();
-        reports.push(metrics(&got, &expected));
+    // T2 and T1 decode at the boundary, at both plane counts. A position sees
+    // keys 0..=pos only: row 0 contributes 128(kv+1), row 513 64(kv+1).
+    for (tokens, q0) in [(2, 512), (1, 0), (1, 512), (1, 513)] {
+        for warps in [4, 8] {
+            let plan = attention_mma::Plan::new(&[keys], tokens, q0, warps).unwrap();
+            let out = attention_mma::launch_planned(&client, &q.handle, &[run],
+                1.0 / (HEAD_DIM as f32).sqrt(), &plan).unwrap();
+            let out = CudaTensor::new_contiguous(
+                client.clone(),
+                device.clone(),
+                [1, tokens, HIDDEN].into(),
+                out,
+                DType::F32,
+            );
+            let got = evidence.tensor(&format!("t{tokens}-q0{q0}-b{warps}-output.f32"), &out);
+            let expected: Vec<f64> = (0..tokens * HIDDEN)
+                .map(|i| {
+                    let pos = q0 + i / HIDDEN;
+                    let kv = (i % HIDDEN) / HEAD_DIM / 16;
+                    let sum = if pos >= 513 { 192.0 } else { 128.0 };
+                    sum * (kv + 1) as f64 / (pos + 1) as f64
+                })
+                .collect();
+            let mut report = metrics(&got, &expected);
+            report["tokens"] = tokens.into();
+            report["q0"] = q0.into();
+            report["warps"] = warps.into();
+            reports.push(report);
+        }
     }
     let uniform_mean_ok = reports
         .iter()
         .all(|r| r["nonfinite"] == 0 && r["max_abs"].as_f64().unwrap() < 1e-5);
-    evidence.finish(serde_json::json!({"q0":512,"tokens":2,"live_keys":514,"capacity":544,"eff":0,"window":null,"comparisons_to_uniform_visible_mean":reports}));
+    evidence.finish(serde_json::json!({"execution":EXECUTION,"live_keys":514,"capacity":544,"eff":0,"window":null,"comparisons_to_uniform_visible_mean":reports}));
     // Q=0 gives a hand-derived uniform distribution. This specifically detects
     // future-row leakage, an added sink, wrong GQA head, or reading NaN padding.
     assert!(uniform_mean_ok);

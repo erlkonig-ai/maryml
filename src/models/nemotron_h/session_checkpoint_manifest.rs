@@ -16,6 +16,9 @@ use inlineencodings::{GenId, Handle, RangeU128, U256BE};
 
 type Result<T> = std::result::Result<T, String>;
 type Visitor<'a> = dyn FnMut(Result<PrefixCheckpoint>) -> ControlFlow<()> + 'a;
+/// Execution-profile text of [`PrefixExecution::NativeB1Bf16KvF32Mamba`], before
+/// the attention algorithm.
+const NATIVE: &str = "native-b1-bf16-kv-f32-mamba/";
 
 /// Gapless little-endian u32 token IDs. Length/4 is the count; empty is valid at
 /// the encoding level. No native-endian cast, magic bytes or tokenizer semantics.
@@ -106,11 +109,11 @@ pub fn encode<R: BlobStoreGet, W: BlobStorePut>(read: &R, write: &mut W,
     let p = &checkpoint.provenance;
     let config = selected_config(read, model_facts, p.source.config)?;
     if config != p.config { return Err("checkpoint config differs from supplied model image".into()); }
-    checkpoint.validate(read, &config, &p.layers, limits, &checkpoint.tokens, p.execution)?;
+    checkpoint.validate(read, &config, &p.layers, limits, &checkpoint.tokens)?;
     let tokens = write.put(TokenIdsLe::encode(&checkpoint.tokens)?)
         .map_err(|e| format!("token put: {e}"))?;
-    let PrefixExecution::NativeB1Bf16KvF32Mamba { attention } = p.execution;
-    let profile = write.put::<UTF8String, _>(format!("native-b1-bf16-kv-f32-mamba/{}", attention.as_str()))
+    let PrefixExecution::NativeB1Bf16KvF32Mamba = p.execution;
+    let profile = write.put::<UTF8String, _>(format!("{NATIVE}{}", attention::EXECUTION))
         .map_err(|e| format!("profile put: {e}"))?;
     let mut layers = Fragment::empty();
     for (index, layer) in checkpoint.layers.iter().enumerate() {
@@ -165,10 +168,11 @@ pub fn encode<R: BlobStoreGet, W: BlobStorePut>(read: &R, write: &mut W,
 /// collection-wide catalogue, global uniqueness check, or derived-ID lookup.
 /// Existing validate() checks geometry/payloads before a candidate is offered as
 /// Ok. It does not authenticate the image, producer or arithmetic compatibility.
-/// The required execution interpretation is explicit. A different profile is
-/// refused after reading profile text, before token, model-image or tensor reads.
+/// Native state recorded under any attention algorithm other than
+/// [`attention::EXECUTION`], every retired profile included, is refused after
+/// reading profile text, before token, model-image or tensor reads.
 pub fn visit_selected<B: BlobStoreGet>(store: &B, facts: &TribleSet, root: Id,
-    limits: Limits, execution: PrefixExecution,
+    limits: Limits,
     mut visitor: impl FnMut(Inline<Handle<SimpleArchive>>, Result<PrefixCheckpoint>)
         -> ControlFlow<()>) -> ControlFlow<()>
 {
@@ -189,9 +193,8 @@ pub fn visit_selected<B: BlobStoreGet>(store: &B, facts: &TribleSet, root: Id,
     {
         let selected = (|| -> Result<Option<PrefixCheckpoint>> {
             let profile: anybytes::View<str> = store.get(profile).map_err(|e| format!("profile get: {e}"))?;
-            let Some(name) = profile.strip_prefix("native-b1-bf16-kv-f32-mamba/") else { return Ok(None) };
-            let Ok(attention) = name.parse::<attention::Profile>() else { return Ok(None) };
-            if (PrefixExecution::NativeB1Bf16KvF32Mamba { attention }) != execution {
+            let Some(name) = profile.strip_prefix(NATIVE) else { return Ok(None) };
+            if name != attention::EXECUTION {
                 return Err("checkpoint execution profile differs".into());
             }
             let position = usize::try_from(position).map_err(|_| "manifest position does not fit host")?;
@@ -205,7 +208,7 @@ pub fn visit_selected<B: BlobStoreGet>(store: &B, facts: &TribleSet, root: Id,
             Ok(Some(PrefixCheckpoint { provenance: PrefixProvenance {
                 source: Source { collection, root: model_root, config, tokenizer_binding: binding,
                     tokenizer_base: base, pre_tokenizer: pre }, config: config_value, layers: Vec::new(),
-                execution: PrefixExecution::NativeB1Bf16KvF32Mamba { attention },
+                execution: PrefixExecution::NativeB1Bf16KvF32Mamba,
             }, position, tokens: Arc::from(tokens), last_logits: logits, layers: Vec::new() }))
         })();
         match selected {
@@ -224,7 +227,7 @@ fn visit_layers<B: BlobStoreGet>(store: &B, facts: &TribleSet, root: Id, limits:
     let index = checkpoint.layers.len();
     if index == checkpoint.provenance.config.layers_block_type.len() {
         return visitor(checkpoint.validate(store, &checkpoint.provenance.config,
-            &checkpoint.provenance.layers, limits, &checkpoint.tokens, checkpoint.provenance.execution)
+            &checkpoint.provenance.layers, limits, &checkpoint.tokens)
             .map(|()| checkpoint.clone()));
     }
     let kind = checkpoint.provenance.config.layers_block_type[index];

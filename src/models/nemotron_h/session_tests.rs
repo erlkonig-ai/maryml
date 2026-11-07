@@ -76,8 +76,8 @@ fn session_host_prefix_admission_counts_shared_boundary_and_only_private_suffix(
     assert_eq!(p.after_advance.private_mamba_bytes, 171_048_960);
     assert_eq!(resident_ownership(&c, l).unwrap().expert_cache_pairs_per_moe, 36);
     assert_eq!(p.suffix.unwrap().device_working_bytes,
-        planned_prefix_chunk_bytes(&c, l, 786_432, 17, 786_432, attention::Profile::default()).unwrap());
-    // Scalar diagnostic from the actual planner, not a measured allocation.
+        planned_prefix_chunk_bytes(&c, l, 786_432, 17, 786_432).unwrap());
+    // Diagnostic from the actual planner, not a measured allocation.
     // Reset retains the prefix while replacing private buffers; 2C bounds KV
     // overlap including an old tensor during replacement, before pool overhead.
     println!("PREFIX_ALLOCATION {}", json!({
@@ -107,15 +107,15 @@ fn session_host_prefill_full_window_pages_and_allocation_inventory() {
     let l = Limits { capacity: 1 << 20, max_resident_bytes: 21_334_315_328,
         max_chunk_bytes: usize::MAX };
     for (tokens, pages, hidden, latent, accumulator, total) in [
-        (785_039, 3, 6_431_039_488, 1_607_759_872, 3_215_519_744, 11_325_854_728),
-        (1_048_576, 4, 8_589_934_592, 2_147_483_648, 4_294_967_296, 15_103_921_160),
+        (785_039, 3, 6_431_039_488, 1_607_759_872, 3_215_519_744, 11_357_819_912),
+        (1_048_576, 4, 8_589_934_592, 2_147_483_648, 4_294_967_296, 15_135_886_344),
     ] {
         let a = prefill_admission(&c, l, 0, tokens).unwrap();
         assert!(a.layer_major);
         assert_eq!((a.hidden_pages, a.hidden_bytes, a.latent_bytes, a.accumulator_bytes),
             (pages, hidden, latent, accumulator));
         assert_eq!(a.largest_hidden_page_bytes, 1 << 31);
-        assert_eq!(a.tile_workspace_bytes, 68_439_040);
+        assert_eq!(a.tile_workspace_bytes, 100_404_224);
         assert_eq!(a.pending_expert_bytes, 3_096_584);
         assert_eq!(a.device_working_bytes, total);
         assert_eq!(a.host_routing_bytes, tokens * 272 + tokens.div_ceil(64) * 512 * 8);
@@ -134,17 +134,17 @@ fn session_host_prefill_full_window_pages_and_allocation_inventory() {
 }
 
 #[test]
-fn session_host_full_tile_rows48_chunk_and_span_budgets() {
+fn session_host_full_tile_chunk_and_span_budgets() {
     // Isolate attention's contribution so an unchanged larger Mamba maximum
     // cannot hide stale native split accounting in the aggregate planners.
     let mut c = full_config(1 << 20);
     c.layers_block_type = vec![LayerKind::Attention];
     let l = Limits { max_chunk_bytes: usize::MAX, ..full_limits(1 << 20) };
     for (prefix, chunk_bytes, span_bytes, tile_bytes) in [
-        (0, 60_634_112, 59_845_632, 57_740_288),
-        (524_032, 64_893_952, 64_105_472, 62_000_128),
+        (0, 103_298_048, 102_509_568, 100_404_224),
+        (524_032, 107_557_888, 106_769_408, 104_664_064),
     ] {
-        assert_eq!(planned_prefix_chunk_bytes(&c, l, 524_032, 256, prefix, attention::Profile::default()).unwrap(), chunk_bytes);
+        assert_eq!(planned_prefix_chunk_bytes(&c, l, 524_032, 256, prefix).unwrap(), chunk_bytes);
         let short = prefill::admission_with_prefix(&c, l, 524_032, 256, prefix).unwrap();
         assert!(!short.layer_major);
         assert_eq!(short.device_working_bytes, chunk_bytes);
@@ -163,27 +163,25 @@ fn session_host_full_tile_rows48_chunk_and_span_budgets() {
 }
 
 #[test]
-fn session_host_profile_prefill_covers_actual_prefix_tile_peak() {
+fn session_host_prefill_covers_actual_prefix_tile_peak() {
     let mut c = full_config(131072);
     c.layers_block_type = vec![LayerKind::Attention];
     let l = Limits { max_chunk_bytes: usize::MAX, ..full_limits(131072) };
-    for profile in [attention::Profile::MmaBf16PV1, attention::Profile::MmaHiLoPV1] {
-        let earlier = layer_prefix_working_bytes(&c, l, 130560, 256, &LayerKind::Attention, 8192, profile).unwrap();
-        let final_width_peak = (1..=256).map(|t| layer_prefix_working_bytes(&c, l,
-            131072 - t, t, &LayerKind::Attention, 8192, profile).unwrap()).max().unwrap();
-        assert!(earlier > final_width_peak, "actual earlier tile must not be hidden by final-width scan");
-        let a = prefill::admission_with_prefix_profile(&c, l, 8192, 131072 - 8192, 8192, profile).unwrap();
-        let outer = bytes(&[MAX_CHUNK, H], 8).unwrap() + bytes(&[MAX_CHUNK], 12).unwrap();
-        assert!(a.tile_workspace_bytes >= outer + earlier);
-        assert!(prefill::admission_with_prefix_profile(&c,
-            Limits { max_chunk_bytes: a.device_working_bytes - 1, ..l },
-            8192, 131072 - 8192, 8192, profile).is_err());
-        let whole = prefix_admission_with_profile(&c, l, 131072, 8192, profile).unwrap();
-        assert_eq!(whole.suffix.unwrap().device_working_bytes, a.device_working_bytes);
-        let cold = admission_with_profile(&c, l, 4096, profile).unwrap();
-        assert_eq!(cold.prefill.device_working_bytes,
-            prefill_admission_with_profile(&c, l, 0, 4096, profile).unwrap().device_working_bytes);
-    }
+    let earlier = layer_prefix_working_bytes(&c, l, 130560, 256, &LayerKind::Attention, 8192).unwrap();
+    let final_width_peak = (1..=256).map(|t| layer_prefix_working_bytes(&c, l,
+        131072 - t, t, &LayerKind::Attention, 8192).unwrap()).max().unwrap();
+    assert!(earlier > final_width_peak, "actual earlier tile must not be hidden by final-width scan");
+    let a = prefill::admission_with_prefix(&c, l, 8192, 131072 - 8192, 8192).unwrap();
+    let outer = bytes(&[MAX_CHUNK, H], 8).unwrap() + bytes(&[MAX_CHUNK], 12).unwrap();
+    assert!(a.tile_workspace_bytes >= outer + earlier);
+    assert!(prefill::admission_with_prefix(&c,
+        Limits { max_chunk_bytes: a.device_working_bytes - 1, ..l },
+        8192, 131072 - 8192, 8192).is_err());
+    let whole = prefix_admission(&c, l, 131072, 8192).unwrap();
+    assert_eq!(whole.suffix.unwrap().device_working_bytes, a.device_working_bytes);
+    let cold = admission(&c, l, 4096).unwrap();
+    assert_eq!(cold.prefill.device_working_bytes,
+        prefill_admission(&c, l, 0, 4096).unwrap().device_working_bytes);
 }
 
 #[test]
@@ -346,26 +344,27 @@ fn session_host_expert_cache_full_geometry_uses_caller_resident_limit() {
 
 #[test]
 fn session_host_admission_full_geometry_matches_existing_accounting() {
-    // Arithmetic witnesses from the pre-extraction formulas, not a device
-    // measurement or an assertion about allocator/host/runtime overhead.
+    // Arithmetic witnesses from the pre-extraction formulas, attention terms
+    // from the tensor-core plan; not a device measurement or an assertion
+    // about allocator/host/runtime overhead.
     let a = admission(&full_config(2048), full_limits(2048), 88).unwrap();
     assert_eq!(a.base_resident_bytes, 8_302_088_512);
     assert_eq!(a.expert_cache_pairs_per_moe, 36);
     assert_eq!(a.expert_cache_bytes, 4_459_069_440);
     assert_eq!(a.resident_bytes, 12_761_157_952);
     assert_eq!(a.first_chunk_tokens, 88);
-    assert_eq!(a.first_chunk_bytes, 1_809_020_264);
-    assert_eq!(a.max_prompt_chunk_bytes, 1_809_020_264);
-    assert_eq!(a.max_capacity_chunk_bytes, 5_026_804_744);
+    assert_eq!(a.first_chunk_bytes, 1_797_485_928);
+    assert_eq!(a.max_prompt_chunk_bytes, 1_797_485_928);
+    assert_eq!(a.max_capacity_chunk_bytes, 5_095_486_472);
 
     let a = admission(&full_config(262144), full_limits(262144), 513).unwrap();
     assert_eq!(a.base_resident_bytes, 10_432_794_944);
     assert_eq!(a.expert_cache_pairs_per_moe, 19);
     assert_eq!(a.resident_bytes, 12_786_192_704);
     assert_eq!(a.first_chunk_tokens, MAX_CHUNK);
-    assert_eq!(a.first_chunk_bytes, 4_924_568_584);
-    assert_eq!(a.max_prompt_chunk_bytes, 4_992_726_024);
-    assert_eq!(a.max_capacity_chunk_bytes, 5_026_804_744);
+    assert_eq!(a.first_chunk_bytes, 4_891_014_152);
+    assert_eq!(a.max_prompt_chunk_bytes, 4_959_171_592);
+    assert_eq!(a.max_capacity_chunk_bytes, 5_368_116_232);
 }
 
 #[test]
@@ -375,19 +374,19 @@ fn session_host_admission_partial_last_chunk_and_attention_split_boundaries() {
     // A late 255-token remainder can be larger than the first 256-token
     // chunk because its attention split count has grown from two to four.
     for (tokens, expected) in [
-        (1, 217_940_364),
-        (255, 4_907_653_764),
-        (256, 4_924_568_584),
-        (257, 4_924_568_584),
-        (300, 4_924_568_584),
-        (511, 4_975_544_964),
-        (512, 4_992_726_024),
-        (513, 4_992_726_024),
+        (1, 217_809_292),
+        (255, 4_874_230_404),
+        (256, 4_891_014_152),
+        (257, 4_891_014_152),
+        (300, 4_891_014_152),
+        (511, 4_942_121_604),
+        (512, 4_959_171_592),
+        (513, 4_959_171_592),
     ] {
         assert_eq!(admission(&c, l, tokens).unwrap().max_prompt_chunk_bytes, expected);
     }
     // Max-capacity accounting considers decode too, at its latest start.
-    assert_eq!(planned_chunk_bytes(&c, l, 2047, 1).unwrap(), 219_937_164);
+    assert_eq!(planned_chunk_bytes(&c, l, 2047, 1).unwrap(), 219_806_092);
     let short = admission(&full_config(1), full_limits(1), 1).unwrap();
     assert_eq!(short.max_capacity_chunk_bytes, short.first_chunk_bytes);
 }
@@ -405,7 +404,7 @@ fn session_host_admission_budget_boundaries_precede_any_session() {
     l.max_resident_bytes -= 1;
     assert!(admission(&c, l, 256).is_err());
     l = full_limits(2048);
-    l.max_chunk_bytes = 4_924_568_584;
+    l.max_chunk_bytes = 4_891_014_152;
     let first = admission(&c, l, 256).unwrap();
     assert_eq!(first.first_chunk_bytes, l.max_chunk_bytes);
     assert!(first.max_capacity_chunk_bytes > l.max_chunk_bytes);
@@ -1002,7 +1001,7 @@ fn session_gpu_shared_model_rejects_origin_upload_error() {
     assert_ne!(caller, origin);
     let device = CudaDevice { index: 0 };
     let error = origin.executes(|| source::load(
-        snapshot, source, &ids, device.clone(), limits(), None, attention::Profile::default(),
+        snapshot, source, &ids, device.clone(), limits(), None,
         |client, device, embedding| {
             assert_eq!(StreamId::current(), origin);
             // A real ordinary CUDA-server write Err, on a real fixed operand's

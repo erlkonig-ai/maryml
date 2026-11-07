@@ -34,7 +34,7 @@ use source::NativeExperts;
 
 #[path = "session_prefix.rs"]
 mod prefix;
-pub use prefix::{Prefix, PrefixAllocation, PrefixOwnership, prefix_admission, prefix_admission_with_profile};
+pub use prefix::{Prefix, PrefixAllocation, PrefixOwnership, prefix_admission};
 #[path = "session_checkpoint.rs"]
 mod checkpoint;
 pub use checkpoint::{PrefixCheckpoint, PrefixExecution, PrefixProvenance, PrefixLayer, KvChunk};
@@ -42,8 +42,7 @@ pub use checkpoint::{PrefixCheckpoint, PrefixExecution, PrefixProvenance, Prefix
 pub mod checkpoint_manifest;
 #[path = "session_prefill.rs"]
 mod prefill;
-pub use prefill::{PrefillAllocation, PrefillOutcome, admission as prefill_admission,
-    admission_with_profile as prefill_admission_with_profile};
+pub use prefill::{PrefillAllocation, PrefillOutcome, admission as prefill_admission};
 
 type Result<T> = std::result::Result<T, String>;
 const H: usize = 4096;
@@ -151,7 +150,6 @@ struct LayerWeights {
 /// the origin stream before this owner can escape. This is not a certificate of
 /// future device health. No raw mutable weight handles are exposed.
 pub struct DeviceModel<S> {
-    attention_profile: attention::Profile,
     snapshot: Arc<ModelSnapshot<S>>,
     source: Source,
     client: ComputeClient<CudaRuntime>,
@@ -403,11 +401,6 @@ fn expert_cache_pairs(resident: usize, limit: usize, moe_layers: usize) -> Resul
 /// memory. The caller separately admits any response reserve against capacity.
 /// This does not validate source payloads or establish physical readiness.
 pub fn admission(config: &TextConfig, limits: Limits, prompt_tokens: usize) -> Result<Admission> {
-    admission_with_profile(config, limits, prompt_tokens, attention::Profile::default())
-}
-pub fn admission_with_profile(config: &TextConfig, limits: Limits, prompt_tokens: usize,
-    profile: attention::Profile) -> Result<Admission>
-{
     validate_config(config, limits)?;
     if prompt_tokens == 0 || prompt_tokens > limits.capacity {
         return Err("empty prompt or prompt exceeds session capacity".into());
@@ -422,10 +415,10 @@ pub fn admission_with_profile(config: &TextConfig, limits: Limits, prompt_tokens
         .and_then(|n| n.checked_mul(expert_cache_pairs_per_moe))
         .ok_or("session expert cache byte sum overflow")?;
     let resident_bytes = add(base_resident_bytes, expert_cache_bytes)?;
-    let prefill = prefill_admission_with_profile(config, limits, 0, prompt_tokens, profile)?;
+    let prefill = prefill_admission(config, limits, 0, prompt_tokens)?;
     let comparison = Limits { max_chunk_bytes: usize::MAX, ..limits };
     let first_chunk_tokens = prompt_tokens.min(MAX_CHUNK);
-    let first_chunk_bytes = planned_chunk_bytes_with_profile(config, comparison, 0, first_chunk_tokens, profile)?;
+    let first_chunk_bytes = planned_chunk_bytes(config, comparison, 0, first_chunk_tokens)?;
     let mut max_prompt_chunk_bytes = first_chunk_bytes;
     // Preserve the old chunked schedule as an explicitly descriptive comparison.
     // For fixed width, only attention's split count depends on start, and it
@@ -433,13 +426,13 @@ pub fn admission_with_profile(config: &TextConfig, limits: Limits, prompt_tokens
     let remainder = prompt_tokens % MAX_CHUNK;
     let full_end = prompt_tokens - remainder;
     if full_end > 0 {
-        max_prompt_chunk_bytes = max_prompt_chunk_bytes.max(planned_chunk_bytes_with_profile(
-            config, comparison, full_end - MAX_CHUNK, MAX_CHUNK, profile,
+        max_prompt_chunk_bytes = max_prompt_chunk_bytes.max(planned_chunk_bytes(
+            config, comparison, full_end - MAX_CHUNK, MAX_CHUNK,
         )?);
     }
     if remainder > 0 {
-        max_prompt_chunk_bytes = max_prompt_chunk_bytes.max(planned_chunk_bytes_with_profile(
-            config, comparison, full_end, remainder, profile,
+        max_prompt_chunk_bytes = max_prompt_chunk_bytes.max(planned_chunk_bytes(
+            config, comparison, full_end, remainder,
         )?);
     }
     // Report all possible future widths without rejecting a prompt because
@@ -447,8 +440,8 @@ pub fn admission_with_profile(config: &TextConfig, limits: Limits, prompt_tokens
     let unbounded_chunk = Limits { max_chunk_bytes: usize::MAX, ..limits };
     let max_capacity_chunk_bytes = (1..=limits.capacity.min(MAX_CHUNK))
         .try_fold(0usize, |maximum, tokens| -> Result<usize> {
-            Ok(maximum.max(planned_chunk_bytes_with_profile(
-                config, unbounded_chunk, limits.capacity - tokens, tokens, profile,
+            Ok(maximum.max(planned_chunk_bytes(
+                config, unbounded_chunk, limits.capacity - tokens, tokens,
             )?))
         })?;
     Ok(Admission {
@@ -462,14 +455,10 @@ pub fn admission_with_profile(config: &TextConfig, limits: Limits, prompt_tokens
 /// validated by admission/source::load. The loader checks actual head [V,H],
 /// Mamba input [projected,H]/output [H,inner] and each fixed attention/MoE shape
 /// before constructing a Session, so these are the uploaded operand extents.
-#[cfg(test)]
 fn planned_chunk_bytes(c: &TextConfig, l: Limits, start: usize, t: usize) -> Result<usize> {
-    planned_chunk_bytes_with_profile(c, l, start, t, attention::Profile::default())
+    planned_prefix_chunk_bytes(c, l, start, t, 0)
 }
-fn planned_chunk_bytes_with_profile(c: &TextConfig, l: Limits, start: usize, t: usize, profile: attention::Profile) -> Result<usize> {
-    planned_prefix_chunk_bytes(c, l, start, t, 0, profile)
-}
-fn planned_prefix_chunk_bytes(c: &TextConfig, l: Limits, start: usize, t: usize, prefix: usize, profile: attention::Profile) -> Result<usize> {
+fn planned_prefix_chunk_bytes(c: &TextConfig, l: Limits, start: usize, t: usize, prefix: usize) -> Result<usize> {
     if !(1..=MAX_CHUNK).contains(&t)
         || start.checked_add(t).filter(|&end| end <= l.capacity).is_none()
     {
@@ -486,7 +475,7 @@ fn planned_prefix_chunk_bytes(c: &TextConfig, l: Limits, start: usize, t: usize,
         if matches!(kind, LayerKind::Moe) {
             expert_peak = expert_peak.max(moe::admission(moe_limits(l))?.expert_bytes);
         }
-        total = add(total, layer_prefix_working_bytes(c, l, start, t, kind, prefix, profile)?)?;
+        total = add(total, layer_prefix_working_bytes(c, l, start, t, kind, prefix)?)?;
     }
     total = add(total, expert_peak)?;
     if total > l.max_chunk_bytes {
@@ -495,10 +484,10 @@ fn planned_prefix_chunk_bytes(c: &TextConfig, l: Limits, start: usize, t: usize,
     Ok(total)
 }
 
-fn layer_prefix_working_bytes(c: &TextConfig, l: Limits, start: usize, t: usize, kind: &LayerKind, prefix: usize, profile: attention::Profile) -> Result<usize> {
+fn layer_prefix_working_bytes(c: &TextConfig, l: Limits, start: usize, t: usize, kind: &LayerKind, prefix: usize) -> Result<usize> {
     Ok(match kind {
         LayerKind::Attention => attention::Attention::planned_prefix_working_bytes(
-            start, t, attention_limits(c, l), prefix, profile,
+            start, t, attention_limits(c, l), prefix,
         )?,
         LayerKind::Moe => moe::working_bytes(t)?,
         LayerKind::Mamba => {
@@ -519,7 +508,6 @@ fn layer_prefix_working_bytes(c: &TextConfig, l: Limits, start: usize, t: usize,
 }
 
 impl<S> DeviceModel<S> {
-    pub fn attention_profile(&self) -> attention::Profile { self.attention_profile }
     pub fn source(&self) -> Source { self.source }
     pub fn snapshot(&self) -> &ModelSnapshot<S> { &self.snapshot }
     pub fn config(&self) -> &TextConfig { &self.config }
@@ -611,13 +599,7 @@ impl<S: BlobStoreGet> Session<S> {
         device: CudaDevice,
         limits: Limits,
     ) -> Result<Self> {
-        Self::from_snapshot_with_attention_profile(snapshot, source, layer_ids, device, limits,
-            attention::Profile::default())
-    }
-    pub fn from_snapshot_with_attention_profile(snapshot: Arc<ModelSnapshot<S>>, source: Source,
-        layer_ids: &[Id], device: CudaDevice, limits: Limits, profile: attention::Profile) -> Result<Self>
-    {
-        source::load(snapshot, source, layer_ids, device, limits, None, profile,
+        source::load(snapshot, source, layer_ids, device, limits, None,
             #[cfg(test)]
             |_, _, _| {},
         )
@@ -625,7 +607,6 @@ impl<S: BlobStoreGet> Session<S> {
     pub fn source(&self) -> Source {
         self.model.source
     }
-    pub fn attention_profile(&self) -> attention::Profile { self.model.attention_profile }
     pub fn snapshot(&self) -> &ModelSnapshot<S> {
         &self.model.snapshot
     }
@@ -654,7 +635,7 @@ impl<S: BlobStoreGet> Session<S> {
     }
     fn chunk_bytes(&self, t: usize) -> Result<usize> {
         planned_prefix_chunk_bytes(&self.model.config, self.limits, self.committed.len(), t,
-            self.prefix.as_ref().map_or(0, |p| p.ids.len()), self.attention_profile())
+            self.prefix.as_ref().map_or(0, |p| p.ids.len()))
     }
     fn preflight(&self, ids: &[u32]) -> Result<()> {
         if self.status != Status::Ready {

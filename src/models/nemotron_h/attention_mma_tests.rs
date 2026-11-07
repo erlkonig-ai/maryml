@@ -1,26 +1,19 @@
-//! Finite synthetic fixtures for the phase-A tensor-core attention kernel.
+//! Finite synthetic fixtures for the tensor-core attention kernel.
 //! Test-only: no model, no pile, no runtime policy, admission or cache ABI.
 //!
-//! Every case runs four arms on the same immutable BF16 Q and BF16 K/V runs:
-//! * `scalar-cast-rows48`: the existing cast path, `burn` cast of Q to F32 then
-//!   `flash::flash_attention_launch` at 48 rows, as the BF16-query
-//!   diagnostic's cast arm runs it (the cast is inside the wall bracket);
-//! * `mma-hilo-b4`, `mma-hilo-b8`, `mma-bf16-b8`: [`mma_attention_launch`].
-//!
-//! Small cases are compared with an independent f64 two-pass oracle against
-//! the existing 5e-5 / 1e-5 bounds; large cases with the scalar baseline. Both
-//! are RECORDED, never asserted: until the hi/lo arm's own error expectation is
-//! established, the amended design makes a miss an investigation, not a
-//! failure. The HiLo-vs-oracle misses are listed in the `completed` record and
-//! in `complete.json`. The hard asserts are finiteness, coverage and the
-//! partial-write canary (`gpu_mma_attention_partial_canary`).
+//! Hard invariants only, on immutable synthetic BF16 Q and K/V runs at B4 and
+//! B8, T1 decode included: every output finite, bitwise determinism across
+//! launches, causal masking (a key changes exactly the queries that may see
+//! it, bitwise, and a key past every query changes nothing), padded planes
+//! and the NaN tail never read or written (`gpu_mma_attention_partial_canary`),
+//! and exact masked/boundary values. Model quality is judged by capability,
+//! not by numerical agreement with another implementation.
 //!
 //! Each masking/padding fixture also carries a host replay of the kernel's own
 //! split and causal trimming (`coverage`), and asserts that the property it is
 //! named for actually occurs in the launch, so a fixture cannot silently stop
 //! exercising its case.
 use super::*;
-use crate::models::inkling::flash::KvElem;
 use crate::models::nemotron_h::{attention::HIDDEN, fp8::CudaTensor};
 use burn::tensor::DType;
 use cubecl::{
@@ -42,23 +35,20 @@ const LONG_KEYS: usize = 524_288;
 const LONG_QUERIES: usize = 256;
 const MAX_SECONDS: u64 = 250;
 const MAX_RECORDS: usize = 160;
-const ABS_LIMIT: f64 = 5e-5;
-const SCALED_LIMIT: f64 = 1e-5;
-const BASELINE_ROWS: usize = 48;
+/// The plane counts the owner plans: B4 (T1, and below live end 65536) and B8.
+const WARPS: [usize; 2] = [4, 8];
 
 #[test]
 fn mma_host_checked_plan_sizes_and_rejections() {
     for (warps, slots) in [(4, 8), (8, 16)] {
-        for mode in [PMode::Bf16, PMode::HiLo] {
-            let p = Plan::new(&[524288], 256, 524032, warps, mode).unwrap();
-            assert_eq!(p.split_of, [slots]);
-            assert_eq!(p.po_elems * 4, slots * 256 * 4096 * 4);
-            assert_eq!(p.pml_elems * 4, slots * 256 * 32 * 2 * 4);
-            assert_eq!(p.working_bytes, (p.po_elems + p.pml_elems) * 4 + 256 * 4096 * 6);
-            assert!(p.validate_splits(&[0]).is_err());
-            assert!(p.validate_splits(&[]).is_err());
-            assert!(p.validate_splits(&[slots + 1]).is_err());
-        }
+        let p = Plan::new(&[524288], 256, 524032, warps).unwrap();
+        assert_eq!(p.split_of, [slots]);
+        assert_eq!(p.po_elems * 4, slots * 256 * 4096 * 4);
+        assert_eq!(p.pml_elems * 4, slots * 256 * 32 * 2 * 4);
+        assert_eq!(p.working_bytes, (p.po_elems + p.pml_elems) * 4 + 256 * 4096 * 6);
+        assert!(p.validate_splits(&[0]).is_err());
+        assert!(p.validate_splits(&[]).is_err());
+        assert!(p.validate_splits(&[slots + 1]).is_err());
     }
     for (spans, nq, q0, warps) in [
         (vec![], 1, 0, 4), (vec![1], 0, 0, 4), (vec![1], 257, 0, 4),
@@ -66,21 +56,21 @@ fn mma_host_checked_plan_sizes_and_rejections() {
         (vec![1], 1, u32::MAX as usize - 1, 4),
         (vec![usize::MAX, 1], 1, 0, 4),
     ] {
-        assert!(Plan::new(&spans, nq, q0, warps, PMode::Bf16).is_err());
+        assert!(Plan::new(&spans, nq, q0, warps).is_err());
     }
     assert!(extent(&[usize::MAX, 2], 4).is_err());
     assert!(extent(&[u32::MAX as usize], 4).is_err());
-    assert_eq!(Plan::new(&[0], 3, 0, 4, PMode::Bf16).unwrap().split_of, [1]);
+    assert_eq!(Plan::new(&[0], 3, 0, 4).unwrap().split_of, [1]);
     assert_eq!(shared_bytes(), 35840);
 }
 
 #[test]
 fn mma_host_prefix_rounding_earlier_endpoint_exceeds_final_width_envelope() {
-    let earlier = Plan::new(&[8192, 130816 - 8192], 256, 130560, 8, PMode::Bf16).unwrap();
+    let earlier = Plan::new(&[8192, 130816 - 8192], 256, 130560, 8).unwrap();
     assert_eq!(earlier.split_of, [2, 15]);
     assert_eq!(earlier.nq * earlier.slots, 4352);
     let final_max = (2..=256).map(|t| {
-        let p = Plan::new(&[8192, 131072 - 8192], t, 131072 - t, 8, PMode::Bf16).unwrap();
+        let p = Plan::new(&[8192, 131072 - 8192], t, 131072 - t, 8).unwrap();
         p.nq * p.slots
     }).max().unwrap();
     assert_eq!(final_max, 4320);
@@ -122,50 +112,9 @@ impl Case {
     fn runs(self) -> Vec<(usize, usize, usize)> {
         self.spans().into_iter().map(|(base, rows)| (base, 0, rows.min(self.keys - base))).collect()
     }
-    fn small(self) -> bool {
-        self.queries * (self.q0 + self.queries) <= 17 * 281
-    }
     fn json(self) -> Value {
         json!({"name":self.name,"queries":self.queries,"keys":self.keys,"capacity":self.capacity,
             "q0":self.q0,"cut":self.cut,"uniform":self.uniform,"runs":self.runs()})
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Arm {
-    Baseline,
-    Mma(usize, PMode),
-}
-const ARMS: [Arm; 4] =
-    [Arm::Baseline, Arm::Mma(4, PMode::HiLo), Arm::Mma(8, PMode::HiLo), Arm::Mma(8, PMode::Bf16)];
-impl Arm {
-    fn label(self) -> String {
-        match self {
-            Arm::Baseline => format!("scalar-cast-rows{BASELINE_ROWS}"),
-            Arm::Mma(w, mode) => format!("mma-{}-b{w}", mode.as_str()),
-        }
-    }
-    fn q_tiles(self, nq: usize) -> usize {
-        match self {
-            Arm::Baseline => nq.div_ceil(BASELINE_ROWS / (HEADS / KV_HEADS)),
-            Arm::Mma(w, _) => query_tiles(nq, w),
-        }
-    }
-    fn plan(self, case: Case) -> Value {
-        let spans: Vec<_> = case.runs().iter().map(|&(_, lo, hi)| hi - lo).collect();
-        let tiles = self.q_tiles(case.queries);
-        let splits = flash::key_run_splits(&spans, tiles, KV_HEADS);
-        let slots: usize = splits.iter().sum();
-        let shared = match self {
-            Arm::Baseline => flash::shared_floats(BASELINE_ROWS as u32, HEAD_DIM as u32) * 4,
-            Arm::Mma(..) => shared_bytes(),
-        };
-        let partial = slots * case.queries * HIDDEN * 4;
-        let stats = slots * case.queries * HEADS * 2 * 4;
-        let named = case.capacity * KV_WIDTH * 4 + case.queries * HIDDEN * 10 + partial + stats;
-        assert!(named <= 640 << 20, "named allocation ceiling");
-        json!({"arm":self.label(),"query_tiles":tiles,"splits":splits,"partial_bytes":partial,
-            "stats_bytes":stats,"named_device_bytes":named,"shared_bytes_per_cube":shared})
     }
 }
 
@@ -351,73 +300,16 @@ fn key_buffer(
     start: usize,
     rows: usize,
     salt: u64,
+    changed: Option<usize>,
 ) -> CudaTensor {
     assert!(start + rows <= case.capacity);
     upload(client, device, &[rows, KV_WIDTH], |i| {
         let global = start * KV_WIDTH + i;
-        if global / KV_WIDTH >= case.keys { f32::NAN } else { sample(global, salt) }
+        let row = global / KV_WIDTH;
+        if row >= case.keys { f32::NAN }
+        else if changed == Some(row) { sample(global, salt ^ 0x5a5a) }
+        else { sample(global, salt) }
     })
-}
-
-// Independent two-pass f64 reference on the exact rounded BF16 operands:
-// query `qi` sees absolute keys `0 ..= q0 + qi`. No tiles, splits, online
-// recurrence, fragments or kernel mask arithmetic.
-fn oracle(case: Case) -> Vec<f64> {
-    assert!(case.small());
-    let seen = case.q0 + case.queries;
-    let q: Vec<_> = (0..case.queries * HIDDEN)
-        .map(|i| if case.uniform { 0.0 } else { f64::from(sample(i, 1)) })
-        .collect();
-    let k: Vec<_> = (0..seen * KV_WIDTH).map(|i| f64::from(sample(i, 2))).collect();
-    let v: Vec<_> = (0..seen * KV_WIDTH).map(|i| f64::from(sample(i, 3))).collect();
-    let scale = 1.0 / (HEAD_DIM as f64).sqrt();
-    let mut out = vec![0.0; case.queries * HIDDEN];
-    for qi in 0..case.queries {
-        for h in 0..HEADS {
-            let kvh = h / (HEADS / KV_HEADS);
-            let qo = qi * HIDDEN + h * HEAD_DIM;
-            let scores: Vec<_> = (0..=case.q0 + qi)
-                .map(|j| {
-                    let ko = j * KV_WIDTH + kvh * HEAD_DIM;
-                    (0..HEAD_DIM).map(|d| q[qo + d] * k[ko + d]).sum::<f64>() * scale
-                })
-                .collect();
-            let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-            let denom: f64 = scores.iter().map(|s| (s - max).exp()).sum();
-            for (j, score) in scores.into_iter().enumerate() {
-                let p = (score - max).exp() / denom;
-                for d in 0..HEAD_DIM {
-                    out[qo + d] += p * v[j * KV_WIDTH + kvh * HEAD_DIM + d];
-                }
-            }
-        }
-    }
-    out
-}
-
-/// Recorded, never asserted here: `within` says whether the existing bounds
-/// hold, and the caller decides what a miss means.
-fn compare(got: &[f32], expected: &[f64]) -> Value {
-    assert_eq!(got.len(), expected.len());
-    let (mut absolute, mut scaled, mut worst) = (0.0f64, 0.0f64, 0usize);
-    for (i, (&a, &b)) in got.iter().zip(expected).enumerate() {
-        assert!(a.is_finite() && b.is_finite());
-        let e = (f64::from(a) - b).abs();
-        if e > absolute {
-            worst = i;
-        }
-        absolute = absolute.max(e);
-        scaled = scaled.max(e / b.abs().max(1.0));
-    }
-    json!({"elements":got.len(),"max_abs":absolute,"max_scaled_floor1":scaled,
-        "worst":{"index":worst,"query":worst / HIDDEN,"head":worst % HIDDEN / HEAD_DIM,
-            "dim":worst % HEAD_DIM},
-        "absolute_limit":ABS_LIMIT,"scaled_limit":SCALED_LIMIT,
-        "within":absolute <= ABS_LIMIT && scaled <= SCALED_LIMIT})
-}
-
-fn widen(values: &[f32]) -> Vec<f64> {
-    values.iter().map(|&v| f64::from(v)).collect()
 }
 
 fn differing_bits(a: &[f32], b: &[f32]) -> usize {
@@ -432,7 +324,10 @@ struct Inputs {
     owners: Vec<(CudaTensor, CudaTensor)>,
 }
 impl Inputs {
-    fn new(client: &ComputeClient<CudaRuntime>, device: &CudaDevice, case: Case) -> Self {
+    /// `changed`: one absolute key row whose K and V take different finite values.
+    fn new(client: &ComputeClient<CudaRuntime>, device: &CudaDevice, case: Case,
+        changed: Option<usize>) -> Self
+    {
         case.validate();
         let q = upload(client, device, &[1, case.queries, HIDDEN], |i| {
             if case.uniform { 0.0 } else { sample(i, 1) }
@@ -441,8 +336,8 @@ impl Inputs {
             .spans()
             .into_iter()
             .map(|(start, rows)| {
-                (key_buffer(client, device, case, start, rows, 2),
-                    key_buffer(client, device, case, start, rows, 3))
+                (key_buffer(client, device, case, start, rows, 2, changed),
+                    key_buffer(client, device, case, start, rows, 3, changed))
             })
             .collect();
         Self { q, owners }
@@ -467,112 +362,33 @@ impl Inputs {
     }
 }
 
-/// One launch of one arm, bracketed by completion fences. The wall is host
-/// enqueue plus the completion fence (the baseline's Q cast included), NOT a
-/// CUDA-event kernel duration. Readback and persistence are outside it.
-fn run_arm(
-    arm: Arm,
-    case: Case,
-    inputs: &Inputs,
-    evidence: &mut Evidence,
-    phase: &str,
-) -> Vec<f32> {
-    let q = &inputs.q;
-    let client = &q.client;
+fn contract(evidence: &mut Evidence, cases: &[Case]) {
+    evidence.record("contract", json!({"seed":SEED,"heads":HEADS,"kv_heads":KV_HEADS,
+        "head_dim":HEAD_DIM,"nk":NK,"max_seconds":MAX_SECONDS,"warps":WARPS,
+        "mma_shared_bytes_per_cube":shared_bytes(),
+        "shared_limit_bytes":SHARED_LIMIT_BYTES,
+        "v_staging":V_STAGING,
+        "cases":cases.iter().map(|c| c.json()).collect::<Vec<_>>()}));
+}
+
+/// One complete launch, fenced, read back; every output must be finite.
+fn launch(client: &ComputeClient<CudaRuntime>, inputs: &Inputs, case: Case, warps: usize) -> Vec<f32> {
     let runs = inputs.runs(case);
-    let scaling = 1.0 / (HEAD_DIM as f32).sqrt();
+    let out = mma_attention_launch(client, &inputs.q.handle, &runs, case.queries, case.q0,
+        1.0 / (HEAD_DIM as f32).sqrt(), warps);
     fence(client);
-    let started = Instant::now();
-    let (out, widened) = match arm {
-        Arm::Baseline => {
-            let q32 = burn_cubecl::kernel::cast(q.clone(), DType::F32);
-            let out = flash::flash_attention_launch(client, &q32.handle, &runs, &q32.handle,
-                KvElem::Bf16, case.queries, case.q0, HEADS, KV_HEADS, HEAD_DIM, 0, None,
-                scaling, BASELINE_ROWS, None);
-            (out, Some(q32))
-        }
-        Arm::Mma(warps, mode) => (
-            mma_attention_launch(client, &q.handle, &runs, case.queries, case.q0, scaling,
-                warps, mode),
-            None,
-        ),
-    };
-    let enqueue_ns = started.elapsed().as_nanos();
-    let waiting = Instant::now();
-    fence(client);
-    let fence_ns = waiting.elapsed().as_nanos();
-    let completed_ns = started.elapsed().as_nanos();
-    // The cast temporary stays owned until completion, as do Q and the runs.
-    drop(widened);
     let bytes = client.read_one(out).unwrap();
     let n = case.queries * HIDDEN;
     assert!(bytes.len() >= n * 4);
     let values: Vec<f32> =
         bytes[..n * 4].chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
-    let nonfinite = values.iter().filter(|v| !v.is_finite()).count();
-    evidence.record("launch", json!({"case":case.name,"phase":phase,"arm":arm.label(),
-        "plan":arm.plan(case),"host_enqueue_ns":enqueue_ns,"host_fence_ns":fence_ns,
-        "host_completed_ns":completed_ns,"gpu_duration_ns":Value::Null,"nonfinite":nonfinite,
-        "output_blake3":blake3::hash(&bytes[..n * 4]).to_hex().to_string()}));
-    assert_eq!(nonfinite, 0, "nonfinite output: {} {phase}", arm.label());
+    assert!(values.iter().all(|v| v.is_finite()), "nonfinite output: {} B{warps}", case.name);
     values
-}
-
-/// All four arms once, then the comparisons. Returns the HiLo-vs-oracle
-/// misses (recorded by the caller, an investigation and never a failure) and
-/// the first outputs, for the timing pass's determinism check.
-fn run_case(
-    client: &ComputeClient<CudaRuntime>,
-    inputs: &Inputs,
-    case: Case,
-    evidence: &mut Evidence,
-) -> (Vec<String>, Vec<Vec<f32>>) {
-    let outputs: Vec<_> =
-        ARMS.iter().map(|&arm| run_arm(arm, case, inputs, evidence, "first")).collect();
-    let baseline = &outputs[0];
-    let reference = widen(baseline);
-    let expected = case.small().then(|| oracle(case));
-    let mut arms = Vec::new();
-    let mut misses = Vec::new();
-    if let Some(expected) = &expected {
-        arms.push(json!({"arm":ARMS[0].label(),"vs_oracle":compare(baseline, expected)}));
-    }
-    for (arm, got) in ARMS.iter().zip(&outputs).skip(1) {
-        let mut row = json!({"arm":arm.label(),"vs_baseline":compare(got, &reference),
-            "differing_bits_vs_baseline":differing_bits(got, baseline)});
-        if let Some(expected) = &expected {
-            let c = compare(got, expected);
-            if matches!(arm, Arm::Mma(_, PMode::HiLo)) && c["within"] != json!(true) {
-                misses.push(format!("{} {}: {c}", case.name, arm.label()));
-            }
-            row["vs_oracle"] = c;
-        }
-        arms.push(row);
-    }
-    evidence.record("comparison", json!({"case":case.name,"oracle":expected.is_some(),
-        "asserted":"nothing: record only, a miss is an investigation",
-        "arms":arms}));
-    fence(client);
-    (misses, outputs)
-}
-
-fn contract(evidence: &mut Evidence, cases: &[Case]) {
-    evidence.record("contract", json!({"seed":SEED,"heads":HEADS,"kv_heads":KV_HEADS,
-        "head_dim":HEAD_DIM,"nk":NK,"max_seconds":MAX_SECONDS,
-        "arms":ARMS.iter().map(|a| a.label()).collect::<Vec<_>>(),
-        "mma_shared_bytes_per_cube":{"b4":shared_bytes(),"b8":shared_bytes()},
-        "shared_limit_bytes":SHARED_LIMIT_BYTES,
-        "timing":"host enqueue plus completion fence per launch; baseline includes its Q cast; \
-            NOT CUDA-event duration (gpu_duration_ns null)",
-        "bounds":{"abs":ABS_LIMIT,"scaled_floor1":SCALED_LIMIT,
-            "asserted":"nothing: recorded, a hilo miss vs the f64 oracle is an investigation"},
-        "v_staging":V_STAGING,
-        "cases":cases.iter().map(|c| c.json()).collect::<Vec<_>>()}));
 }
 
 // ------------------------------------------------------------- fixtures --
 
-const ORACLE_CASES: [Case; 10] = [
+const CASES: [Case; 13] = [
     Case { name: "small-17x281-cut0-uniform", queries: 17, keys: 281, capacity: 288, q0: 264,
         cut: 0, uniform: true },
     Case { name: "small-17x281-cut127-uniform", queries: 17, keys: 281, capacity: 288, q0: 264,
@@ -603,6 +419,15 @@ const ORACLE_CASES: [Case; 10] = [
     // so most splits are EMPTY and many planes see none of their split.
     Case { name: "masked-splits-17x16384", queries: 17, keys: 16_384, capacity: 16_400, q0: 0,
         cut: 0, uniform: false },
+    // T1 decode: one live plane per cube, 512 key splits at most. The last
+    // two over one long run and over a resident-shaped prefix plus a 16-row
+    // private run; the first stops well before its run's later keys.
+    Case { name: "decode-early-1x281", queries: 1, keys: 281, capacity: 288, q0: 200, cut: 0,
+        uniform: false },
+    Case { name: "decode-1x16384", queries: 1, keys: 16_384, capacity: 16_400, q0: 16_383,
+        cut: 0, uniform: false },
+    Case { name: "decode-1x16384-cut16368", queries: 1, keys: 16_384, capacity: 16_400,
+        q0: 16_383, cut: 16_368, uniform: false },
 ];
 
 /// The property each masking/padding fixture is named for must occur at
@@ -630,37 +455,49 @@ fn assert_coverage(case: Case, warps: usize, cov: &Value) {
 }
 
 #[test]
-#[ignore = "finite owned GPU: mma attention vs f64 oracle and scalar baseline, small and masking cases"]
-fn gpu_mma_attention_oracle_fixtures() {
+#[ignore = "finite owned GPU: mma attention finite, deterministic and causal at T1 and T>1, B4 and B8"]
+fn gpu_mma_attention_invariants() {
     let _turn = gpu_turn();
-    let mut evidence = Evidence::new("mma_oracle_fixtures");
+    let mut evidence = Evidence::new("mma_invariants");
     let device = CudaDevice { index: 0 };
     let client = CudaRuntime::client(&device);
-    contract(&mut evidence, &ORACLE_CASES);
-    let mut misses = Vec::new();
-    for case in ORACLE_CASES {
-        assert!(case.small());
-        let coverage: Vec<_> = [4, 8].map(|w| coverage(case, w)).into_iter().collect();
+    contract(&mut evidence, &CASES);
+    let mut checks = 0usize;
+    for case in CASES {
+        let coverage: Vec<_> = WARPS.map(|w| coverage(case, w)).into_iter().collect();
         evidence.record("coverage", json!({"case":case.name,"b4":coverage[0],"b8":coverage[1]}));
-        for (w, cov) in [4, 8].into_iter().zip(&coverage) {
+        for (w, cov) in WARPS.into_iter().zip(&coverage) {
             assert_coverage(case, w, cov);
         }
-        let inputs = Inputs::new(&client, &device, case);
-        let (m, _) = run_case(&client, &inputs, case, &mut evidence);
-        misses.extend(m);
-        drop(inputs);
+        let inputs = Inputs::new(&client, &device, case, None);
+        // The last query's own key is visible to it alone; the next key, when
+        // the run has one, to none of them.
+        let own = case.q0 + case.queries - 1;
+        let own_changed = Inputs::new(&client, &device, case, Some(own));
+        let future = (own + 1 < case.keys).then(|| Inputs::new(&client, &device, case, Some(own + 1)));
+        let last = (case.queries - 1) * HIDDEN;
+        for warps in WARPS {
+            let first = launch(&client, &inputs, case, warps);
+            for _ in 0..2 {
+                assert_eq!(differing_bits(&launch(&client, &inputs, case, warps), &first), 0,
+                    "nondeterministic: {} B{warps}", case.name);
+            }
+            let changed = launch(&client, &own_changed, case, warps);
+            assert_eq!(differing_bits(&changed[..last], &first[..last]), 0,
+                "a key changed a query that cannot see it: {} B{warps}", case.name);
+            let own_bits = differing_bits(&changed[last..], &first[last..]);
+            assert!(own_bits > 0, "a visible key changed nothing: {} B{warps}", case.name);
+            let future_bits = future.as_ref().map(|f| differing_bits(&launch(&client, f, case, warps), &first));
+            assert!(future_bits.is_none_or(|n| n == 0), "a future key leaked: {} B{warps}", case.name);
+            evidence.record("invariants", json!({"case":case.name,"warps":warps,
+                "deterministic_launches":3,"own_key_differing":own_bits,"future_key_differing":future_bits}));
+            checks += 1;
+        }
+        drop((inputs, own_changed, future));
         fence(&client);
     }
-    // `passed` covers the hard asserts only (finiteness, coverage); a hilo
-    // miss is listed for investigation and fails nothing.
-    let summary = json!({"passed":true,"hilo_oracle_within":misses.is_empty(),
-        "hilo_oracle_misses":misses,"launches":ORACLE_CASES.len() * ARMS.len()});
-    evidence.record("completed", summary.clone());
-    if !summary["hilo_oracle_within"].as_bool().unwrap() {
-        eprintln!("INVESTIGATE: hilo arm outside the f64 oracle bounds: {}",
-            summary["hilo_oracle_misses"]);
-    }
-    fs::write(evidence.root.join("complete.json"), format!("{summary}\n")).unwrap();
+    evidence.record("completed", json!({"passed":true,"checks":checks}));
+    fs::write(evidence.root.join("complete.json"), b"{\"passed\":true}\n").unwrap();
 }
 
 /// A quiet-NaN bit pattern the kernel never produces (every partial it writes
@@ -679,7 +516,6 @@ fn partial_canary(
     inputs: &Inputs,
     case: Case,
     warps: usize,
-    mode: PMode,
     evidence: &mut Evidence,
 ) {
     let runs = inputs.runs(case);
@@ -701,7 +537,7 @@ fn partial_canary(
     let pml = fill(pml_len);
     fence(client);
     let scaling = 1.0 / (HEAD_DIM as f32).sqrt();
-    mma_attention_partials(client, &inputs.q.handle, &runs, nq, case.q0, scaling, warps, mode,
+    mma_attention_partials(client, &inputs.q.handle, &runs, nq, case.q0, scaling, warps,
         &split_of, &po, po_len, &pml, pml_len);
     fence(client);
     let words = |h: Handle, n: usize| -> Vec<u32> {
@@ -720,7 +556,7 @@ fn partial_canary(
             "owned_unwritten":unwritten,"owned_nonfinite":nonfinite,
             "canary_overwritten":past_end_written}));
     }
-    let label = Arm::Mma(warps, mode).label();
+    let label = format!("mma-hilo-b{warps}");
     evidence.record("partial_canary", json!({"case":case.name,"arm":label,"splits":split_of,
         "slots":slots,"padded_rows_past_last_slot":past_end,"canary":format!("{CANARY:#010x}"),
         "buffers":buffers,"clean":clean}));
@@ -737,15 +573,13 @@ fn gpu_mma_attention_partial_canary() {
     let mut evidence = Evidence::new("mma_partial_canary");
     let device = CudaDevice { index: 0 };
     let client = CudaRuntime::client(&device);
-    contract(&mut evidence, &ORACLE_CASES);
+    contract(&mut evidence, &CASES);
     let mut checks = 0usize;
-    for case in ORACLE_CASES {
-        let inputs = Inputs::new(&client, &device, case);
-        for arm in ARMS {
-            if let Arm::Mma(warps, mode) = arm {
-                partial_canary(&client, &inputs, case, warps, mode, &mut evidence);
-                checks += 1;
-            }
+    for case in CASES {
+        let inputs = Inputs::new(&client, &device, case, None);
+        for warps in WARPS {
+            partial_canary(&client, &inputs, case, warps, &mut evidence);
+            checks += 1;
         }
         drop(inputs);
         fence(&client);
@@ -760,128 +594,31 @@ fn gpu_mma_checked_nonzero_lo_and_all_masked() {
     let _turn = gpu_turn();
     let mut evidence = Evidence::new("mma_checked_ranges");
     // Admit named payload BEFORE upload/launch, not as after-the-fact accounting.
-    let max = Plan::new(&[2], 3, 3, 4, PMode::HiLo).unwrap();
+    let max = Plan::new(&[2], 3, 3, 4).unwrap();
     assert!(max.working_bytes + 3 * HIDDEN * 2 + 2 * 4 * KV_WIDTH * 2 < 1 << 20);
     let device = CudaDevice { index: 0 };
     let client = CudaRuntime::client(&device);
     let q = upload(&client, &device, &[3, HIDDEN], |_| 0.0);
     let k = upload(&client, &device, &[4, KV_WIDTH], |i| if i / KV_WIDTH < 2 { f32::NAN } else { 0.0 });
     let v = upload(&client, &device, &[4, KV_WIDTH], |i| if i / KV_WIDTH < 2 { f32::NAN } else { 2.0 });
-    for mode in [PMode::Bf16, PMode::HiLo] {
-        for warps in [4, 8] {
+    for tokens in [1, 3] {
+        for warps in WARPS {
             for masked in [false, true] {
                 let run = KeyRun { k: &k.handle, v: &v.handle, k_scales: None, v_scales: None,
                     rows: 4, base: if masked { 10 } else { 0 }, lo: 2, hi: 4, row0: 0 };
-                let plan = Plan::new(&[2], 3, if masked { 0 } else { 3 }, warps, mode).unwrap();
+                let plan = Plan::new(&[2], tokens, if masked { 0 } else { 3 }, warps).unwrap();
                 let output = launch_planned(&client, &q.handle, &[run], 1.0 / 128.0f32.sqrt(), &plan).unwrap();
                 fence(&client);
                 let bytes = client.read_one(output).unwrap();
                 let values: Vec<_> = bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
                 let expected = if masked { 0.0 } else { 2.0 };
                 let wrong = values.iter().filter(|&&v| !v.is_finite() || v != expected).count();
-                evidence.record("checked-range", json!({"mode":mode.as_str(),"warps":warps,
+                evidence.record("checked-range", json!({"tokens":tokens,"warps":warps,
                     "lo":2,"fully_masked":masked,"elements":values.len(),"wrong":wrong}));
-                assert_eq!(values.len(), 3 * HIDDEN);
+                assert_eq!(values.len(), tokens * HIDDEN);
                 assert_eq!(wrong, 0, "uniform value/masking contract, not model capability");
             }
         }
     }
     fence(&client);
-}
-
-const FULL_CASES: [Case; 3] = [
-    Case { name: "full-256x256", queries: 256, keys: 256, capacity: 272, q0: 0, cut: 0,
-        uniform: false },
-    Case { name: "full-256x16384-cut8192", queries: 256, keys: 16_384, capacity: 16_400,
-        q0: 16_128, cut: 8_192, uniform: false },
-    Case { name: "full-256x524288", queries: LONG_QUERIES, keys: LONG_KEYS,
-        capacity: LONG_KEYS + TAIL, q0: LONG_KEYS - LONG_QUERIES, cut: 0, uniform: false },
-];
-
-#[test]
-#[ignore = "finite owned GPU: mma attention vs scalar baseline at T256, record only, plus warm timing"]
-fn gpu_mma_attention_full_query() {
-    let _turn = gpu_turn();
-    let mut evidence = Evidence::new("mma_full_query");
-    let device = CudaDevice { index: 0 };
-    let client = CudaRuntime::client(&device);
-    contract(&mut evidence, &FULL_CASES);
-    for case in FULL_CASES {
-        assert!(!case.small());
-        let inputs = Inputs::new(&client, &device, case);
-        let (_, first) = run_case(&client, &inputs, case, &mut evidence);
-        if case.keys == LONG_KEYS {
-            // Warm, alternating order over the four arms: two orders x three
-            // repeats, each launch its own host completion wall.
-            let forward: Vec<_> = (0..ARMS.len()).collect();
-            let backward: Vec<_> = forward.iter().rev().copied().collect();
-            for (order_index, order) in [forward, backward].into_iter().enumerate() {
-                for repeat in 0..3 {
-                    for &a in &order {
-                        let phase = format!("warm-order{order_index}-repeat{repeat}");
-                        let got = run_arm(ARMS[a], case, &inputs, &mut evidence, &phase);
-                        // Same inputs, same arm: a nonzero count is itself a
-                        // finding (nondeterminism), recorded not asserted.
-                        evidence.record("warm_repeat", json!({"case":case.name,"phase":phase,
-                            "arm":ARMS[a].label(),
-                            "differing_bits_vs_first":differing_bits(&got, &first[a])}));
-                    }
-                }
-            }
-        }
-        drop(first);
-        drop(inputs);
-        fence(&client);
-    }
-    evidence.record("completed", json!({"passed":true,"first_launches":FULL_CASES.len() * ARMS.len(),
-        "warm_launches":2 * 3 * ARMS.len()}));
-    fs::write(evidence.root.join("complete.json"), b"{\"passed\":true}\n").unwrap();
-}
-
-/// The context sweep: T256 at the END of each context (q0 = keys - 256), so
-/// every query sees almost all keys, as in a long prefill's late chunks.
-const SWEEP_CASES: [Case; 4] = [
-    Case { name: "sweep-256x4096", queries: 256, keys: 4_096, capacity: 4_096 + TAIL,
-        q0: 4_096 - 256, cut: 0, uniform: false },
-    Case { name: "sweep-256x16384", queries: 256, keys: 16_384, capacity: 16_384 + TAIL,
-        q0: 16_384 - 256, cut: 0, uniform: false },
-    Case { name: "sweep-256x65536", queries: 256, keys: 65_536, capacity: 65_536 + TAIL,
-        q0: 65_536 - 256, cut: 0, uniform: false },
-    Case { name: "sweep-256x131072", queries: 256, keys: 131_072, capacity: 131_072 + TAIL,
-        q0: 131_072 - 256, cut: 0, uniform: false },
-];
-
-#[test]
-#[ignore = "finite owned GPU: mma attention context sweep at T256, record only, warm timing per K"]
-fn gpu_mma_attention_context_sweep() {
-    let _turn = gpu_turn();
-    let mut evidence = Evidence::new("mma_context_sweep");
-    let device = CudaDevice { index: 0 };
-    let client = CudaRuntime::client(&device);
-    contract(&mut evidence, &SWEEP_CASES);
-    for case in SWEEP_CASES {
-        assert!(!case.small());
-        let inputs = Inputs::new(&client, &device, case);
-        let (_, first) = run_case(&client, &inputs, case, &mut evidence);
-        // Warm, alternating order over the four arms: two orders x two
-        // repeats (the record cap allows four contexts at this depth).
-        let forward: Vec<_> = (0..ARMS.len()).collect();
-        let backward: Vec<_> = forward.iter().rev().copied().collect();
-        for (order_index, order) in [forward, backward].into_iter().enumerate() {
-            for repeat in 0..2 {
-                for &a in &order {
-                    let phase = format!("warm-order{order_index}-repeat{repeat}");
-                    let got = run_arm(ARMS[a], case, &inputs, &mut evidence, &phase);
-                    evidence.record("warm_repeat", json!({"case":case.name,"phase":phase,
-                        "arm":ARMS[a].label(),
-                        "differing_bits_vs_first":differing_bits(&got, &first[a])}));
-                }
-            }
-        }
-        drop(first);
-        drop(inputs);
-        fence(&client);
-    }
-    evidence.record("completed", json!({"passed":true}));
-    fs::write(evidence.root.join("complete.json"), b"{\"passed\":true}\n").unwrap();
 }

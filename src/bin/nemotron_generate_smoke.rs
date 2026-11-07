@@ -9,7 +9,7 @@ use cubecl::cuda::CudaDevice;
 use mary::{
     model_collection,
     models::nemotron_h::{
-        attention::Profile,
+        attention,
         chat::{ChatCodec, History, Message, RenderOptions, StopReason},
         generation::{Generator, LimitCause, TurnOptions},
         session::{Limits, Session, Source},
@@ -75,9 +75,6 @@ struct Args {
     /// Plain input byte ceiling (not a token count); at most 131072.
     #[arg(long, default_value_t = MAX_PROMPT_BYTES)]
     max_prompt_bytes: usize,
-    /// Explicit immutable execution choice. No environment override or retry.
-    #[arg(long, default_value_t = Profile::default())]
-    attention_profile: Profile,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -334,10 +331,8 @@ fn execute(args: &Args, record: &mut Value) -> Result<()> {
     record["phase"] = json!("construct-session-and-codec");
     let started = Instant::now();
     let limits = Limits { capacity: args.capacity, ..LIMITS };
-    let session = Session::from_snapshot_with_attention_profile(snapshot, source, &layers,
-        CudaDevice::default(), limits, args.attention_profile)
+    let session = Session::from_snapshot(snapshot, source, &layers, CudaDevice::default(), limits)
         .map_err(anyhow::Error::msg)?;
-    record["execution"]["actual"] = json!(session.attention_profile().as_str());
     record["output"]["committed_tokens"] = json!(session.committed_ids().len());
     record["output"]["committed_ids"] = json!(session.committed_ids());
     record["output"]["session_status"] = json!(format!("{:?}", session.status()));
@@ -407,9 +402,7 @@ fn main() -> Result<()> {
         // failures. generation_started is a separate subgroup, never success.
         "evaluation":{"contract_requested":args.case.is_some() || args.expect_answer.is_some(),
             "generation_started":false},
-        "execution":{"requested":args.attention_profile.as_str(),"actual":null,
-            "mma_v1_policy":"NK64; T1 scalar; T2..256 MMA B4 below live end 65536, B8 otherwise; heuristic",
-            "profile_is_not_proof_of_completed_mma_dispatch":true},
+        "execution":{"attention":attention::EXECUTION},
         "task":{"status":"not_evaluated","reason":"not-generated","expected_answer":args.expect_answer},
         "output":{"emitted_ids":[],"partial":{"raw_text":"","reasoning":"","answer":"","protocol_error":null},
             "decoded_complete":true,"stop":null,"limit":null,"proposal_returned":false,
@@ -516,7 +509,6 @@ mod tests {
     #[test]
     fn old_inline_invocation_keeps_defaults_and_is_ungraded() {
         let args = args(&["--prompt", "hello"]);
-        assert_eq!(args.attention_profile, Profile::ScalarF32V1);
         assert_eq!((args.capacity, args.max_new_tokens, args.max_prompt_bytes), (256, 8, 4096));
         assert_eq!(read_prompt(&args).unwrap(), ("hello".into(), None));
         let result = task_outcome(None, "anything", &StopReason::Eos { id: 2 }, true, false, false);
@@ -525,12 +517,9 @@ mod tests {
     }
 
     #[test]
-    fn explicit_attention_profiles_and_unknown_refusal() {
-        for profile in [Profile::ScalarF32V1, Profile::MmaBf16PV1, Profile::MmaHiLoPV1] {
-            assert_eq!(args(&["--prompt", "hello", "--attention-profile", profile.as_str()]).attention_profile, profile);
-        }
+    fn attention_has_no_runtime_choice() {
         assert!(Args::try_parse_from(["smoke", "r", "o", "--prompt", "x",
-            "--attention-profile", "automatic"]).is_err());
+            "--attention-profile", "scalar-f32-v1"]).is_err());
     }
 
     #[test]

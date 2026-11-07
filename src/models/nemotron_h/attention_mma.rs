@@ -1,6 +1,6 @@
 //! Nemotron-H attention on tensor cores, phase A (BF16 Q, BF16 K/V runs).
 //!
-//! Explicitly selected by the native attention owner; scalar stays the default.
+//! The native attention owner's only route, at every T including T1 decode.
 //! Checked Plan is shared by admission and launch. Kernel arithmetic is the
 //! frozen NK64 single-buffer phase-A implementation, not the NK32 experiment.
 //!
@@ -27,9 +27,9 @@
 //! * `P` becomes the k16 A fragment of `O += P V` in registers by the mapping
 //!   measured bitwise on this GB10 (`mma_probe_tests.rs`): the A fragment for
 //!   keys `16 kk .. 16 kk + 16` is n8 tile `2 kk`'s accumulator vectors
-//!   followed by n8 tile `2 kk + 1`'s, each cast to BF16. [`PMode::HiLo`]
-//!   splits `p = hi + lo` into two BF16 operands and issues both MMAs into the
-//!   same accumulator; [`PMode::Bf16`] issues one.
+//!   followed by n8 tile `2 kk + 1`'s. `p = hi + lo` is split
+//!   into two BF16 operands, `hi = bf16(p)` and `lo = bf16(p - f32(hi))`, and
+//!   both MMAs go into the same accumulator.
 //!
 //! The partials are written in EXACTLY `flash_kernel`'s layout and
 //! normalisation (unnormalised `o`, then `m`, `l`), and the existing
@@ -64,24 +64,6 @@ pub(crate) const V_STAGING: &str = "vt-store-4dp-x-8kp";
 /// Fits the existing 48KiB block limit; no opt-in shared-memory policy.
 pub(crate) const SHARED_LIMIT_BYTES: usize = 48 * 1024;
 
-/// How `P` enters the PV tensor-core product.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PMode {
-    /// `bf16(p)`: one PV MMA per k16 step (the fast candidate).
-    Bf16,
-    /// `hi = bf16(p)`, `lo = bf16(p - f32(hi))`: two PV MMAs into the same
-    /// accumulator (the diagnostic reference arm).
-    HiLo,
-}
-impl PMode {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Bf16 => "bf16",
-            Self::HiLo => "hilo",
-        }
-    }
-}
-
 /// Shared bytes one cube uses. Independent of `warps`: Q, S, P and O never
 /// leave registers, so only the K and transposed V tiles are staged.
 pub(crate) fn shared_bytes() -> usize {
@@ -100,8 +82,7 @@ pub(crate) struct Plan {
     nq: usize,
     q0: usize,
     query_tiles: usize,
-    warps: usize,
-    mode: PMode,
+    pub(crate) warps: usize,
     spans: Vec<usize>,
     split_of: Vec<usize>,
     slots: usize,
@@ -121,7 +102,7 @@ fn extent(dims: &[usize], width: usize) -> Result<usize, String> {
 }
 
 impl Plan {
-    pub(crate) fn new(spans: &[usize], nq: usize, q0: usize, warps: usize, mode: PMode) -> Result<Self, String> {
+    pub(crate) fn new(spans: &[usize], nq: usize, q0: usize, warps: usize) -> Result<Self, String> {
         if !(1..=super::attention::MAX_CHUNK).contains(&nq) || ![4, 8].contains(&warps) || spans.is_empty() {
             return Err("MMA needs T1..256, B4/B8 and key runs".into());
         }
@@ -153,7 +134,7 @@ impl Plan {
             .and_then(|v| q_elems.checked_mul(6).and_then(|q| v.checked_add(q)))
             .ok_or("MMA scratch sum overflow")?;
         if shared_bytes() > SHARED_LIMIT_BYTES { return Err("MMA shared storage exceeds 48KiB".into()); }
-        Ok(Self { nq, q0, query_tiles: tiles, warps, mode, spans: spans.to_vec(), split_of, slots,
+        Ok(Self { nq, q0, query_tiles: tiles, warps, spans: spans.to_vec(), split_of, slots,
             q_elems, po_elems, pml_elems, working_bytes })
     }
 
@@ -204,7 +185,6 @@ fn mma_attention_kernel<N: Size>(
     slot0: u32,
     splits: u32,
     #[comptime] warps: usize,
-    #[comptime] hilo: bool,
 ) {
     let def = cmma::MmaDefinition::<bf16, bf16, f32>::new(16usize, 8usize, 16usize);
     let qt = CUBE_POS_X;
@@ -474,10 +454,8 @@ fn mma_attention_kernel<N: Size>(
                 let h1 = Vector::<bf16, N>::cast_from(s1);
                 ph[i] = h0;
                 ph[i + vc_c] = h1;
-                if comptime![hilo] {
-                    pl[i] = Vector::<bf16, N>::cast_from(s0 - Vector::<f32, N>::cast_from(h0));
-                    pl[i + vc_c] = Vector::<bf16, N>::cast_from(s1 - Vector::<f32, N>::cast_from(h1));
-                }
+                pl[i] = Vector::<bf16, N>::cast_from(s0 - Vector::<f32, N>::cast_from(h0));
+                pl[i + vc_c] = Vector::<bf16, N>::cast_from(s1 - Vector::<f32, N>::cast_from(h1));
             }
             #[unroll]
             for dt in 0..16usize {
@@ -496,17 +474,10 @@ fn mma_attention_kernel<N: Size>(
                     c[i] = of[dt * vc_c + i];
                 }
                 let d = def.execute(&ph, &b, &c);
-                if comptime![hilo] {
-                    let d2 = def.execute(&pl, &b, &d);
-                    #[unroll]
-                    for i in 0..vc_c {
-                        of[dt * vc_c + i] = d2[i];
-                    }
-                } else {
-                    #[unroll]
-                    for i in 0..vc_c {
-                        of[dt * vc_c + i] = d[i];
-                    }
+                let d2 = def.execute(&pl, &b, &d);
+                #[unroll]
+                for i in 0..vc_c {
+                    of[dt * vc_c + i] = d2[i];
                 }
             }
         }
@@ -566,7 +537,7 @@ fn launch_partials<R: Runtime>(
     pml: &Handle,
     pml_len: usize,
 ) {
-    let (nq, q0, warps, mode, split_of) = (plan.nq, plan.q0, plan.warps, plan.mode, plan.split_of.as_slice());
+    let (nq, q0, warps, split_of) = (plan.nq, plan.q0, plan.warps, plan.split_of.as_slice());
     // The only callers validate the complete plan, input runs and output
     // extents before allocation/launch. Consume that geometry without replanning.
     let vs = 32 / bf16::cube_type().size_bits();
@@ -597,7 +568,6 @@ fn launch_partials<R: Runtime>(
                 slot0 as u32,
                 splits as u32,
                 warps,
-                mode == PMode::HiLo,
             )
         };
         slot0 += splits;
@@ -621,10 +591,9 @@ pub(crate) fn mma_attention_launch<R: Runtime>(
     q0: usize,
     scaling: f32,
     warps: usize,
-    mode: PMode,
 ) -> Handle {
     let spans: Vec<_> = runs.iter().map(|r| r.hi.checked_sub(r.lo).expect("invalid run")).collect();
-    let plan = Plan::new(&spans, nq, q0, warps, mode).expect("MMA plan");
+    let plan = Plan::new(&spans, nq, q0, warps).expect("MMA plan");
     launch_planned(client, q, runs, scaling, &plan).expect("MMA input")
 }
 
@@ -661,11 +630,11 @@ pub(crate) fn launch_planned<R: Runtime>(client: &ComputeClient<R>, q: &Handle,
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn mma_attention_partials<R: Runtime>(client: &ComputeClient<R>, q: &Handle,
-    runs: &[KeyRun<'_>], nq: usize, q0: usize, scaling: f32, warps: usize, mode: PMode,
+    runs: &[KeyRun<'_>], nq: usize, q0: usize, scaling: f32, warps: usize,
     split_of: &[usize], po: &Handle, po_len: usize, pml: &Handle, pml_len: usize)
 {
     let spans: Vec<_> = runs.iter().map(|r| r.hi.checked_sub(r.lo).expect("invalid run")).collect();
-    let plan = Plan::new(&spans, nq, q0, warps, mode).expect("MMA plan");
+    let plan = Plan::new(&spans, nq, q0, warps).expect("MMA plan");
     plan.validate_inputs(q, runs, scaling).expect("MMA inputs");
     plan.validate_splits(split_of).expect("MMA splits");
     extent(&[po_len], 4).expect("partial extent");

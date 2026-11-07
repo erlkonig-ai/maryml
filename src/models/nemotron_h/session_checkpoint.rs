@@ -14,12 +14,10 @@ use triblespace::core::inline::{Inline, encodings::hash::Handle as BlobHandle};
 /// arithmetic/kernel profile for the destination execution.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrefixExecution {
-    NativeB1Bf16KvF32Mamba { attention: attention::Profile },
-}
-impl<S> DeviceModel<S> {
-    pub fn prefix_execution(&self) -> PrefixExecution {
-        PrefixExecution::NativeB1Bf16KvF32Mamba { attention: self.attention_profile }
-    }
+    /// B1, BF16 KV, F32 Mamba state, and the one attention algorithm,
+    /// [`attention::EXECUTION`]. A manifest records both; state recorded under
+    /// any other attention name, every retired profile included, is refused.
+    NativeB1Bf16KvF32Mamba,
 }
 
 /// Exact loader selections, not an authenticated portable operand fingerprint.
@@ -91,20 +89,13 @@ fn read<T: TensorElement, const R: usize, B: BlobStoreGet>(store: &B,
 }
 
 impl PrefixCheckpoint {
-    fn check_execution(&self, expected: PrefixExecution) -> Result<()> {
-        if self.provenance.execution != expected {
-            return Err("checkpoint execution profile differs".into());
-        }
-        Ok(())
-    }
     /// CPU-only structural and complete typed-payload validation. This does NOT
     /// verify operand equivalence, authority, durability or device readiness.
     /// The exact token slice is the caller's selected common prefix, not the
     /// full divergent prompt. A later Mamba boundary cannot serve a shorter one.
     pub fn validate<B: BlobStoreGet>(&self, store: &B, config: &TextConfig,
-        layer_ids: &[Id], limits: Limits, expected_tokens: &[u32], execution: PrefixExecution) -> Result<()>
+        layer_ids: &[Id], limits: Limits, expected_tokens: &[u32]) -> Result<()>
     {
-        self.check_execution(execution)?;
         validate_config(config, limits)?;
         resident_ownership(config, limits)?;
         prefix::validate_seed(config, limits, Some(&self.tokens))?;
@@ -113,7 +104,8 @@ impl PrefixCheckpoint {
         }
         if self.provenance.config != *config || self.provenance.layers != layer_ids
             || self.layers.len() != config.layers_block_type.len()
-            || layer_ids.len() != self.layers.len() {
+            || layer_ids.len() != self.layers.len()
+            || self.provenance.execution != PrefixExecution::NativeB1Bf16KvF32Mamba {
             return Err("checkpoint config/layer order/execution contract differs".into());
         }
         for (kind, layer) in config.layers_block_type.iter().zip(&self.layers) {
@@ -205,7 +197,7 @@ impl<S> Prefix<S> {
             fence(&self.model.client)?;
             Ok(PrefixCheckpoint {
                 provenance: PrefixProvenance { source: self.model.source, config: self.model.config.clone(),
-                    layers: self.model.layer_ids().collect(), execution: self.model.prefix_execution() },
+                    layers: self.model.layer_ids().collect(), execution: PrefixExecution::NativeB1Bf16KvF32Mamba },
                 position: self.ids.len(), tokens: self.ids.clone(), last_logits, layers,
             })
         })
@@ -251,10 +243,8 @@ impl<S: BlobStoreGet> Session<S> {
         caller_policy: impl FnOnce(&PrefixProvenance, &DeviceModel<S>) -> Result<()>,
         #[cfg(test)] before_fence: impl FnOnce(&DeviceModel<S>, &[Boundary]),
     ) -> Result<()> {
-        checkpoint.check_execution(self.model.prefix_execution())?;
         caller_policy(&checkpoint.provenance, &self.model)?;
-        checkpoint.validate(store, &self.model.config, &self.model.layer_ids().collect::<Vec<_>>(),
-            self.limits, expected_tokens, self.model.prefix_execution())?;
+        checkpoint.validate(store, &self.model.config, &self.model.layer_ids().collect::<Vec<_>>(), self.limits, expected_tokens)?;
         let stream = self.stream;
         stream.executes(|| {
             self.invalidate();
