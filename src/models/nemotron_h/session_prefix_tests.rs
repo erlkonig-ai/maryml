@@ -14,7 +14,7 @@ fn session_gpu_prefix_forks_restore_and_keep_independent_suffixes() {
     assert!(2 * o.fixed_model_bytes + 7 * o.private_state_bytes + l.max_chunk_bytes < 4 << 30);
     let mut parent = Session::from_snapshot_seed(snapshot.clone(), source, &layers,
         CudaDevice { index: 0 }, l, &[1, 5, 7]).unwrap();
-    assert_eq!(parent.prefix_ownership().unwrap().private_kv_bytes, 3 * 1024);
+    assert_eq!(parent.prefix_ownership().unwrap().private_kv_bytes, 3 * attention::KV_ROW_BYTES);
     assert!(parent.saved_prefix().is_none());
     assert!(parent.append_ids(&[1, 5, 6]).is_err());
     assert!(parent.committed_ids().is_empty());
@@ -22,8 +22,8 @@ fn session_gpu_prefix_forks_restore_and_keep_independent_suffixes() {
     let model = parent.device_model().clone();
     let saved = parent.saved_prefix().unwrap().clone();
     assert_eq!(saved.token_ids(), [1, 5, 7]);
-    assert_eq!(parent.prefix_ownership().unwrap().shared_kv_bytes, 3 * 1024);
-    assert_eq!(parent.prefix_ownership().unwrap().private_kv_bytes, 5 * 1024);
+    assert_eq!(parent.prefix_ownership().unwrap().shared_kv_bytes, 3 * attention::KV_ROW_BYTES);
+    assert_eq!(parent.prefix_ownership().unwrap().private_kv_bytes, 5 * attention::KV_ROW_BYTES);
     let mut a = Session::from_prefix(model.clone(), saved.clone(), l).unwrap();
     let mut b = Session::from_prefix(model.clone(), saved.clone(), l).unwrap();
     let boundary = state_bytes(&a);
@@ -71,7 +71,7 @@ fn session_gpu_prefix_forks_restore_and_keep_independent_suffixes() {
     // genuinely empty full-capacity storage, not a C-P buffer labelled C.
     b.reset_for_prompt(&[1, 5]).unwrap();
     assert!(b.saved_prefix().is_none() && b.committed_ids().is_empty());
-    assert_eq!(b.prefix_ownership().unwrap().private_kv_bytes, 8 * 1024);
+    assert_eq!(b.prefix_ownership().unwrap().private_kv_bytes, 8 * attention::KV_ROW_BYTES);
     b.append_ids(&[1, 5, 7, 9]).unwrap();
     for (&reference, &segmented) in b.last_logits().unwrap().values.iter().zip(&b_logits) {
         assert!((reference - segmented).abs() <= 0.02 + 0.02 * reference.abs());
@@ -83,7 +83,7 @@ fn session_gpu_prefix_forks_restore_and_keep_independent_suffixes() {
     assert_eq!(full.last_logits().unwrap().values, boundary_logits);
     assert!(full.append_ids(&[2]).is_err());
     full.reset().unwrap();
-    assert_eq!(full.prefix_ownership().unwrap().private_kv_bytes, 3 * 1024);
+    assert_eq!(full.prefix_ownership().unwrap().private_kv_bytes, 3 * attention::KV_ROW_BYTES);
     full.append_ids(&[2, 3, 4]).unwrap();
     drop(full);
 

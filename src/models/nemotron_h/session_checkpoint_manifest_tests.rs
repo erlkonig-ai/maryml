@@ -1,6 +1,6 @@
 //! Host-only temporary stores. No tokenizer, CUDA client or live collection.
 use super::*;
-use super::super::{checkpoint::tests::host_checkpoint, tests::{configuration, limits}};
+use super::super::{checkpoint::tests::{host_checkpoint, nvfp4_kv_payload}, tests::{configuration, limits}};
 use triblespace::core::{blob::MemoryBlobStoreSnapshot, trible::Trible};
 use triblespace::core::{collection::{AdmissionPolicy, CollectionPolicy,
     CollectionSnapshotExt, CollectionStoreExt}, repo::pile::Pile};
@@ -25,9 +25,8 @@ fn fixture() -> (PrefixCheckpoint, MemoryBlobStore, Inline<Handle<SimpleArchive>
     for chunk in chunks {
         // Unlike the shared host fixture, V must differ from K: swapping their
         // roles must fail the manifest round trip, not pass through equal handles.
-        let values: Vec<u8> = (0..chunk.rows * 256)
-            .flat_map(|i| ((i as u16) ^ 0x4000).to_le_bytes()).collect();
-        chunk.values = store.put(leaf::leaf_blob::<BF16, 3>([chunk.rows as u64, 2, 128],
+        let values = nvfp4_kv_payload(&(0..chunk.rows).collect::<Vec<_>>(), 0x11);
+        chunk.values = store.put(leaf::leaf_blob::<NVFP4, 3>([chunk.rows as u64, 2, 128],
             anybytes::Bytes::from_source(values)).unwrap()).unwrap();
         assert_ne!(chunk.keys, chunk.values);
     }
@@ -124,7 +123,7 @@ fn manifest_host_roundtrip_execution_tokens_ranges_and_typed_handles() {
         pattern!(&facts, [{ root @ schema::execution_profile: ?profile }])).collect();
     assert_eq!(profiles.len(), 1);
     let text: anybytes::View<str> = reader.get(profiles[0]).unwrap();
-    assert_eq!(&*text, "native-b1-bf16-kv-f32-mamba/mma-hilo-p-t1-v1");
+    assert_eq!(&*text, "native-b1-nvfp4-kv-f32-mamba/mma-b2-nvfp4-kv-fp4-qk-hilo-p-v1");
     let results = decode(&reader, &facts, root, image);
     assert_eq!(results.len(), 1);
     assert_checkpoint(results[0].as_ref().unwrap(), &checkpoint);
@@ -133,12 +132,12 @@ fn manifest_host_roundtrip_execution_tokens_ranges_and_typed_handles() {
     let view = leaf::read_leaf(blob).unwrap();
     assert!(view.payload().chunks_exact(4).all(|b| b == 0x3f80_0001u32.to_le_bytes()));
     let PrefixLayer::Attention(chunks) = &checkpoint.layers[1] else { panic!() };
-    let blob: Blob<Tensor<BF16, 3>> = reader.get(chunks[0].keys).unwrap();
+    let blob: Blob<Tensor<NVFP4, 3>> = reader.get(chunks[0].keys).unwrap();
     let view = leaf::read_leaf(blob).unwrap();
-    assert_eq!(&view.payload()[..4], &[0, 128, 1, 128]);
-    let blob: Blob<Tensor<BF16, 3>> = reader.get(chunks[0].values).unwrap();
+    assert_eq!(view.payload().as_ref(), nvfp4_kv_payload(&[0, 1], 0).as_slice());
+    let blob: Blob<Tensor<NVFP4, 3>> = reader.get(chunks[0].values).unwrap();
     let view = leaf::read_leaf(blob).unwrap();
-    assert_eq!(&view.payload()[..4], &[0, 64, 1, 64]);
+    assert_eq!(view.payload().as_ref(), nvfp4_kv_payload(&[0, 1], 0x11).as_slice());
 }
 
 #[test]
@@ -248,9 +247,11 @@ fn manifest_host_profile_alternatives_are_visited_and_can_stop() {
     let (checkpoint, mut store, image) = fixture();
     let fragment = encode_fixture(&checkpoint, &mut store, image);
     let root = fragment.root().unwrap();
-    let second = store.put::<UTF8String, _>("native-b1-bf16-kv-f32-mamba/mma-hilo-p-v1").unwrap();
+    let second = store.put::<UTF8String, _>("native-b1-nvfp4-kv-f32-mamba/mma-hilo-p-t1-v1").unwrap();
     let unknown = store.put::<UTF8String, _>("future-unsupported-profile").unwrap();
-    let extra = entity! { ExclusiveId::force_ref(&root) @ schema::execution_profile*: [second, unknown] };
+    // The BF16-KV family before this one is another type: skipped, not refused.
+    let bf16_kv = store.put::<UTF8String, _>("native-b1-bf16-kv-f32-mamba/mma-hilo-p-t1-v1").unwrap();
+    let extra = entity! { ExclusiveId::force_ref(&root) @ schema::execution_profile*: [second, unknown, bf16_kv] };
     let mut facts = fragment.facts().clone();
     facts.union(extra.facts().clone());
     let reader = store.snapshot().unwrap();
@@ -273,12 +274,13 @@ fn manifest_host_retired_profiles_are_refused_before_other_payload_reads() {
     let (checkpoint, mut store, image) = fixture();
     let fragment = encode_fixture(&checkpoint, &mut store, image);
     let root = fragment.root().unwrap();
-    // Every profile this execution replaced, scalar T1 decode included. The
-    // store holds ONLY the profile text: any further read would fail first.
-    for retired in ["scalar-f32-v1", "mma-bf16-p-v1", "mma-hilo-p-v1"] {
+    // Every attention algorithm this execution replaced, under this family's
+    // prefix. The store holds ONLY the profile text: any further read would
+    // fail first.
+    for retired in ["scalar-f32-v1", "mma-bf16-p-v1", "mma-hilo-p-v1", "mma-hilo-p-t1-v1"] {
         let mut profile_only = MemoryBlobStore::new();
         let text = profile_only.put::<UTF8String, _>(
-            format!("native-b1-bf16-kv-f32-mamba/{retired}")).unwrap();
+            format!("native-b1-nvfp4-kv-f32-mamba/{retired}")).unwrap();
         let facts = replace(fragment.facts(), root, &schema::execution_profile, text);
         let reader = profile_only.snapshot().unwrap();
         let results = decode(&reader, &facts, root, image);
@@ -338,21 +340,16 @@ fn manifest_host_branching_kv_paths_are_complete_and_stoppable() {
     let mut children = Fragment::empty();
     for (start, end) in [(0usize, 1usize), (1, 3)] {
         let rows = end - start;
-        let payload = |xor: u16| -> anybytes::Bytes {
-            anybytes::Bytes::from_source((start..end).flat_map(|row| {
-                // Existing fixture restarts its pattern at the last 2..3 chunk.
-                let source_row = if row == 2 { 0 } else { row };
-                (0..256).flat_map(move |column|
-                    (((source_row * 256 + column) as u16) ^ xor).to_le_bytes())
-            }).collect::<Vec<_>>())
-        };
-        let keys = store.put(leaf::leaf_blob::<BF16, 3>([rows as u64, 2, 128],
-            payload(0x8000)).unwrap()).unwrap();
-        let values = store.put(leaf::leaf_blob::<BF16, 3>([rows as u64, 2, 128],
-            payload(0x4000)).unwrap()).unwrap();
+        // Existing fixture restarts its pattern at the last 2..3 chunk.
+        let source: Vec<_> = (start..end).map(|row| if row == 2 { 0 } else { row }).collect();
+        let payload = |xor: u8| anybytes::Bytes::from_source(nvfp4_kv_payload(&source, xor));
+        let keys = store.put(leaf::leaf_blob::<NVFP4, 3>([rows as u64, 2, 128],
+            payload(0)).unwrap()).unwrap();
+        let values = store.put(leaf::leaf_blob::<NVFP4, 3>([rows as u64, 2, 128],
+            payload(0x11)).unwrap()).unwrap();
         assert_ne!(keys, values);
-        let keys = entity! { metadata::tag: schema::KEYS, leaf::leaf::<BF16, 3>(): keys };
-        let values = entity! { metadata::tag: schema::VALUES, leaf::leaf::<BF16, 3>(): values };
+        let keys = entity! { metadata::tag: schema::KEYS, leaf::leaf::<NVFP4, 3>(): keys };
+        let values = entity! { metadata::tag: schema::VALUES, leaf::leaf::<NVFP4, 3>(): values };
         children += entity! { schema::token_range: (start as u128, end as u128),
             model::member*: keys + values };
     }
@@ -368,21 +365,22 @@ fn manifest_host_branching_kv_paths_are_complete_and_stoppable() {
         assert_eq!(selected.provenance.layers, checkpoint.provenance.layers);
         let PrefixLayer::Attention(chunks) = &selected.layers[1] else { panic!() };
         paths.push(chunks.iter().map(|c| (c.start, c.start + c.rows)).collect::<Vec<_>>());
-        let mut key_bytes = Vec::new();
-        let mut value_bytes = Vec::new();
+        // Per tensor, the rows' code planes and scale planes joined in order.
+        let (c, s) = (attention::CODE_ROW_BYTES, attention::SCALE_ROW_BYTES);
+        let mut planes = [[Vec::new(), Vec::new()], [Vec::new(), Vec::new()]];
         for chunk in chunks {
-            let keys: Blob<Tensor<BF16, 3>> = reader.get(chunk.keys).unwrap();
-            let values: Blob<Tensor<BF16, 3>> = reader.get(chunk.values).unwrap();
-            key_bytes.extend_from_slice(leaf::read_leaf(keys).unwrap().payload());
-            value_bytes.extend_from_slice(leaf::read_leaf(values).unwrap().payload());
+            for (tensor, handle) in [chunk.keys, chunk.values].into_iter().enumerate() {
+                let blob: Blob<Tensor<NVFP4, 3>> = reader.get(handle).unwrap();
+                let payload = leaf::read_leaf(blob).unwrap().payload().to_vec();
+                planes[tensor][0].extend_from_slice(&payload[..chunk.rows * c]);
+                planes[tensor][1].extend_from_slice(&payload[chunk.rows * c..chunk.rows * (c + s)]);
+            }
         }
-        let expected = |xor: u16| (0..3).flat_map(|row| {
-            let source_row = if row == 2 { 0 } else { row };
-            (0..256).flat_map(move |column|
-                (((source_row * 256 + column) as u16) ^ xor).to_le_bytes())
-        }).collect::<Vec<_>>();
-        assert_eq!(key_bytes, expected(0x8000));
-        assert_eq!(value_bytes, expected(0x4000));
+        for (tensor, xor) in [0u8, 0x11].into_iter().enumerate() {
+            let whole = nvfp4_kv_payload(&[0, 1, 0], xor);
+            assert_eq!(planes[tensor][0], &whole[..3 * c]);
+            assert_eq!(planes[tensor][1], &whole[3 * c..3 * (c + s)]);
+        }
     }
     paths.sort(); // operation-local test comparison, not a reader selection policy
     assert_eq!(paths, vec![vec![(0, 1), (1, 3)], vec![(0, 2), (2, 3)]]);
@@ -441,7 +439,7 @@ fn manifest_host_pile_reopen_preserves_execution_payloads_and_opaque_alternative
             row.v::<triblespace::core::inline::encodings::UnknownInline>()));
     }
     let other_profile = pile.put::<UTF8String, _>(
-        "native-b1-bf16-kv-f32-mamba/scalar-f32-v1").unwrap();
+        "native-b1-nvfp4-kv-f32-mamba/scalar-f32-v1").unwrap();
     let future_profile = pile.put::<UTF8String, _>("unknown-future-profile").unwrap();
     let extra = entity! { ExclusiveId::force_ref(&opaque_root) @
         metadata::tag: *genid(),
@@ -478,11 +476,11 @@ fn manifest_host_pile_reopen_preserves_execution_payloads_and_opaque_alternative
     assert_eq!((success, refused), (1, 1)); // unsupported profile is skipped
     let PrefixLayer::Attention(chunks) = &checkpoint.layers[1] else { panic!() };
     for chunk in chunks {
-        let keys: Blob<Tensor<BF16, 3>> = reader.get(chunk.keys).unwrap();
-        let values: Blob<Tensor<BF16, 3>> = reader.get(chunk.values).unwrap();
+        let keys: Blob<Tensor<NVFP4, 3>> = reader.get(chunk.keys).unwrap();
+        let values: Blob<Tensor<NVFP4, 3>> = reader.get(chunk.values).unwrap();
         assert_ne!(keys.bytes, values.bytes);
-        assert_eq!(&leaf::read_leaf(keys).unwrap().payload()[..4], &[0, 128, 1, 128]);
-        assert_eq!(&leaf::read_leaf(values).unwrap().payload()[..4], &[0, 64, 1, 64]);
+        assert_eq!(&leaf::read_leaf(keys).unwrap().payload()[..4], &[0x80, 0x81, 0x82, 0x83]);
+        assert_eq!(&leaf::read_leaf(values).unwrap().payload()[..4], &[0x91, 0x90, 0x93, 0x92]);
     }
     drop(observed);
     drop(reader);

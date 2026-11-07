@@ -3,6 +3,7 @@
 //! Native partition agreement alone is not acceptance of the attention model.
 use super::*;
 use crate::models::inkling::flash;
+use half::bf16;
 use std::{fs, path::PathBuf};
 
 fn limits(capacity: usize) -> Limits {
@@ -22,8 +23,8 @@ fn projection_bytes(tokens: usize) -> usize {
 
 #[test]
 fn attention_every_width_plans_tensor_cores_with_exact_budget() {
-    assert_eq!(EXECUTION, "mma-hilo-p-t1-v1");
-    for retired in ["scalar-f32-v1", "mma-bf16-p-v1", "mma-hilo-p-v1"] {
+    assert_eq!(EXECUTION, "mma-b2-nvfp4-kv-fp4-qk-hilo-p-v1");
+    for retired in ["scalar-f32-v1", "mma-bf16-p-v1", "mma-hilo-p-v1", "mma-hilo-p-t1-v1"] {
         assert_ne!(EXECUTION, retired);
     }
     let l = Limits { max_working_bytes: usize::MAX, max_resident_bytes: 2 << 30, ..limits(1 << 20) };
@@ -32,12 +33,12 @@ fn attention_every_width_plans_tensor_cores_with_exact_budget() {
             for tokens in 1..=MAX_CHUNK {
                 let p = plan_with_prefix(start, tokens, l, prefix).unwrap();
                 let end = start + tokens;
-                let expected = if tokens == 1 || end < 65536 { 4 } else { 8 };
-                assert_eq!((p.tokens, p.end, p.mma.warps), (tokens, end, expected),
+                assert_eq!((p.tokens, p.end), (tokens, end),
                     "start={start}, prefix={prefix}, tokens={tokens}");
                 let spans = if prefix == 0 { vec![end] } else { vec![prefix, end - prefix] };
+                // No append staging: K and V are quantized into the cache rows.
                 assert_eq!(p.working_bytes, projection_bytes(tokens)
-                    + attention_mma::Plan::new(&spans, tokens, start, expected).unwrap().working_bytes);
+                    + attention_mma::Plan::new(&spans, tokens, start).unwrap().working_bytes);
             }
         }
     }
@@ -106,11 +107,13 @@ fn gpu_attention_mma_prefix_decode_and_pending_ownership() {
 fn attention_geometry_budgets_and_positions_before_device() {
     let a = admission(limits(1024)).unwrap();
     assert_eq!(a.weight_bytes, 35_651_584);
-    assert_eq!(a.kv_bytes, 1 << 20);
+    // NVFP4 K and V: 2 x (128 code + 16 scale) bytes per token, not 1,024.
+    assert_eq!(KV_ROW_BYTES, 288);
+    assert_eq!(a.kv_bytes, 1024 * 288);
     assert_eq!(a.resident_bytes, a.weight_bytes + a.kv_bytes);
     let mut large = limits(1 << 20);
     large.max_resident_bytes = 2 << 30;
-    assert_eq!(admission(large).unwrap().kv_bytes, 1 << 30);
+    assert_eq!(admission(large).unwrap().kv_bytes, 301_989_888);
     // 1024 is a witness size, not an architectural ceiling.
     assert!(admission(limits(1025)).is_ok());
     for capacity in [0, (1 << 20) + 1, usize::MAX] {
@@ -162,20 +165,20 @@ fn attention_budget_counts_prefix_and_private_run_rounding_at_t1_and_full_tiles(
     // T tokens: projections 68,608 T + Q 24,576 T = 93,184 T B; every
     // reduction slot adds 16,640 T B of F32 partials and statistics.
     // Splits: TARGET_CUBES 1024 over (query tiles x 2 KV heads), shared by
-    // span, at most one per 128 keys; B4 tiles are ceil(T/4), B8 ceil(T/8).
+    // span, at most one per 128 keys; tiles are ceil(T/4) at every T (B4).
     let last = (1 << 20) - 1;
     for (prefix, start, tokens, expected_splits, expected_bytes) in [
         (0, 0, 256, vec![2], 32_374_784),
         (0, 16_128, 256, vec![8], 57_933_824),
-        (0, 524_032, 256, vec![16], 92_012_544),
+        (0, 524_032, 256, vec![8], 57_933_824),
         (257, 511, 256, vec![3, 4], 53_673_984),
-        (524_032, 524_032, 256, vec![16, 1], 96_272_384),
+        (524_032, 524_032, 256, vec![8, 1], 62_193_664),
         (0, last, 1, vec![512], 8_612_864),
         (1_048_560, last, 1, vec![512, 1], 8_629_504),
     ] {
         let p = plan_with_prefix(start, tokens, l, prefix).unwrap();
         let spans = if prefix == 0 { vec![p.end] } else { vec![prefix, p.end - prefix] };
-        let tiles = attention_mma::query_tiles(tokens, p.mma.warps);
+        let tiles = attention_mma::query_tiles(tokens);
         assert_eq!(flash::key_run_splits(&spans, tiles, KV_HEADS), expected_splits);
         assert_eq!(p.working_bytes, expected_bytes);
         assert!(plan_with_prefix(start, tokens,
@@ -349,16 +352,16 @@ impl Evidence {
             .collect()
     }
     fn cache(&mut self, prefix: &str, a: &Attention) {
-        for (label, handle) in [("k", &a.keys), ("v", &a.values)] {
-            let bytes = a.weights.client.read_one(handle.clone()).unwrap();
+        for (label, rows) in [("k", &a.keys), ("v", &a.values)] {
             // Discard uninitialized/previous-context tail bytes, never export.
-            let live = a.attended() * KV_WIDTH * 2;
-            self.raw(
-                &format!("{prefix}-{label}-cache.bf16"),
-                &bytes[..live],
-                "BF16_LE",
-                &[a.attended(), KV_HEADS, HEAD_DIM],
-            );
+            for (plane, handle, width, dtype, shape) in [
+                ("codes", &rows.codes, CODE_ROW_BYTES, "E2M1X2_LOW_NIBBLE_FIRST", [a.attended(), KV_HEADS, HEAD_DIM / 2]),
+                ("scales", &rows.scales, SCALE_ROW_BYTES, "E4M3", [a.attended(), KV_HEADS, HEAD_DIM / 16]),
+            ] {
+                let bytes = a.weights.client.read_one(handle.clone()).unwrap();
+                let live = a.attended() * width;
+                self.raw(&format!("{prefix}-{label}-cache-{plane}.bin"), &bytes[..live], dtype, &shape);
+            }
         }
     }
     fn finish(&self, report: serde_json::Value) {
@@ -506,7 +509,7 @@ fn gpu_attention_component_partitions_and_state() {
         metrics(&joined[2], &joined[0]),
         metrics(&after_reset, &joined[0][..HIDDEN]),
     ];
-    evidence.finish(serde_json::json!({"scope":"synthetic full Super attention geometry, not model acceptance","scales_qkvo":scales,"heads":32,"kv_heads":2,"head_dim":128,"capacity":5,"context_limit":1<<20,"phases":reports,"comparisons":comparisons,"native_policy":"static FP8 MMA projections; BF16 KV; F32 online attention; BF16 before O"}));
+    evidence.finish(serde_json::json!({"scope":"synthetic full Super attention geometry, not model acceptance","scales_qkvo":scales,"heads":32,"kv_heads":2,"head_dim":128,"capacity":5,"context_limit":1<<20,"phases":reports,"comparisons":comparisons,"native_policy":"static FP8 MMA projections; NVFP4 KV; NVFP4 Q in the kernel; F32 online attention; BF16 before O"}));
     assert!(
         joined
             .iter()
@@ -535,6 +538,8 @@ fn gpu_online_attention_514_keys() {
             }
         })
         .collect();
+    // 96 (kv + 1) and 48 (kv + 1) are exact in NVFP4 (code 6 under the exact
+    // scales 16, 32 and 8, 16), so the visible mean is exact.
     let v: Vec<f32> = (0..capacity * KV_WIDTH)
         .map(|i| {
             let row = i / KV_WIDTH;
@@ -542,9 +547,9 @@ fn gpu_online_attention_514_keys() {
             if row >= keys {
                 f32::NAN
             } else if row == 0 {
-                128.0 * (h + 1) as f32
+                96.0 * (h + 1) as f32
             } else if row == 513 {
-                64.0 * (h + 1) as f32
+                48.0 * (h + 1) as f32
             } else {
                 0.0
             }
@@ -555,11 +560,20 @@ fn gpu_online_attention_514_keys() {
     evidence.tensor("q.bf16", &q);
     evidence.tensor("k-reserved.bf16", &k); // Tail is explicit synthetic NaNs, not uninitialized memory.
     evidence.tensor("v-reserved.bf16", &v);
+    // The cache's quantizer, and the dead tail's scales set to the E4M3 NaN
+    // the quantizer never writes: a read of any of them turns the output NaN.
+    let nvfp4 = |t: &CudaTensor| -> Rows {
+        let (codes, scales) = fp4quant::quantize_nvfp4_bf16(&client, &t.handle, capacity, KV_WIDTH);
+        let mut bytes = client.read_one(scales).unwrap()[..capacity * SCALE_ROW_BYTES].to_vec();
+        bytes[keys * SCALE_ROW_BYTES..].fill(0x7f);
+        Rows { codes, scales: client.create_from_slice(&bytes) }
+    };
+    let (k, v) = (nvfp4(&k), nvfp4(&v));
     let run = KeyRun {
-        k: &k.handle,
-        v: &v.handle,
-        k_scales: None,
-        v_scales: None,
+        k: &k.codes,
+        v: &v.codes,
+        k_scales: Some(&k.scales),
+        v_scales: Some(&v.scales),
         rows: capacity,
         base: 0,
         lo: 0,
@@ -567,11 +581,11 @@ fn gpu_online_attention_514_keys() {
         row0: 0,
     };
     let mut reports = Vec::new();
-    // T2 and T1 decode at the boundary, at both plane counts. A position sees
-    // keys 0..=pos only: row 0 contributes 128(kv+1), row 513 64(kv+1).
+    // T2 and T1 decode at the boundary. A position sees keys 0..=pos only:
+    // row 0 contributes 96(kv+1), row 513 48(kv+1).
     for (tokens, q0) in [(2, 512), (1, 0), (1, 512), (1, 513)] {
-        for warps in [4, 8] {
-            let plan = attention_mma::Plan::new(&[keys], tokens, q0, warps).unwrap();
+        {
+            let plan = attention_mma::Plan::new(&[keys], tokens, q0).unwrap();
             let out = attention_mma::launch_planned(&client, &q.handle, &[run],
                 1.0 / (HEAD_DIM as f32).sqrt(), &plan).unwrap();
             let out = CudaTensor::new_contiguous(
@@ -581,19 +595,19 @@ fn gpu_online_attention_514_keys() {
                 out,
                 DType::F32,
             );
-            let got = evidence.tensor(&format!("t{tokens}-q0{q0}-b{warps}-output.f32"), &out);
+            let got = evidence.tensor(&format!("t{tokens}-q0{q0}-output.f32"), &out);
             let expected: Vec<f64> = (0..tokens * HIDDEN)
                 .map(|i| {
                     let pos = q0 + i / HIDDEN;
                     let kv = (i % HIDDEN) / HEAD_DIM / 16;
-                    let sum = if pos >= 513 { 192.0 } else { 128.0 };
+                    let sum = if pos >= 513 { 144.0 } else { 96.0 };
                     sum * (kv + 1) as f64 / (pos + 1) as f64
                 })
                 .collect();
             let mut report = metrics(&got, &expected);
             report["tokens"] = tokens.into();
             report["q0"] = q0.into();
-            report["warps"] = warps.into();
+            report["warps"] = attention_mma::WARPS.into();
             reports.push(report);
         }
     }

@@ -63,7 +63,7 @@ pub(super) fn mamba_bytes(c: &TextConfig) -> Result<usize> {
 fn ownership(c: &TextConfig, l: Limits, prefix: usize) -> Result<PrefixOwnership> {
     if prefix == 0 || prefix > l.capacity { return Err("prefix outside context capacity".into()); }
     let row = c.layers_block_type.iter().filter(|k| matches!(k, LayerKind::Attention)).count()
-        .checked_mul(2 * 2 * 2 * 128).ok_or("prefix KV row overflow")?;
+        .checked_mul(attention::KV_ROW_BYTES).ok_or("prefix KV row overflow")?;
     Ok(PrefixOwnership {
         prefix_tokens: prefix,
         shared_kv_bytes: prefix.checked_mul(row).ok_or("prefix KV overflow")?,

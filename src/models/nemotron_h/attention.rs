@@ -1,10 +1,18 @@
 //! Bounded native Nemotron attention mixer, not an assembled hybrid session.
 //!
 //! Normalized BF16 [1,T,4096] -> four separately scaled static FP8 projections
-//! -> tensor-core online attention (BF16 Q/K/V, F32 accumulation) over plain
-//! BF16 KV -> BF16 mixer output.
-//! No RoPE, Q/K norm, gate, sink, outer norm or residual. F32 online reduction
-//! is a declared native choice, not bitwise eager-BF16 attention parity.
+//! -> K and V quantized to NVFP4 rows on append -> tensor-core online attention
+//! (Q quantized to NVFP4 in the kernel, block-scaled FP4 Q K^T, V decoded to
+//! BF16 for the PV product, F32 accumulation) -> BF16 mixer output.
+//! No RoPE, Q/K norm, gate, sink, outer norm or residual. FP4 K/V and Q and F32
+//! online reduction are declared native precision choices, judged by model
+//! capability, not by numerical agreement with eager-BF16 attention.
+//!
+//! The cache is `inkling::kvpages::Fp4Rows`' layout, written by the same
+//! `fp4quant::quantize_nvfp4_bf16` rule: per row, `u32` E2M1 code words and one
+//! E4M3 scale byte per 16 features, no second level. Quantization runs along
+//! features, so an append writes only its own rows and never re-quantizes an
+//! earlier one, and a prefix is shared by handle as before.
 //!
 //! The owner privately binds uploaded weights, cache, device and provenance.
 //! Enqueue stages only beyond the committed KV prefix. Commit fences device
@@ -15,14 +23,13 @@
 
 use super::fp8::{CudaTensor, Projection};
 use super::attention_mma;
-use crate::models::inkling::flash::KeyRun;
+use crate::models::inkling::{flash::KeyRun, fp4quant};
 use burn::tensor::DType;
 use cubecl::{
     cuda::{CudaDevice, CudaRuntime},
     prelude::*,
     server::Handle,
 };
-use half::bf16;
 use std::sync::Arc;
 use triblespace::prelude::Id;
 
@@ -33,6 +40,13 @@ pub const KV_HEADS: usize = 2;
 pub const HEAD_DIM: usize = 128;
 pub const MAX_CHUNK: usize = 256;
 const KV_WIDTH: usize = KV_HEADS * HEAD_DIM;
+/// NVFP4 code bytes per cached K (or V) row: two E2M1 codes a byte.
+pub const CODE_ROW_BYTES: usize = KV_WIDTH / 2;
+/// E4M3 block-scale bytes per cached K (or V) row: one per 16 features.
+pub const SCALE_ROW_BYTES: usize = KV_WIDTH / fp4quant::GROUP;
+/// Cache bytes per token per attention layer, K and V together:
+/// 2 x (128 + 16) = 288, against 1,024 as BF16.
+pub const KV_ROW_BYTES: usize = 2 * (CODE_ROW_BYTES + SCALE_ROW_BYTES);
 const SHAPES: [[usize; 2]; 4] = [
     [HIDDEN, HIDDEN],
     [KV_WIDTH, HIDDEN],
@@ -41,19 +55,13 @@ const SHAPES: [[usize; 2]; 4] = [
 ];
 
 /// The one attention algorithm this owner runs, as checkpoint provenance
-/// records it: tensor-core MMA at NK64 with P split into BF16 hi + lo, at
-/// every T including T1 decode. A fixed identity, not a choice. It differs
-/// from every retired profile (`scalar-f32-v1`, `mma-bf16-p-v1`, and
-/// `mma-hilo-p-v1`, whose T1 decode was scalar), so state recorded under any
-/// of them is refused.
-pub const EXECUTION: &str = "mma-hilo-p-t1-v1";
-
-/// Query planes per cube: B4 for T1 (one live plane) and below live end
-/// 65536, B8 above. The threshold is a measured-context heuristic, not a
-/// proven crossover.
-fn warps(tokens: usize, end: usize) -> usize {
-    if tokens == 1 || end < 65536 { 4 } else { 8 }
-}
+/// records it: NVFP4 K/V rows, Q quantized to NVFP4 in the kernel, S on the
+/// block-scaled FP4 MMA (phase B2), V decoded to BF16, P split into BF16 hi +
+/// lo, NK32, two cp.async stages, B4, at every T including T1 decode. A fixed
+/// identity, not a choice. It differs from every retired profile
+/// (`scalar-f32-v1`, `mma-bf16-p-v1`, `mma-hilo-p-v1` and `mma-hilo-p-t1-v1`,
+/// all over BF16 K/V), so state recorded under any of them is refused.
+pub const EXECUTION: &str = "mma-b2-nvfp4-kv-fp4-qk-hilo-p-v1";
 
 /// Caller-selected provenance, not an assertion about an upstream checkpoint.
 /// Bytes/scales must be selected together from one frozen native observation.
@@ -78,7 +86,7 @@ pub struct Limits {
     /// Caller supplies the configured model limit; no implicit 1024-token cap.
     pub context_limit: usize,
     pub capacity: usize,
-    /// Four packed projection weights plus two reserved BF16 KV buffers.
+    /// Four packed projection weights plus the reserved NVFP4 K/V rows.
     pub max_resident_bytes: usize,
     /// Conservative sum of fresh projection/cast/online-attention allocations.
     pub max_working_bytes: usize,
@@ -145,10 +153,32 @@ pub(super) struct Weights {
     projections: [Projection; 4],
 }
 
+/// One tensor's NVFP4 rows, `kvpages::Fp4Rows`' two planes: `codes` is
+/// `[rows, 256 / 8]` `u32` E2M1 words, `scales` `[rows, 256 / 16]` E4M3 bytes.
+#[derive(Clone)]
+pub(super) struct Rows {
+    pub(super) codes: Handle,
+    pub(super) scales: Handle,
+}
+impl Rows {
+    fn reserve(client: &ComputeClient<CudaRuntime>, rows: usize) -> Self {
+        Self { codes: client.empty(rows * CODE_ROW_BYTES), scales: client.empty(rows * SCALE_ROW_BYTES) }
+    }
+    /// Views of rows `start .. start + rows` (bounded by the caller).
+    fn rows(&self, start: usize, rows: usize) -> Result<Self> {
+        let slice = |h: &Handle, width: usize| -> Result<Handle> {
+            let hi = checked_elements(&[start + rows, width], 1)?;
+            if h.size_in_used() < hi as u64 { return Err("short KV backing".into()); }
+            Ok(h.clone().offset_start((start * width) as u64).offset_end(h.size_in_used() - hi as u64))
+        };
+        Ok(Self { codes: slice(&self.codes, CODE_ROW_BYTES)?, scales: slice(&self.scales, SCALE_ROW_BYTES)? })
+    }
+}
+
 pub struct Attention {
     pub(super) weights: Arc<Weights>,
-    keys: Handle,
-    values: Handle,
+    keys: Rows,
+    values: Rows,
     private_rows: usize,
     prefix: Option<Arc<KvPrefix>>,
     limits: Limits,
@@ -156,34 +186,31 @@ pub struct Attention {
     sequence: Sequence,
 }
 
-/// Sealed contiguous BF16 K/V at a completed boundary. Never writable through
-/// a Session. The exact uploaded projection owner is part of compatibility.
+/// Sealed contiguous NVFP4 K/V rows at a completed boundary. Never writable
+/// through a Session. The exact uploaded projection owner is part of
+/// compatibility.
 pub(super) struct KvPrefix {
     weights: Arc<Weights>,
-    keys: Handle,
-    values: Handle,
+    keys: Rows,
+    values: Rows,
     rows: usize,
 }
 
 impl KvPrefix {
-    /// Owning handles over one exact contiguous token range. The caller keeps
-    /// this immutable prefix alive and reads on its fenced origin stream.
-    pub(super) fn range(&self, start: usize, rows: usize) -> Result<[Handle; 2]> {
+    /// Owning handles over one exact contiguous token range, `[keys, values]`.
+    /// The caller keeps this immutable prefix alive and reads on its fenced
+    /// origin stream.
+    pub(super) fn range(&self, start: usize, rows: usize) -> Result<[Rows; 2]> {
         let end = start.checked_add(rows).ok_or("KV export range overflow")?;
         if rows == 0 || end > self.rows { return Err("KV export outside prefix".into()); }
-        let hi = checked_elements(&[end, KV_WIDTH], 2)? * 2;
-        let lo = start * KV_WIDTH * 2; // bounded by checked hi
-        let slice = |h: &Handle| -> Result<Handle> {
-            if h.size_in_used() < hi as u64 { return Err("short KV backing".into()); }
-            Ok(h.clone().offset_start(lo as u64).offset_end(h.size_in_used() - hi as u64))
-        };
-        Ok([slice(&self.keys)?, slice(&self.values)?])
+        Ok([self.keys.rows(start, rows)?, self.values.rows(start, rows)?])
     }
 
-    /// The hybrid importer owns/fences both uploads before publishing Prefix.
-    pub(super) fn imported(weights: Arc<Weights>, rows: usize, keys: Handle, values: Handle) -> Result<Arc<Self>> {
-        let size = checked_elements(&[rows, KV_WIDTH], 2)? * 2;
-        if keys.size_in_used() != size as u64 || values.size_in_used() != size as u64 {
+    /// The hybrid importer owns/fences every upload before publishing Prefix.
+    pub(super) fn imported(weights: Arc<Weights>, rows: usize, keys: Rows, values: Rows) -> Result<Arc<Self>> {
+        let codes = checked_elements(&[rows, CODE_ROW_BYTES], 1)? as u64;
+        let scales = checked_elements(&[rows, SCALE_ROW_BYTES], 1)? as u64;
+        if [&keys, &values].iter().any(|r| r.codes.size_in_used() != codes || r.scales.size_in_used() != scales) {
             return Err("imported KV backing differs from prefix extent".into());
         }
         Ok(Arc::new(Self { weights, rows, keys, values }))
@@ -220,7 +247,7 @@ pub(super) fn admission(limits: Limits) -> Result<Admission> {
     if limits.capacity == 0 || limits.capacity > limits.context_limit {
         return Err("attention capacity must be positive and within explicit context limit".into());
     }
-    let kv_bytes = checked_elements(&[limits.capacity, KV_WIDTH], 2)? * 4;
+    let kv_bytes = checked_elements(&[limits.capacity, KV_ROW_BYTES], 1)?;
     let weight_bytes = SHAPES.iter().try_fold(0usize, |sum, s| -> Result<usize> {
         sum.checked_add(checked_elements(s, 1)?)
             .ok_or("weight byte sum overflow".into())
@@ -262,7 +289,8 @@ fn plan_with_prefix(start: usize, tokens: usize, limits: Limits, prefix: usize) 
     // The launcher's actual per-run split rounding, including the extra
     // partial slot a second run can require. No full-capacity tail is counted.
     let spans = if prefix == 0 { vec![end] } else { vec![prefix, end - prefix] };
-    let mma = attention_mma::Plan::new(&spans, tokens, start, warps(tokens, end))?;
+    // K and V are quantized straight into the reserved rows: no staging copy.
+    let mma = attention_mma::Plan::new(&spans, tokens, start)?;
     let mut working = mma.working_bytes;
     for [n, k] in SHAPES {
         // Peer Projection::working_bytes = FP8 input + F32 accumulator + BF16 output.
@@ -335,8 +363,8 @@ impl Attention {
             upload(o, SHAPES[3])?,
         ];
         let client = CudaRuntime::client(&device);
-        let keys = client.empty(admission.kv_bytes / 2);
-        let values = client.empty(admission.kv_bytes / 2);
+        let keys = Rows::reserve(&client, limits.capacity);
+        let values = Rows::reserve(&client, limits.capacity);
         Ok(Self {
             weights: Arc::new(Weights { source, client, device, projections }),
             keys,
@@ -352,8 +380,8 @@ impl Attention {
     /// projections remain bound to the exact uploaded owner.
     pub(super) fn from_weights(weights: Arc<Weights>, limits: Limits) -> Result<Self> {
         let admission = admission(limits)?;
-        let keys = weights.client.empty(admission.kv_bytes / 2);
-        let values = weights.client.empty(admission.kv_bytes / 2);
+        let keys = Rows::reserve(&weights.client, limits.capacity);
+        let values = Rows::reserve(&weights.client, limits.capacity);
         Ok(Self { weights, keys, values, private_rows: limits.capacity, prefix: None,
             limits, admission, sequence: Sequence::default() })
     }
@@ -376,14 +404,14 @@ impl Attention {
         // At P=C no append is possible. These owning placeholders are never
         // passed as writable bindings; no zero-byte allocation is manufactured.
         let keys = if private_rows == 0 { prefix.keys.clone() }
-            else { weights.client.empty(private_rows * KV_WIDTH * 2) };
+            else { Rows::reserve(&weights.client, private_rows) };
         let values = if private_rows == 0 { prefix.values.clone() }
-            else { weights.client.empty(private_rows * KV_WIDTH * 2) };
+            else { Rows::reserve(&weights.client, private_rows) };
         let sequence = Sequence { attended: prefix.rows, phase: Phase::Ready };
         Ok(Self { weights, keys, values, private_rows, prefix: Some(prefix), limits, admission, sequence })
     }
     pub(super) fn prefix_len(&self) -> usize { self.prefix.as_ref().map_or(0, |p| p.rows) }
-    pub(super) fn private_kv_bytes(&self) -> usize { self.private_rows * KV_WIDTH * 4 }
+    pub(super) fn private_kv_bytes(&self) -> usize { self.private_rows * KV_ROW_BYTES }
     pub(super) fn restore_prefix(&mut self) -> Result<()> {
         let position = self.prefix.as_ref().ok_or("attention has no saved prefix")?.rows;
         self.reset()?;
@@ -398,8 +426,8 @@ impl Attention {
             // The old state is drained. Partial allocation failure/unwind must
             // not advertise a Ready attention owner with insufficient backing.
             self.sequence.phase = Phase::Poisoned;
-            self.keys = self.weights.client.empty(admission.kv_bytes / 2);
-            self.values = self.weights.client.empty(admission.kv_bytes / 2);
+            self.keys = Rows::reserve(&self.weights.client, capacity);
+            self.values = Rows::reserve(&self.weights.client, capacity);
             self.private_rows = capacity;
             self.prefix = None;
             self.limits = limits;
@@ -480,31 +508,24 @@ impl Attention {
         let q = self.weights.projections[0].project(input, self.limits.max_working_bytes)?;
         let k = self.weights.projections[1].project(input, self.limits.max_working_bytes)?;
         let v = self.weights.projections[2].project(input, self.limits.max_working_bytes)?;
-        let n = p.tokens * KV_WIDTH;
-        let cube = CubeDim::new_1d(128);
-        unsafe {
-            append_tail::launch_unchecked::<CudaRuntime>(
-                &self.weights.client,
-                cubecl::calculate_cube_count_elemwise(&self.weights.client, n, cube),
-                cube,
-                ArrayArg::from_raw_parts(k.handle.clone(), n),
-                ArrayArg::from_raw_parts(v.handle.clone(), n),
-                ArrayArg::from_raw_parts(self.keys.clone(), self.private_rows * KV_WIDTH),
-                ArrayArg::from_raw_parts(self.values.clone(), self.private_rows * KV_WIDTH),
-                n,
-                (expected_start - self.prefix_len()) * KV_WIDTH,
-            );
+        // The new rows only, quantized straight into the private tail.
+        let at = expected_start - self.prefix_len();
+        for (rows, x) in [(&self.keys, &k), (&self.values, &v)] {
+            let tail = rows.rows(at, p.tokens)?;
+            fp4quant::quantize_nvfp4_bf16_into(&self.weights.client, &x.handle, p.tokens, KV_WIDTH,
+                &tail.codes, &tail.scales);
         }
         let mut runs = Vec::with_capacity(2);
         if let Some(prefix) = &self.prefix {
-            runs.push(KeyRun { k: &prefix.keys, v: &prefix.values, k_scales: None, v_scales: None,
+            runs.push(KeyRun { k: &prefix.keys.codes, v: &prefix.values.codes,
+                k_scales: Some(&prefix.keys.scales), v_scales: Some(&prefix.values.scales),
                 rows: prefix.rows, base: 0, lo: 0, hi: prefix.rows, row0: 0 });
         }
         runs.push(KeyRun {
-            k: &self.keys,
-            v: &self.values,
-            k_scales: None,
-            v_scales: None,
+            k: &self.keys.codes,
+            v: &self.values.codes,
+            k_scales: Some(&self.keys.scales),
+            v_scales: Some(&self.values.scales),
             rows: self.private_rows,
             base: self.prefix_len(),
             lo: 0,
@@ -558,42 +579,34 @@ impl Attention {
             cubecl::future::block_on(client.sync()).map_err(|e| format!("attention reset: {e:?}"))
         })
     }
-    /// Test-only committed prefix readback; never exports uninitialized tail.
+    /// Test-only committed readback, `[key codes, key scales, value codes,
+    /// value scales]` of every committed row; never exports uninitialized tail.
     #[cfg(test)]
-    pub(super) fn diagnostic_kv(&self) -> Result<[Vec<u8>; 2]> {
+    pub(super) fn diagnostic_kv(&self) -> Result<[Vec<u8>; 4]> {
         if self.sequence.phase != Phase::Ready {
             return Err("diagnostic KV read requires committed ready state".into());
         }
-        let read = |h: &Handle, rows: usize| -> Result<Vec<u8>> {
-            let bytes = rows * KV_WIDTH * 2;
+        let read = |h: &Handle, bytes: usize| -> Result<Vec<u8>> {
             self.weights.client.read_one(h.clone()).map(|v| v[..bytes].to_vec())
                 .map_err(|e| format!("diagnostic KV read: {e:?}"))
         };
-        let mut result = if let Some(prefix) = &self.prefix {
-            [read(&prefix.keys, prefix.rows)?, read(&prefix.values, prefix.rows)?]
-        } else { [Vec::new(), Vec::new()] };
+        let planes = |r: &Rows, rows: usize| -> Result<[Vec<u8>; 2]> {
+            Ok([read(&r.codes, rows * CODE_ROW_BYTES)?, read(&r.scales, rows * SCALE_ROW_BYTES)?])
+        };
+        let mut result: [Vec<u8>; 4] = Default::default();
+        let mut push = |keys: [Vec<u8>; 2], values: [Vec<u8>; 2]| {
+            for (out, bytes) in result.iter_mut().zip(keys.into_iter().chain(values)) {
+                out.extend(bytes);
+            }
+        };
+        if let Some(prefix) = &self.prefix {
+            push(planes(&prefix.keys, prefix.rows)?, planes(&prefix.values, prefix.rows)?);
+        }
         let suffix = self.sequence.attended - self.prefix_len();
         if suffix > 0 {
-            result[0].extend(read(&self.keys, suffix)?);
-            result[1].extend(read(&self.values, suffix)?);
+            push(planes(&self.keys, suffix)?, planes(&self.values, suffix)?);
         }
         Ok(result)
-    }
-}
-
-#[cube(launch_unchecked)]
-fn append_tail(
-    k: &Array<bf16>,
-    v: &Array<bf16>,
-    keys: &mut Array<bf16>,
-    values: &mut Array<bf16>,
-    n: usize,
-    offset: usize,
-) {
-    let i = ABSOLUTE_POS as usize;
-    if i < n {
-        keys[offset + i] = k[i];
-        values[offset + i] = v[i];
     }
 }
 

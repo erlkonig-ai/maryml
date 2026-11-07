@@ -285,6 +285,40 @@ fn quantize_nvfp4_as<E: Scalar + Cast, R: Runtime>(
     rows: usize,
     k: usize,
 ) -> (Handle, Handle) {
+    assert!(k > 0 && k % 64 == 0 && rows > 0, "NVFP4 needs rows > 0 and k a positive multiple of 64");
+    let n = rows * k;
+    let codes = client.empty(n / CODES_PER_WORD * core::mem::size_of::<u32>());
+    let scales = client.empty(n / GROUP);
+    quantize_nvfp4_into::<E, R>(client, x, rows, k, &codes, &scales);
+    (codes, scales)
+}
+
+/// [`quantize_nvfp4_bf16`] into caller-owned destinations: `rows` rows of
+/// codes and scales written at the START of `codes` and `scales`, which may be
+/// offset views ([`Handle::offset_start`]) into longer buffers. An appending
+/// cache uses it to write new rows behind the ones it already holds, which it
+/// never rewrites: the rows are independent, so the bytes are the ones
+/// [`quantize_nvfp4_bf16`] would return for the same input. The views must
+/// hold at least `rows * k / 8` `u32` and `rows * k / 16` bytes.
+pub fn quantize_nvfp4_bf16_into<R: Runtime>(
+    client: &ComputeClient<R>,
+    x: &Handle,
+    rows: usize,
+    k: usize,
+    codes: &Handle,
+    scales: &Handle,
+) {
+    quantize_nvfp4_into::<half::bf16, R>(client, x, rows, k, codes, scales)
+}
+
+fn quantize_nvfp4_into<E: Scalar + Cast, R: Runtime>(
+    client: &ComputeClient<R>,
+    x: &Handle,
+    rows: usize,
+    k: usize,
+    codes: &Handle,
+    scales: &Handle,
+) {
     assert!(
         k > 0 && k % 64 == 0,
         "k must be a positive multiple of 64, got {k}"
@@ -294,9 +328,11 @@ fn quantize_nvfp4_as<E: Scalar + Cast, R: Runtime>(
     let n = rows * k;
     let blocks = n / GROUP;
     let words = n / CODES_PER_WORD;
-
-    let codes = client.empty(words * core::mem::size_of::<u32>());
-    let scales = client.empty(blocks);
+    assert!(
+        codes.size_in_used() >= (words * core::mem::size_of::<u32>()) as u64
+            && scales.size_in_used() >= blocks as u64,
+        "NVFP4 destinations shorter than {rows} rows of {k}"
+    );
 
     let cubes = blocks.div_ceil(CUBE_SIZE as usize) as u32;
     unsafe {
@@ -311,8 +347,6 @@ fn quantize_nvfp4_as<E: Scalar + Cast, R: Runtime>(
             blocks,
         );
     }
-
-    (codes, scales)
 }
 
 /// The eight representable E2M1 magnitudes, indexed by the code's low three

@@ -6,7 +6,7 @@ use super::*;
 use super::prefix::Boundary;
 use crate::leaf;
 use triblespace::core::blob::{Blob, encodings::tensor::{Tensor, TensorElement, TensorView,
-    elements::{BF16, F32}}};
+    elements::{BF16, F32, NVFP4}}};
 use triblespace::core::inline::{Inline, encodings::hash::Handle as BlobHandle};
 
 /// The state interpretation implemented here, not a general cross-device
@@ -14,10 +14,10 @@ use triblespace::core::inline::{Inline, encodings::hash::Handle as BlobHandle};
 /// arithmetic/kernel profile for the destination execution.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrefixExecution {
-    /// B1, BF16 KV, F32 Mamba state, and the one attention algorithm,
+    /// B1, NVFP4 KV, F32 Mamba state, and the one attention algorithm,
     /// [`attention::EXECUTION`]. A manifest records both; state recorded under
     /// any other attention name, every retired profile included, is refused.
-    NativeB1Bf16KvF32Mamba,
+    NativeB1Nvfp4KvF32Mamba,
 }
 
 /// Exact loader selections, not an authenticated portable operand fingerprint.
@@ -35,9 +35,12 @@ pub struct PrefixProvenance {
 pub struct KvChunk {
     pub start: usize,
     pub rows: usize,
-    /// Contiguous [rows, KV heads=2, head dimension=128], native BF16 bits.
-    pub keys: Inline<BlobHandle<Tensor<BF16, 3>>>,
-    pub values: Inline<BlobHandle<Tensor<BF16, 3>>>,
+    /// Contiguous logical [rows, KV heads=2, head dimension=128] as NVFP4: the
+    /// cache's own E2M1 code bytes (low nibble first), its E4M3 block scales
+    /// (one per 16 features), and a global scale of exactly 1.0, which this
+    /// cache never applies and restore requires.
+    pub keys: Inline<BlobHandle<Tensor<NVFP4, 3>>>,
+    pub values: Inline<BlobHandle<Tensor<NVFP4, 3>>>,
 }
 
 #[derive(Clone)]
@@ -69,10 +72,24 @@ pub struct PrefixCheckpoint {
 fn put<T: TensorElement, const R: usize, B: BlobStorePut>(store: &mut B,
     dims: [usize; R], payload: anybytes::Bytes) -> Result<Inline<BlobHandle<Tensor<T, R>>>>
 {
-    let expected = bytes(&dims, T::BITS / 8)?;
+    let elements = dims.iter().try_fold(1usize, |n, &d| n.checked_mul(d)).ok_or("checkpoint extent overflow")?;
+    let expected = T::payload_len(elements).ok_or("checkpoint extent overflow")?;
     if payload.len() != expected { return Err("checkpoint payload extent differs".into()); }
     let blob = leaf::leaf_blob::<T, R>(dims.map(|n| n as u64), payload).map_err(|e| e.to_string())?;
     store.put(blob).map_err(|e| format!("checkpoint put: {e}"))
+}
+
+/// One KV chunk's NVFP4 payload as the cache's two planes: the code bytes
+/// and the scale bytes. Refuses a global scale other than exactly 1.0 (the
+/// device rows carry none) and an E4M3 NaN scale (the quantizer never writes
+/// one); the codes are finite by construction.
+fn kv_planes(view: &TensorView, rows: usize) -> Result<(&[u8], &[u8])> {
+    let payload = view.payload();
+    let (codes, rest) = payload.split_at(rows * attention::CODE_ROW_BYTES);
+    let (scales, global) = rest.split_at(rows * attention::SCALE_ROW_BYTES);
+    if global != 1.0f32.to_le_bytes() { return Err("checkpoint KV global scale is not 1.0".into()); }
+    if scales.iter().any(|b| b & 0x7f == 0x7f) { return Err("checkpoint KV NaN block scale".into()); }
+    Ok((codes, scales))
 }
 
 /// The shared typed decoder validates all extent arithmetic before exposing
@@ -105,7 +122,7 @@ impl PrefixCheckpoint {
         if self.provenance.config != *config || self.provenance.layers != layer_ids
             || self.layers.len() != config.layers_block_type.len()
             || layer_ids.len() != self.layers.len()
-            || self.provenance.execution != PrefixExecution::NativeB1Bf16KvF32Mamba {
+            || self.provenance.execution != PrefixExecution::NativeB1Nvfp4KvF32Mamba {
             return Err("checkpoint config/layer order/execution contract differs".into());
         }
         for (kind, layer) in config.layers_block_type.iter().zip(&self.layers) {
@@ -118,8 +135,9 @@ impl PrefixCheckpoint {
                             return Err("checkpoint KV has gap/overlap/empty/outside range".into());
                         }
                         let shape = [chunk.rows, attention::KV_HEADS, attention::HEAD_DIM];
-                        read::<BF16, 3, _>(store, chunk.keys, shape)?;
-                        read::<BF16, 3, _>(store, chunk.values, shape)?;
+                        for handle in [chunk.keys, chunk.values] {
+                            kv_planes(&read::<NVFP4, 3, _>(store, handle, shape)?, chunk.rows)?;
+                        }
                         next = end;
                     }
                     if next != self.position { return Err("incomplete checkpoint KV prefix".into()); }
@@ -166,10 +184,16 @@ impl<S> Prefix<S> {
                         while start < self.ids.len() {
                             let rows = chunk_rows.min(self.ids.len() - start);
                             let [keys, values] = kv.range(start, rows)?;
-                            let mut capture = |handle| -> Result<_> {
-                                let data = self.model.client.read_one(handle).map_err(|e| format!("checkpoint KV read: {e:?}"))?;
-                                put::<BF16, 3, _>(store, [rows, attention::KV_HEADS, attention::HEAD_DIM],
-                                    anybytes::Bytes::from_source(data.to_vec()))
+                            // The cache's two planes, then the global scale 1.0.
+                            let mut capture = |planes: attention::Rows| -> Result<_> {
+                                let mut payload = Vec::new();
+                                for handle in [planes.codes, planes.scales] {
+                                    payload.extend_from_slice(&self.model.client.read_one(handle)
+                                        .map_err(|e| format!("checkpoint KV read: {e:?}"))?);
+                                }
+                                payload.extend_from_slice(&1.0f32.to_le_bytes());
+                                put::<NVFP4, 3, _>(store, [rows, attention::KV_HEADS, attention::HEAD_DIM],
+                                    anybytes::Bytes::from_source(payload))
                             };
                             chunks.push(KvChunk { start, rows, keys: capture(keys)?, values: capture(values)? });
                             start += rows;
@@ -197,7 +221,7 @@ impl<S> Prefix<S> {
             fence(&self.model.client)?;
             Ok(PrefixCheckpoint {
                 provenance: PrefixProvenance { source: self.model.source, config: self.model.config.clone(),
-                    layers: self.model.layer_ids().collect(), execution: PrefixExecution::NativeB1Bf16KvF32Mamba },
+                    layers: self.model.layer_ids().collect(), execution: PrefixExecution::NativeB1Nvfp4KvF32Mamba },
                 position: self.ids.len(), tokens: self.ids.clone(), last_logits, layers,
             })
         })
@@ -256,22 +280,30 @@ impl<S: BlobStoreGet> Session<S> {
             for (weights, state) in model.layers.iter().zip(&checkpoint.layers) {
                 let boundary = match (&weights.mixer, state) {
                     (MixerWeights::Attention(w), PrefixLayer::Attention(chunks)) => {
-                        let size = bytes(&[checkpoint.position, attention::KV_HEADS, attention::HEAD_DIM], 2)?;
-                        let shape = [checkpoint.position, attention::KV_HEADS, attention::HEAD_DIM];
-                        let keys = CudaTensor::new_contiguous(model.client.clone(), model.device.clone(), shape.into(),
-                            model.client.empty(size), DType::BF16);
-                        self.pending.push(keys.clone());
-                        let values = CudaTensor::new_contiguous(model.client.clone(), model.device.clone(), shape.into(),
-                            model.client.empty(size), DType::BF16);
-                        self.pending.push(values.clone());
+                        let rows = checkpoint.position;
+                        let mut plane = |width: usize, unit: usize, dtype: DType| -> Result<cubecl::server::Handle> {
+                            let size = bytes(&[rows, width], 1)?;
+                            let shape = [rows, width / unit];
+                            let owner = CudaTensor::new_contiguous(model.client.clone(), model.device.clone(),
+                                shape.into(), model.client.empty(size), dtype);
+                            self.pending.push(owner.clone());
+                            Ok(owner.handle)
+                        };
                         // Session owns destinations across every failed fence
                         // or unwind, independently of these local wrappers.
-                        let kv = attention::KvPrefix::imported(w.clone(), checkpoint.position, keys.handle.clone(), values.handle.clone())?;
+                        let mut rows_of = || -> Result<attention::Rows> {
+                            Ok(attention::Rows { codes: plane(attention::CODE_ROW_BYTES, 4, DType::U32)?,
+                                scales: plane(attention::SCALE_ROW_BYTES, 1, DType::U8)? })
+                        };
+                        let (keys, values) = (rows_of()?, rows_of()?);
+                        let kv = attention::KvPrefix::imported(w.clone(), rows, keys, values)?;
                         for chunk in chunks {
                             let targets = kv.range(chunk.start, chunk.rows)?;
                             for (target, handle) in targets.into_iter().zip([chunk.keys, chunk.values]) {
-                                let view = read::<BF16, 3, _>(store, handle, [chunk.rows, attention::KV_HEADS, attention::HEAD_DIM])?;
-                                write(&model, target, view.payload())?;
+                                let view = read::<NVFP4, 3, _>(store, handle, [chunk.rows, attention::KV_HEADS, attention::HEAD_DIM])?;
+                                let (codes, scales) = kv_planes(&view, chunk.rows)?;
+                                write(&model, target.codes, codes)?;
+                                write(&model, target.scales, scales)?;
                             }
                         }
                         Boundary::Attention(kv)
@@ -337,7 +369,7 @@ impl<S: BlobStoreGet> Session<S> {
 /// new copy kernel. The server owns staging bytes and the binding through its
 /// queued write; the caller retains the full destination and observes errors
 /// on THIS stream. Per-chunk fence bounds queued host staging.
-fn write<S>(model: &DeviceModel<S>, target: cubecl::server::Handle, payload: &anybytes::Bytes) -> Result<()> {
+fn write<S>(model: &DeviceModel<S>, target: cubecl::server::Handle, payload: &[u8]) -> Result<()> {
     use cubecl::{device::Device, device_handle::DeviceHandle, server::{ComputeServer, CopyDescriptor}};
     if target.size_in_used() != payload.len() as u64 { return Err("checkpoint upload range differs".into()); }
     let stream = StreamId::current();

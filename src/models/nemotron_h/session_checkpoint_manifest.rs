@@ -10,15 +10,17 @@ use super::{attention, KvChunk, LayerKind, Limits, PrefixCheckpoint, PrefixExecu
 use crate::{format::attrs as model, jsonfacts, leaf, tokenizer};
 use std::{ops::{ControlFlow, Range}, sync::Arc};
 use triblespace::{core::{id_hex, metadata, blob::encodings::tensor::{Tensor,
-    elements::{BF16, F32}}}, prelude::*};
+    elements::{BF16, F32, NVFP4}}}, prelude::*};
 use blobencodings::{SimpleArchive, UTF8String};
 use inlineencodings::{GenId, Handle, RangeU128, U256BE};
 
 type Result<T> = std::result::Result<T, String>;
 type Visitor<'a> = dyn FnMut(Result<PrefixCheckpoint>) -> ControlFlow<()> + 'a;
-/// Execution-profile text of [`PrefixExecution::NativeB1Bf16KvF32Mamba`], before
-/// the attention algorithm.
-const NATIVE: &str = "native-b1-bf16-kv-f32-mamba/";
+/// Execution-profile text of [`PrefixExecution::NativeB1Nvfp4KvF32Mamba`], before
+/// the attention algorithm. A profile of another family (the BF16-KV
+/// `native-b1-bf16-kv-f32-mamba/` before it included) is a type this reader
+/// does not decode, so it is skipped, never refused.
+const NATIVE: &str = "native-b1-nvfp4-kv-f32-mamba/";
 
 /// Gapless little-endian u32 token IDs. Length/4 is the count; empty is valid at
 /// the encoding level. No native-endian cast, magic bytes or tokenizer semantics.
@@ -112,7 +114,7 @@ pub fn encode<R: BlobStoreGet, W: BlobStorePut>(read: &R, write: &mut W,
     checkpoint.validate(read, &config, &p.layers, limits, &checkpoint.tokens)?;
     let tokens = write.put(TokenIdsLe::encode(&checkpoint.tokens)?)
         .map_err(|e| format!("token put: {e}"))?;
-    let PrefixExecution::NativeB1Bf16KvF32Mamba = p.execution;
+    let PrefixExecution::NativeB1Nvfp4KvF32Mamba = p.execution;
     let profile = write.put::<UTF8String, _>(format!("{NATIVE}{}", attention::EXECUTION))
         .map_err(|e| format!("profile put: {e}"))?;
     let mut layers = Fragment::empty();
@@ -124,9 +126,9 @@ pub fn encode<R: BlobStoreGet, W: BlobStorePut>(read: &R, write: &mut W,
                 for chunk in chunks {
                     let end = chunk.start.checked_add(chunk.rows).ok_or("KV range overflow")?;
                     let keys = entity! { metadata::tag: schema::KEYS,
-                        leaf::leaf::<BF16, 3>(): chunk.keys };
+                        leaf::leaf::<NVFP4, 3>(): chunk.keys };
                     let values = entity! { metadata::tag: schema::VALUES,
-                        leaf::leaf::<BF16, 3>(): chunk.values };
+                        leaf::leaf::<NVFP4, 3>(): chunk.values };
                     children += entity! { schema::token_range: (chunk.start as u128, end as u128),
                         model::member*: keys + values };
                 }
@@ -208,7 +210,7 @@ pub fn visit_selected<B: BlobStoreGet>(store: &B, facts: &TribleSet, root: Id,
             Ok(Some(PrefixCheckpoint { provenance: PrefixProvenance {
                 source: Source { collection, root: model_root, config, tokenizer_binding: binding,
                     tokenizer_base: base, pre_tokenizer: pre }, config: config_value, layers: Vec::new(),
-                execution: PrefixExecution::NativeB1Bf16KvF32Mamba,
+                execution: PrefixExecution::NativeB1Nvfp4KvF32Mamba,
             }, position, tokens: Arc::from(tokens), last_logits: logits, layers: Vec::new() }))
         })();
         match selected {
@@ -285,12 +287,12 @@ fn visit_attention(facts: &TribleSet, layer: Id, position: usize,
     // Ephemeral alternatives from one selected layer, not retained cache state.
     let mut chunks = Vec::new();
     for (range, keys, values) in find!((range: Range<u128>,
-        keys: Inline<Handle<Tensor<BF16, 3>>>, values: Inline<Handle<Tensor<BF16, 3>>>),
+        keys: Inline<Handle<Tensor<NVFP4, 3>>>, values: Inline<Handle<Tensor<NVFP4, 3>>>),
         pattern!(facts, [
             { (layer) @ model::member: _?chunk },
             { _?chunk @ schema::token_range: ?range, model::member: _?keys, model::member: _?values },
-            { _?keys @ metadata::tag: schema::KEYS, leaf::leaf::<BF16, 3>(): ?keys },
-            { _?values @ metadata::tag: schema::VALUES, leaf::leaf::<BF16, 3>(): ?values }
+            { _?keys @ metadata::tag: schema::KEYS, leaf::leaf::<NVFP4, 3>(): ?keys },
+            { _?values @ metadata::tag: schema::VALUES, leaf::leaf::<NVFP4, 3>(): ?values }
         ])) {
         if range.start >= range.end || range.end > position as u128 {
             visitor(Err("checkpoint KV empty/reversed/outside range".into()))?;

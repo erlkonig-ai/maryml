@@ -24,17 +24,27 @@ pub(in crate::models::nemotron_h::session) fn host_checkpoint() -> (PrefixCheckp
     let mut chunks = Vec::new();
     for (start, rows) in [(0, 2), (2, 1)] {
         let shape = [rows, 2, 128];
-        let payload = anybytes::Bytes::from_source((0..rows * 256)
-            .flat_map(|i| ((i as u16) ^ 0x8000).to_le_bytes()).collect::<Vec<_>>());
-        let keys = put::<BF16, 3, _>(&mut store, shape, payload.clone()).unwrap();
-        let values = put::<BF16, 3, _>(&mut store, shape, payload).unwrap();
+        let payload = anybytes::Bytes::from_source(nvfp4_kv_payload(&(0..rows).collect::<Vec<_>>(), 0));
+        let keys = put::<NVFP4, 3, _>(&mut store, shape, payload.clone()).unwrap();
+        let values = put::<NVFP4, 3, _>(&mut store, shape, payload).unwrap();
         chunks.push(KvChunk { start, rows, keys, values });
     }
     let last_logits = put::<F32, 1, _>(&mut store, [c.vocab_size], zeros(&[c.vocab_size], 4)).unwrap();
     (PrefixCheckpoint { provenance: PrefixProvenance { source, config: c, layers: ids,
-        execution: PrefixExecution::NativeB1Bf16KvF32Mamba }, position: 3, tokens: Arc::from([1, 5, 7]),
+        execution: PrefixExecution::NativeB1Nvfp4KvF32Mamba }, position: 3, tokens: Arc::from([1, 5, 7]),
         last_logits, layers: vec![PrefixLayer::Mamba { position: 3, conv, recurrent },
             PrefixLayer::Attention(chunks), PrefixLayer::Stateless] }, store)
+}
+
+/// Synthetic cache rows (`rows` names each row's pattern) as a typed NVFP4
+/// payload: every code byte pattern (the `-0.0` code 8 included, `xor` to
+/// tell K from V), finite scale bytes (never the E4M3 NaN), global 1.0.
+pub(in crate::models::nemotron_h::session) fn nvfp4_kv_payload(rows: &[usize], xor: u8) -> Vec<u8> {
+    let (c, s) = (attention::CODE_ROW_BYTES, attention::SCALE_ROW_BYTES);
+    let mut payload: Vec<u8> = rows.iter().flat_map(|&r| (0..c).map(move |i| ((r * c + i) as u8) ^ 0x80 ^ xor)).collect();
+    payload.extend(rows.iter().flat_map(|&r| (0..s).map(move |j| ((r * s + j) % 0x7f) as u8)));
+    payload.extend_from_slice(&1.0f32.to_le_bytes());
+    payload
 }
 
 fn valid(c: &PrefixCheckpoint, store: &MemoryBlobStoreSnapshot) -> Result<()> {
@@ -49,16 +59,18 @@ fn checkpoint_host_typed_chunks_preserve_bits_and_own_views() {
     let PrefixLayer::Attention(chunks) = &checkpoint.layers[1] else { panic!() };
     assert_eq!((chunks[0].start, chunks[0].rows, chunks[1].start, chunks[1].rows), (0, 2, 2, 1));
     assert_eq!(chunks[0].keys, chunks[0].values, "identical typed bytes share a handle, without model salt");
-    let view = read::<BF16, 3, _>(&snapshot, chunks[0].keys, [2, 2, 128]).unwrap();
+    let view = read::<NVFP4, 3, _>(&snapshot, chunks[0].keys, [2, 2, 128]).unwrap();
     let PrefixLayer::Mamba { recurrent, .. } = &checkpoint.layers[0] else { panic!() };
     let m = mamba_config(&config());
     let recurrence = read::<F32, 4, _>(&snapshot, *recurrent, [1, m.heads, m.head_dim, m.state_dim]).unwrap();
-    let expected: Vec<u8> = (0..512).flat_map(|i| ((i as u16) ^ 0x8000).to_le_bytes()).collect();
+    let expected = nvfp4_kv_payload(&[0, 1], 0);
     drop(snapshot);
     drop(store);
     assert_eq!(view.payload().as_ref(), expected.as_slice(), "owning view outlives the store and snapshot");
-    // Includes signed zero and subnormals: no host f32 conversion/requantization.
-    assert_eq!(&view.payload()[..4], &[0, 128, 1, 128]);
+    // Codes, scales and the 1.0 global as stored: no host decode/requantization.
+    assert_eq!(view.payload().len(), 2 * 128 + 2 * 16 + 4);
+    assert_eq!(&view.payload()[..4], &[0x80, 0x81, 0x82, 0x83]);
+    assert_eq!(&view.payload()[2 * 144..], &1.0f32.to_le_bytes());
     assert!(recurrence.payload().chunks_exact(4).all(|v| v == 0x3f80_0001u32.to_le_bytes()),
         "F32 recurrent bits not representable as BF16 must survive unchanged");
 }
@@ -118,16 +130,26 @@ fn checkpoint_host_rejects_missing_malformed_shape_dtype_and_logits() {
     // Same-width F16/BF16 provenance is the typed query boundary's contract;
     // the raw bytes cannot prove their own interpretation.
     let fp32 = leaf::leaf_blob::<F32, 3>([2, 2, 128], anybytes::Bytes::from_source(vec![0u8; 2048])).unwrap();
-    let bad = store.insert(fp32.transmute::<Tensor<BF16, 3>>());
+    let bad = store.insert(fp32.transmute::<Tensor<NVFP4, 3>>());
     wrong = checkpoint.clone();
     if let PrefixLayer::Attention(chunks) = &mut wrong.layers[1] { chunks[0].keys = bad; }
     assert!(valid(&wrong, &store.snapshot().unwrap()).is_err());
     // Exact-length malicious header, rejected before decoder multiplication.
     let mut raw = vec![0; TENSOR_HEADER_LEN + 1024];
     for offset in [0, 8, 16] { raw[offset..offset + 8].copy_from_slice(&u64::MAX.to_le_bytes()); }
-    let bad = store.insert(Blob::<Tensor<BF16, 3>>::new(anybytes::Bytes::from_source(raw)));
+    let bad = store.insert(Blob::<Tensor<NVFP4, 3>>::new(anybytes::Bytes::from_source(raw)));
     if let PrefixLayer::Attention(chunks) = &mut wrong.layers[1] { chunks[0].keys = bad; }
     assert!(valid(&wrong, &store.snapshot().unwrap()).is_err());
+    // The device rows carry no global scale and no NaN block scale: a
+    // well-typed payload with either is refused before anything is uploaded.
+    for (at, byte) in [(2 * 144 + 3, 0x40u8), (2 * 128 + 5, 0x7f), (2 * 128 + 5, 0xff)] {
+        let mut payload = nvfp4_kv_payload(&[0, 1], 0);
+        payload[at] = byte;
+        let bad = put::<NVFP4, 3, _>(&mut store, [2, 2, 128], anybytes::Bytes::from_source(payload)).unwrap();
+        wrong = checkpoint.clone();
+        if let PrefixLayer::Attention(chunks) = &mut wrong.layers[1] { chunks[0].values = bad; }
+        assert!(valid(&wrong, &store.snapshot().unwrap()).is_err(), "payload byte {at} = {byte:#04x}");
+    }
     wrong = checkpoint.clone();
     let values: Vec<u8> = vec![f32::NAN; config().vocab_size].iter().flat_map(|v| v.to_le_bytes()).collect();
     wrong.last_logits = put::<F32, 1, _>(&mut store, [config().vocab_size], anybytes::Bytes::from_source(values)).unwrap();
@@ -197,8 +219,8 @@ fn checkpoint_roundtrip(seed: &[u32], l: Limits, export_rows: usize) {
     let mut a = other;
     assert_eq!(state_bytes(&a), expected);
     assert_eq!(a.last_logits().unwrap().values, expected_logits);
-    assert_eq!(a.prefix_ownership().unwrap().shared_kv_bytes, seed.len() * 1024);
-    assert_eq!(a.prefix_ownership().unwrap().private_kv_bytes, (l.capacity - seed.len()) * 1024);
+    assert_eq!(a.prefix_ownership().unwrap().shared_kv_bytes, seed.len() * attention::KV_ROW_BYTES);
+    assert_eq!(a.prefix_ownership().unwrap().private_kv_bytes, (l.capacity - seed.len()) * attention::KV_ROW_BYTES);
     let mut b = Session::from_prefix(destination, restored, l).unwrap();
     producer.append_ids(&[9]).unwrap();
     a.append_ids(&[9]).unwrap();
@@ -238,7 +260,7 @@ fn checkpoint_gpu_failed_origin_upload_never_publishes_restore() {
     assert!(result.is_err());
     assert_eq!(StreamId::current(), caller);
     assert_eq!(destination.status(), Status::Poisoned);
-    assert!(destination.saved_prefix().is_none() && destination.pending.len() == 4);
+    assert!(destination.saved_prefix().is_none() && destination.pending.len() == 6);
     let retained = destination.pending.len();
     destination.fault = Some(Fault::Reset);
     assert!(destination.reset().is_err());
@@ -254,7 +276,7 @@ fn checkpoint_gpu_failed_origin_upload_never_publishes_restore() {
     assert!(result.err().unwrap().contains("checkpoint CUDA completion"));
     assert_eq!(StreamId::current(), caller);
     assert_eq!(destination.status(), Status::Poisoned);
-    assert!(destination.saved_prefix().is_none() && destination.pending.len() == 4);
+    assert!(destination.saved_prefix().is_none() && destination.pending.len() == 6);
     // No inference/recovery after the defined checked descriptor rejection.
     // The caller still owns the original immutable checkpoint and host blobs.
     assert_eq!(checkpoint.tokens.as_ref(), &[1, 5, 7]);

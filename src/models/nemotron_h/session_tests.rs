@@ -68,13 +68,14 @@ fn full_limits(capacity: usize) -> Limits {
 #[test]
 fn session_host_prefix_admission_counts_shared_boundary_and_only_private_suffix() {
     let c = full_config(1 << 20);
-    // The exact minimum resident allowance at 1M: the whole model, bank included.
-    let l = Limits { capacity: 1 << 20, max_resident_bytes: 80_293_122_368, max_chunk_bytes: usize::MAX };
+    // The exact minimum resident allowance at 1M: the whole model, bank included,
+    // with 8 layers of NVFP4 K/V at 288 bytes per token each.
+    let l = Limits { capacity: 1 << 20, max_resident_bytes: 74_119_106_880, max_chunk_bytes: usize::MAX };
     assert!(prefix_admission(&c, Limits { max_resident_bytes: l.max_resident_bytes - 1, ..l },
         786_432 + 17, 786_432).is_err());
     let p = prefix_admission(&c, l, 786_432 + 17, 786_432).unwrap();
-    assert_eq!(p.after_advance.shared_kv_bytes, 6 << 30);
-    assert_eq!(p.after_advance.private_kv_bytes, 2 << 30);
+    assert_eq!(p.after_advance.shared_kv_bytes, 786_432 * 8 * 288);
+    assert_eq!(p.after_advance.private_kv_bytes, 262_144 * 8 * 288);
     assert_eq!(p.after_advance.shared_mamba_bytes, 171_048_960);
     assert_eq!(p.after_advance.private_mamba_bytes, 171_048_960);
     assert_eq!(resident_ownership(&c, l).unwrap().expert_bank_bytes, 63_417_876_480);
@@ -107,19 +108,21 @@ fn session_host_prefix_admission_counts_shared_boundary_and_only_private_suffix(
 #[test]
 fn session_host_prefill_full_window_pages_and_allocation_inventory() {
     let c = full_config(1 << 20);
-    let l = Limits { capacity: 1 << 20, max_resident_bytes: 80_293_122_368,
+    let l = Limits { capacity: 1 << 20, max_resident_bytes: 74_119_106_880,
         max_chunk_bytes: usize::MAX };
-    // No pending expert pair: each total is 3_096_584 below its cached-era figure.
+    // No pending expert pair: each total is 3_096_584 below its cached-era
+    // figure. The B4 attention tile (57_933_824 at T256) no longer sets the
+    // tile workspace: 8_391_680 outer + 60_047_360, a Mamba/MoE tile's.
     for (tokens, pages, hidden, latent, accumulator, total) in [
-        (785_039, 3, 6_431_039_488, 1_607_759_872, 3_215_519_744, 11_354_723_328),
-        (1_048_576, 4, 8_589_934_592, 2_147_483_648, 4_294_967_296, 15_132_789_760),
+        (785_039, 3, 6_431_039_488, 1_607_759_872, 3_215_519_744, 11_322_758_144),
+        (1_048_576, 4, 8_589_934_592, 2_147_483_648, 4_294_967_296, 15_100_824_576),
     ] {
         let a = prefill_admission(&c, l, 0, tokens).unwrap();
         assert!(a.layer_major);
         assert_eq!((a.hidden_pages, a.hidden_bytes, a.latent_bytes, a.accumulator_bytes),
             (pages, hidden, latent, accumulator));
         assert_eq!(a.largest_hidden_page_bytes, 1 << 31);
-        assert_eq!(a.tile_workspace_bytes, 100_404_224);
+        assert_eq!(a.tile_workspace_bytes, 68_439_040);
         assert_eq!(a.pending_expert_bytes, 0);
         assert_eq!(a.device_working_bytes, total);
         assert_eq!(a.host_routing_bytes, tokens * 272 + tokens.div_ceil(64) * 512 * 8);
@@ -144,9 +147,10 @@ fn session_host_full_tile_chunk_and_span_budgets() {
     let mut c = full_config(1 << 20);
     c.layers_block_type = vec![LayerKind::Attention];
     let l = Limits { max_chunk_bytes: usize::MAX, ..full_limits(1 << 20) };
+    // B4 at every T: 8 key splits at T256 here, 8 + 1 over the prefix.
     for (prefix, chunk_bytes, span_bytes, tile_bytes) in [
-        (0, 103_298_048, 102_509_568, 100_404_224),
-        (524_032, 107_557_888, 106_769_408, 104_664_064),
+        (0, 69_219_328, 68_430_848, 66_325_504),
+        (524_032, 73_479_168, 72_690_688, 70_585_344),
     ] {
         assert_eq!(planned_prefix_chunk_bytes(&c, l, 524_032, 256, prefix).unwrap(), chunk_bytes);
         let short = prefill::admission_with_prefix(&c, l, 524_032, 256, prefix).unwrap();
@@ -168,20 +172,22 @@ fn session_host_full_tile_chunk_and_span_budgets() {
 
 #[test]
 fn session_host_prefill_covers_actual_prefix_tile_peak() {
-    let mut c = full_config(131072);
+    // At B4 the witness is the first suffix tile, [8192, 8448) over an
+    // 8192-row prefix: 9 partial slots, against at most 8 at capacity 65536.
+    let mut c = full_config(65536);
     c.layers_block_type = vec![LayerKind::Attention];
-    let l = Limits { max_chunk_bytes: usize::MAX, ..full_limits(131072) };
-    let earlier = layer_prefix_working_bytes(&c, l, 130560, 256, &LayerKind::Attention, 8192).unwrap();
+    let l = Limits { max_chunk_bytes: usize::MAX, ..full_limits(65536) };
+    let earlier = layer_prefix_working_bytes(&c, l, 8192, 256, &LayerKind::Attention, 8192).unwrap();
     let final_width_peak = (1..=256).map(|t| layer_prefix_working_bytes(&c, l,
-        131072 - t, t, &LayerKind::Attention, 8192).unwrap()).max().unwrap();
+        65536 - t, t, &LayerKind::Attention, 8192).unwrap()).max().unwrap();
     assert!(earlier > final_width_peak, "actual earlier tile must not be hidden by final-width scan");
-    let a = prefill::admission_with_prefix(&c, l, 8192, 131072 - 8192, 8192).unwrap();
+    let a = prefill::admission_with_prefix(&c, l, 8192, 65536 - 8192, 8192).unwrap();
     let outer = bytes(&[MAX_CHUNK, H], 8).unwrap() + bytes(&[MAX_CHUNK], 12).unwrap();
     assert!(a.tile_workspace_bytes >= outer + earlier);
     assert!(prefill::admission_with_prefix(&c,
         Limits { max_chunk_bytes: a.device_working_bytes - 1, ..l },
-        8192, 131072 - 8192, 8192).is_err());
-    let whole = prefix_admission(&c, l, 131072, 8192).unwrap();
+        8192, 65536 - 8192, 8192).is_err());
+    let whole = prefix_admission(&c, l, 65536, 8192).unwrap();
     assert_eq!(whole.suffix.unwrap().device_working_bytes, a.device_working_bytes);
     let cold = admission(&c, l, 4096).unwrap();
     assert_eq!(cold.prefill.device_working_bytes,
@@ -199,8 +205,9 @@ fn session_host_shared_ownership_counts_the_bank_once() {
     // 8_114_262_336 fixed operands without experts, plus the bank.
     assert_eq!(small.fixed_model_bytes, 71_532_138_816);
     assert_eq!(large.fixed_model_bytes, small.fixed_model_bytes);
-    assert_eq!(small.private_state_bytes, 187_826_176);
-    assert_eq!(large.private_state_bytes, 2_318_532_608);
+    // Mamba state plus 8 layers of NVFP4 K/V at 288 bytes per token.
+    assert_eq!(small.private_state_bytes, 175_767_552);
+    assert_eq!(large.private_state_bytes, 775_028_736);
     for (capacity, ownership) in [(2048, small), (262144, large)] {
         let admitted = admission(&c, full_limits(capacity), 1).unwrap();
         assert_eq!(admitted.expert_cache_pairs_per_moe, moe::EXPERTS);
@@ -212,9 +219,9 @@ fn session_host_shared_ownership_counts_the_bank_once() {
     }
     // Two Sessions of unequal context share the fixed operands and the bank.
     let combined = small.fixed_model_bytes + small.private_state_bytes + large.private_state_bytes;
-    assert_eq!(combined, 74_038_497_600);
+    assert_eq!(combined, 72_482_935_104);
     let base = resident_bytes(&c, full_limits(2048)).unwrap();
-    assert_eq!(base, 71_719_964_992);
+    assert_eq!(base, 71_707_906_368);
     let rejected = Limits { max_resident_bytes: base - 1, ..full_limits(2048) };
     assert_eq!(resident_ownership(&c, rejected).unwrap_err(),
         admission(&c, rejected, 1).unwrap_err());
@@ -289,8 +296,8 @@ fn session_host_geometry_and_aggregate_admission() {
     let c = config();
     validate_config(&c, limits()).unwrap();
     let n = resident_bytes(&c, limits()).unwrap();
-    // 132_574_040 without experts, plus one layer's bank of 1_585_446_912.
-    assert_eq!(n, 1_718_020_952);
+    // 132_568_152 without experts, plus one layer's bank of 1_585_446_912.
+    assert_eq!(n, 1_718_015_064);
     let mut l = limits();
     l.max_resident_bytes = n - 1;
     assert!(resident_bytes(&c, l).is_err());
@@ -311,7 +318,7 @@ fn session_host_geometry_and_aggregate_admission() {
 
 #[test]
 fn session_host_bank_full_geometry_minimum_resident_limit() {
-    for (capacity, minimum) in [(2048, 71_719_964_992), (1 << 20, 80_293_122_368)] {
+    for (capacity, minimum) in [(2048, 71_707_906_368), (1 << 20, 74_119_106_880)] {
         let c = full_config(capacity);
         let l = Limits { capacity, max_resident_bytes: minimum, max_chunk_bytes: 6 << 30 };
         validate_config(&c, l).unwrap();
@@ -328,23 +335,25 @@ fn session_host_admission_full_geometry_matches_existing_accounting() {
     // Chunks no longer carry a pending expert pair: 3_096_584 below the
     // cached-era figures. Resident adds the whole bank, 63_417_876_480.
     let a = admission(&full_config(2048), full_limits(2048), 88).unwrap();
-    assert_eq!(a.base_resident_bytes, 8_302_088_512);
+    assert_eq!(a.base_resident_bytes, 8_290_029_888);
     assert_eq!(a.expert_cache_pairs_per_moe, 512);
     assert_eq!(a.expert_cache_bytes, 63_417_876_480);
-    assert_eq!(a.resident_bytes, 71_719_964_992);
+    assert_eq!(a.resident_bytes, 71_707_906_368);
     assert_eq!(a.first_chunk_tokens, 88);
     assert_eq!(a.first_chunk_bytes, 1_794_389_344);
     assert_eq!(a.max_prompt_chunk_bytes, 1_794_389_344);
     assert_eq!(a.max_capacity_chunk_bytes, 5_092_389_888);
 
     let a = admission(&full_config(262144), full_limits(262144), 513).unwrap();
-    assert_eq!(a.base_resident_bytes, 10_432_794_944);
+    assert_eq!(a.base_resident_bytes, 8_889_291_072);
     assert_eq!(a.expert_cache_pairs_per_moe, 512);
-    assert_eq!(a.resident_bytes, 73_850_671_424);
+    assert_eq!(a.resident_bytes, 72_307_167_552);
     assert_eq!(a.first_chunk_tokens, MAX_CHUNK);
     assert_eq!(a.first_chunk_bytes, 4_887_917_568);
     assert_eq!(a.max_prompt_chunk_bytes, 4_956_075_008);
-    assert_eq!(a.max_capacity_chunk_bytes, 5_365_019_648);
+    // B4 at the capacity end: 8 key splits per attention layer where B8 had
+    // 16, 8 x 8 x 16_640 x 256 = 272_629_760 below the B8 figure.
+    assert_eq!(a.max_capacity_chunk_bytes, 5_092_389_888);
 }
 
 #[test]
@@ -375,7 +384,7 @@ fn session_host_admission_partial_last_chunk_and_attention_split_boundaries() {
 fn session_host_admission_budget_boundaries_precede_any_session() {
     let c = full_config(2048);
     let mut l = full_limits(2048);
-    let base = 71_719_964_992;
+    let base = 71_707_906_368;
     l.max_resident_bytes = base;
     let exact = admission(&c, l, 256).unwrap();
     assert_eq!(exact.expert_cache_pairs_per_moe, 512);
@@ -399,7 +408,7 @@ fn session_host_admission_budget_boundaries_precede_any_session() {
     assert!(admission(&c, Limits { max_chunk_bytes: span_exact.max_chunk_bytes - 1, ..l }, 511).is_err());
     l.max_chunk_bytes -= 1;
     assert!(admission(&c, l, 256).is_err());
-    assert!(admission(&full_config(1048576), Limits { max_resident_bytes: 80_293_122_367,
+    assert!(admission(&full_config(1048576), Limits { max_resident_bytes: 74_119_106_879,
         ..full_limits(1048576) }, 1).is_err());
 }
 
@@ -1172,19 +1181,19 @@ fn session_host_preflight_refuses_past_allocatable_with_its_source() {
 fn session_host_physical_requirement_at_1m() {
     // full_config is 40 Mamba, then 40 MoE, then 8 attention layers.
     let c = full_config(1 << 20);
-    let l = Limits { capacity: 1 << 20, max_resident_bytes: 80_293_122_368,
-        max_chunk_bytes: 15_132_789_760 };
+    let l = Limits { capacity: 1 << 20, max_resident_bytes: 74_119_106_880,
+        max_chunk_bytes: 15_100_824_576 };
     // Largest upload window: embedding, head and final norm 1_610_620_928,
     // 40 x (norm 8_192 + Mamba weights 109_696_512), then the first MoE layer
     // (norm 8_192 + fixed 45_746_184 + bank 1_585_446_912).
     assert_eq!(resident_payload(&c, l).unwrap().window, 7_630_010_376);
-    assert_eq!(transient_bytes(&c, l).unwrap(), 15_132_789_760);
-    // 80_293_122_368 resident + 15_132_789_760 span + 7_630_010_376 window.
-    assert_eq!(load_requirement(&c, l, false).unwrap(), 103_055_922_504);
+    assert_eq!(transient_bytes(&c, l).unwrap(), 15_100_824_576);
+    // 74_119_106_880 resident + 15_100_824_576 span + 7_630_010_376 window.
+    assert_eq!(load_requirement(&c, l, false).unwrap(), 96_849_941_832);
     // A seed keeps a sealed boundary: 40 x 4_276_224 Mamba state.
-    assert_eq!(load_requirement(&c, l, true).unwrap(), 103_226_971_464);
-    // A further Session: KV 8_589_934_592 + Mamba 171_048_960 + span.
-    assert_eq!(session_requirement(&c, l, false).unwrap(), 23_893_773_312);
+    assert_eq!(load_requirement(&c, l, true).unwrap(), 97_020_990_792);
+    // A further Session: NVFP4 KV 2_415_919_104 + Mamba 171_048_960 + span.
+    assert_eq!(session_requirement(&c, l, false).unwrap(), 17_687_792_640);
     // A smaller allowance caps the working set it admits.
     let small = Limits { max_chunk_bytes: 6 << 30, ..l };
     assert_eq!(transient_bytes(&c, small).unwrap(), 6 << 30);
