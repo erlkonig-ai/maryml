@@ -197,6 +197,10 @@ nvfp4-score-cuda = ["nvfp4-encode-cuda"]
 flint-cuda = ["import", "dep:cubecl", "cubecl?/cuda"]
 nemotron-cuda = ["dep:cubecl", "cubecl?/cuda", "dep:burn-cubecl", "dep:cubek", "dep:tracing", "dep:cudarc"]
 nemotron-timing = ["nemotron-cuda"]
+# Opt-in whole-append prefill bracket and CUPTI device attribution
+# (models::nemotron_h::prefill_timing). Off by default; with it off the
+# Session source is unchanged. cudarc's CUPTI bindings load libcupti lazily.
+nemotron-prefill-timing = ["nemotron-cuda", "nemotron-timing", "cudarc?/cupti"]
 # Investigation-only: burn's REAL Cuda backend, for backend_matmul_probe.
 burn-cuda-bench = ["burn/cuda", "burn/autotune"]
 
@@ -1006,6 +1010,12 @@ required-features = ["import", "tokenizer"]
 [[bin]]
 name = "nemotron_generate_smoke"
 required-features = ["nemotron-cuda", "import", "tokenizer"]
+
+# One whole-prefill timing run against a native model pile: bracket-only and
+# CUPTI-attributed appends of the same prompt, one JSON line and one table.
+[[bin]]
+name = "nemotron_prefill_timing"
+required-features = ["nemotron-prefill-timing", "tokenizer"]
 
 [[bin]]
 name = "flint_head_repeat"

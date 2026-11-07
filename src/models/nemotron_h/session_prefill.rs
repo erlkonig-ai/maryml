@@ -537,6 +537,8 @@ impl Progress {
         committed: usize,
         force: bool,
     ) {
+        #[cfg(feature = "nemotron-prefill-timing")]
+        crate::models::nemotron_h::prefill_timing::mark(layer, phase, rows);
         if !force && self.last.elapsed() < std::time::Duration::from_secs(1) {
             return;
         }
@@ -566,6 +568,30 @@ impl<S: BlobStoreGet> Session<S> {
         ids: &[u32],
         cancelled: &mut dyn FnMut() -> bool,
     ) -> Result<PrefillOutcome> {
+        // Opt-in bracket around this whole call; the nested call below runs
+        // the unchanged body (the probe refuses to bracket twice).
+        #[cfg(feature = "nemotron-prefill-timing")]
+        {
+            use crate::models::nemotron_h::prefill_timing::{Kind, Probe};
+            let kinds = || self.layers.iter().map(|l| match &l.mixer {
+                Mixer::Mamba(_) => Kind::Mamba,
+                Mixer::Attention(_) => Kind::Attention,
+                Mixer::Moe(_) => Kind::Moe,
+            }).collect();
+            if let Some(probe) = Probe::requested(ids.len(), self.committed.len(), kinds) {
+                let mut probe = probe?;
+                let synced = std::time::Instant::now();
+                self.stream.executes(|| self.fence())?;
+                probe.start(synced.elapsed())?;
+                let result = self.prefill_ids(ids, cancelled);
+                probe.finish(match &result {
+                    Ok(PrefillOutcome::Completed) => "completed",
+                    Ok(PrefillOutcome::Cancelled) => "cancelled",
+                    Err(_) => "error",
+                }, self.committed.len(), self.status == Status::Ready);
+                return result;
+            }
+        }
         if let Some(seed) = self.seed.clone() {
             let start = self.committed.len();
             let count = seed.len().checked_sub(start).ok_or("prefix seed position exceeded")?.min(ids.len());
@@ -794,6 +820,8 @@ impl<S: BlobStoreGet> Session<S> {
         let row = copied_tile(&page, last % PAGE_ROWS, 1, &mut self.pending)?;
         let logits = self.project_last_logits(&row)?;
         self.fence()?;
+        #[cfg(feature = "nemotron-prefill-timing")]
+        crate::models::nemotron_h::prefill_timing::mark(self.layers.len(), "lm_head", tokens);
         if cancelled() {
             return Ok(None);
         }
@@ -894,9 +922,21 @@ impl<S: BlobStoreGet> Session<S> {
                     return Ok(false);
                 }
                 let tile: Vec<_> = rows.by_ref().take(MAX_CHUNK).collect();
+                #[cfg(feature = "nemotron-prefill-timing")]
+                let enqueue = crate::models::nemotron_h::prefill_timing::HostSpan::enqueue();
                 if let Mixer::Moe(m) = &self.layers[index].mixer {
                     m.prefill_expert_tile(expert, &latent, &accumulator, &tile, &mut self.pending)?;
                 }
+                #[cfg(feature = "nemotron-prefill-timing")]
+                enqueue.done(true);
+                #[cfg(feature = "nemotron-prefill-timing")]
+                {
+                    let fence = crate::models::nemotron_h::prefill_timing::HostSpan::fence();
+                    let completion = self.fence();
+                    fence.done(completion.is_ok());
+                    completion?;
+                }
+                #[cfg(not(feature = "nemotron-prefill-timing"))]
                 self.fence()?;
                 self.pending.clear();
                 completed_rows += tile.len();

@@ -17,3 +17,5 @@ pub mod moe;
 pub mod session;
 #[cfg(all(feature = "nemotron-cuda", feature = "tokenizer"))]
 pub mod generation;
+#[cfg(feature = "nemotron-prefill-timing")]
+pub mod prefill_timing;

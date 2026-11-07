@@ -125,6 +125,33 @@ impl Timings {
     }
 }
 
+/// The expert-tile counters, as one per-bracket JSON object for
+/// prefill_timing. Keys follow `emit`; no remainder or total is derived here.
+/// The expert bank is resident from load (mary 1a4ee30): there is no cache,
+/// lookup, validation or upload on this path, so those rows are ABSENT, never 0.
+#[cfg(feature = "nemotron-prefill-timing")]
+impl Timings {
+    pub(super) fn prefill_report(&self) -> serde_json::Value {
+        let work = |w: &Work| serde_json::json!({"calls": w.calls, "succeeded": w.succeeded,
+            "wall_ns": w.wall_ns, "requested_bytes": w.requested_bytes,
+            "accepted_bytes": w.accepted_bytes, "saturated": w.saturated});
+        serde_json::json!({
+            "scope": "host wall of existing synchronous calls in the layer-major expert tiles, per bracket; not GPU time",
+            "nesting": "expert_tile_enqueue and expert_tile_fence are separate calls on the same thread. Never sum these rows.",
+            "expert_tile_enqueue": work(&self.enqueue),
+            "expert_tile_fence": work(&self.expert_fence),
+            "absent": RETIRED,
+            "absent_reason": "the whole expert bank is uploaded once at load (mary 1a4ee30); prefill has no expert cache, lookup, validation or upload to measure",
+        })
+    }
+}
+
+/// Metrics of the per-call expert cache path that no longer exists.
+#[cfg(feature = "nemotron-prefill-timing")]
+pub(super) const RETIRED: [&str; 6] = [
+    "cache_hits", "cache_misses", "cache_evictions", "lookup_view", "packed_validation", "weight_upload_api",
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
