@@ -1187,7 +1187,7 @@ fn session_host_physical_requirement_at_1m() {
     // 40 x (norm 8_192 + Mamba weights 109_696_512), then the first MoE layer
     // (norm 8_192 + fixed 45_746_184 + bank 1_585_446_912).
     assert_eq!(resident_payload(&c, l).unwrap().window, 7_630_010_376);
-    assert_eq!(transient_bytes(&c, l).unwrap(), 15_100_824_576);
+    assert_eq!(transient_bytes(&c, l, false).unwrap(), 15_100_824_576);
     // 74_119_106_880 resident + 15_100_824_576 span + 7_630_010_376 window.
     assert_eq!(load_requirement(&c, l, false).unwrap(), 96_849_941_832);
     // A seed keeps a sealed boundary: 40 x 4_276_224 Mamba state.
@@ -1196,7 +1196,14 @@ fn session_host_physical_requirement_at_1m() {
     assert_eq!(session_requirement(&c, l, false).unwrap(), 17_687_792_640);
     // A smaller allowance caps the working set it admits.
     let small = Limits { max_chunk_bytes: 6 << 30, ..l };
-    assert_eq!(transient_bytes(&c, small).unwrap(), 6 << 30);
+    assert_eq!(transient_bytes(&c, small, false).unwrap(), 6 << 30);
+    // A seeded suffix reads two key runs: a one-token prefix with the
+    // C-1 suffix after it needs 2_131_968 bytes more than the cold span
+    // (Astra's witness), so an allowance that admits it is priced for it.
+    let open = Limits { max_chunk_bytes: usize::MAX, ..l };
+    assert_eq!(transient_bytes(&c, open, false).unwrap(), 15_100_824_576);
+    assert_eq!(transient_bytes(&c, open, true).unwrap(), 15_102_956_544);
+    assert_eq!(transient_bytes(&c, l, true).unwrap(), 15_100_824_576);
 }
 
 fn rss_anon_bytes() -> usize {

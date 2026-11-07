@@ -375,9 +375,19 @@ fn resident_payload(c: &TextConfig, l: Limits) -> Result<ResidentPayload> {
 
 /// The largest working set one call may hold: the cold prefill of the whole
 /// capacity, or the widest late decode chunk, within the caller's allowance.
-fn transient_bytes(c: &TextConfig, l: Limits) -> Result<usize> {
-    let a = admission(c, Limits { max_chunk_bytes: usize::MAX, ..l }, l.capacity)?;
-    Ok(a.prefill.device_working_bytes.max(a.max_capacity_chunk_bytes).min(l.max_chunk_bytes))
+/// A seeded Session's suffix reads two key runs, which can need more than the
+/// cold span; the worst split is a one-token prefix with the C-1 suffix after
+/// it (Astra's B2 budget report, Files 163cca3d: at most want+1 slots, and P=1
+/// attains it), so a seeded preflight prices that span too.
+fn transient_bytes(c: &TextConfig, l: Limits, seeded: bool) -> Result<usize> {
+    let unbounded = Limits { max_chunk_bytes: usize::MAX, ..l };
+    let a = admission(c, unbounded, l.capacity)?;
+    let mut working = a.prefill.device_working_bytes.max(a.max_capacity_chunk_bytes);
+    if seeded && l.capacity > 1 {
+        working = working.max(prefill::admission_with_prefix(c, unbounded, 1, l.capacity - 1, 1)?
+            .device_working_bytes);
+    }
+    Ok(working.min(l.max_chunk_bytes))
 }
 
 /// Allocatable memory a load needs: every resident byte, the largest working
@@ -386,14 +396,14 @@ fn transient_bytes(c: &TextConfig, l: Limits) -> Result<usize> {
 /// the advancing state.
 fn load_requirement(c: &TextConfig, l: Limits, seeded: bool) -> Result<usize> {
     let p = resident_payload(c, l)?;
-    let n = add(add(p.total, transient_bytes(c, l)?)?, p.window)?;
+    let n = add(add(p.total, transient_bytes(c, l, seeded)?)?, p.window)?;
     if seeded { add(n, prefix::mamba_bytes(c)?) } else { Ok(n) }
 }
 
 /// What one more Session of a loaded model needs: its private state and its
 /// working set, plus the sealed boundary when seeded.
 fn session_requirement(c: &TextConfig, l: Limits, seeded: bool) -> Result<usize> {
-    let n = add(resident_payload(c, l)?.private, transient_bytes(c, l)?)?;
+    let n = add(resident_payload(c, l)?.private, transient_bytes(c, l, seeded)?)?;
     if seeded { add(n, prefix::mamba_bytes(c)?) } else { Ok(n) }
 }
 
