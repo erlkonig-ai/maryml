@@ -161,8 +161,14 @@ pub(super) struct Rows {
     pub(super) scales: Handle,
 }
 impl Rows {
-    fn reserve(client: &ComputeClient<CudaRuntime>, rows: usize) -> Self {
-        Self { codes: client.empty(rows * CODE_ROW_BYTES), scales: client.empty(rows * SCALE_ROW_BYTES) }
+    /// KV rows at their own size on every path (a new Session, a published
+    /// seed, a restored checkpoint, a capacity reset): in CubeCL's default
+    /// pool a 1M private tail would sit in ~8 GB pages.
+    pub(super) fn reserve(client: &ComputeClient<CudaRuntime>, rows: usize) -> Self {
+        crate::nn::exact_alloc::exact(client, || Self {
+            codes: client.empty(rows * CODE_ROW_BYTES),
+            scales: client.empty(rows * SCALE_ROW_BYTES),
+        })
     }
     /// Views of rows `start .. start + rows` (bounded by the caller).
     fn rows(&self, start: usize, rows: usize) -> Result<Self> {

@@ -1279,3 +1279,57 @@ fn session_gpu_physical_matches_logical() {
     assert!(exact < (600 << 20) + (1 << 20), "{exact}");
     assert!(physical.bytes_reserved < logical as u64 + (logical as u64) / 50, "{physical:?} vs {logical}");
 }
+
+#[test]
+#[ignore = "reserved CUDA, default memory configuration: KV rows at their own size on every path"]
+fn session_gpu_kv_rows_reserve_exactly() {
+    let device = CudaDevice { index: 0 };
+    // About 600 MiB of codes plus scales: the size class of a 1M private tail plane.
+    let rows = (600usize << 20) / attention::CODE_ROW_BYTES;
+    let logical = (rows * (attention::CODE_ROW_BYTES + attention::SCALE_ROW_BYTES)) as u64;
+    let (bare, nested, after_inner, after_unwind, outside) = std::thread::spawn(move || {
+        let client = CudaRuntime::client(&device);
+        let reserved = || client.memory_usage().unwrap().bytes_reserved;
+        // Outside any caller scope: the publish, restore and reset paths.
+        let base = reserved();
+        let kv = attention::Rows::reserve(&client, rows);
+        let bare = reserved() - base;
+        drop(kv);
+        client.memory_cleanup();
+        // Inside a caller's exact scope (from_state): the inner scope must
+        // not end the outer one, so the buffer after it is exact too.
+        let base = reserved();
+        let (kv, nested, buffer, after_inner, after_unwind) = crate::nn::exact_alloc::exact(&client, || {
+            let kv = attention::Rows::reserve(&client, rows);
+            let nested = reserved() - base;
+            let buffer = client.empty(600 << 20);
+            let after_inner = reserved() - base - nested;
+            // An inner scope that unwinds must leave the outer one exact.
+            let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::nn::exact_alloc::exact(&client, || panic!("inner scope unwinds"))
+            }));
+            assert!(unwound.is_err());
+            let before = reserved();
+            let second = client.empty(600 << 20);
+            let after_unwind = reserved() - before;
+            drop(second);
+            (kv, nested, buffer, after_inner, after_unwind)
+        });
+        drop((kv, buffer));
+        client.memory_cleanup();
+        // Leaving the outermost scope restores the default pool.
+        let before = reserved();
+        let pooled = client.empty(600 << 20);
+        let outside = reserved() - before;
+        drop(pooled);
+        client.memory_cleanup();
+        cubecl::future::block_on(client.sync()).unwrap();
+        (bare, nested, after_inner, after_unwind, outside)
+    }).join().unwrap();
+    println!("KV_ROWS {}", json!({"logical": logical, "bare": bare, "nested": nested,
+        "buffer_after_inner_scope": after_inner, "buffer_after_inner_unwind": after_unwind,
+        "buffer_outside_any_scope": outside}));
+    for grown in [bare, nested] { assert!(grown < logical + (1 << 20), "{grown} vs {logical}"); }
+    for grown in [after_inner, after_unwind] { assert!(grown < (600 << 20) + (1 << 20), "{grown}"); }
+    assert!(outside > (600 << 20) + (1 << 20), "the default pool should be back: {outside}");
+}
