@@ -413,12 +413,12 @@ pub struct RealtimePipeline {
 
 #[cfg(feature = "q4")]
 impl RealtimePipeline {
-    /// Load all components from one bundle-bound runtime source. `fmt` picks
+    /// Load all components from one authority-bound runtime source. `fmt` picks
     /// the temporal stack's weight format (q4/q8/f16); `depth_f16` stores the
     /// CPU depformer's weights as f16 (f32 accumulate) instead of f32, and is
     /// ignored unless `PERSONAPLEX_DEPTH=cpu` selects that arm (the default
     /// GPU arm carries its own per-tensor [`DepthFmt`]). Accepting the authority/loader pair
-    /// prevents a future native cache from being checked against one bundle
+    /// prevents a future native cache from being checked against one member
     /// while its unchanged weights come from another.
     pub fn load(source: &super::PersonaPlexRuntimeSource, fmt: WeightFmt, depth_f16: bool) -> Self {
         Self::load_with_depth(source, fmt, DepthChoice::from_env(depth_f16))
@@ -451,7 +451,7 @@ impl RealtimePipeline {
     ///
     /// The legacy filename-discovered cache could not prove that transformed
     /// bytes belonged to this source. Automatic loading therefore recomputes
-    /// from the verified bundle while preserving the authority/loader binding
+    /// from the verified model while preserving the authority/loader binding
     /// needed by any future cache design.
     pub fn load_auto(
         source: &super::PersonaPlexRuntimeSource,
@@ -689,7 +689,7 @@ impl RealtimePipeline {
     }
 }
 
-/// Load a depth arm on its own, from the same bundle-bound source a
+/// Load a depth arm on its own, from the same authority-bound source a
 /// [`RealtimePipeline`] was loaded from.
 ///
 /// This exists for the PAIRED A/B measurement, and the pairing is not

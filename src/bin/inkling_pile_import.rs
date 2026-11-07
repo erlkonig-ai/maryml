@@ -82,7 +82,7 @@ fn main() -> Result<()> {
             pile.refresh()
                 .map_err(|e| anyhow::anyhow!("load pile: {e:?}"))?;
             let _collection =
-                mary::model_collection::model_graph_collection_or_create(&mut pile, &signing_key)
+                mary::model_collection::model_collection_or_create(&mut pile, &signing_key)
                     .map_err(|e| anyhow::anyhow!("model collection writer: {e}"))?;
             Some((pile, signing_key, Fragment::empty()))
         }

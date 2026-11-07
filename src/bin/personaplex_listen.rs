@@ -103,11 +103,11 @@ fn main() {
     );
 
     let t0 = Instant::now();
-    let source = mary::persist::personaplex_bundle(Path::new(&pile))
+    let source = mary::persist::personaplex_model(Path::new(&pile))
         .unwrap_or_else(|e| panic!("pile: {e}"))
         .into_runtime_source();
     // `load_auto` deliberately recomputes the quantized runtime form from the
-    // bundle-bound source.
+    // authority-bound source.
     let mut pipe = RealtimePipeline::load_auto(&source, fmt, true);
     // GREEDY vs SAMPLING. Greedy is attractive because it makes two runs differ
     // only by weight format — but greedy decoding collapses audio LMs to a

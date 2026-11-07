@@ -448,7 +448,7 @@ mod tests {
         for (key_byte,value) in [(41,1.0f32),(42,2.0f32)] {
             let key=ed25519_dalek::SigningKey::from_bytes(&[key_byte;32]);
             let policy=CollectionPolicy::new(AdmissionPolicy::direct(key.verifying_key()),AdmissionPolicy::direct(key.verifying_key()));
-            let collection=pile.collection(model_collection::mary_model_graph_name(),policy)?;
+            let collection=pile.collection(model_collection::model_collection_name(),policy)?;
             let weight=leaf_fragment(leaf::leaf_blob::<F32,1>([1],Bytes::from_source(value.to_le_bytes().to_vec()))?);
             let parameters=entity! {attrs::kind:"probe",attrs::weight*:weight};
             let fragment=model_fragment(parameters,&super::super::config::tests::fixture())?;

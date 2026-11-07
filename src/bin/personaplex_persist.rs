@@ -10,8 +10,8 @@
 //!     gated against; persisted here so the pile is the SELF-CONTAINED voice
 //!     stack: codec encoder + decoder + LM).
 //!
-//! After this runs, the pile file and its signed one-row model-bundle COMMIT
-//! are the durable weight authority; the HF download is no longer needed. Tensor
+//! After this runs, the pile file and its signed `models` COMMIT, whose member
+//! archive states the whole model, are the durable weight authority; the HF download is no longer needed. Tensor
 //! names don't collide across the two checkpoints
 //! (`transformer.*`/`depformer.*`/`emb.*`… vs
 //! `encoder.*`/`decoder.*`/`quantizer.*`…), so one strict root serves both
@@ -40,6 +40,7 @@ use safetensors::tensor::{Dtype, TensorView};
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::Instant;
+use triblespace::core::blob::IntoBlob;
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::signing_key_file;
 use triblespace::prelude::SnapshotSource;
@@ -185,25 +186,28 @@ fn main() -> anyhow::Result<()> {
             .root()
             .ok_or_else(|| anyhow::anyhow!("PersonaPlex candidate has no unique model root"))?;
         let collection =
-            mary::model_collection::model_bundle_collection_or_create(&mut pile, &signing_key)?;
+            mary::model_collection::model_collection_or_create(&mut pile, &signing_key)?;
 
-        // H must be independently complete. Validate only the candidate facts
-        // against the already-staged attachment prefix; an old broad graph
-        // union is not allowed to fill holes in this bundle.
+        // The member must be independently complete. Validate only the
+        // candidate facts against the already-staged attachment prefix; the
+        // union of other members is not allowed to fill holes in it.
         let reader = pile.snapshot()?;
         let weights = PersonaPlexWeights::from_graph(candidate.facts(), reader)?;
         anyhow::ensure!(
             weights.root() == root,
             "staged PersonaPlex root differs from the candidate's exact Source/native root"
         );
-        let prepared = mary::model_collection::prepare_model_bundle_fragment(root, candidate)?;
+        let model_archive_data = triblespace::prelude::inlineencodings::Handle::<
+            triblespace::core::blob::encodings::simplearchive::SimpleArchive,
+        >::to_hash(candidate.facts().clone().to_blob().get_handle());
+        let prepared = mary::model_collection::prepare_model_fragment(candidate);
         let store = pile.snapshot()?;
         let existing = mary::model_collection::snapshot_model_collection_for(&store, collection)?;
-        if let Some(existing) = PersonaPlexWeights::find_in_bundle_snapshot(existing)? {
+        if let Some(existing) = PersonaPlexWeights::find_in_snapshot(existing)? {
             anyhow::ensure!(
                 existing.authority().model_root() == root
-                    && existing.authority().model_archive_data() == prepared.model_archive_data(),
-                "a different PersonaPlex bundle is already authoritative in this pile"
+                    && existing.authority().model_archive_data() == model_archive_data,
+                "a different PersonaPlex model is already authoritative in this pile"
             );
         }
         eprintln!(
@@ -374,12 +378,11 @@ fn main() -> anyhow::Result<()> {
         );
         drop(weights);
         let staged = prepared
-            .into_prepared_commit()
             .stage_for(&mut pile, collection, &signing_key)
-            .map_err(|error| anyhow::anyhow!("stage validated PersonaPlex bundle: {error}"))?;
+            .map_err(|error| anyhow::anyhow!("stage validated PersonaPlex model: {error}"))?;
         staged
             .finalize()
-            .map_err(|error| anyhow::anyhow!("finalize validated PersonaPlex bundle: {error}"))?;
+            .map_err(|error| anyhow::anyhow!("finalize validated PersonaPlex model: {error}"))?;
         Ok((root, checked, elems, lm_count))
     })();
 

@@ -249,7 +249,7 @@ fn two_shards_one_root_native_bf16_assets_reopen_without_checkpoint() {
     std::fs::File::create(&path).unwrap();
     let mut pile = Pile::open(&path).unwrap();
     let key = ed25519_dalek::SigningKey::from_bytes(&[17; 32]);
-    crate::model_collection::model_graph_collection_or_create(&mut pile, &key).unwrap();
+    crate::model_collection::model_collection_or_create(&mut pile, &key).unwrap();
     let mut candidate = import::ingest_checkpoint(&mut pile, &checkpoint, "tiny-fixture").unwrap();
     assert_eq!(candidate.tensor_count, 15);
     let ids = candidate.artifacts;

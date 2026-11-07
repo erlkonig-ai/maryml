@@ -316,7 +316,7 @@ fn main() -> Result<()> {
     // resident ACTION_WRITE proof; an empty pile is founded under this durable
     // key. This happens before any tensor payload is read or blob appended.
     let collection =
-        mary::model_collection::model_graph_collection_or_create(&mut store, &signing_key)
+        mary::model_collection::model_collection_or_create(&mut store, &signing_key)
             .map_err(|e| anyhow::anyhow!("model collection writer: {e}"))?;
     let mut present: std::collections::HashSet<(String, i64)> = Default::default();
     let observation = store

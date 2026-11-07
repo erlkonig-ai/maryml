@@ -114,7 +114,7 @@ fn publish_embedding_candidate_with_contract_impl(
     // destination's own reader, then append the signed commit as the final
     // publication step.
     let candidate_facts = candidate.facts().clone();
-    let collection = mary::model_collection::model_graph_collection_or_create(pile, signing_key)?;
+    let collection = mary::model_collection::model_collection_or_create(pile, signing_key)?;
     let prepared = mary::model_collection::prepare_model_fragment(candidate);
     let mut staged = prepared
         .stage_for(pile, collection, signing_key)

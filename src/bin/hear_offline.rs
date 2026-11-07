@@ -12,7 +12,7 @@
 //!
 //! The model is the `nvfp4` Voxtral root of the model collection
 //! `--collection blake3:HEX` names in `<pile>`, or with `--root HEX` one
-//! explicit root of a legacy native pile (found in its `mary-model-graph`),
+//! explicit root of a legacy native pile (found in its `models` collection),
 //! whose 16-bit projections `--weights f16|nvfp4` decides. `--lane w4a4|w4a16`
 //! is how stored NVFP4 projections multiply prompt-height activations;
 //! `--unpaced` skips the real-time pass (its columns read 0). One

@@ -194,7 +194,7 @@ fn main() {
     );
 
     let t0 = Instant::now();
-    let source = mary::persist::personaplex_bundle(Path::new(&pile))
+    let source = mary::persist::personaplex_model(Path::new(&pile))
         .unwrap_or_else(|e| panic!("pile load: {e}"))
         .into_runtime_source();
     let mut p = RealtimePipeline::load_auto(&source, fmt, false);

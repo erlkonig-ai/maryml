@@ -71,12 +71,6 @@ fn handle_hex(handle: &triblespace::core::collection::CollectionHandle) -> Strin
     handle.raw.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn collection_identity(
-    source: &mary::persist::ModelPileCollection,
-) -> (mary::persist::ModelPileCollectionShape, [u8; 32]) {
-    (source.shape, source.collection.handle().raw)
-}
-
 /// One spelling per fact: project the canonical aliases in, then drop the
 /// pre-epoch literals they cover.
 ///
@@ -100,40 +94,18 @@ fn main() -> Result<()> {
     let source = mary::persist::read_model_pile(src)?;
     let converted = mary::persist::read_model_pile(dst)?;
 
-    // The collection set is the thing a converted model pile is FOR. Every
-    // shape and policy-bearing descriptor identity must be the source's, byte for
-    // byte: model piles resolve by content address, and silently collapsing a
-    // mixed graph+bundle source to one graph collection is data-model loss even
-    // if the decoded union happens to contain the same facts.
-    let src_collections = source
-        .collections
-        .iter()
-        .map(collection_identity)
-        .collect::<Vec<_>>();
-    let dst_collections = converted
-        .collections
-        .iter()
-        .map(collection_identity)
-        .collect::<Vec<_>>();
+    // The collection is the thing a converted model pile is FOR. Its
+    // policy-bearing descriptor identity must be the source's, byte for byte:
+    // model piles resolve by content address.
+    let (src_collection, dst_collection) =
+        (source.collection.handle(), converted.collection.handle());
     anyhow::ensure!(
-        src_collections == dst_collections,
-        "collection shape or identity moved: source {src_collections:02X?}, \
-         converted {dst_collections:02X?}"
+        src_collection == dst_collection,
+        "collection identity moved: source {}, converted {}",
+        handle_hex(&src_collection),
+        handle_hex(&dst_collection)
     );
-    println!(
-        "collections {} shape(s) unchanged: {}",
-        source.collections.len(),
-        source
-            .collections
-            .iter()
-            .map(|entry| format!(
-                "{:?}:{}",
-                entry.shape,
-                handle_hex(&entry.collection.handle())
-            ))
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
+    println!("collection unchanged: {}", handle_hex(&src_collection));
 
     let (src_tribles, src_reader) = (canonical_facts(&source.facts)?, source.store);
     let (dst_tribles, dst_reader) = (canonical_facts(&converted.facts)?, converted.store);

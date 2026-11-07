@@ -30,7 +30,6 @@ use crate::selection::{ModelSelector, SelectedModelIndex};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::{Blob, TryFromBlob};
 use triblespace::core::collection::{CollectionData, Support};
-use triblespace::core::metadata;
 use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::prelude::{BlobStoreGet, Id, Inline, TribleSet, blobencodings, inlineencodings};
 
@@ -41,19 +40,19 @@ pub const SOURCE: &str = "nvidia/personaplex-7b-v1";
 ///
 /// The root is the union of the LM and Mimi checkpoint tensors. Runtime code
 /// deliberately accepts only faithful f32 leaves under [`SOURCE`] and
-/// `quantization="native"`. Steady-state loads enter through signed model
-/// bundles; direct graph selection exists only for validating a staged
-/// candidate before its token COMMIT is finalized.
+/// `quantization="native"`. Steady-state loads select it from one member
+/// archive of the signed `models` collection; direct graph selection exists
+/// only for validating a staged candidate before its COMMIT is finalized.
 pub struct PersonaPlexWeights<R> {
     selected: SelectedModelIndex<R>,
 }
 
-/// Exact signed bundle authority retained alongside one PersonaPlex loader.
+/// Exact signed authority retained alongside one PersonaPlex loader: the
+/// collection member that states the whole model, and its root.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PersonaPlexAuthority {
     model_root: Id,
     model_archive_data: CollectionData,
-    bundle_token_data: CollectionData,
     support: Support,
 }
 
@@ -66,14 +65,9 @@ impl PersonaPlexAuthority {
         self.model_root
     }
 
-    /// Complete canonical model-fact archive `H`.
+    /// The collection member: the complete canonical model-fact archive.
     pub fn model_archive_data(&self) -> CollectionData {
         self.model_archive_data
-    }
-
-    /// Source-collection data `T`: the one-row archive containing `τ`.
-    pub fn bundle_token_data(&self) -> CollectionData {
-        self.bundle_token_data
     }
 
     /// Exact admitted foundational support frozen with this loader.
@@ -83,15 +77,15 @@ impl PersonaPlexAuthority {
 }
 
 /// PersonaPlex weights plus the exact authority from which they were loaded.
-pub struct PersonaPlexBundle<R> {
+pub struct PersonaPlexModel<R> {
     weights: PersonaPlexWeights<R>,
     authority: PersonaPlexAuthority,
 }
 
-/// Bundle-bound authority and loader for deterministic runtime transforms.
+/// Authority-bound loader for deterministic runtime transforms.
 ///
-/// Its fields are private so a caller cannot label weights from one bundle
-/// with another bundle's `(collection, root, H, τ)` identity.
+/// Its fields are private so a caller cannot label weights from one member
+/// with another member's `(collection, root, archive)` identity.
 pub struct PersonaPlexRuntimeSource {
     authority: PersonaPlexAuthority,
     loader: WeightLoader,
@@ -107,7 +101,7 @@ impl PersonaPlexRuntimeSource {
     }
 }
 
-impl<R> PersonaPlexBundle<R> {
+impl<R> PersonaPlexModel<R> {
     pub fn authority(&self) -> &PersonaPlexAuthority {
         &self.authority
     }
@@ -149,124 +143,104 @@ impl<R: BlobStoreGet> PersonaPlexWeights<R> {
         Self::admit(selected)
     }
 
-    /// Select PersonaPlex from individually self-contained signed bundle
-    /// tokens, retaining the frozen support and exact `(root, H, τ)` identity.
-    pub fn find_in_bundle_snapshot(
+    /// Select PersonaPlex from the members of one `models` snapshot. Each
+    /// member is a self-contained model-fact archive; a member stating one
+    /// Source/native PersonaPlex root is that model. Members stating none are
+    /// other models or annotations and are skipped. The same root stated by
+    /// several members is the same model (its id is its content); the first
+    /// member in canonical order is its authority. Two different roots fail
+    /// closed, and so does one member stating two such roots, because nothing
+    /// names which of them is meant.
+    pub fn find_in_snapshot(
         snapshot: ModelSnapshot<R>,
-    ) -> anyhow::Result<Option<PersonaPlexBundle<R>>>
+    ) -> anyhow::Result<Option<PersonaPlexModel<R>>>
     where
         R: Clone,
     {
         use anyhow::{Context, anyhow};
         let (_, support, reader) = snapshot.into_parts();
-        let mut selected: Option<(Self, Id, CollectionData, CollectionData)> = None;
-        for token_handle in support.members() {
-            let token_data = inlineencodings::Handle::<SimpleArchive>::to_hash(token_handle);
-            let token_blob: Blob<SimpleArchive> = reader
-                .get(token_handle)
-                .map_err(|error| anyhow!("read bundle token {token_handle:?}: {error}"))?;
-            let token = TribleSet::try_from_blob(token_blob)
-                .with_context(|| format!("decode bundle token {token_handle:?}"))?;
-            anyhow::ensure!(
-                token.len() == 1,
-                "bundle member {token_handle:?} must be exactly one token row, found {}",
-                token.len()
-            );
-            let fact = token.iter().next().expect("one-row bundle token");
-            anyhow::ensure!(
-                fact.a() == &metadata::archive.id(),
-                "bundle member {token_handle:?} does not use metadata::archive"
-            );
-            let root = *fact.e();
-            let model_archive_data = inlineencodings::Handle::<SimpleArchive>::to_hash(
-                *fact.v::<inlineencodings::Handle<SimpleArchive>>(),
-            );
-            let source_blob: Blob<SimpleArchive> = reader
-                .get(inlineencodings::Handle::<SimpleArchive>::from_hash(
-                    model_archive_data,
-                ))
-                .map_err(|error| {
-                    anyhow!("read model archive H for bundle {token_handle:?}: {error}")
-                })?;
-            triblespace::core::collection::simplearchive_union::validate_element(&source_blob)
-                .map_err(|error| {
-                    anyhow!("model archive H for bundle {token_handle:?} is not canonical: {error}")
-                })?;
-            let facts = TribleSet::try_from_blob(source_blob)
-                .with_context(|| format!("decode model archive H for bundle {token_handle:?}"))?;
-            anyhow::ensure!(
-                facts.iter().any(|row| row.e() == &root),
-                "bundle member {token_handle:?} asserts root {root} absent from H",
-            );
-
-            let native = triblespace::prelude::exists!(triblespace::prelude::pattern!(
-                &facts,
-                [{ root @ crate::format::attrs::quantization: crate::persist::QUANTIZATION_NATIVE }]
-            ));
-            if !native {
-                continue;
-            }
-            let mut source_matches = false;
-            for (handle,) in triblespace::prelude::find!(
-                (source: Inline<inlineencodings::Handle<blobencodings::UTF8String>>),
-                triblespace::prelude::pattern!(&facts, [{ root @ crate::format::attrs::source: ?source }])
+        let mut selected: Option<(Self, Id, CollectionData)> = None;
+        for member in support.members() {
+            let model_archive_data = inlineencodings::Handle::<SimpleArchive>::to_hash(member);
+            let blob: Blob<SimpleArchive> = reader
+                .get(member)
+                .map_err(|error| anyhow!("read model member {member:?}: {error}"))?;
+            triblespace::core::collection::simplearchive_union::validate_element(&blob)
+                .map_err(|error| anyhow!("model member {member:?} is not canonical: {error}"))?;
+            let facts = TribleSet::try_from_blob(blob)
+                .with_context(|| format!("decode model member {member:?}"))?;
+            let mut roots = Vec::new();
+            for (root,) in triblespace::prelude::find!(
+                (root: Id),
+                triblespace::prelude::pattern!(
+                    &facts,
+                    [{ ?root @ crate::format::attrs::quantization: crate::persist::QUANTIZATION_NATIVE }]
+                )
             ) {
-                let value: anybytes::View<str> = reader
-                    .get(handle)
-                    .map_err(|error| anyhow!("read PersonaPlex source coordinate: {error}"))?;
-                source_matches |= value.as_ref() == SOURCE;
+                let mut source_matches = false;
+                for (handle,) in triblespace::prelude::find!(
+                    (source: Inline<inlineencodings::Handle<blobencodings::UTF8String>>),
+                    triblespace::prelude::pattern!(&facts, [{ root @ crate::format::attrs::source: ?source }])
+                ) {
+                    let value: anybytes::View<str> = reader
+                        .get(handle)
+                        .map_err(|error| anyhow!("read PersonaPlex source coordinate: {error}"))?;
+                    source_matches |= value.as_ref() == SOURCE;
+                }
+                // Other source/format labels are annotations on the same root.
+                if source_matches && !roots.contains(&root) {
+                    roots.push(root);
+                }
             }
-            if !source_matches {
-                continue;
-            }
-
-            // The signed token already names the exact root. Bind selection to
-            // that identity rather than rediscovering it from an ambient
-            // source coordinate and comparing only afterwards. The matching
-            // labels above are annotations: another source/format label does
-            // not invalidate the same weights or their signed root identity.
+            let root = match roots.as_slice() {
+                [] => continue,
+                [root] => *root,
+                many => anyhow::bail!(
+                    "model member {member:?} states {} PersonaPlex Source/native roots; nothing names one",
+                    many.len()
+                ),
+            };
             let weights = Self::admit(SelectedModelIndex::from_graph(
                 &facts,
                 reader.clone(),
                 ModelSelector::Root(root),
             )?)
-            .with_context(|| format!("validate PersonaPlex bundle {token_handle:?}"))?;
+            .with_context(|| format!("validate PersonaPlex member {member:?}"))?;
             anyhow::ensure!(
                 weights.root() == root,
-                "bundle member {token_handle:?} asserts root {root}, but H selects {}",
+                "model member {member:?} states root {root}, but selects {}",
                 weights.root()
             );
-            if let Some((_, existing_root, existing_h, _)) = &selected {
+            if let Some((_, existing_root, existing_h)) = &selected {
                 anyhow::ensure!(
-                    *existing_root == root && *existing_h == model_archive_data,
-                    "ambiguous PersonaPlex bundle authority: ({existing_root}, {existing_h:?}) and ({root}, {model_archive_data:?})"
+                    *existing_root == root,
+                    "ambiguous PersonaPlex authority: ({existing_root}, {existing_h:?}) and ({root}, {model_archive_data:?})"
                 );
             } else {
-                selected = Some((weights, root, model_archive_data, token_data));
+                selected = Some((weights, root, model_archive_data));
             }
         }
 
-        let Some((weights, model_root, model_archive_data, bundle_token_data)) = selected else {
+        let Some((weights, model_root, model_archive_data)) = selected else {
             return Ok(None);
         };
-        Ok(Some(PersonaPlexBundle {
+        Ok(Some(PersonaPlexModel {
             weights,
             authority: PersonaPlexAuthority {
                 model_root,
                 model_archive_data,
-                bundle_token_data,
                 support,
             },
         }))
     }
 
-    /// Required form of [`Self::find_in_bundle_snapshot`].
-    pub fn from_bundle_snapshot(snapshot: ModelSnapshot<R>) -> anyhow::Result<PersonaPlexBundle<R>>
+    /// Required form of [`Self::find_in_snapshot`].
+    pub fn from_snapshot(snapshot: ModelSnapshot<R>) -> anyhow::Result<PersonaPlexModel<R>>
     where
         R: Clone,
     {
-        Self::find_in_bundle_snapshot(snapshot)?
-            .ok_or_else(|| anyhow::anyhow!("no admitted PersonaPlex bundle in exact support"))
+        Self::find_in_snapshot(snapshot)?
+            .ok_or_else(|| anyhow::anyhow!("no admitted PersonaPlex model in exact support"))
     }
 
     /// Content-addressed root of the complete exact model.
@@ -315,8 +289,8 @@ impl PersonaPlexWeights<PileSnapshot> {
     }
 }
 
-impl PersonaPlexBundle<PileSnapshot> {
-    /// Split a bundle-native load into its immutable authority and runtime
+impl PersonaPlexModel<PileSnapshot> {
+    /// Split a collection-native load into its immutable authority and runtime
     /// loader without reopening the pile or observing a wider prefix.
     pub fn into_parts(self) -> (PersonaPlexAuthority, WeightLoader) {
         (self.authority, self.weights.into_loader())
@@ -431,7 +405,7 @@ mod native_authority_tests {
     }
 
     #[test]
-    fn exact_bundle_is_selected_and_repeated_publication_appends_nothing() {
+    fn exact_member_is_selected_and_repeated_publication_appends_nothing() {
         let file = TestPile::new();
         let fragment = model_fragment(
             &[
@@ -444,33 +418,23 @@ mod native_authority_tests {
         let root = fragment.root().expect("PersonaPlex model root");
         let signing_key = SigningKey::from_bytes(&[0x50; 32]);
         let mut pile = Pile::open(file.path()).expect("open synthetic PersonaPlex pile");
-        let first = crate::model_collection::publish_model_bundle_fragment(
-            &mut pile,
-            &signing_key,
-            root,
-            fragment.clone(),
-        )
+        let first = crate::model_collection::publish_model_fragment(&mut pile, &signing_key, fragment.clone())
         .expect("publish exact PersonaPlex root");
         let len_after_first = std::fs::metadata(file.path()).unwrap().len();
-        let repeated = crate::model_collection::publish_model_bundle_fragment(
-            &mut pile,
-            &signing_key,
-            root,
-            fragment,
-        )
+        let repeated = crate::model_collection::publish_model_fragment(&mut pile, &signing_key, fragment)
         .expect("repeat exact PersonaPlex publication");
         let len_after_retry = std::fs::metadata(file.path()).unwrap().len();
         assert_eq!(first, repeated);
         assert_eq!(len_after_first, len_after_retry);
 
         let snapshot =
-            crate::model_collection::snapshot_model_bundle_collection_local_latest(&mut pile)
+            crate::model_collection::snapshot_model_collection_local_latest(&mut pile)
                 .expect("freeze exact PersonaPlex prefix");
-        let bundle = PersonaPlexWeights::from_bundle_snapshot(snapshot)
-            .expect("select exact PersonaPlex bundle");
-        let authority = bundle.authority();
+        let model = PersonaPlexWeights::from_snapshot(snapshot)
+            .expect("select exact PersonaPlex model");
+        let authority = model.authority();
         assert_eq!(authority.model_root(), root);
-        assert_eq!(authority.bundle_token_data(), first.data());
+        assert_eq!(authority.model_archive_data(), first.data());
         assert_eq!(authority.support().len(), 1);
         assert!(
             authority
@@ -479,17 +443,19 @@ mod native_authority_tests {
                     first.data()
                 ))
         );
-        let weights = bundle.weights();
+        let weights = model.weights();
         assert_eq!(weights.root(), root);
         assert_eq!(weights.count(), 2);
         assert!(weights.exact().contains_key("transformer.weight"));
         assert!(weights.exact().contains_key("encoder.weight"));
-        drop(bundle);
+        drop(model);
         pile.close().expect("close synthetic PersonaPlex pile");
     }
 
+    /// Without a token naming the root, a member stating two PersonaPlex
+    /// Source/native roots does not choose one by accident.
     #[test]
-    fn signed_bundle_root_is_selected_from_a_multi_root_archive() {
+    fn member_with_two_personaplex_roots_fails_closed() {
         let file = TestPile::new();
         let mut asserted = model_fragment(
             &[("asserted.weight", &[1.0], &[1])],
@@ -502,35 +468,72 @@ mod native_authority_tests {
             false,
             crate::leaf::Form::TwoBlob,
         );
-        let ambient_root = ambient.root().expect("ambient PersonaPlex root");
         asserted += ambient;
         let (_, facts, metafacts, blobs) = asserted.into_parts();
         let combined = Fragment::rooted_from_parts(root, facts, metafacts, blobs);
 
         let mut pile = Pile::open(file.path()).expect("open synthetic PersonaPlex pile");
-        crate::model_collection::publish_model_bundle_fragment(
+        crate::model_collection::publish_model_fragment(
             &mut pile,
             &SigningKey::from_bytes(&[0x50; 32]),
-            root,
             combined,
         )
-        .expect("publish exact root with an ambient peer");
-        let snapshot =
-            crate::model_collection::snapshot_model_bundle_collection_local_latest(&mut pile)
-                .expect("freeze multi-root PersonaPlex bundle");
-        let bundle = PersonaPlexWeights::from_bundle_snapshot(snapshot)
-            .expect("signed token must select its asserted root exactly");
-        assert_eq!(bundle.authority().model_root(), root);
-        assert_eq!(bundle.weights().root(), root);
-        assert_ne!(bundle.weights().root(), ambient_root);
-        assert!(bundle.weights().exact().contains_key("asserted.weight"));
-        assert!(!bundle.weights().exact().contains_key("ambient.weight"));
-        drop(bundle);
+        .expect("publish a member with two roots");
+        let snapshot = crate::model_collection::snapshot_model_collection_local_latest(&mut pile)
+            .expect("freeze multi-root PersonaPlex member");
+        let error = PersonaPlexWeights::from_snapshot(snapshot)
+            .err()
+            .expect("two roots in one member must fail closed");
+        assert!(format!("{error:#}").contains("2 PersonaPlex Source/native roots"), "{error:#}");
+        pile.close().expect("close synthetic PersonaPlex pile");
+    }
+
+    /// The same root in two members is one model, not an ambiguity.
+    #[test]
+    fn same_root_in_two_members_is_one_model() {
+        let file = TestPile::new();
+        let mut pile = Pile::open(file.path()).expect("open synthetic PersonaPlex pile");
+        let key = SigningKey::from_bytes(&[0x50; 32]);
+        let fragment = model_fragment(&[("weight", &[1.0], &[1])], false, crate::leaf::Form::TwoBlob);
+        let root = fragment.root().unwrap();
+        let mut annotated = fragment.clone();
+        annotated += entity! { _ @ attrs::kind: "an unrelated annotation" };
+        crate::model_collection::publish_model_fragment(&mut pile, &key, fragment).unwrap();
+        crate::model_collection::publish_model_fragment(&mut pile, &key, annotated).unwrap();
+        let snapshot = crate::model_collection::snapshot_model_collection_local_latest(&mut pile)
+            .expect("freeze two members");
+        assert_eq!(snapshot.support().len(), 2);
+        let model = PersonaPlexWeights::from_snapshot(snapshot).expect("one model in two members");
+        assert_eq!(model.authority().model_root(), root);
+        pile.close().expect("close synthetic PersonaPlex pile");
+    }
+
+    /// A tokenizer or other model published as its own member is skipped.
+    #[test]
+    fn other_members_are_skipped() {
+        let file = TestPile::new();
+        let mut pile = Pile::open(file.path()).expect("open synthetic PersonaPlex pile");
+        let key = SigningKey::from_bytes(&[0x50; 32]);
+        crate::model_collection::publish_model_fragment(
+            &mut pile,
+            &key,
+            entity! { _ @ attrs::kind: "tokenizer" },
+        )
+        .expect("publish an unrelated member");
+        let fragment = model_fragment(&[("weight", &[1.0], &[1])], false, crate::leaf::Form::TwoBlob);
+        let root = fragment.root().unwrap();
+        crate::model_collection::publish_model_fragment(&mut pile, &key, fragment)
+            .expect("publish PersonaPlex member");
+        let snapshot = crate::model_collection::snapshot_model_collection_local_latest(&mut pile)
+            .expect("freeze two members");
+        assert_eq!(snapshot.support().len(), 2);
+        let model = PersonaPlexWeights::from_snapshot(snapshot).expect("select the PersonaPlex member");
+        assert_eq!(model.authority().model_root(), root);
         pile.close().expect("close synthetic PersonaPlex pile");
     }
 
     #[test]
-    fn bundle_snapshot_retains_its_collection_identity() {
+    fn snapshot_retains_its_collection_identity() {
         let file = TestPile::new();
         let mut pile = Pile::open(file.path()).expect("open synthetic PersonaPlex pile");
         let fragment = model_fragment(
@@ -538,21 +541,15 @@ mod native_authority_tests {
             false,
             crate::leaf::Form::TwoBlob,
         );
-        let root = fragment.root().unwrap();
-        crate::model_collection::publish_model_bundle_fragment(
-            &mut pile,
-            &SigningKey::from_bytes(&[0x50; 32]),
-            root,
-            fragment,
-        )
-        .expect("publish PersonaPlex bundle");
+        crate::model_collection::publish_model_fragment(&mut pile, &SigningKey::from_bytes(&[0x50; 32]), fragment)
+        .expect("publish PersonaPlex model");
         let snapshot =
-            crate::model_collection::snapshot_model_bundle_collection_local_latest(&mut pile)
-                .expect("freeze PersonaPlex bundle");
+            crate::model_collection::snapshot_model_collection_local_latest(&mut pile)
+                .expect("freeze PersonaPlex model");
         let collection = snapshot.support().collection();
-        let bundle = PersonaPlexWeights::from_bundle_snapshot(snapshot)
-            .expect("select exact PersonaPlex bundle");
-        assert_eq!(bundle.authority().collection(), collection);
+        let model = PersonaPlexWeights::from_snapshot(snapshot)
+            .expect("select exact PersonaPlex model");
+        assert_eq!(model.authority().collection(), collection);
         pile.close().expect("close synthetic PersonaPlex pile");
     }
 
@@ -565,18 +562,12 @@ mod native_authority_tests {
             true,
             crate::leaf::Form::TwoBlob,
         );
-        let root = fragment.root().unwrap();
-        crate::model_collection::publish_model_bundle_fragment(
-            &mut pile,
-            &SigningKey::from_bytes(&[0x50; 32]),
-            root,
-            fragment,
-        )
+        crate::model_collection::publish_model_fragment(&mut pile, &SigningKey::from_bytes(&[0x50; 32]), fragment)
         .expect("publish incompatible PersonaPlex root");
         let snapshot =
-            crate::model_collection::snapshot_model_bundle_collection_local_latest(&mut pile)
+            crate::model_collection::snapshot_model_collection_local_latest(&mut pile)
                 .expect("freeze incompatible PersonaPlex prefix");
-        let error = PersonaPlexWeights::from_bundle_snapshot(snapshot)
+        let error = PersonaPlexWeights::from_snapshot(snapshot)
             .err()
             .expect("f16 exact coordinate must fail");
         assert!(format!("{error:#}").contains("is not f32"), "{error:#}");
@@ -584,7 +575,7 @@ mod native_authority_tests {
     }
 
     #[test]
-    fn bundle_root_accepts_an_additional_source_annotation() {
+    fn root_accepts_an_additional_source_annotation() {
         let file = TestPile::new();
         let mut pile = Pile::open(file.path()).expect("open synthetic PersonaPlex pile");
         let mut fragment = model_fragment(
@@ -595,24 +586,19 @@ mod native_authority_tests {
         let root = fragment.root().unwrap();
         let other_source = fragment.put::<UTF8String, _>("example/other".to_owned());
         fragment += entity! { ExclusiveId::force_ref(&root) @ attrs::source: other_source };
-        crate::model_collection::publish_model_bundle_fragment(
-            &mut pile,
-            &SigningKey::from_bytes(&[0x50; 32]),
-            root,
-            fragment,
-        )
+        crate::model_collection::publish_model_fragment(&mut pile, &SigningKey::from_bytes(&[0x50; 32]), fragment)
         .expect("publish multiply labelled PersonaPlex root");
         let snapshot =
-            crate::model_collection::snapshot_model_bundle_collection_local_latest(&mut pile)
+            crate::model_collection::snapshot_model_collection_local_latest(&mut pile)
                 .expect("freeze multiply labelled PersonaPlex prefix");
-        let bundle = PersonaPlexWeights::from_bundle_snapshot(snapshot)
+        let model = PersonaPlexWeights::from_snapshot(snapshot)
             .expect("an additional source label must not invalidate a matching root");
-        assert_eq!(bundle.authority().model_root(), root);
+        assert_eq!(model.authority().model_root(), root);
         pile.close().expect("close synthetic PersonaPlex pile");
     }
 
     #[test]
-    fn bundle_root_accepts_an_additional_quantization_annotation() {
+    fn root_accepts_an_additional_quantization_annotation() {
         let file = TestPile::new();
         let mut pile = Pile::open(file.path()).expect("open synthetic PersonaPlex pile");
         let mut fragment = model_fragment(
@@ -622,24 +608,19 @@ mod native_authority_tests {
         );
         let root = fragment.root().unwrap();
         fragment += entity! { ExclusiveId::force_ref(&root) @ attrs::quantization: "other" };
-        crate::model_collection::publish_model_bundle_fragment(
-            &mut pile,
-            &SigningKey::from_bytes(&[0x50; 32]),
-            root,
-            fragment,
-        )
+        crate::model_collection::publish_model_fragment(&mut pile, &SigningKey::from_bytes(&[0x50; 32]), fragment)
         .expect("publish multiply labelled PersonaPlex root");
         let snapshot =
-            crate::model_collection::snapshot_model_bundle_collection_local_latest(&mut pile)
+            crate::model_collection::snapshot_model_collection_local_latest(&mut pile)
                 .expect("freeze multiply labelled PersonaPlex prefix");
-        let bundle = PersonaPlexWeights::from_bundle_snapshot(snapshot)
+        let model = PersonaPlexWeights::from_snapshot(snapshot)
             .expect("an additional format label must not invalidate a matching root");
-        assert_eq!(bundle.authority().model_root(), root);
+        assert_eq!(model.authority().model_root(), root);
         pile.close().expect("close synthetic PersonaPlex pile");
     }
 
     #[test]
-    fn conflicting_bundle_roots_fail_closed() {
+    fn conflicting_member_roots_fail_closed() {
         let file = TestPile::new();
         let mut pile = Pile::open(file.path()).expect("open synthetic PersonaPlex pile");
         let existing = model_fragment(
@@ -647,13 +628,7 @@ mod native_authority_tests {
             false,
             crate::leaf::Form::TwoBlob,
         );
-        let existing_root = existing.root().unwrap();
-        let existing_commit = crate::model_collection::publish_model_bundle_fragment(
-            &mut pile,
-            &SigningKey::from_bytes(&[0x50; 32]),
-            existing_root,
-            existing,
-        )
+        let existing_commit = crate::model_collection::publish_model_fragment(&mut pile, &SigningKey::from_bytes(&[0x50; 32]), existing)
         .expect("publish existing PersonaPlex authority");
 
         let candidate = model_fragment(
@@ -661,18 +636,12 @@ mod native_authority_tests {
             false,
             crate::leaf::Form::TwoBlob,
         );
-        let candidate_root = candidate.root().unwrap();
-        let candidate_commit = crate::model_collection::publish_model_bundle_fragment(
-            &mut pile,
-            &SigningKey::from_bytes(&[0x50; 32]),
-            candidate_root,
-            candidate,
-        )
+        let candidate_commit = crate::model_collection::publish_model_fragment(&mut pile, &SigningKey::from_bytes(&[0x50; 32]), candidate)
         .expect("publish conflicting PersonaPlex authority");
         let snapshot =
-            crate::model_collection::snapshot_model_bundle_collection_local_latest(&mut pile)
-                .expect("freeze conflicting bundle authority");
-        let error = PersonaPlexWeights::from_bundle_snapshot(snapshot)
+            crate::model_collection::snapshot_model_collection_local_latest(&mut pile)
+                .expect("freeze conflicting model authority");
+        let error = PersonaPlexWeights::from_snapshot(snapshot)
             .err()
             .expect("conflicting Source/native roots must fail closed");
         assert!(format!("{error:#}").contains("ambiguous"), "{error:#}");
@@ -680,12 +649,12 @@ mod native_authority_tests {
         pile.close().expect("close synthetic PersonaPlex pile");
     }
 
-    /// The bundle selects and the exact coordinate keeps its shape and width
+    /// A member selects and the exact coordinate keeps its shape and width
     /// under either leaf form. `models/personaplex.pile` is two-blob today; a
     /// typed conversion of it must land on the same weights, and this is where
     /// that stops being an assumption.
     #[test]
-    fn personaplex_bundle_selects_in_either_leaf_form() {
+    fn personaplex_member_selects_in_either_leaf_form() {
         for form in crate::leaf::FORMS {
             let file = TestPile::new();
             let mut pile = Pile::open(file.path()).expect("open synthetic PersonaPlex pile");
@@ -698,25 +667,20 @@ mod native_authority_tests {
                 form,
             );
             let root = fragment.root().expect("PersonaPlex model root");
-            crate::model_collection::publish_model_bundle_fragment(
-                &mut pile,
-                &SigningKey::from_bytes(&[0x50; 32]),
-                root,
-                fragment,
-            )
+            crate::model_collection::publish_model_fragment(&mut pile, &SigningKey::from_bytes(&[0x50; 32]), fragment)
             .expect("publish PersonaPlex root");
             let snapshot =
-                crate::model_collection::snapshot_model_bundle_collection_local_latest(&mut pile)
+                crate::model_collection::snapshot_model_collection_local_latest(&mut pile)
                     .expect("freeze PersonaPlex prefix");
-            let bundle = PersonaPlexWeights::from_bundle_snapshot(snapshot)
-                .unwrap_or_else(|e| panic!("{} bundle must select: {e:#}", form.label()));
-            let weights = bundle.weights();
+            let model = PersonaPlexWeights::from_snapshot(snapshot)
+                .unwrap_or_else(|e| panic!("{} model must select: {e:#}", form.label()));
+            let weights = model.weights();
             assert_eq!(weights.root(), root, "{}", form.label());
             assert_eq!(weights.count(), 2, "{}", form.label());
             let encoder = &weights.exact()["encoder.weight"];
             assert_eq!(encoder.shape(), vec![1, 2], "{}", form.label());
             assert_eq!(encoder.to_f32(), vec![3.0, 4.0], "{}", form.label());
-            drop(bundle);
+            drop(model);
             pile.close().expect("close synthetic PersonaPlex pile");
         }
     }

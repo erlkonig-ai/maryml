@@ -669,7 +669,7 @@ pub fn write_packed_pile(
     let mut pile = Pile::open(out).map_err(|e| anyhow::anyhow!("open {}: {e:?}", out.display()))?;
     pile.refresh()
         .map_err(|e| anyhow::anyhow!("refresh {}: {e:?}", out.display()))?;
-    crate::model_collection::model_graph_collection_or_create(&mut pile, key)
+    crate::model_collection::model_collection_or_create(&mut pile, key)
         .map_err(|e| anyhow::anyhow!("create the model collection: {e}"))?;
 
     let mut graph = Fragment::empty();

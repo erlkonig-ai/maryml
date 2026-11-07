@@ -144,7 +144,7 @@ fn mixed_dtype_scalar_and_documents_reopen_without_source_and_select_opaque_code
     std::fs::File::create(&path).unwrap();
     let mut pile = Pile::open(&path).unwrap();
     let key = ed25519_dalek::SigningKey::from_bytes(&[23u8; 32]); // synthetic fixture signer only
-    crate::model_collection::model_graph_collection_or_create(&mut pile, &key).unwrap();
+    crate::model_collection::model_collection_or_create(&mut pile, &key).unwrap();
     let mut candidate = import::ingest_checkpoint(&mut pile, &checkpoint, "test-revision").unwrap();
     assert_eq!(candidate.tensor_count, 4);
     assert_eq!(candidate.parameter_count, 11);

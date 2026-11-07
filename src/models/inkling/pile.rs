@@ -1323,7 +1323,7 @@ impl PileSource {
         let mut pile = Pile::open(path).map_err(|e| anyhow::anyhow!("open {path:?}: {e:?}"))?;
         // The one model collection. A learned model is a version root inside
         // it (`super::learned`), never a collection beside it.
-        let collection_name: &'static str = crate::model_collection::mary_model_graph_name();
+        let collection_name: &'static str = crate::model_collection::model_collection_name();
         let snapshot = crate::model_collection::snapshot_model_collection_named_local_latest(
             &mut pile,
             collection_name,

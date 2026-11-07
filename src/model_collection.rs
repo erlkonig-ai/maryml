@@ -1,5 +1,10 @@
 //! Native policy collections and compatibility projection for Mary models.
 //!
+//! Mary has one model collection, named `models` ([`model_collection_name`]).
+//! Its members are model fact archives; a model is a root inside it. Piles
+//! written under the retired `mary-model-graph` and `mary-model-bundles` names
+//! are not read here: `model_collection_migrate` appends their `models` collection.
+//!
 //! A model collection is its typed descriptor handle. New collections use
 //! independent direct READ and WRITE policies rooted at their founding signer;
 //! an existing descriptor keeps its own policy. Callers never reconstruct a
@@ -19,12 +24,12 @@ use anyhow::{Context, anyhow, bail};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use triblespace::core::attribute::Attribute;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace::core::blob::{Blob, IntoBlob, TryFromBlob};
+use triblespace::core::blob::{Blob, TryFromBlob};
 use triblespace::core::collection::descriptor;
 use triblespace::core::collection::simplearchive_union::PreparedCollectionCommit;
 use triblespace::core::collection::{
     ACTION_READ, ACTION_WRITE, AdmissionPolicy, Collection, CollectionCommit, CollectionHandle,
-    CollectionPolicy, CollectionRead, CollectionRecord, CollectionSnapshotExt, CollectionStoreExt,
+    CollectionPolicy, CollectionRecord, CollectionSnapshotExt, CollectionStoreExt,
     Cover, Support,
 };
 use triblespace::core::inline::encodings::UnknownInline;
@@ -35,12 +40,9 @@ use triblespace::core::trible::TribleSet;
 use triblespace::prelude::inlineencodings::{F64, U256BE};
 use triblespace::prelude::*;
 
-pub const fn mary_model_graph_name() -> &'static str {
-    "mary-model-graph"
-}
-
-pub const fn mary_model_bundle_name() -> &'static str {
-    "mary-model-bundles"
+/// The one model collection. Its members are model fact archives.
+pub const fn model_collection_name() -> &'static str {
+    "models"
 }
 
 pub type ModelCollection = Collection<SimpleArchive>;
@@ -164,27 +166,6 @@ impl<S> ModelSnapshot<S> {
 
 pub type ModelPileSnapshot = ModelSnapshot<PileSnapshot>;
 
-#[derive(Clone, Debug)]
-pub struct PreparedModelBundle {
-    model_root: Id,
-    model_archive_data: triblespace::core::collection::CollectionData,
-    prepared: PreparedCollectionCommit,
-}
-
-impl PreparedModelBundle {
-    pub fn model_root(&self) -> Id {
-        self.model_root
-    }
-
-    pub fn model_archive_data(&self) -> triblespace::core::collection::CollectionData {
-        self.model_archive_data
-    }
-
-    pub fn into_prepared_commit(self) -> PreparedCollectionCommit {
-        self.prepared
-    }
-}
-
 pub fn prepare_model_fragment(fragment: Fragment) -> PreparedCollectionCommit {
     PreparedCollectionCommit::from_fragment(fragment)
 }
@@ -237,7 +218,8 @@ fn named_collections_from_handles<R: StoreRead>(
     (collections, retired)
 }
 
-fn named_collections_in<R: StoreRead>(
+/// Every current collection descriptor named `wanted` in this observation.
+pub fn collections_named_in<R: StoreRead>(
     store: &R,
     wanted: &str,
 ) -> anyhow::Result<Vec<ModelCollection>> {
@@ -264,10 +246,10 @@ fn sole_named_collection_in<R: StoreRead>(
     store: &R,
     wanted: &'static str,
 ) -> anyhow::Result<ModelCollection> {
-    let collections = named_collections_in(store, wanted)?;
+    let collections = collections_named_in(store, wanted)?;
     match collections.as_slice() {
         [collection] => Ok(*collection),
-        [] => bail!("no collection named '{wanted}' in this pile"),
+        [] => bail!("no collection named '{wanted}' in this pile (a pile under the retired model collection names needs `model_collection_migrate`)"),
         _ => bail!(
             "{} policy collections are named '{wanted}'; select one explicitly: {:?}",
             collections.len(),
@@ -340,7 +322,7 @@ fn sole_named_collection_acquiring_in<R: StoreRead>(
         [] if !retired.is_empty() => bail!(
             "found only retired descriptors named '{wanted}' ({retired:?}); run the additive model collection migration"
         ),
-        [] => bail!("no collection named '{wanted}' in this pile"),
+        [] => bail!("no collection named '{wanted}' in this pile (a pile under the retired model collection names needs `model_collection_migrate`)"),
         _ => bail!(
             "{} policy collections are named '{wanted}'; select one explicitly: {:?}",
             collections.len(), collections,
@@ -348,12 +330,8 @@ fn sole_named_collection_acquiring_in<R: StoreRead>(
     }
 }
 
-pub fn model_graph_collections_in<R: StoreRead>(store: &R) -> anyhow::Result<Vec<ModelCollection>> {
-    named_collections_in(store, mary_model_graph_name())
-}
-
-pub fn model_bundle_collections_in<R: StoreRead>(store: &R) -> anyhow::Result<Vec<ModelCollection>> {
-    named_collections_in(store, mary_model_bundle_name())
+pub fn model_collections_in<R: StoreRead>(store: &R) -> anyhow::Result<Vec<ModelCollection>> {
+    collections_named_in(store, model_collection_name())
 }
 
 /// Select the sole collection named `name`, or found it under this signer.
@@ -371,7 +349,7 @@ pub(crate) fn collection_or_create(
     let snapshot = pile
         .snapshot()
         .context("freeze model collection selection")?;
-    let collections = named_collections_in(&snapshot, name)?;
+    let collections = collections_named_in(&snapshot, name)?;
     match collections.as_slice() {
         [] => pile
             .collection(name, direct_model_policy(signer))
@@ -396,18 +374,11 @@ pub(crate) fn collection_or_create(
     }
 }
 
-pub fn model_graph_collection_or_create(
+pub fn model_collection_or_create(
     pile: &mut Pile,
     signing_key: &SigningKey,
 ) -> anyhow::Result<ModelCollection> {
-    collection_or_create(pile, signing_key, mary_model_graph_name())
-}
-
-pub fn model_bundle_collection_or_create(
-    pile: &mut Pile,
-    signing_key: &SigningKey,
-) -> anyhow::Result<ModelCollection> {
-    collection_or_create(pile, signing_key, mary_model_bundle_name())
+    collection_or_create(pile, signing_key, model_collection_name())
 }
 
 pub fn publish_model_fragment(
@@ -416,7 +387,7 @@ pub fn publish_model_fragment(
     fragment: Fragment,
 ) -> anyhow::Result<CollectionCommit> {
     pile.refresh().context("refresh before model publication")?;
-    let collection = model_graph_collection_or_create(pile, signing_key)?;
+    let collection = model_collection_or_create(pile, signing_key)?;
     pile.commit(collection, signing_key, fragment)
         .map_err(|error| anyhow!("publish model fragment: {error}"))
 }
@@ -487,50 +458,6 @@ pub fn publish_model_fragment_into(
         .map_err(|error| anyhow!("publish model fragment: {error}"))
 }
 
-pub fn prepare_model_bundle_fragment(
-    model_root: Id,
-    fragment: Fragment,
-) -> anyhow::Result<PreparedModelBundle> {
-    if !fragment.facts().iter().any(|fact| fact.e() == &model_root) {
-        bail!("model root {model_root} is absent from the candidate fragment");
-    }
-
-    let (_, facts, metafacts, blobs) = fragment.into_parts();
-    let model_archive: Blob<SimpleArchive> = facts.to_blob();
-    let mut token = Fragment::empty();
-    token.blobs_mut().union(blobs);
-    let source = token.put::<SimpleArchive, _>(model_archive);
-    let model_archive_data = inlineencodings::Handle::<SimpleArchive>::to_hash(source);
-    token += entity! {
-        ExclusiveId::force_ref(&model_root) @ metadata::archive: source
-    };
-    *token.metafacts_mut() += metafacts;
-    debug_assert_eq!(token.facts().len(), 1);
-
-    Ok(PreparedModelBundle {
-        model_root,
-        model_archive_data,
-        prepared: PreparedCollectionCommit::from_fragment(token),
-    })
-}
-
-pub fn publish_model_bundle_fragment(
-    pile: &mut Pile,
-    signing_key: &SigningKey,
-    model_root: Id,
-    fragment: Fragment,
-) -> anyhow::Result<CollectionCommit> {
-    pile.refresh()
-        .context("refresh before model bundle publication")?;
-    let collection = model_bundle_collection_or_create(pile, signing_key)?;
-    prepare_model_bundle_fragment(model_root, fragment)?
-        .into_prepared_commit()
-        .stage_for(pile, collection, signing_key)
-        .map_err(|error| anyhow!("stage model bundle: {error}"))?
-        .finalize()
-        .map_err(|error| anyhow!("publish model bundle: {error}"))
-}
-
 /// Attach the model collection and check it stands on `support`: what the
 /// caller selected must be what the store's root stands on now, or the
 /// caller is reading a different lattice than it thinks.
@@ -556,13 +483,6 @@ pub fn snapshot_model_collection_exact<R: StoreRead>(
         .context("materialize model support")?;
     let (store, support, cover) = attached.into_parts().context("retain selected model cover")?;
     Ok(ModelSnapshot::from_cover(facts, support, store, cover))
-}
-
-pub fn snapshot_model_bundle_collection_exact<R: StoreRead>(
-    store: &R,
-    support: &Support,
-) -> anyhow::Result<ModelSnapshot<R>> {
-    snapshot_model_collection_exact(store, support)
 }
 
 pub fn local_model_support<R: StoreRead>(
@@ -615,7 +535,7 @@ pub fn snapshot_model_collection_local_latest(
 /// resolves the descriptor, names, policy definitions and selected model bytes
 /// through its exact-read contract; a local reader retains local-only behavior.
 pub fn snapshot_model_collection_in<R: StoreRead>(store: &R) -> anyhow::Result<ModelSnapshot<R>> {
-    snapshot_model_collection_named_in(store, mary_model_graph_name())
+    snapshot_model_collection_named_in(store, model_collection_name())
 }
 
 /// Operational model read: choose the cover once from this observation,
@@ -625,7 +545,7 @@ pub fn snapshot_model_collection_in<R: StoreRead>(store: &R) -> anyhow::Result<M
 pub fn snapshot_model_collection_acquiring_in<R: StoreRead>(
     store: &R,
 ) -> anyhow::Result<ModelSnapshot<R>> {
-    let collection = sole_named_collection_acquiring_in(store, mary_model_graph_name())?;
+    let collection = sole_named_collection_acquiring_in(store, model_collection_name())?;
     let observed = store
         .collection_acquiring(collection)
         .context("select model collection for acquisition")?;
@@ -674,20 +594,6 @@ pub fn snapshot_model_collection_for<R: StoreRead>(
         .into_parts()
         .context("resolve model collection support for snapshot")?;
     Ok(ModelSnapshot::from_cover(facts, support, store, cover))
-}
-
-pub fn snapshot_model_bundle_collection_local_latest(
-    pile: &mut Pile,
-) -> anyhow::Result<ModelPileSnapshot> {
-    let store = pile.snapshot().context("freeze model bundle observation")?;
-    snapshot_model_bundle_collection_in(&store)
-}
-
-pub fn snapshot_model_bundle_collection_in<R: StoreRead>(
-    store: &R,
-) -> anyhow::Result<ModelSnapshot<R>> {
-    let collection = sole_named_collection_in(store, mary_model_bundle_name())?;
-    snapshot_model_collection_for(store, collection)
 }
 
 pub fn load_model_collection_local_latest(
@@ -1230,7 +1136,7 @@ mod tests {
         use triblespace::core::repo::memoryrepo::MemoryRepo;
         let mut repo = MemoryRepo::default();
         let key = SigningKey::from_bytes(&[0x70; 32]);
-        let collection = repo.collection(mary_model_graph_name(),
+        let collection = repo.collection(model_collection_name(),
             direct_model_policy(key.verifying_key())).unwrap();
         let subject = genid();
         let fragment = entity! { &subject @ metadata::tag: metadata::KIND_MULTI };
@@ -1375,7 +1281,7 @@ mod tests {
         let second = SigningKey::from_bytes(&[0x72; 32]);
         let descriptor = entity! {
             metadata::tag: KIND_COLLECTION_DESCRIPTOR,
-            collection_name: mary_model_graph_name().to_owned(),
+            collection_name: model_collection_name().to_owned(),
             collection_representation: SimpleArchive::id(),
             resource_policy*: AdmissionPolicy::direct(first.verifying_key()).binding(read_capability())
                 + AdmissionPolicy::direct(second.verifying_key()).binding(read_capability()),
@@ -1415,13 +1321,13 @@ mod tests {
         let snapshot = pile.snapshot().unwrap();
         let (current, retired) = named_collections_from_handles(
             &snapshot,
-            mary_model_graph_name(),
+            model_collection_name(),
             [collection.handle()],
         );
         assert_eq!(current, vec![collection]);
         assert!(retired.is_empty());
         assert_eq!(
-            model_graph_collections_in(&snapshot).unwrap(),
+            model_collections_in(&snapshot).unwrap(),
             vec![collection],
         );
         let materialized = snapshot_model_collection_in(&snapshot).unwrap();
@@ -1439,7 +1345,7 @@ mod tests {
         let mut repo = MemoryRepo::default();
         let key = SigningKey::from_bytes(&[0x76; 32]);
         let collection = repo.collection(
-            mary_model_graph_name(), direct_model_policy(key.verifying_key()),
+            model_collection_name(), direct_model_policy(key.verifying_key()),
         ).unwrap();
         repo.commit(collection, &key, entity! { metadata::name: "known model" }).unwrap();
         let absent: Blob<SimpleArchive> = entity! {
@@ -1451,15 +1357,15 @@ mod tests {
             inlineencodings::Handle::<SimpleArchive>::to_hash(data), data,
         ))).unwrap();
         let before = repo.snapshot().unwrap();
-        assert_eq!(model_graph_collections_in(&before).unwrap(), vec![collection]);
-        let error = sole_named_collection_acquiring_in(&before, mary_model_graph_name()).unwrap_err();
+        assert_eq!(model_collections_in(&before).unwrap(), vec![collection]);
+        let error = sole_named_collection_acquiring_in(&before, model_collection_name()).unwrap_err();
         assert!(error.to_string().contains("read model candidate descriptor"));
         // An available but unrecognized descriptor is still an open-world
         // non-match. It does not poison another correctly named collection.
         repo.put::<SimpleArchive, _>(absent).unwrap();
         let after = repo.snapshot().unwrap();
-        assert_eq!(sole_named_collection_acquiring_in(&after, mary_model_graph_name()).unwrap(), collection);
-        assert!(sole_named_collection_acquiring_in(&before, mary_model_graph_name()).is_err());
+        assert_eq!(sole_named_collection_acquiring_in(&after, model_collection_name()).unwrap(), collection);
+        assert!(sole_named_collection_acquiring_in(&before, model_collection_name()).is_err());
     }
 
     #[test]
@@ -1473,7 +1379,7 @@ mod tests {
         }.into_facts().to_blob();
         let descriptor = entity! {
             metadata::tag: KIND_COLLECTION_DESCRIPTOR,
-            collection_name: mary_model_graph_name().to_owned(),
+            collection_name: model_collection_name().to_owned(),
             collection_representation: SimpleArchive::id(),
             resource_policy*: AdmissionPolicy::direct(key.verifying_key()).binding(definition.get_handle())
                 + AdmissionPolicy::direct(key.verifying_key()).binding(write_capability()),
@@ -1483,11 +1389,11 @@ mod tests {
         let collection = repo.register_collection::<SimpleArchive>(descriptor).unwrap();
         repo.commit(collection, &key, entity! { metadata::name: "model member" }).unwrap();
         let before = repo.snapshot().unwrap();
-        let error = sole_named_collection_acquiring_in(&before, mary_model_graph_name()).unwrap_err();
+        let error = sole_named_collection_acquiring_in(&before, model_collection_name()).unwrap_err();
         assert!(error.to_string().contains("read model policy definition"));
         repo.put::<SimpleArchive, _>(definition).unwrap();
         let after = repo.snapshot().unwrap();
-        assert_eq!(sole_named_collection_acquiring_in(&after, mary_model_graph_name()).unwrap(), collection);
+        assert_eq!(sole_named_collection_acquiring_in(&after, model_collection_name()).unwrap(), collection);
     }
 
     #[test]
@@ -1498,7 +1404,7 @@ mod tests {
         let mut repo = MemoryRepo::default();
         let key = SigningKey::from_bytes(&[0x75; 32]);
         let collection = repo.collection(
-            mary_model_graph_name(), direct_model_policy(key.verifying_key()),
+            model_collection_name(), direct_model_policy(key.verifying_key()),
         ).unwrap();
         let first = entity! { metadata::name: "resident model annotation" };
         let mut expected = first.facts().clone();
@@ -1578,7 +1484,7 @@ mod tests {
         let outsider = SigningKey::from_bytes(&[0x74; 32]);
         let collection = pile
             .collection(
-                mary_model_bundle_name(),
+                model_collection_name(),
                 direct_model_policy(root.verifying_key()),
             )
             .unwrap();
@@ -1588,7 +1494,7 @@ mod tests {
         let snapshot = pile.snapshot().unwrap();
         let (current, retired) = named_collections_from_handles(
             &snapshot,
-            mary_model_bundle_name(),
+            model_collection_name(),
             [collection.handle()],
         );
         assert_eq!(current, vec![collection]);
@@ -1613,10 +1519,10 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(
-            model_bundle_collections_in(&snapshot).unwrap(),
+            model_collections_in(&snapshot).unwrap(),
             vec![collection],
         );
-        let materialized = snapshot_model_bundle_collection_in(&snapshot).unwrap();
+        let materialized = snapshot_model_collection_in(&snapshot).unwrap();
         assert!(materialized.support().is_empty());
         assert!(materialized.facts().is_empty());
         drop(materialized);

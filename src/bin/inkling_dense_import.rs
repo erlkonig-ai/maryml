@@ -258,7 +258,7 @@ fn main() -> Result<()> {
             // Fail before checkpoint indexing or the first tensor conversion
             // unless this durable signer can publish to the existing authority.
             let collection =
-                mary::model_collection::model_graph_collection_or_create(&mut store, &signing_key)
+                mary::model_collection::model_collection_or_create(&mut store, &signing_key)
                     .map_err(|e| anyhow::anyhow!("model collection writer: {e}"))?;
             let observation = store
                 .snapshot()

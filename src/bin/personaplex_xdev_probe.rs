@@ -109,7 +109,7 @@ fn main() {
     println!("loader ready   : {:.2}s", t0.elapsed().as_secs_f64());
 
     let t1 = Instant::now();
-    // Recompute the temporal transform from the signed source bundle on this
+    // Recompute the temporal transform from the signed source model on this
     // CUDA probe path.
     let mut tm = TemporalMetal::load(&loader, fmt);
     println!("model loaded   : {:.2}s", t1.elapsed().as_secs_f64());

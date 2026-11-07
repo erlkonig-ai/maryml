@@ -36,7 +36,7 @@ fn main() -> Result<()> {
     let mut pile = Pile::open(&args.pile).context("open model pile")?;
     let result = (|| -> Result<_> {
         pile.refresh().context("refresh model pile")?;
-        mary::model_collection::model_graph_collection_or_create(&mut pile, &key)?;
+        mary::model_collection::model_collection_or_create(&mut pile, &key)?;
         let candidate =
             step_audio2::import::ingest_checkpoint(&mut pile, &args.checkpoint, &args.revision)?;
         let ids = candidate.artifacts;

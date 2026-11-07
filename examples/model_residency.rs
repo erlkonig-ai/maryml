@@ -1,6 +1,6 @@
 //! Model residency: is a model root's whole tensor closure in this pile?
 //!
-//! Freezes the pile's `mary-model-graph` collection through the ordinary
+//! Freezes the pile's `models` collection through the ordinary
 //! reader and loads the keymap of each named root the way every consumer
 //! does (`selection::load_keymap_from_graph`), which reads every tensor leaf
 //! and folds the packed roots' channel scales. No inference, no network, no

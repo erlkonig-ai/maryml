@@ -258,7 +258,7 @@ fn publish_root(mut a: RootArgs) -> anyhow::Result<()> {
                 collection
             }
             None => {
-                mary::model_collection::model_graph_collection_or_create(&mut pile, &signing_key)?
+                mary::model_collection::model_collection_or_create(&mut pile, &signing_key)?
             }
         };
         let commit = pile

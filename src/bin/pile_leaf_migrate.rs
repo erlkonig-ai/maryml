@@ -52,18 +52,11 @@
 //! pins are fragments of a history, the collection is the model.
 //!
 //! Writing the branch alone is wrong in the other direction: `mary::speak`
-//! resolves weights out of a `mary-model-graph` COLLECTION, so a converted pile
+//! resolves weights out of a `models` COLLECTION, so a converted pile
 //! with only a branch fails to open with "no signed model collection" no matter
 //! how correct its tensors are. The conversion was already right about the
 //! bytes before this seam existed; it was one epoch behind the reader it has to
 //! feed.
-//!
-//! A source containing a bundle collection is rejected before the destination
-//! is opened, even when it also contains a graph collection. Bundle members
-//! are signed one-row tokens that name model archives, not the model facts
-//! themselves. Rewriting one truthfully means replacing those archives and
-//! publishing new bundle tokens; folding their decoded facts into a graph
-//! commit would silently change the source's collection shape instead.
 //!
 //! ## Collection identity is preserved, deliberately
 //!
@@ -164,22 +157,8 @@ fn migrate(src: &Path, dst: &Path, signing_key: &ed25519_dalek::SigningKey) -> R
     let mary::persist::ModelPileSource {
         facts: tribles,
         store: reader,
-        collections,
+        collection: expected,
     } = mary::persist::read_model_pile(src)?;
-    let [source_collection] = collections.as_slice() else {
-        anyhow::bail!(
-            "pile_leaf_migrate accepts exactly one `mary-model-graph` source collection; \
-             found {} native source collections (bundle collections require a bundle-preserving \
-             rewrite)",
-            collections.len()
-        );
-    };
-    anyhow::ensure!(
-        source_collection.shape == mary::persist::ModelPileCollectionShape::Graph,
-        "pile_leaf_migrate accepts exactly one `mary-model-graph` source collection; \
-         `mary-model-bundles` requires a bundle-preserving rewrite"
-    );
-    let expected = source_collection.collection;
     eprintln!(
         "[migrate] {src:?}: native collection, {} facts",
         tribles.len()
@@ -408,123 +387,4 @@ fn migrate(src: &Path, dst: &Path, signing_key: &ed25519_dalek::SigningKey) -> R
         total as f64 / (1024.0 * 1024.0 * 1024.0)
     );
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ed25519_dalek::SigningKey;
-    use std::fs::OpenOptions;
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    static NEXT_TEMP_PILE: AtomicU64 = AtomicU64::new(0);
-
-    struct TempPilePath(PathBuf);
-
-    impl TempPilePath {
-        fn new(label: &str) -> Self {
-            let ordinal = NEXT_TEMP_PILE.fetch_add(1, Ordering::Relaxed);
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system clock after Unix epoch")
-                .as_nanos();
-            let path = std::env::temp_dir().join(format!(
-                "mary-pile-leaf-migrate-{label}-{}-{nanos}-{ordinal}.pile",
-                std::process::id()
-            ));
-            OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-                .expect("create isolated test pile");
-            Self(path)
-        }
-
-        fn as_path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TempPilePath {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
-    }
-
-    #[test]
-    fn bundle_only_source_is_rejected_before_destination_mutation() {
-        let source = TempPilePath::new("bundle-source");
-        let destination = TempPilePath::new("bundle-destination");
-        let signer = SigningKey::from_bytes(&[0x61; 32]);
-
-        let model = entity! {
-            _ @ attrs::data: vec![1.25_f32].to_blob(),
-                attrs::shape: vec![1_u64].to_blob()
-        };
-        let model_root = model.root().expect("fixture model root");
-        let mut pile = Pile::open(source.as_path()).expect("open source pile");
-        mary::model_collection::publish_model_bundle_fragment(
-            &mut pile, &signer, model_root, model,
-        )
-        .expect("publish bundle-only tensor model");
-        pile.close().expect("close source pile");
-
-        let before = std::fs::read(destination.as_path()).expect("read destination before");
-        let error = migrate(source.as_path(), destination.as_path(), &signer)
-            .expect_err("bundle-only migration must be rejected");
-        assert!(
-            error.to_string().contains("`mary-model-bundles`"),
-            "unexpected diagnostic: {error:#}"
-        );
-        let after = std::fs::read(destination.as_path()).expect("read destination after");
-        assert_eq!(
-            after, before,
-            "rejecting a bundle-only source must not stage even a descriptor"
-        );
-    }
-
-    #[test]
-    fn mixed_graph_and_bundle_source_is_rejected_before_destination_mutation() {
-        let source = TempPilePath::new("mixed-source");
-        let destination = TempPilePath::new("mixed-destination");
-        let signer = SigningKey::from_bytes(&[0x62; 32]);
-
-        let graph = entity! {
-            _ @ attrs::data: vec![1.25_f32].to_blob(),
-                attrs::shape: vec![1_u64].to_blob()
-        };
-        let bundle = entity! {
-            _ @ attrs::data: vec![2.5_f32].to_blob(),
-                attrs::shape: vec![1_u64].to_blob()
-        };
-        let bundle_root = bundle.root().expect("fixture bundle root");
-        let mut pile = Pile::open(source.as_path()).expect("open source pile");
-        mary::model_collection::publish_model_fragment(&mut pile, &signer, graph)
-            .expect("publish graph tensor model");
-        mary::model_collection::publish_model_bundle_fragment(
-            &mut pile,
-            &signer,
-            bundle_root,
-            bundle,
-        )
-        .expect("publish bundle tensor model");
-        pile.close().expect("close source pile");
-
-        let before = std::fs::read(destination.as_path()).expect("read destination before");
-        let error = migrate(source.as_path(), destination.as_path(), &signer)
-            .expect_err("mixed-shape migration must be rejected");
-        assert!(
-            error
-                .to_string()
-                .contains("found 2 native source collections"),
-            "unexpected diagnostic: {error:#}"
-        );
-        let after = std::fs::read(destination.as_path()).expect("read destination after");
-        assert_eq!(
-            after, before,
-            "rejecting a mixed-shape source must not stage even a descriptor"
-        );
-    }
 }

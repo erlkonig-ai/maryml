@@ -372,7 +372,7 @@ mod tests {
         store.refresh()?;
         let key = ed25519_dalek::SigningKey::from_bytes(&[17; 32]);
         let collection =
-            crate::model_collection::model_graph_collection_or_create(&mut store, &key)?;
+            crate::model_collection::model_collection_or_create(&mut store, &key)?;
         let expert = LearnedExpert {
             name: "model.llm.layers.41.mlp.experts.w2_weight".to_string(),
             layer: 41,

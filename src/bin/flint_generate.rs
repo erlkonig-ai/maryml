@@ -20,7 +20,7 @@ struct Args {
     /// Model entity in the explicitly named positional pile path (not a GGUF).
     #[arg(long)] typed_pile:Option<String>,
     /// Exact native collection descriptor (64 hex digits), separate from root.
-    /// Omit only when the pile has one discoverable mary-model-graph collection.
+    /// Omit only when the pile has one discoverable models collection.
     #[arg(long,requires="typed_pile")] collection:Option<String>,
     /// trusted-framed parses literal controls in caller-rendered trusted text;
     /// it performs no template rendering, escaping or user-content sanitation.

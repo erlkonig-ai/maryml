@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Mary has one model collection, `models`, whose members are model fact
+  archives. The `mary-model-graph` / `mary-model-bundles` pair is gone, with
+  the bundle shape: its one-row `metadata::archive` token, its reader branch,
+  `prepare_model_bundle_fragment` / `publish_model_bundle_fragment`, and
+  `ModelPileCollectionShape`. `persist::ModelPileSource` carries the one
+  `collection`. PersonaPlex selects the member archive that states its
+  Source/native root (`persist::personaplex_model`, `PersonaPlexModel`); a
+  member stating two such roots now fails closed. There is no loader fallback
+  to the old names. `model_collection_migrate <pile> <key>` makes the archives the
+  old collections held (a bundle's archive itself, not its token) members of
+  the pile's `models` collection, joining an existing one under its own
+  descriptor and policy or founding it, touches no other blob, and proves
+  fact-set and member equality before it reports success.
+
 - Native Nemotron loads every routed expert (40 x 512 NVFP4 pairs, 63.4 GB)
   into device memory once, into one bank in the shared model weights that every
   Session uses. The per-Session expert cache, its miss/stage/complete path and

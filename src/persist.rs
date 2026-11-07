@@ -258,7 +258,7 @@ pub fn import_model_to_collection(
 ) -> anyhow::Result<(Id, CollectionCommit)> {
     pile.refresh()
         .context("refresh before model import preflight")?;
-    let _collection = crate::model_collection::model_graph_collection_or_create(pile, signing_key)
+    let _collection = crate::model_collection::model_collection_or_create(pile, signing_key)
         .context("preflight model collection writer")?;
     let root = ingest_model_fragment(pile, model_dir, dtype, source, quantization)?;
     let root_id = root.root().expect("model root id");
@@ -970,7 +970,7 @@ fn open_preflighted_model_graph_pile(
         return Err(close_writer_after_error(pile, error));
     }
     let collection =
-        match crate::model_collection::model_graph_collection_or_create(&mut pile, signing_key) {
+        match crate::model_collection::model_collection_or_create(&mut pile, signing_key) {
             Ok(collection) => collection,
             Err(error) => {
                 let error = anyhow::anyhow!("select model collection writer: {error}");
@@ -1297,44 +1297,47 @@ fn load_aliased_loader_and_roots_from_pile(
     Ok((WeightLoader::Pile(keymap), exact_roots))
 }
 
-/// Load the canonical PersonaPlex bundle from its exact admitted cover.
+/// Load the canonical PersonaPlex model from the exact admitted cover of the
+/// pile's `models` collection.
 ///
-/// Each admitted COMMIT must contain one atomic `(root, archive, H)` token;
-/// `H` is decoded and validated independently rather than reconstructed from
-/// a broad graph union. The returned bundle retains the frozen cover and
-/// `(root, H, τ)` identity alongside the exact loader.
+/// The model is the one member archive stating a Source/native PersonaPlex
+/// root; it is decoded and validated on its own rather than reconstructed from
+/// the union of every member. The returned model retains the frozen cover and
+/// `(root, member)` identity alongside the exact loader.
 #[cfg(feature = "qwen3tts")]
-pub fn personaplex_bundle(
+pub fn personaplex_model(
     pile_path: &Path,
 ) -> anyhow::Result<
-    crate::models::personaplex::PersonaPlexBundle<triblespace::core::repo::pile::PileSnapshot>,
+    crate::models::personaplex::PersonaPlexModel<triblespace::core::repo::pile::PileSnapshot>,
 > {
     let mut pile = Pile::open(pile_path)
-        .with_context(|| format!("open PersonaPlex bundle pile {pile_path:?}"))?;
-    let snapshot =
-        match crate::model_collection::snapshot_model_bundle_collection_local_latest(&mut pile) {
-            Ok(observation) => observation,
-            Err(error) => {
-                let _ = pile.close();
-                return Err(error).with_context(|| {
-                    format!("freeze the sole PersonaPlex bundle snapshot in {pile_path:?}")
-                });
-            }
-        };
+        .with_context(|| format!("open PersonaPlex model pile {pile_path:?}"))?;
+    let snapshot = match crate::model_collection::snapshot_model_collection_local_latest(&mut pile) {
+        Ok(observation) => observation,
+        Err(error) => {
+            let _ = pile.close();
+            return Err(error).with_context(|| {
+                format!(
+                    "freeze the sole `models` collection in {pile_path:?} (a pile under the \
+                     retired model collection names needs `model_collection_migrate`)"
+                )
+            });
+        }
+    };
     pile.close()
-        .with_context(|| format!("close PersonaPlex bundle pile {pile_path:?}"))?;
-    crate::models::personaplex::PersonaPlexWeights::from_bundle_snapshot(snapshot)
-        .with_context(|| format!("select exact PersonaPlex bundle from {pile_path:?}"))
+        .with_context(|| format!("close PersonaPlex model pile {pile_path:?}"))?;
+    crate::models::personaplex::PersonaPlexWeights::from_snapshot(snapshot)
+        .with_context(|| format!("select exact PersonaPlex model from {pile_path:?}"))
 }
 
-/// Convenience weight-loader projection backed exclusively by bundle authority.
-/// Runtime consumers should use [`personaplex_bundle`] when the exact cover
-/// and identity must stay paired with the loader.
+/// Convenience weight-loader projection of [`personaplex_model`]. Runtime
+/// consumers should use that when the exact cover and identity must stay
+/// paired with the loader.
 #[cfg(feature = "qwen3tts")]
 pub fn personaplex_loader(
     pile_path: &Path,
 ) -> anyhow::Result<crate::nn::weight_loader::WeightLoader> {
-    personaplex_bundle(pile_path).map(|bundle| bundle.into_parts().1)
+    personaplex_model(pile_path).map(|model| model.into_parts().1)
 }
 
 /// The derived FOLDED half-width sibling of a qwen3tts weights pile:
@@ -1883,58 +1886,22 @@ mod legacy_spelling_tests {
     }
 }
 
-/// Which native collection shape contributes to a model-pile read.
-///
-/// The declaration order is also the canonical order in
-/// [`ModelPileSource::collections`]: direct graph facts first, bundle archives
-/// second. A pile may carry either one, or both.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub enum ModelPileCollectionShape {
-    /// `mary-model-graph`: collection members are model fact archives.
-    Graph,
-    /// `mary-model-bundles`: collection members name complete model archives.
-    Bundle,
-}
-
-/// One exact native collection that contributed to a model-pile read.
-pub struct ModelPileCollection {
-    /// How this collection contributes its facts.
-    pub shape: ModelPileCollectionShape,
-    /// Exact typed collection selected from the pile's admitted cover.
-    pub collection: triblespace::core::collection::Collection<
-        triblespace::core::blob::encodings::simplearchive::SimpleArchive,
-    >,
-}
-
-/// A model pile's complete facts and the exact collections that stated them.
+/// A model pile's complete facts and the exact collection that stated them.
 pub struct ModelPileSource {
     /// Every fact the model is stated by, canonical aliases projected in.
     pub facts: TribleSet,
     /// The frozen store observation every fact and attachment came from;
     /// valid after the pile closes, because it owns the immutable mapping.
     pub store: triblespace::core::repo::pile::PileSnapshot,
-    /// One or two contributing collections, canonically ordered graph then
-    /// bundle. Mixed shapes retain both independently authorized identities.
-    pub collections: Vec<ModelPileCollection>,
+    /// The pile's sole `models` collection, selected from its admitted cover.
+    pub collection: crate::model_collection::ModelCollection,
 }
 
-/// Read a model pile's complete facts from its signed collections.
+/// Read a model pile's complete facts from its signed `models` collection.
 ///
-/// A pile states its model in one or both of two native shapes, and which one
-/// is a fact about when the pile was written rather than about what the caller
-/// wants: `mary-model-graph` holds the facts directly, while
-/// `mary-model-bundles` holds one signed token per model whose `metadata::archive`
-/// names the complete fact archive. Reading only the first made every
-/// bundle-migrated pile unreadable here — `personaplex.pile` carries its 10195
-/// model facts under a bundle and nothing else, so a loader that asks for the
-/// graph by name reports "no collection named `mary-model-graph`" about a pile
-/// whose model is right there. Both shapes are read and unioned, which is also
-/// the only correct answer for a pile carrying both: a bundle for its weights
-/// and a graph for a tokenizer published separately is exactly the shape
-/// `personaplex.pile` has after its tokenizer was restored.
-///
-/// There is deliberately no branch fallback. Pre-collection piles are inputs
-/// to the standalone model migration tool, not an alternate runtime truth.
+/// There is deliberately no fallback, to retired collection names or to
+/// branches. A pile written under `mary-model-graph` or `mary-model-bundles`
+/// is an input to `model_collection_migrate`, not an alternate runtime truth.
 pub fn read_model_pile(path: &Path) -> anyhow::Result<ModelPileSource> {
     let mut pile = Pile::open(path).map_err(|e| anyhow::anyhow!("open {path:?}: {e:?}"))?;
     let read = read_model_collections(&mut pile, path);
@@ -1973,138 +1940,38 @@ pub fn read_model_pile_snapshot_read_only(
 }
 
 fn read_model_collections(pile: &mut Pile, path: &Path) -> anyhow::Result<ModelPileSource> {
-    // This used to be a seqlock: sample `Pile::store_revision`, read both
-    // collections, sample again, and retry the whole thing whenever an append
-    // landed in between. A model pile is 171 GB and its two shapes are read one
-    // after the other, so the window was real, not theoretical. `Pile::snapshot`
-    // freezes blobs, collection records, capability proofs, and peer evidence at
-    // one validated prefix, so the graph shape, the bundle shape, and the bytes
-    // they name cannot come from different prefixes any more. There is nothing
-    // left to retry.
+    // `Pile::snapshot` freezes blobs, collection records, capability proofs and
+    // peer evidence at one validated prefix, so the collection and the bytes
+    // it names come from one observation.
     let store = pile
         .snapshot()
         .map_err(|error| anyhow::anyhow!("{path:?}: observe model pile: {error}"))?;
     read_model_collections_in(&store, path)
 }
 
-/// Read both native model shapes from one candidate pile prefix.
-///
-/// The enclosing revision loop discards this entire value if either discovery
-/// or materialization observed an interleaved append. In particular, an
-/// ambiguity discovered in one shape cannot be hidden by successfully reading
-/// the other, and the final reader is captured only after both shapes have
-/// been resolved.
 fn read_model_collections_in(
     store: &triblespace::core::repo::pile::PileSnapshot,
     path: &Path,
 ) -> anyhow::Result<ModelPileSource> {
-    let mut facts = TribleSet::new();
-    let mut collections = Vec::with_capacity(2);
-    let mut graph_error = None;
-    let mut bundle_error = None;
-
-    match crate::model_collection::model_graph_collections_in(store)?.as_slice() {
-        [] => graph_error = Some("no collection named `mary-model-graph` in this pile".to_string()),
-        [collection] => {
-            let snapshot =
-                crate::model_collection::snapshot_model_collection_for(store, *collection)
-                    .with_context(|| format!("{path:?}: resolve model graph collection"))?;
-            facts += pre_epoch_aliased(snapshot.facts());
-            let (_, support, _) = snapshot.into_parts();
-            collections.push(ModelPileCollection {
-                shape: ModelPileCollectionShape::Graph,
-                collection: support.collection(),
-            });
-        }
+    let name = crate::model_collection::model_collection_name();
+    let collection = match crate::model_collection::model_collections_in(store)?.as_slice() {
+        [collection] => *collection,
+        [] => anyhow::bail!(
+            "{path:?}: no collection named `{name}` in this pile \
+             (a pile under the retired model collection names needs `model_collection_migrate`)"
+        ),
         many => anyhow::bail!(
-            "{path:?}: {} policy collections are named `mary-model-graph`; select one explicitly",
+            "{path:?}: {} policy collections are named `{name}`; select one explicitly",
             many.len(),
         ),
-    }
-
-    match crate::model_collection::model_bundle_collections_in(store)?.as_slice() {
-        [] => {
-            bundle_error = Some("no collection named `mary-model-bundles` in this pile".to_string())
-        }
-        [collection] => {
-            let snapshot =
-                crate::model_collection::snapshot_model_collection_for(store, *collection)
-                    .with_context(|| format!("{path:?}: resolve model bundle collection"))?;
-            let (_, support, bundle_reader) = snapshot.into_parts();
-            facts += model_bundle_archive_facts(&support, &bundle_reader)
-                .map_err(|e| anyhow::anyhow!("{path:?}: read model bundle archives: {e}"))?;
-            collections.push(ModelPileCollection {
-                shape: ModelPileCollectionShape::Bundle,
-                collection: support.collection(),
-            });
-        }
-        many => anyhow::bail!(
-            "{path:?}: {} policy collections are named `mary-model-bundles`; select one explicitly",
-            many.len(),
-        ),
-    }
-
-    if collections.is_empty() {
-        // Neither shape is present. Name BOTH, because "no collection named
-        // `mary-model-graph`" sent two lanes hunting for a graph in a pile that
-        // was never going to have one.
-        anyhow::bail!(
-            "{path:?}: no unambiguous native model collection: \
-             `mary-model-graph`: {}; `mary-model-bundles`: {}",
-            graph_error.as_deref().unwrap_or("read failed"),
-            bundle_error.as_deref().unwrap_or("read failed"),
-        );
-    }
-
+    };
+    let snapshot = crate::model_collection::snapshot_model_collection_for(store, collection)
+        .with_context(|| format!("{path:?}: resolve the `{name}` collection"))?;
     Ok(ModelPileSource {
-        facts,
-        // No second acquisition: this is the same observation both shapes were
-        // read out of, so the reader can no longer be newer than the records.
+        facts: pre_epoch_aliased(snapshot.facts()),
         store: store.clone(),
-        collections,
+        collection,
     })
-}
-
-/// The complete model facts every bundle token in admitted support points at.
-///
-/// A bundle COMMIT carries exactly one `(root, metadata::archive, H)` row; `H`
-/// is the canonical archive of the model's whole fact set. Resolving it is what
-/// turns the tiny signed union into the facts a loader can query.
-fn model_bundle_archive_facts(
-    support: &triblespace::core::collection::Support,
-    reader: &triblespace::core::repo::pile::PileSnapshot,
-) -> anyhow::Result<TribleSet> {
-    use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
-    use triblespace::core::blob::{Blob, TryFromBlob};
-    use triblespace::core::metadata;
-
-    let mut facts = TribleSet::new();
-    for member in support.members() {
-        let token_blob: Blob<SimpleArchive> = reader
-            .get(member)
-            .map_err(|error| anyhow::anyhow!("read bundle token {member:?}: {error}"))?;
-        let token = TribleSet::try_from_blob(token_blob)
-            .map_err(|e| anyhow::anyhow!("decode bundle token {member:?}: {e:?}"))?;
-        for row in token.iter() {
-            if row.a() != &metadata::archive.id() {
-                continue;
-            }
-            let archive_blob: Blob<SimpleArchive> = reader
-                .get(inlineencodings::Handle::<SimpleArchive>::from_hash(
-                    inlineencodings::Handle::<SimpleArchive>::to_hash(
-                        *row.v::<inlineencodings::Handle<SimpleArchive>>(),
-                    ),
-                ))
-                .map_err(|error| {
-                    anyhow::anyhow!("read model archive for bundle {member:?}: {error}")
-                })?;
-            let archive = TribleSet::try_from_blob(archive_blob).map_err(|e| {
-                anyhow::anyhow!("decode model archive for bundle {member:?}: {e:?}")
-            })?;
-            facts += pre_epoch_aliased(&archive);
-        }
-    }
-    Ok(facts)
 }
 
 /// Index a pile's TYPED tensor leaves by name, without materializing any of
@@ -2498,7 +2365,7 @@ mod tokenizer_collection_tests {
         assert!(ingest.facts > 0);
         let mut pile = Pile::open(&pile_path).unwrap();
         let store = pile.snapshot().unwrap();
-        let collections = crate::model_collection::model_graph_collections_in(&store).unwrap();
+        let collections = crate::model_collection::model_collections_in(&store).unwrap();
         assert_eq!(collections.len(), 1);
         assert!(
             collections[0]

@@ -112,8 +112,8 @@ fn pile_loader(pile: &str) -> WeightLoader {
 }
 
 fn runtime_source(pile: &str) -> mary::models::personaplex::PersonaPlexRuntimeSource {
-    mary::persist::personaplex_bundle(Path::new(pile))
-        .unwrap_or_else(|e| panic!("bundle load: {e}"))
+    mary::persist::personaplex_model(Path::new(pile))
+        .unwrap_or_else(|e| panic!("model load: {e}"))
         .into_runtime_source()
 }
 
