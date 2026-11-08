@@ -177,10 +177,17 @@ fn embed(args: &[String]) -> Result<()> {
         let client = warm.client.clone();
         let avail = || -> u64 { fs::read_to_string("/proc/meminfo").ok().and_then(|m| m.lines()
             .find(|l| l.starts_with("MemAvailable")).and_then(|l| l.split_whitespace().nth(1)?.parse().ok())).unwrap_or(0) };
+        let profile = std::env::var("WEMM_PROFILE_SCAN").is_ok();
         for b in list.split(',').map(|s| s.parse::<usize>()).collect::<Result<Vec<_>, _>>()? {
             client.memory_cleanup();
             let before = avail();
             let texts = vec![window; b];
+            if profile {
+                // One untimed warm forward, then capture only the timed ones
+                // (nsys --capture-range=cudaProfilerApi).
+                for e in native.embed_texts(&texts).map_err(anyhow::Error::msg)? { sync(&e)?; }
+                unsafe { cudarc::driver::sys::cuProfilerStart(); }
+            }
             let mut best = f64::MAX;
             for _ in 0..3 {
                 let t = Instant::now();
@@ -188,6 +195,7 @@ fn embed(args: &[String]) -> Result<()> {
                 for e in &es { sync(e)?; }
                 best = best.min(ms(t));
             }
+            if profile { unsafe { cudarc::driver::sys::cuProfilerStop(); } }
             let usage = client.memory_usage().map_err(|e| anyhow::anyhow!("{e:?}"))?;
             say!("steady_batch\tB\t{b}\tids_each\t248\tbest_of_3_ms\t{best:.1}\tms_per_window\t{:.1}\tpool_reserved_mib\t{:.0}\tpool_in_use_mib\t{:.0}\tmemavail_drop_mib\t{:.0}",
                 best / b as f64, usage.bytes_reserved as f64 / 1048576.0, usage.bytes_in_use as f64 / 1048576.0,
@@ -388,7 +396,7 @@ fn upload_bf16(client: &cubecl::client::ComputeClient<cubecl::cuda::CudaRuntime>
 #[derive(Clone, Copy, Debug)]
 enum Routine { Simple, Double, SimpleAsync, DoubleAsync }
 
-fn forced(routine: Routine, m: usize, n: usize, k: usize, part: (u32, u32, u32), stage: (u32, u32), double_partition: bool, swizzle: bool)
+fn forced(routine: Routine, m: usize, n: usize, k: usize, part: (u32, u32, u32), stage: (u32, u32), double_partition: bool, order: cubek::std::cube_count::GlobalOrder)
     -> Result<cubek::matmul::launch::Strategy, String> {
     use cubek::matmul::{components::{stage::PartitionBuffering, tile::TileMatmulKind},
         definition::{MatmulGlobalElems, MatmulProblem, TilingBlueprint, TilingScheme}, launch::Strategy,
@@ -403,7 +411,7 @@ fn forced(routine: Routine, m: usize, n: usize, k: usize, part: (u32, u32, u32),
     let scheme = TilingScheme::builder().with_tile_size((16, 8, 16).into())
         .with_partition_size(part.into()).with_stage_size((stage.0, stage.1, 1).into()).build()?;
     let grid = HypercubeBlueprint::builder()
-        .global_order(if swizzle { GlobalOrder::SwizzleRow(4) } else { GlobalOrder::RowMajor })
+        .global_order(order)
         .cube_count_strategy(CubeCountStrategy::FromProblem).build();
     let mut bp = TilingBlueprint::builder(TileMatmulKind::Mma, scheme, 32, &problem)
         .partition_buffering(if double_partition { PartitionBuffering::Double } else { PartitionBuffering::Single })
@@ -433,25 +441,19 @@ fn gemm(args: &[String]) -> Result<()> {
     // (k, n, uses per 32-layer forward)
     let shapes: &[(usize, usize, usize)] = &[(4096, 12288, 64), (12288, 4096, 32), (4096, 8192, 32),
         (4096, 4096, 56), (4096, 1024, 16), (4096, 32, 48)];
-    type C = (&'static str, Routine, (u32, u32, u32), (u32, u32), bool, bool);
+    use cubek::std::cube_count::GlobalOrder as O;
+    type C = (&'static str, Routine, (u32, u32, u32), (u32, u32), bool, O);
+    // The production wide tiling (p2x8x2 s4x1) under every cube order: the
+    // order only decides which cubes run together, never any arithmetic.
     let candidates: &[C] = &[
-        ("simple p2x1x4 s2x2 (=prod)", Routine::Simple, (2, 1, 4), (2, 2), false, false),
-        ("simple p2x8x2 s4x1", Routine::Simple, (2, 8, 2), (4, 1), false, false),
-        ("simple p2x8x2 s8x1", Routine::Simple, (2, 8, 2), (8, 1), false, false),
-        ("simple p2x8x2 s2x1", Routine::Simple, (2, 8, 2), (2, 1), false, false),
-        ("simple p2x8x2 s4x2", Routine::Simple, (2, 8, 2), (4, 2), false, false),
-        ("simple p4x8x2 s2x1", Routine::Simple, (4, 8, 2), (2, 1), false, false),
-        ("simple p4x8x2 s4x1", Routine::Simple, (4, 8, 2), (4, 1), false, false),
-        ("simple p2x16x2 s4x1", Routine::Simple, (2, 16, 2), (4, 1), false, false),
-        ("simple p4x4x2 s4x1", Routine::Simple, (4, 4, 2), (4, 1), false, false),
-        ("simple p2x4x2 s4x1", Routine::Simple, (2, 4, 2), (4, 1), false, false),
-        ("simple p2x8x1 s4x1", Routine::Simple, (2, 8, 1), (4, 1), false, false),
-        ("simple p2x8x2 s4x1 swz", Routine::Simple, (2, 8, 2), (4, 1), false, true),
-        ("sasync p4x8x2 s2x1", Routine::SimpleAsync, (4, 8, 2), (2, 1), false, false),
-        ("dasync p2x8x2 s4x1", Routine::DoubleAsync, (2, 8, 2), (4, 1), false, false),
-        ("dasync p4x8x2 s2x1", Routine::DoubleAsync, (4, 8, 2), (2, 1), false, false),
-        ("dasync p2x8x2 s8x1", Routine::DoubleAsync, (2, 8, 2), (8, 1), false, false),
-        ("dasync p2x8x4 s4x1", Routine::DoubleAsync, (2, 8, 4), (4, 1), false, false),
+        ("prod tiling rowmajor", Routine::Simple, (2, 8, 2), (4, 1), false, O::RowMajor),
+        ("prod tiling colmajor", Routine::Simple, (2, 8, 2), (4, 1), false, O::ColMajor),
+        ("prod tiling swizzlecol2", Routine::Simple, (2, 8, 2), (4, 1), false, O::SwizzleCol(2)),
+        ("prod tiling swizzlecol4", Routine::Simple, (2, 8, 2), (4, 1), false, O::SwizzleCol(4)),
+        ("prod tiling swizzlecol8", Routine::Simple, (2, 8, 2), (4, 1), false, O::SwizzleCol(8)),
+        ("prod tiling swizzlecol16", Routine::Simple, (2, 8, 2), (4, 1), false, O::SwizzleCol(16)),
+        ("prod tiling swizzlerow2", Routine::Simple, (2, 8, 2), (4, 1), false, O::SwizzleRow(2)),
+        ("prod tiling swizzlerow8", Routine::Simple, (2, 8, 2), (4, 1), false, O::SwizzleRow(8)),
     ];
     let time = |f: &mut dyn FnMut() -> Result<()>| -> Result<f64> {
         f()?; f()?;
@@ -476,9 +478,9 @@ fn gemm(args: &[String]) -> Result<()> {
         let flops = 2.0 * (m * n * k) as f64;
         println!("k {k} n {n} uses {uses}: production {t:.3} ms {:.1} TFLOP/s -> {:.1} ms/forward", flops / t / 1e9, t * uses as f64);
         totals[0] += t * uses as f64;
-        for (ci, &(name, routine, part, stage, dpart, swz)) in candidates.iter().enumerate() {
+        for (ci, &(name, routine, part, stage, dpart, order)) in candidates.iter().enumerate() {
             if only.as_deref().is_some_and(|o| !name.contains(o)) { valid[ci + 1] = false; continue; }
-            let strategy = match forced(routine, m, n, k, part, stage, dpart, swz) {
+            let strategy = match forced(routine, m, n, k, part, stage, dpart, order) {
                 Ok(s) => s,
                 Err(e) => { println!("  {name}: setup {e}"); valid[ci + 1] = false; continue; }
             };
