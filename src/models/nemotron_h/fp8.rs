@@ -97,7 +97,7 @@ impl Projection {
         self.project_with(input, max_working_bytes, true)
     }
 
-    /// `one_row`: a one-row input whose K is a multiple of GEMV_K takes the
+    /// `one_row`: a one-row input whose K is a multiple of GEMV_K (and N of 8) takes the
     /// decode kernel; false forces the general MMA path (the test oracle).
     fn project_with(&self, input: &CudaTensor, max_working_bytes: usize, one_row: bool) -> Result<CudaTensor> {
         let dims = input.meta.shape().as_slice();
@@ -145,7 +145,7 @@ impl Projection {
                 ArrayArg::from_raw_parts(quantized.clone(), input_len), input_len, self.input_scale,
             );
         }
-        if one_row && rows == 1 && k % GEMV_K == 0 {
+        if one_row && rows == 1 && k % GEMV_K == 0 && n % 8 == 0 {
             launch_gemv_staged(client, &quantized, &self.weight, &output, self.alpha, n, k, GEMV_UNROLL);
             return Ok(CubeTensor::new_contiguous(client.clone(), self.device.clone(),
                 [dims[0], dims[1], n].into(), output, DType::BF16));
