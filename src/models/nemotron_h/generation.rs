@@ -16,7 +16,7 @@ use super::{
         ChatCodec, Completion, History, OutputParser, PartialOutput, RenderOptions, RenderedPrompt,
         StopReason, Tools,
     },
-    session::{PrefillOutcome, Session, Status},
+    session::{PrefillOutcome, PromptReset, Session, Status},
 };
 use crate::sampling::{Sampler, SamplingConfig};
 use anyhow::{Context, Result, ensure};
@@ -99,7 +99,9 @@ pub enum ReplacementOutcome {
     },
     /// Reset/restore succeeded: Ready at zero or the exact saved prefix. The
     /// caller may now assign its host History; this owner never stores that copy.
-    ReadyForAssignment { admission: PromptAdmission },
+    /// `offered_seal` is the token boundary the caller asked to keep the saved
+    /// prefix at (0: none), and `reset` what the runtime did with it.
+    ReadyForAssignment { admission: PromptAdmission, offered_seal: usize, reset: PromptReset },
 }
 
 #[derive(Clone, Debug)]
@@ -203,8 +205,34 @@ impl<S: BlobStoreGet> Generator<S> {
         history: &History,
         options: TurnOptions,
     ) -> ReplacementOutcome {
+        self.prepare_history_replacement_sealed(history, options, 0)
+    }
+
+    /// [`Self::prepare_history_replacement`], offering to keep the one saved
+    /// prefix at the end of the first `sealed_messages` messages of `history`.
+    ///
+    /// The seal is the exact token rendering of that message prefix
+    /// ([`prefix_token_ids`]: whole messages, no generation prompt), and is
+    /// offered only if it is a token prefix of the admitted prompt. The
+    /// runtime restores an exact saved prefix first and otherwise reseals at
+    /// the offered boundary when it can admit that ([`Session::reset_for_prompt_sealed`]).
+    /// A seal that cannot be rendered as an exact prefix is not offered: that
+    /// is the ordinary cleared reset, never a guessed shorter boundary.
+    pub fn prepare_history_replacement_sealed(
+        &mut self,
+        history: &History,
+        options: TurnOptions,
+        sealed_messages: usize,
+    ) -> ReplacementOutcome {
         let admission = self.preflight(history, options);
-        replace_admitted(&mut self.session, admission)
+        let seal = match &admission {
+            Ok(admission) if sealed_messages > 0 => prefix_token_ids(
+                &self.codec, history, &admission.prompt.token_ids, sealed_messages,
+                options.enable_thinking, options.tools_enabled,
+            ).map_or(0, |ids| ids.len()),
+            _ => 0,
+        };
+        replace_admitted(&mut self.session, admission, seal)
     }
 
     /// A turn always returns its partial/result, even on render, reset, runtime
@@ -262,6 +290,9 @@ trait Runtime {
     fn last_logits(&self) -> Option<&[f32]>;
     fn reset(&mut self) -> Result<()>;
     fn reset_for_prompt(&mut self, _ids: &[u32]) -> Result<()> { self.reset() }
+    fn reset_for_prompt_sealed(&mut self, ids: &[u32], _seal: usize) -> Result<PromptReset> {
+        self.reset_for_prompt(ids).map(|()| PromptReset::Cleared)
+    }
     fn can_reuse(&self, ids: &[u32]) -> bool {
         self.status() == Status::Ready && ids.starts_with(self.committed_ids())
     }
@@ -272,6 +303,9 @@ trait Runtime {
 impl<S: BlobStoreGet> Runtime for Session<S> {
     fn reset_for_prompt(&mut self, ids: &[u32]) -> Result<()> {
         Session::reset_for_prompt(self, ids).map_err(anyhow::Error::msg)
+    }
+    fn reset_for_prompt_sealed(&mut self, ids: &[u32], seal: usize) -> Result<PromptReset> {
+        Session::reset_for_prompt_sealed(self, ids, seal).map_err(anyhow::Error::msg)
     }
     fn can_reuse(&self, ids: &[u32]) -> bool { self.can_reuse_prefix(ids) }
     fn observe_reuse(&self) { Session::observe_reuse(self) }
@@ -364,9 +398,30 @@ fn admit_prompt(
     })
 }
 
+/// The exact rendered token IDs of `history`'s first `messages` messages, as
+/// the prefix of a prompt whose complete rendering is `full_ids`: whole
+/// messages, no generation prompt, the same render options. Refused unless
+/// they are an exact token prefix of `full_ids`, since an adapted rendering
+/// may change earlier tokens and equal text does not imply equal tokens.
+/// `messages == 0` is the empty prefix.
+pub fn prefix_token_ids(codec: &ChatCodec, history: &History, full_ids: &[u32], messages: usize,
+    enable_thinking: bool, tools_enabled: bool) -> Result<Vec<u32>>
+{
+    if messages == 0 { return Ok(Vec::new()); }
+    ensure!(messages <= history.messages.len(), "prefix boundary exceeds history");
+    let mut prefix = history.clone();
+    prefix.messages.truncate(messages);
+    let rendered = codec.render_adapted(&prefix, RenderOptions {
+        enable_thinking, medium_effort: false, add_generation_prompt: false, tools_enabled,
+    })?;
+    ensure!(full_ids.starts_with(&rendered.token_ids), "prefix is not an exact token prefix of the prompt");
+    Ok(rendered.token_ids)
+}
+
 fn replace_admitted(
     runtime: &mut impl Runtime,
     admission: Result<PromptAdmission>,
+    seal: usize,
 ) -> ReplacementOutcome {
     let admission = match admission {
         Ok(value) => value,
@@ -376,8 +431,8 @@ fn replace_admitted(
             };
         }
     };
-    match runtime.reset_for_prompt(&admission.prompt.token_ids) {
-        Ok(()) => ReplacementOutcome::ReadyForAssignment { admission },
+    match runtime.reset_for_prompt_sealed(&admission.prompt.token_ids, seal) {
+        Ok(reset) => ReplacementOutcome::ReadyForAssignment { admission, offered_seal: seal, reset },
         Err(error) => ReplacementOutcome::ResetFailedTerminal {
             error: format!("{error:#}"),
             session_status: runtime.status(),

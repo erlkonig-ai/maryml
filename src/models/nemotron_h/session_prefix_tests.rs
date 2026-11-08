@@ -182,3 +182,50 @@ fn session_gpu_prefix_never_publishes_partial_or_failed_completion() {
     assert!(failed.saved_prefix().is_none());
     assert_eq!(failed.status(), Status::Poisoned);
 }
+
+#[test]
+#[ignore = "reserved CUDA: synthetic in-place reseal against a fresh seeded owner, bit for bit; no checkpoint"]
+fn session_gpu_reseal_in_place_equals_a_fresh_seeded_owner() {
+    let (snapshot, source, layers) = fixture();
+    let l = limits();
+    let mut s = Session::from_snapshot_seed(snapshot, source, &layers,
+        CudaDevice { index: 0 }, l, &[1, 5, 7]).unwrap();
+    assert_eq!(s.prefill_ids(&[1, 5, 7, 3], &mut || false).unwrap(), PrefillOutcome::Completed);
+    let model = s.device_model().clone();
+    // A young-region change: the head [1, 5, 7] restores, whatever the seal.
+    assert_eq!(s.reset_for_prompt_sealed(&[1, 5, 7, 4, 2], 3).unwrap(), PromptReset::Restored { tokens: 3 });
+    assert_eq!(s.committed_ids(), [1, 5, 7]);
+    s.append_ids(&[4, 2]).unwrap();
+    // A head change: cleared, with the new head pending as the seed. Only its
+    // P rows are reserved, exactly as for a startup seed.
+    assert_eq!(s.reset_for_prompt_sealed(&[1, 6, 7, 4, 2], 3).unwrap(), PromptReset::Resealed { tokens: 3 });
+    assert!(s.saved_prefix().is_none() && s.committed_ids().is_empty());
+    assert_eq!(s.prefix_ownership().unwrap().private_kv_bytes, 3 * attention::KV_ROW_BYTES);
+    assert!(s.append_ids(&[1, 6, 6]).is_err(), "the pending seed admits only its own IDs");
+    assert_eq!(s.prefill_ids(&[1, 6, 7, 4, 2], &mut || false).unwrap(), PrefillOutcome::Completed);
+    assert_eq!(s.saved_prefix().unwrap().token_ids(), [1, 6, 7]);
+    let (resealed_state, resealed_logits) = (state_bytes(&s), s.last_logits().unwrap().values.to_vec());
+    // Reference: a FRESH seeded owner on the same uploaded model, same spans.
+    let mut r = Session::from_device_model_seed(model.clone(), l, &[1, 6, 7]).unwrap();
+    assert_eq!(r.prefill_ids(&[1, 6, 7, 4, 2], &mut || false).unwrap(), PrefillOutcome::Completed);
+    assert_eq!(state_bytes(&r), resealed_state, "in-place reseal state is bit-identical");
+    assert_eq!(r.last_logits().unwrap().values, resealed_logits);
+    assert_eq!(s.prefix_ownership().unwrap(), r.prefix_ownership().unwrap());
+    // The resealed prefix then restores to the reference boundary exactly.
+    assert_eq!(s.reset_for_prompt_sealed(&[1, 6, 7, 9], 3).unwrap(), PromptReset::Restored { tokens: 3 });
+    r.restore_prefix().unwrap();
+    assert_eq!(state_bytes(&s), state_bytes(&r));
+    assert_eq!(s.last_logits().unwrap().values, r.last_logits().unwrap().values);
+    s.append_ids(&[9]).unwrap();
+    r.append_ids(&[9]).unwrap();
+    assert_eq!(s.last_logits().unwrap().values, r.last_logits().unwrap().values);
+    // An owner admitted unseeded never reseals: its reservation never priced it.
+    let mut plain = Session::from_device_model(model, l).unwrap();
+    plain.append_ids(&[1, 5]).unwrap();
+    assert_eq!(plain.reset_for_prompt_sealed(&[2, 2, 2, 4], 3).unwrap(), PromptReset::Cleared);
+    assert!(plain.saved_prefix().is_none() && plain.committed_ids().is_empty());
+    assert_eq!(plain.prefix_ownership().unwrap().private_kv_bytes, 8 * attention::KV_ROW_BYTES);
+    // Validation precedes mutation.
+    assert!(s.reset_for_prompt_sealed(&[32], 1).is_err());
+    assert_eq!(s.committed_ids(), [1, 6, 7, 9]);
+}

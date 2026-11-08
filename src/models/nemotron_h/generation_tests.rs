@@ -21,6 +21,10 @@ struct Script {
     cancel_inside_prefill: Option<Rc<Cell<bool>>>,
     saved_prefix: Option<Vec<u32>>,
     restored: usize,
+    // Sealed-replacement model of Session: a pending seed publishes as the
+    // saved prefix once committed IDs cover it, as `publish_seed_if_complete`.
+    seed: Option<Vec<u32>>,
+    reseedable: bool,
 }
 fn row(id: u32) -> Vec<f32> {
     let mut values = vec![0.0; 16];
@@ -43,10 +47,37 @@ impl Script {
             cancel_inside_prefill: None,
             saved_prefix: None,
             restored: 0,
+            seed: None,
+            reseedable: true,
         }
     }
 }
 impl Runtime for Script {
+    fn reset_for_prompt_sealed(&mut self, ids: &[u32], seal: usize) -> Result<PromptReset> {
+        if seal == 0 && self.seed.is_none() {
+            let restored = self.restored;
+            self.reset_for_prompt(ids)?;
+            return Ok(if self.restored > restored {
+                PromptReset::Restored { tokens: self.committed.len() }
+            } else { PromptReset::Cleared });
+        }
+        let plan = super::super::session::reseal_plan(self.saved_prefix.as_deref(),
+            self.seed.is_some(), self.reseedable, ids, seal, |_, _| true);
+        match plan {
+            PromptReset::Restored { .. } => self.reset_for_prompt(ids)?,
+            PromptReset::Resealed { tokens } => {
+                self.reset()?;
+                self.saved_prefix = None;
+                self.seed = Some(ids[..tokens].to_vec());
+            }
+            PromptReset::Cleared => {
+                self.reset()?;
+                self.saved_prefix = None;
+                self.seed = None;
+            }
+        }
+        Ok(plan)
+    }
     fn reset_for_prompt(&mut self, ids: &[u32]) -> Result<()> {
         if let Some(prefix) = self.saved_prefix.clone().filter(|p| ids.starts_with(p)) {
             self.status = Status::Poisoned;
@@ -109,6 +140,9 @@ impl Runtime for Script {
             .expect("script needs next logits"));
         self.committed.extend_from_slice(ids);
         self.status = Status::Ready;
+        if self.seed.as_ref().is_some_and(|seed| self.committed.starts_with(seed)) {
+            self.saved_prefix = self.seed.take();
+        }
         if let Some((count, signal)) = &self.cancel_after_append {
             if *count == self.appends.len() {
                 signal.set(true);
@@ -896,7 +930,7 @@ fn generation_replacement_rejects_full_prompt_and_render_failure_before_reset() 
         s.committed = vec![9];
         let admission = admit_prompt(&s, rendered(&ids), 1);
         assert!(matches!(
-            replace_admitted(&mut s, admission),
+            replace_admitted(&mut s, admission, 0),
             ReplacementOutcome::RejectedUnchanged { .. }
         ));
         assert_eq!(s.committed, [9]);
@@ -905,7 +939,7 @@ fn generation_replacement_rejects_full_prompt_and_render_failure_before_reset() 
     }
     let mut s = Script::new(&[]);
     s.committed = vec![9];
-    let outcome = replace_admitted(&mut s, Err(anyhow::anyhow!("scripted render failure")));
+    let outcome = replace_admitted(&mut s, Err(anyhow::anyhow!("scripted render failure")), 0);
     assert!(
         matches!(outcome, ReplacementOutcome::RejectedUnchanged { error } if error.contains("render failure"))
     );
@@ -919,7 +953,7 @@ fn generation_replacement_rejects_reserve_and_overflow_before_reset() {
         let mut s = Script::new(&[]);
         s.committed = vec![9];
         let admission = admit_prompt(&s, rendered(&[1]), budget);
-        let outcome = replace_admitted(&mut s, admission);
+        let outcome = replace_admitted(&mut s, admission, 0);
         let ReplacementOutcome::RejectedUnchanged { error } = outcome else {
             panic!("must reject")
         };
@@ -940,7 +974,7 @@ fn generation_replacement_success_is_empty_ready_not_prefilled() {
     s.committed = vec![1]; // Even an exact old prefix is deliberately reset.
     s.logits = row(5);
     let admission = admit_prompt(&s, rendered(&[1]), 0);
-    let ReplacementOutcome::ReadyForAssignment { admission } = replace_admitted(&mut s, admission)
+    let ReplacementOutcome::ReadyForAssignment { admission, .. } = replace_admitted(&mut s, admission, 0)
     else {
         panic!("reset must succeed")
     };
@@ -980,7 +1014,7 @@ fn generation_saved_prefix_refusal_cancel_and_restore_failure_preserve_control_c
     s.logits = row(5);
     s.capacity = 3;
     let invalid = admit_prompt(&s, rendered(&[1, 2]), 2);
-    assert!(matches!(replace_admitted(&mut s, invalid), ReplacementOutcome::RejectedUnchanged { .. }));
+    assert!(matches!(replace_admitted(&mut s, invalid, 0), ReplacementOutcome::RejectedUnchanged { .. }));
     assert_eq!(s.restored, 0);
     let output = run_turn(&mut s, &mut Sampler::new(SamplingConfig::greedy(), 0).unwrap(),
         &[1, 2], 1, &mut || true, DecodeScript::default());
@@ -989,7 +1023,7 @@ fn generation_saved_prefix_refusal_cancel_and_restore_failure_preserve_control_c
     assert_eq!(s.restored, 0);
     s.fail_reset = true;
     let admitted = admit_prompt(&s, rendered(&[1, 2]), 1);
-    assert!(matches!(replace_admitted(&mut s, admitted), ReplacementOutcome::ResetFailedTerminal { .. }));
+    assert!(matches!(replace_admitted(&mut s, admitted, 0), ReplacementOutcome::ResetFailedTerminal { .. }));
     assert_eq!(s.status, Status::Poisoned);
     assert!(s.appends.is_empty());
 }
@@ -1000,7 +1034,7 @@ fn generation_replacement_reset_failure_is_terminal_not_rejected_unchanged() {
     s.committed = vec![9];
     s.fail_reset = true;
     let admission = admit_prompt(&s, rendered(&[1]), 2);
-    let outcome = replace_admitted(&mut s, admission);
+    let outcome = replace_admitted(&mut s, admission, 0);
     assert!(matches!(outcome, ReplacementOutcome::ResetFailedTerminal {
             error, session_status: Status::Poisoned, committed_tokens: 1
         } if error.contains("reset failure")));
@@ -1009,4 +1043,62 @@ fn generation_replacement_reset_failure_is_terminal_not_rejected_unchanged() {
     assert!(s.appends.is_empty());
     // Retained count is diagnostic; the outcome makes no rollback assertion.
     assert_eq!(s.committed, [9]);
+}
+
+/// The three cover sequences, over the scripted runtime's model of a Session
+/// (restore wins; a reseal installs a seed that publishes on the next prefill).
+/// Tokens stand for a rendered wake: head, young region, then the rest.
+#[test]
+fn sealed_replacement_reuses_the_head_reseals_once_and_reuses_again() {
+    let mut s = Script::new(&[11; 8]);
+    let wake = |s: &mut Script, prompt: &[u32], seal: usize| {
+        let admission = admit_prompt(s, rendered(prompt), 1);
+        let ReplacementOutcome::ReadyForAssignment { offered_seal, reset, .. } =
+            replace_admitted(s, admission, seal) else { panic!("replacement must succeed") };
+        assert_eq!(offered_seal, seal);
+        let reused = s.committed.len();
+        let output = run(s, prompt, 1, DecodeScript::default());
+        assert_eq!(output.session_status, Status::Ready);
+        assert_eq!(s.committed, prompt, "the whole prompt is attended");
+        (reset, reused)
+    };
+    // First wake: nothing saved yet; reseal at the head [1, 2, 3].
+    assert_eq!(wake(&mut s, &[1, 2, 3, 4, 5, 6], 3), (PromptReset::Resealed { tokens: 3 }, 0));
+    assert_eq!(s.saved_prefix.as_deref(), Some(&[1, 2, 3][..]), "the prefill published the seal");
+    // (1) append-only: the head is unchanged, so its prefix is restored and
+    // only the young suffix is prefilled.
+    assert_eq!(wake(&mut s, &[1, 2, 3, 4, 5, 7, 6], 3), (PromptReset::Restored { tokens: 3 }, 3));
+    assert_eq!(s.appends.last().unwrap(), &[4, 5, 7, 6]);
+    // (2) a late summary inside the head: one reseal at the NEW head ...
+    assert_eq!(wake(&mut s, &[1, 8, 3, 4, 5, 7, 6], 3), (PromptReset::Resealed { tokens: 3 }, 0));
+    assert_eq!(s.saved_prefix.as_deref(), Some(&[1, 8, 3][..]));
+    // (3) ... after which a young-region change reuses that head again.
+    assert_eq!(wake(&mut s, &[1, 8, 3, 9, 6], 3), (PromptReset::Restored { tokens: 3 }, 3));
+    assert_eq!(s.appends.last().unwrap(), &[9, 6]);
+    // A head that grew past the saved one still restores the saved, exact,
+    // shorter prefix: reuse never waits for a reseal.
+    assert_eq!(wake(&mut s, &[1, 8, 3, 9, 6], 4), (PromptReset::Restored { tokens: 3 }, 3));
+    // An owner not admitted as seeded clears, exactly as before sealing.
+    s.reseedable = false;
+    assert_eq!(wake(&mut s, &[2, 2, 2, 6], 3), (PromptReset::Cleared, 0));
+    assert!(s.saved_prefix.is_none() && s.seed.is_none());
+}
+
+#[test]
+fn reseal_plan_restores_first_and_reseals_only_when_admitted() {
+    use super::super::session::reseal_plan;
+    let yes = |_: usize, _: usize| true;
+    let ids = [1, 2, 3, 4];
+    assert_eq!(reseal_plan(Some(&[1, 2]), false, true, &ids, 3, yes), PromptReset::Restored { tokens: 2 });
+    assert_eq!(reseal_plan(Some(&[1, 9]), false, true, &ids, 3, yes), PromptReset::Resealed { tokens: 3 });
+    // A pending seed is not a saved prefix.
+    assert_eq!(reseal_plan(Some(&[1, 2]), true, true, &ids, 3, yes), PromptReset::Resealed { tokens: 3 });
+    assert_eq!(reseal_plan(None, false, true, &ids, 0, yes), PromptReset::Cleared);
+    assert_eq!(reseal_plan(None, false, true, &ids, 5, yes), PromptReset::Cleared);
+    assert_eq!(reseal_plan(None, false, false, &ids, 3, yes), PromptReset::Cleared);
+    // The admission is asked for this prompt at this boundary, and obeyed.
+    let mut asked = None;
+    assert_eq!(reseal_plan(None, false, true, &ids, 3, |prompt, seal| { asked = Some((prompt, seal)); false }),
+        PromptReset::Cleared);
+    assert_eq!(asked, Some((4, 3)));
 }

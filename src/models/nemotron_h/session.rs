@@ -33,7 +33,7 @@ mod source;
 
 #[path = "session_prefix.rs"]
 mod prefix;
-pub use prefix::{Prefix, PrefixAllocation, PrefixOwnership, prefix_admission};
+pub use prefix::{Prefix, PrefixAllocation, PrefixOwnership, PromptReset, prefix_admission, reseal_plan};
 #[path = "session_checkpoint.rs"]
 mod checkpoint;
 pub use checkpoint::{PrefixCheckpoint, PrefixExecution, PrefixProvenance, PrefixLayer, KvChunk};
@@ -184,6 +184,12 @@ pub struct Session<S> {
     // One explicit checkpoint, not an indexed cache of past observations.
     seed: Option<Arc<[u32]>>,
     prefix: Option<Arc<Prefix<S>>>,
+    // Whether this owner's admission priced a SEEDED session: the sealed Mamba
+    // boundary beside private state and the seeded two-run suffix scratch
+    // (`session_requirement`/`load_requirement` with `seeded`). Only such an
+    // owner may reseal in place (`reset_for_prompt_sealed`); any other keeps
+    // the cleared reset, never an unpriced boundary.
+    reseedable: bool,
     // Span-wide owners survive an error/unwind independently of the current
     // tile. A successful fence retires tile scratch, never these live slabs.
     span_pending: Option<prefill::Pending>,
@@ -557,6 +563,7 @@ impl<S: BlobStoreGet> Session<S> {
     {
         validate_config(&model.config, limits)?;
         prefix::validate_initial(&model, limits, seed.as_deref(), prefix.as_deref())?;
+        let reseedable = seed.is_some();
         source::fits(session_requirement(&model.config, limits, seed.is_some())?,
             source::allocatable_bytes(&model.device)?)?;
         let stream = prefix.as_ref().map_or_else(StreamId::current, |p| p.stream);
@@ -589,7 +596,7 @@ impl<S: BlobStoreGet> Session<S> {
         let logits = prefix.as_ref().map_or_else(Vec::new, |p| p.logits.to_vec());
         let session = Self {
             model, stream, limits, layers, status: Status::Ready,
-            committed, logits, pending: Vec::new(), span_pending: None, seed, prefix,
+            committed, logits, pending: Vec::new(), span_pending: None, seed, prefix, reseedable,
             #[cfg(test)]
             fault: None,
         };
@@ -853,9 +860,13 @@ impl<S: BlobStoreGet> Session<S> {
     /// state is published, no Mamba/pending/prefix owner is cleared. Attention
     /// may have individually reset: the hybrid remains poisoned, not rolled back.
     pub fn reset(&mut self) -> Result<()> {
-        self.stream.executes(|| self.reset_on_stream())
+        let capacity = self.limits.capacity;
+        self.stream.executes(|| self.reset_on_stream(capacity))
     }
-    fn reset_on_stream(&mut self) -> Result<()> {
+    /// `attention_capacity`: private KV rows each attention layer holds after
+    /// the reset. The full capacity, or exactly a pending seed's length, as
+    /// `from_state` reserves for a seeded owner until its prefix publishes.
+    fn reset_on_stream(&mut self, attention_capacity: usize) -> Result<()> {
         self.invalidate();
         let mut errors = Vec::new();
         if let Err(e) = self.fence() {
@@ -867,7 +878,7 @@ impl<S: BlobStoreGet> Session<S> {
         }
         for layer in &mut self.layers {
             let result = match &mut layer.mixer {
-                Mixer::Attention(a) => a.reset_capacity(self.limits.capacity),
+                Mixer::Attention(a) => a.reset_capacity(attention_capacity),
                 Mixer::Moe(m) => m.reset(),
                 Mixer::Mamba(_) => Ok(()),
             };
