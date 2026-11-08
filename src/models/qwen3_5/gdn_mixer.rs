@@ -349,10 +349,18 @@ fn projection_blueprint(m: usize, n: usize, k: usize) -> Result<cubek::matmul::d
         [k, 1].into(), [1, k].into(), [n, 1].into(),
         projection_elems(), cubecl::ir::AddressType::U32, None, None,
     ).map_err(|e| format!("fixed projection problem: {e:?}"))?;
+    // The instruction tile (16x8x16) and so the K accumulation order are the
+    // same for every shape; only how many output tiles a plane and a cube own
+    // differs, which leaves every output bit unchanged (wemm_timing gemm:
+    // 0 differing BF16 outputs on all six decoder shapes). Wide weights take
+    // 64x64 per plane-row group: 2x8 tiles per plane, four planes stacked in
+    // M, 28 against 14 TFLOP/s at M=248 on a GB10. The router-sized a/b
+    // projections (N=32) are faster under the original narrow tile.
+    let (partition, stage) = if n >= 1024 { ((2, 8, 2), (4, 1, 1)) } else { ((2, 1, 4), (2, 2, 1)) };
     let scheme = TilingScheme::builder()
         .with_tile_size((16, 8, 16).into())
-        .with_partition_size((2, 1, 4).into())
-        .with_stage_size((2, 2, 1).into())
+        .with_partition_size(partition.into())
+        .with_stage_size(stage.into())
         .build().map_err(str::to_owned)?;
     let grid = HypercubeBlueprint::builder()
         .global_order(GlobalOrder::RowMajor)
@@ -453,6 +461,13 @@ mod projection_tests {
         assert_eq!(expected.tiling_scheme.elements_per_stage_along_m(), 64);
         assert_eq!(expected.tiling_scheme.elements_per_stage_along_n(), 16);
         assert_eq!(expected.tiling_scheme.elements_per_stage_along_k(), 64);
+        let wide = projection_blueprint(1, 4096, 4096).unwrap();
+        for m in [2, 17, 64, 130, 248, 256] {
+            assert_eq!(projection_blueprint(m, 4096, 4096).unwrap(), wide);
+        }
+        assert_eq!(wide.tiling_scheme.elements_per_stage_along_m(), 128);
+        assert_eq!(wide.tiling_scheme.elements_per_stage_along_n(), 64);
+        assert_eq!(wide.tiling_scheme.elements_per_stage_along_k(), 32);
     }
 
     #[test]
