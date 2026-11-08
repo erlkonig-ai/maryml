@@ -330,6 +330,7 @@ fn w4a4_grouped_kernel<AB: Scalar, S: Scalar, O: Scalar + Cast, NA: Size, NC: Si
     alpha: &Array<f32>,
     #[comptime] size_k: usize,
     #[comptime] size_n: usize,
+    #[comptime] unroll: usize,
 ) {
     let def = cmma::MmaDefinition::<AB, AB, f32>::new_scaled::<S>(MTILE, NTILE, KTILE4, 4usize);
     let lane = UNIT_POS_PLANE;
@@ -337,6 +338,14 @@ fn w4a4_grouped_kernel<AB: Scalar, S: Scalar, O: Scalar + Cast, NA: Size, NC: Si
     let n_base = CUBE_POS_Y as usize * NTILE;
     let g = CUBE_POS_Z as usize;
     let e = ids[g] as usize;
+    // Staging, as the one-row FP8/BF16 kernels: per step the 8 weight rows'
+    // next `unroll` k-tiles (8 four-byte elements each per row), padded by 4
+    // elements per row so a fragment read's 8 rows x 4 lanes hit 32 banks.
+    let vec = b.vector_size();
+    let per_tile = comptime!(KTILE4 / 8); // elements of 8 codes per row per tile
+    let row = comptime!(KTILE4 / 8 * unroll);
+    let stride = comptime!(KTILE4 / 8 * unroll + 4);
+    let mut slab = SharedMemory::<Vector<AB, NA>>::new(comptime!(8 * (KTILE4 / 8 * unroll + 4)));
 
     let ec_a = def.elems_per_lane(MatrixIdent::A);
     let vs_a = def.vector_size(MatrixIdent::A);
@@ -360,38 +369,51 @@ fn w4a4_grouped_kernel<AB: Scalar, S: Scalar, O: Scalar + Cast, NA: Size, NC: Si
     let size!(NS) = def.scales_vector_size();
     let sib = def.scales_index(lane, MatrixIdent::B) as usize + n_base;
     let spr = comptime!(size_k / GROUP);
-    let k_tiles = comptime!(size_k / KTILE4);
+    let steps = comptime!(size_k / (KTILE4 * unroll));
     // Every MMA row reads the group's single row (row 0 of its tile).
     let a_row = g * size_k / 2;
     let b_rows = e * size_n;
+    let row_elems = size_k / 2 / vec;
 
-    for t in 0..k_tiles {
-        let kbase = t * KTILE4;
+    for s in 0..steps {
+        let k0 = s * row;
         #[unroll]
-        for i in 0..vc_a {
-            let (_row, col) = def.position_of_nth(lane, (i * vs_a * pack) as u32, MatrixIdent::A);
-            let gc = col as usize + kbase;
-            reg_a[i] = a[(a_row + gc / 2) / a.vector_size()];
+        for j in 0..comptime!(KTILE4 / 8 * unroll * 8 / 32) {
+            let el = j * 32usize + lane as usize;
+            let r = el / row;
+            let c = el % row;
+            slab[r * stride + c] = b[(b_rows + n_base + r) * row_elems + k0 + c];
         }
+        sync_cube();
         #[unroll]
-        for i in 0..vc_b {
-            let (row, col) = def.position_of_nth(lane, (i * vs_b * pack) as u32, MatrixIdent::B);
-            let gr = col as usize + n_base + b_rows;
-            let gc = row as usize + kbase;
-            reg_b[i] = b[(gr * size_k / 2 + gc / 2) / b.vector_size()];
+        for u in 0..unroll {
+            let t = s * unroll + u;
+            let kbase = t * KTILE4;
+            #[unroll]
+            for i in 0..vc_a {
+                let (_row, col) = def.position_of_nth(lane, (i * vs_a * pack) as u32, MatrixIdent::A);
+                let gc = col as usize + kbase;
+                reg_a[i] = a[(a_row + gc / 2) / a.vector_size()];
+            }
+            #[unroll]
+            for i in 0..vc_b {
+                let (k_in, n_in) = def.position_of_nth(lane, (i * vs_b * pack) as u32, MatrixIdent::B);
+                reg_b[i] = slab[n_in as usize * stride + u * per_tile + k_in as usize / 2 / vec];
+            }
+            let mut sa = Vector::<S, NS>::empty();
+            let mut sb = Vector::<S, NS>::empty();
+            #[unroll]
+            for i in 0..scales_count {
+                sa[i] = a_sc[g * spr + t * 4 + i];
+                sb[i] = b_sc[(b_rows + sib) * spr + t * 4 + i];
+            }
+            let d = def.execute_scaled(&reg_a, &reg_b, &acc, sa, sb);
+            #[unroll]
+            for i in 0..vc_c {
+                acc[i] = d[i];
+            }
         }
-        let mut sa = Vector::<S, NS>::empty();
-        let mut sb = Vector::<S, NS>::empty();
-        #[unroll]
-        for i in 0..scales_count {
-            sa[i] = a_sc[g * spr + t * 4 + i];
-            sb[i] = b_sc[(b_rows + sib) * spr + t * 4 + i];
-        }
-        let d = def.execute_scaled(&reg_a, &reg_b, &acc, sa, sb);
-        #[unroll]
-        for i in 0..vc_c {
-            acc[i] = d[i];
-        }
+        sync_cube();
     }
 
     let scale = alpha[e];
@@ -407,6 +429,15 @@ fn w4a4_grouped_kernel<AB: Scalar, S: Scalar, O: Scalar + Cast, NA: Size, NC: Si
             }
         }
     }
+}
+
+/// The staging depth of the grouped W4A4 kernel: the largest count of k-tiles
+/// (64 codes) up to 8 that divides K's tiles (K 1024 -> 8, 2688 -> 7, 4096 ->
+/// 8, 5376 -> 7). It changes only how much each step stages, never the MMA
+/// order.
+fn grouped_unroll(k: usize) -> usize {
+    let tiles = k / KTILE4;
+    (1..=8).rev().find(|d| tiles % d == 0).unwrap_or(1)
 }
 
 /// A bank of `experts` NVFP4 weights `[n, k]`, each plane contiguous
@@ -480,6 +511,7 @@ pub(crate) fn w4a4_grouped_bf16(
             ArrayArg::from_raw_parts(bank.alpha.clone(), bank.experts),
             k,
             n,
+            grouped_unroll(k),
         );
     }
     Ok(out)
