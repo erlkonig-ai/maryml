@@ -140,10 +140,32 @@ impl Stack {
             || shape[2] != HIDDEN {
             return Err("stack requires prepared unpadded BF16 [1,T,4096], T1..256".into());
         }
+        let hidden = self.layers(input, positions, &mut observed)?;
+        self.endpoint.finish_unpadded(&hidden)
+            .map_err(|e| format!("shared output boundary: {e}"))
+    }
+}
+
+impl Stack {
+    /// The 32 layers over a prepared BF16 [B,T,4096], B >= 1. Every operator
+    /// is per row (norms, projections, MLP) or causal within its own sequence
+    /// (convolution, DeltaNet scan, attention, positions by token index), so
+    /// a sequence's first n rows do not depend on what follows them in its
+    /// own row or on the other sequences: right padding needs no mask.
+    fn layers(
+        &self, input: &CudaTensor, positions: Positions,
+        observed: &mut impl FnMut(usize, &CudaTensor) -> Result<(), String>,
+    ) -> Result<CudaTensor, String> {
+        let shape = input.meta.shape().as_slice();
+        if shape.len() != 3 || shape[0] == 0 || !(1..=MAX_TOKENS).contains(&shape[1])
+            || shape[2] != HIDDEN {
+            return Err("stack requires prepared BF16 [B,T,4096], T1..256".into());
+        }
         check_tensor(input, &self.input_anchor, shape)?;
         // Same bound as the existing full-attention producer, checked before
-        // any of the preceding GDN blocks can launch. B=1 makes batch_stride
-        // irrelevant; no position data or model arithmetic is read on CPU.
+        // any of the preceding GDN blocks can launch. Callers here pass
+        // batch_stride 0 (every sequence starts at 0); no position data or
+        // model arithmetic is read on CPU.
         for axis in 0..3 {
             let end = (positions.start as u64)
                 .checked_add(positions.axis_base[axis] as u64)
@@ -175,7 +197,17 @@ impl Stack {
         }
         // Hidden is PRE-final-norm. Finish exactly once; never feed an already
         // final-normalized HF hidden through this endpoint.
-        self.endpoint.finish_unpadded(&hidden)
+        Ok(hidden)
+    }
+
+    /// Right-padded batch of fresh sequences, each starting at position 0:
+    /// `input` is [B,T,4096] and sequence b holds `lengths[b]` valid tokens
+    /// at its front. Returns one [1,4096] embedding per sequence, each pooled
+    /// at its own last valid token.
+    pub fn prefill_padded(&self, input: &CudaTensor, lengths: &[usize]) -> Result<Vec<CudaTensor>, String> {
+        let positions = Positions { start: 0, batch_stride: 0, axis_base: [0; 3], axis_step: [1; 3] };
+        let hidden = self.layers(input, positions, &mut |_, _| Ok(()))?;
+        self.endpoint.finish_padded(&hidden, lengths)
             .map_err(|e| format!("shared output boundary: {e}"))
     }
 }

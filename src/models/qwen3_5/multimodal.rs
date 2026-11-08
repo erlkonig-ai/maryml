@@ -50,6 +50,12 @@ impl PreparedMultimodal {
         self.decoder.embed_unpadded(ids)
     }
 
+    /// Several text sequences through one right-padded forward; one [1,4096]
+    /// embedding per sequence, in order.
+    pub fn embed_texts(&self, sequences: &[&[u32]]) -> Result<Vec<CudaTensor>, String> {
+        self.decoder.embed_padded(sequences)
+    }
+
     /// All 759 roles come from this ONE opaque root and frozen observation;
     /// the constructor never discovers/reselects a model between modalities.
     /// `selected` is immediate provenance exhaust, not a retained catalogue.

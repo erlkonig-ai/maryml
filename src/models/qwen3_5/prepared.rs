@@ -118,6 +118,44 @@ impl PreparedDecoder {
     }
 }
 
+impl PreparedDecoder {
+    /// Several prepared sequences through one forward: right-padded to the
+    /// longest into [B,T,4096] (the pad ID is `<embedding>`, which no valid
+    /// row ever reads, since every operator is causal or per row) and pooled
+    /// at each sequence's own last token. Each sequence is validated exactly
+    /// as [`Self::embed_unpadded`] validates one. Returns one [1,4096]
+    /// embedding per sequence, in order.
+    pub fn embed_padded(&self, sequences: &[&[u32]]) -> Result<Vec<CudaTensor>, String> {
+        if sequences.is_empty() { return Ok(Vec::new()); }
+        for ids in sequences { validate_ids(ids)?; }
+        let tokens = sequences.iter().map(|ids| ids.len()).max().unwrap_or(1);
+        let batch = sequences.len();
+        let mut controls = Vec::with_capacity(batch * tokens * 4);
+        for ids in sequences {
+            for t in 0..tokens {
+                controls.extend(ids.get(t).copied().unwrap_or(EMBEDDING_TOKEN).to_le_bytes());
+            }
+        }
+        let weight = &self.token_embedding;
+        let ids_handle = weight.client.create_from_slice(&controls);
+        let count = batch * tokens * decoder_stack::HIDDEN;
+        if count > u32::MAX as usize { return Err("padded batch exceeds the u32 index domain".into()); }
+        let out = weight.client.empty(count * 2);
+        let dim = CubeDim::new_1d(64);
+        // Every id was validated and all extents are fixed above.
+        unsafe { gather::launch_unchecked::<CudaRuntime>(
+            &weight.client, cubecl::calculate_cube_count_elemwise(&weight.client, count, dim), dim,
+            ArrayArg::from_raw_parts(weight.handle.clone(), VOCAB * decoder_stack::HIDDEN),
+            ArrayArg::from_raw_parts(ids_handle, batch * tokens),
+            ArrayArg::from_raw_parts(out.clone(), count), count,
+        ); }
+        let gathered = CubeTensor::new_contiguous(weight.client.clone(), weight.device.clone(),
+            [batch, tokens, decoder_stack::HIDDEN].as_slice().into(), out, DType::BF16);
+        let lengths: Vec<usize> = sequences.iter().map(|ids| ids.len()).collect();
+        self.stack.prefill_padded(&gathered, &lengths)
+    }
+}
+
 // Same bound model, not independently selected text weights for another
 // embedder. The original affine gather and its public execution stay intact.
 impl PreparedDecoder {

@@ -241,6 +241,19 @@ impl NativeWemm {
             .embedding)
     }
 
+    /// Several raw texts through ONE batched forward, each framed exactly as
+    /// [`Self::embed_text`] frames it and pooled at its own last token. The
+    /// batch is right-padded to the longest framed text; padding is never
+    /// read by a valid row. Returns one [1,4096] embedding per text, in order.
+    /// The caller chooses the batch size, which bounds activation memory.
+    pub fn embed_texts(&mut self, texts: &[&str]) -> Result<Vec<CudaTensor>, String> {
+        let tokens = texts.iter()
+            .map(|text| self.codec.text(text).map_err(|e| format!("WeMM text preparation: {e}")))
+            .collect::<Result<Vec<_>, _>>()?;
+        let sequences: Vec<&[u32]> = tokens.iter().map(|t| t.as_slice()).collect();
+        self.model.embed_texts(&sequences).map_err(|e| format!("WeMM batched text forward: {e}"))
+    }
+
     /// One still image with an optional caller-specified crop in original
     /// pixel coordinates. Pass `None` for the complete raster. Prepared pixel
     /// tensors go directly to this SAME model, with no readback/reupload.

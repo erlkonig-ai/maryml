@@ -93,6 +93,67 @@ impl Boundary {
     }
 }
 
+impl Boundary {
+    /// A right-padded batch: `hidden` is [B,T,4096] and sequence `b` holds
+    /// `lengths[b]` valid tokens at its front. Each sequence is pooled at its
+    /// own last valid token, with the same norm and L2 arithmetic as
+    /// [`Self::finish_unpadded`], so a sequence's embedding does not depend on
+    /// the padding or on the other sequences. Returns one [1,4096] embedding
+    /// per sequence, each a view into one [B,4096] buffer.
+    pub fn finish_padded(&self, hidden: &CudaTensor, lengths: &[usize]) -> Result<Vec<CudaTensor>, String> {
+        let shape = hidden.meta.shape().as_slice();
+        if shape.len() != 3 || shape[0] != lengths.len() || !(1..=MAX_TOKENS).contains(&shape[1])
+            || shape[2] != HIDDEN || lengths.iter().any(|&n| n == 0 || n > shape[1]) {
+            return Err("padded embedding boundary requires BF16 [B,T,4096] and B lengths in 1..=T".into());
+        }
+        check(hidden, &self.final_norm, shape)?;
+        let (batch, tokens) = (shape[0], shape[1]);
+        let final_hidden = decoder_ops::norm(hidden, &self.final_norm, HIDDEN, RMS_EPSILON);
+        let offsets: Vec<u8> = lengths.iter().enumerate()
+            .flat_map(|(b, &n)| (((b * tokens + n - 1) * HIDDEN) as u32).to_le_bytes()).collect();
+        let offsets = hidden.client.create_from_slice(&offsets);
+        let selected = hidden.client.empty(batch * HIDDEN * 2);
+        let embedding = hidden.client.empty(batch * HIDDEN * 2);
+        unsafe {
+            finish_rows_kernel::launch_unchecked::<CudaRuntime>(
+                &hidden.client, CubeCount::Static(batch as u32, 1, 1), CubeDim::new_1d(1),
+                ArrayArg::from_raw_parts(final_hidden.handle.clone(), batch * tokens * HIDDEN),
+                ArrayArg::from_raw_parts(offsets, batch),
+                ArrayArg::from_raw_parts(selected, batch * HIDDEN),
+                ArrayArg::from_raw_parts(embedding.clone(), batch * HIDDEN),
+            );
+        }
+        let row = (HIDDEN * 2) as u64;
+        Ok((0..batch).map(|b| CubeTensor::new_contiguous(
+            hidden.client.clone(), hidden.device.clone(), [1, HIDDEN].as_slice().into(),
+            embedding.clone().offset_start(b as u64 * row).offset_end((batch - 1 - b) as u64 * row),
+            DType::BF16,
+        )).collect())
+    }
+}
+
+/// [`finish_kernel`] once per cube, at that cube's sequence offset.
+#[cube(launch_unchecked)]
+fn finish_rows_kernel(x: &Array<bf16>, offsets: &Array<u32>, selected: &mut Array<bf16>, out: &mut Array<bf16>) {
+    let b = CUBE_POS_X as usize;
+    if UNIT_POS_X == 0 {
+        let offset = offsets[b] as usize;
+        let base = b * 4096usize;
+        let mut sum = 0.0f32;
+        for j in 0..4096usize {
+            let v = f32::cast_from(x[offset + j]);
+            selected[base + j] = x[offset + j];
+            sum += v * v;
+        }
+        let mut denominator = f32::cast_from(bf16::cast_from(sum.sqrt()));
+        let epsilon = f32::cast_from(bf16::cast_from(1.0e-12f32));
+        if denominator < epsilon { denominator = epsilon; }
+        for j in 0..4096usize {
+            out[base + j] = bf16::cast_from(f32::cast_from(x[offset + j]) / denominator);
+        }
+    }
+}
+
 fn check(t: &CudaTensor, weight: &CudaTensor, shape: &[usize]) -> Result<(), String> {
     if t.meta.shape().as_slice() != shape || t.meta.strides().len() != shape.len()
         || t.dtype != DType::BF16 || t.qparams.is_some() || t.device != weight.device
