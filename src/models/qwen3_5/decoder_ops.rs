@@ -12,20 +12,35 @@ fn tensor(like:&CudaTensor,s:&[usize],h:cubecl::server::Handle)->CudaTensor { Cu
 fn len(t:&CudaTensor)->usize { t.meta.shape().as_slice().iter().product() }
 fn grid(t:&CudaTensor,n:usize)->CubeCount { cubecl::calculate_cube_count_elemwise(&t.client,n,CubeDim::new_1d(64)) }
 
+/// Widest row [`norm`] takes: the hidden size.
+const NORM_CAPACITY: usize = 4096;
+const NORM_THREADS: u32 = 128;
+
+/// One cube per row. The cube stages the row in shared memory with coalesced
+/// loads, one unit sums its squares in the original serial order, and the cube
+/// writes the scaled row. Each output is the same expression of the same
+/// values as the one-unit-per-row kernel this replaces, so the bits are the
+/// same; only the loads and stores moved off a single unit striding an 8 KiB
+/// row (361 against ~15 us per [248,4096] norm on a GB10).
 #[cube(launch_unchecked)]
-fn norm_kernel(x:&Array<bf16>,w:&Array<bf16>,y:&mut Array<bf16>,rows:usize,width:usize,eps:f32) {
-    let r=ABSOLUTE_POS as usize;
-    if r<rows { let mut sum=0.0f32; for j in 0..width { let v=f32::cast_from(x[r*width+j]); sum+=v*v; }
-        let inv=1.0f32/(sum/f32::cast_from(width)+eps).sqrt();
-        for j in 0..width { y[r*width+j]=bf16::cast_from(f32::cast_from(x[r*width+j])*inv*(1.0f32+f32::cast_from(w[j]))); }
-    }
+fn norm_kernel(x:&Array<bf16>,w:&Array<bf16>,y:&mut Array<bf16>,width:usize,eps:f32) {
+    let r=CUBE_POS_X as usize; let lane=UNIT_POS_X as usize; let threads=CUBE_DIM_X as usize;
+    let mut row=SharedMemory::<f32>::new(NORM_CAPACITY); let mut scale=SharedMemory::<f32>::new(1usize);
+    let mut j=lane; while j<width { row[j]=f32::cast_from(x[r*width+j]); j+=threads; }
+    sync_cube();
+    if lane==0 { let mut sum=0.0f32; for k in 0..width { let v=row[k]; sum+=v*v; }
+        scale[0]=1.0f32/(sum/f32::cast_from(width)+eps).sqrt(); }
+    sync_cube();
+    let inv=scale[0];
+    let mut j=lane; while j<width { y[r*width+j]=bf16::cast_from(row[j]*inv*(1.0f32+f32::cast_from(w[j]))); j+=threads; }
 }
 pub(super) fn norm(x:&CudaTensor,w:&CudaTensor,width:usize,eps:f32)->CudaTensor {
-    let n=len(x); let out=x.client.empty(n*2);
+    assert!(width<=NORM_CAPACITY, "norm row wider than {NORM_CAPACITY}");
+    let n=len(x); let out=x.client.empty(n*2); let rows=(n/width) as u32;
     // SAFETY: private callers prevalidate all contiguous BF16 extents; output fresh.
-    unsafe { norm_kernel::launch_unchecked::<CudaRuntime>(&x.client,grid(x,n/width),CubeDim::new_1d(64),
+    unsafe { norm_kernel::launch_unchecked::<CudaRuntime>(&x.client,CubeCount::Static(rows,1,1),CubeDim::new_1d(NORM_THREADS),
         ArrayArg::from_raw_parts(x.handle.clone(),n),ArrayArg::from_raw_parts(w.handle.clone(),width),
-        ArrayArg::from_raw_parts(out.clone(),n),n/width,width,eps); }
+        ArrayArg::from_raw_parts(out.clone(),n),width,eps); }
     tensor(x,x.meta.shape().as_slice(),out)
 }
 #[cube(launch_unchecked)]
