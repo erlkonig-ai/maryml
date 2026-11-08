@@ -261,24 +261,39 @@ fn append(new:&CudaTensor,old:Option<&CudaTensor>,past:usize)->CudaTensor {
         ArrayArg::from_raw_parts(out.clone(),n),n,past,s[1],s[2]*s[3]); }
     tensor(new,&shape,out)
 }
+/// Widest head [`scores_kernel`] stages: the WeMM head dimension.
+const SCORE_HEAD_DIM: usize = 256;
+const SCORE_THREADS: u32 = 128;
+/// One cube per (token, head) row. Units take keys in turn, each dot product
+/// in its original serial order over the staged query; the maximum is
+/// order-free; unit 0 sums the exponentials in key order. Every probability
+/// is the same expression of the same values as in the one-unit-per-row
+/// kernel this replaces, so the bits do not change.
 #[cube(launch_unchecked)]
 #[allow(clippy::too_many_arguments)]
-fn scores_kernel(q:&Array<bf16>,k:&Array<bf16>,p:&mut Array<bf16>,rows:usize,tokens:usize,heads:usize,kv:usize,d:usize,total:usize,past:usize,
+fn scores_kernel(q:&Array<bf16>,k:&Array<bf16>,p:&mut Array<bf16>,tokens:usize,heads:usize,kv:usize,d:usize,total:usize,past:usize,
     #[comptime] capacity:usize) {
-    let row=ABSOLUTE_POS as usize;
-    if row<rows { let h=row%heads; let t=row/heads%tokens; let b=row/(heads*tokens); let kh=h/(heads/kv);
-        let available=past+t+1; let mut scores=Array::<f32>::new(capacity); let mut max=f32::cast_from(-3.4028235e38f32);
-        let scale=1.0f32/f32::cast_from(d).sqrt();
-        for key in 0..available { let mut dot=0.0f32;
-            for j in 0..d { dot+=f32::cast_from(q[row*d+j])*f32::cast_from(k[((b*total+key)*kv+kh)*d+j]); }
-            let score=f32::cast_from(bf16::cast_from(f32::cast_from(bf16::cast_from(dot))*scale));
-            scores[key]=score; if score>max { max=score; }
-        }
-        let mut sum=0.0f32;
-        for key in 0..available { scores[key]=(scores[key]-max).exp(); sum+=scores[key]; }
-        for key in 0..total { if key<available { p[row*total+key]=bf16::cast_from(scores[key]/sum); }
-            else { p[row*total+key]=bf16::cast_from(0.0f32); } }
-    }
+    let row=CUBE_POS_X as usize; let lane=UNIT_POS_X as usize; let threads=CUBE_DIM_X as usize;
+    let h=row%heads; let t=row/heads%tokens; let b=row/(heads*tokens); let kh=h/(heads/kv);
+    let available=past+t+1; let scale=1.0f32/f32::cast_from(d).sqrt();
+    let mut scores=SharedMemory::<f32>::new(capacity); let mut qs=SharedMemory::<f32>::new(SCORE_HEAD_DIM);
+    let mut stat=SharedMemory::<f32>::new(2usize);
+    let mut j=lane; while j<d { qs[j]=f32::cast_from(q[row*d+j]); j+=threads; }
+    sync_cube();
+    let mut key=lane; while key<available { let mut dot=0.0f32;
+        for j in 0..d { dot+=qs[j]*f32::cast_from(k[((b*total+key)*kv+kh)*d+j]); }
+        scores[key]=f32::cast_from(bf16::cast_from(f32::cast_from(bf16::cast_from(dot))*scale)); key+=threads; }
+    sync_cube();
+    if lane==0 { let mut max=f32::cast_from(-3.4028235e38f32); for key in 0..available { if scores[key]>max { max=scores[key]; } } stat[0]=max; }
+    sync_cube();
+    let max=stat[0];
+    let mut key=lane; while key<available { scores[key]=(scores[key]-max).exp(); key+=threads; }
+    sync_cube();
+    if lane==0 { let mut sum=0.0f32; for key in 0..available { sum+=scores[key]; } stat[1]=sum; }
+    sync_cube();
+    let sum=stat[1];
+    let mut key=lane; while key<total { if key<available { p[row*total+key]=bf16::cast_from(scores[key]/sum); }
+        else { p[row*total+key]=bf16::cast_from(0.0f32); } key+=threads; }
 }
 #[cube(launch_unchecked)]
 fn value_kernel(p:&Array<bf16>,v:&Array<bf16>,out:&mut Array<bf16>,n:usize,tokens:usize,heads:usize,kv:usize,d:usize,total:usize,past:usize) {
@@ -289,12 +304,13 @@ fn value_kernel(p:&Array<bf16>,v:&Array<bf16>,out:&mut Array<bf16>,n:usize,token
     }
 }
 fn attention(q:&CudaTensor,k:&CudaTensor,v:&CudaTensor,past:usize,c:Config)->CudaTensor {
+    assert!(c.head_dim<=SCORE_HEAD_DIM, "attention head wider than {SCORE_HEAD_DIM}");
     let s=q.meta.shape().as_slice(); let total=past+s[1]; let rows=s[0]*s[1]*c.heads; let n=len(q);
     let probs=q.client.empty(rows*total*2); let out=q.client.empty(n*2);
     unsafe {
-        scores_kernel::launch_unchecked::<CudaRuntime>(&q.client,grid(q,rows),CubeDim::new_1d(64),
+        scores_kernel::launch_unchecked::<CudaRuntime>(&q.client,CubeCount::Static(rows as u32,1,1),CubeDim::new_1d(SCORE_THREADS),
             ArrayArg::from_raw_parts(q.handle.clone(),n),ArrayArg::from_raw_parts(k.handle.clone(),len(k)),
-            ArrayArg::from_raw_parts(probs.clone(),rows*total),rows,s[1],c.heads,c.kv_heads,c.head_dim,total,past,c.capacity);
+            ArrayArg::from_raw_parts(probs.clone(),rows*total),s[1],c.heads,c.kv_heads,c.head_dim,total,past,c.capacity);
         value_kernel::launch_unchecked::<CudaRuntime>(&q.client,grid(q,n),CubeDim::new_1d(64),
             ArrayArg::from_raw_parts(probs,rows*total),ArrayArg::from_raw_parts(v.handle.clone(),len(v)),
             ArrayArg::from_raw_parts(out.clone(),n),n,s[1],c.heads,c.kv_heads,c.head_dim,total,past);
