@@ -1341,5 +1341,9 @@ name = "wemm_behavior"
 required-features = ["wemm-prepared-gate"]
 
 [[bin]]
+name = "wemm_timing"
+required-features = ["wemm-input", "nvfp4-encode-cuda"]
+
+[[bin]]
 name = "flint_tokenizer_gate"
 required-features = ["import", "tokenizer"]
