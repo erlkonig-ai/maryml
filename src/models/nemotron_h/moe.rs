@@ -973,8 +973,96 @@ fn finite(v: f32) -> bool {
     v == v && Abs::abs(v) <= 3.4028235e38f32
 }
 
+// One cube of EXPERTS units per token. Each of the TOP_K + 1 selection rounds
+// is a shared-memory argmax over the experts not yet picked: higher biased
+// score wins, exact ties go to the lower expert ID, exactly the rule of the
+// ascending strict-greater scan this replaces (route_kernel_serial in tests).
+// Sums and outputs are then written by unit 0 in the same order as before.
 #[cube(launch_unchecked)]
 fn route_kernel(input: &Array<bf16>, logits: &Array<f32>, bias: &Array<f32>, out: &mut Array<f32>) {
+    let t = CUBE_POS_X as usize;
+    let u = UNIT_POS_X as usize;
+    let mut scores = SharedMemory::<f32>::new(EXPERTS);
+    let mut bad = SharedMemory::<u32>::new(EXPERTS);
+    let mut best_value = SharedMemory::<f32>::new(EXPERTS);
+    let mut best_index = SharedMemory::<u32>::new(EXPERTS);
+    let mut best_open = SharedMemory::<u32>::new(EXPERTS);
+    let mut picked = SharedMemory::<u32>::new(TOP_K + 1);
+    let mut cutoff = SharedMemory::<f32>::new(TOP_K + 1);
+    let v = logits[t * EXPERTS + u];
+    let score = 1.0f32 / (1.0f32 + Exp::exp(-v));
+    let biased = score + bias[u];
+    let mut invalid = !finite(v) || !finite(bias[u]) || !finite(score) || !finite(biased);
+    for i in 0..8usize {
+        invalid = invalid || !finite(f32::cast_from(input[t * HIDDEN + u + i * EXPERTS]));
+    }
+    bad[u] = select(invalid, 1u32, 0u32);
+    scores[u] = score;
+    let mut open = 1u32;
+    for j in 0..TOP_K + 1 {
+        best_value[u] = biased;
+        best_index[u] = u as u32;
+        best_open[u] = open;
+        sync_cube();
+        let mut step = 256usize; // EXPERTS / 2, as a runtime variable
+        while step > 0usize {
+            if u < step {
+                let (a_open, b_open) = (best_open[u], best_open[u + step]);
+                let (a, b) = (best_value[u], best_value[u + step]);
+                let (a_index, b_index) = (best_index[u], best_index[u + step]);
+                let take = b_open > a_open
+                    || (b_open == a_open && (b > a || (b == a && b_index < a_index)));
+                if take {
+                    best_value[u] = b;
+                    best_index[u] = b_index;
+                    best_open[u] = b_open;
+                }
+            }
+            sync_cube();
+            step /= 2usize;
+        }
+        let winner = best_index[0usize];
+        if u == 0usize {
+            picked[j] = winner;
+            cutoff[j] = best_value[0usize];
+        }
+        if winner == u as u32 {
+            open = 0u32;
+        }
+        sync_cube();
+    }
+    if u == 0usize {
+        let mut fail = 0u32;
+        for e in 0..EXPERTS {
+            fail += bad[e];
+        }
+        let base = t * ROUTE_WIDTH;
+        if fail != 0 {
+            for j in 0..ROUTE_WIDTH {
+                out[base + j] = 0.0f32;
+            }
+            out[base + ROUTE_WIDTH - 1] = 1.0f32;
+        } else {
+            let mut sum = 0.0f32;
+            for j in 0..TOP_K {
+                sum += scores[picked[j] as usize];
+            }
+            out[base + 2 * TOP_K] = cutoff[TOP_K - 1];
+            out[base + 2 * TOP_K + 1] = cutoff[TOP_K];
+            let denominator = sum + 1e-20f32;
+            for j in 0..TOP_K {
+                out[base + j] = f32::cast_from(picked[j]);
+                out[base + TOP_K + j] = (scores[picked[j] as usize] / denominator) * 5.0f32;
+            }
+            out[base + ROUTE_WIDTH - 1] = 0.0f32;
+        }
+    }
+}
+/// The original one-thread selection, kept as the test oracle for
+/// route_kernel: both must write byte-identical route records.
+#[cfg(test)]
+#[cube(launch_unchecked)]
+fn route_kernel_serial(input: &Array<bf16>, logits: &Array<f32>, bias: &Array<f32>, out: &mut Array<f32>) {
     let t = CUBE_POS_X as usize;
     let u = UNIT_POS_X as usize;
     let mut choice = SharedMemory::<f32>::new(EXPERTS);

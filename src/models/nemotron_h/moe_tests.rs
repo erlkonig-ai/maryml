@@ -897,3 +897,66 @@ fn moe_gpu_bank_upload_releases_host_staging() {
     assert!(trimmed + bank <= untrimmed, "trim gave back only {untrimmed} -> {trimmed}");
     drop((handle, third, layers));
 }
+
+#[test]
+#[ignore = "reserved CUDA: parallel route selection versus the one-thread scan it replaced"]
+fn moe_gpu_parallel_route_matches_serial_scan_bytes() {
+    let device = CudaDevice { index: 0 };
+    let client = CudaRuntime::client(&device);
+    // Deterministic pseudo-random tokens, plus quantized logits that force
+    // many exact ties, plus one token with a nonfinite input.
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 40) as f32 / (1u64 << 24) as f32
+    };
+    let t = 7;
+    let mut x = vec![0.0f32; t * HIDDEN];
+    let mut logits = vec![0.0f32; t * EXPERTS];
+    for row in 0..t {
+        for v in &mut x[row * HIDDEN..(row + 1) * HIDDEN] {
+            *v = next() - 0.5;
+        }
+        for v in &mut logits[row * EXPERTS..(row + 1) * EXPERTS] {
+            *v = match row {
+                1 | 2 => ((next() * 8.0).floor() - 4.0) * 0.5, // heavy ties
+                3 => 0.0,                                     // all tied
+                _ => (next() - 0.5) * 12.0,
+            };
+        }
+    }
+    x[5 * HIDDEN + 17] = f32::NAN;
+    let bias: Vec<f32> = (0..EXPERTS).map(|e| if e % 3 == 0 { 0.0 } else { (next() - 0.5) * 0.25 }).collect();
+    let xh = input(&client, &device, &x, t, HIDDEN);
+    let lh = client.create_from_slice(f32::as_bytes(&logits));
+    let bh = client.create_from_slice(f32::as_bytes(&bias));
+    // A distinct sentinel per run: a launch that never ran cannot pass by
+    // reading the other run's bytes back from a reused pool slice.
+    let run = |serial: bool| {
+        let fill = vec![if serial { -7.0f32 } else { -9.0f32 }; t * ROUTE_WIDTH];
+        let out = client.create_from_slice(f32::as_bytes(&fill));
+        unsafe {
+            let args = (
+                ArrayArg::from_raw_parts(xh.handle.clone(), t * HIDDEN),
+                ArrayArg::from_raw_parts(lh.clone(), t * EXPERTS),
+                ArrayArg::from_raw_parts(bh.clone(), EXPERTS),
+                ArrayArg::from_raw_parts(out.clone(), t * ROUTE_WIDTH),
+            );
+            if serial {
+                route_kernel_serial::launch_unchecked::<CudaRuntime>(&client, CubeCount::new_1d(t as u32),
+                    CubeDim::new_1d(EXPERTS as u32), args.0, args.1, args.2, args.3);
+            } else {
+                route_kernel::launch_unchecked::<CudaRuntime>(&client, CubeCount::new_1d(t as u32),
+                    CubeDim::new_1d(EXPERTS as u32), args.0, args.1, args.2, args.3);
+            }
+        }
+        client.read_one(out).unwrap()[..t * ROUTE_WIDTH * 4].to_vec()
+    };
+    let (serial, parallel) = (run(true), run(false));
+    assert_eq!(serial, parallel, "parallel route record differs from the serial scan");
+    let flag = |row: usize| f32::from_le_bytes(serial[(row * ROUTE_WIDTH + ROUTE_WIDTH - 1) * 4..][..4].try_into().unwrap());
+    assert_eq!(flag(5), 1.0, "token 5 carries a nonfinite input");
+    assert!((0..t).filter(|&r| r != 5).all(|r| flag(r) == 0.0));
+}
