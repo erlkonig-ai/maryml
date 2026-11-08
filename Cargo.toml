@@ -1017,6 +1017,12 @@ required-features = ["nemotron-cuda", "import", "tokenizer"]
 name = "nemotron_prefill_timing"
 required-features = ["nemotron-prefill-timing", "tokenizer"]
 
+# Greedy one-token decode timing against a native model pile: caller wall per
+# step, bracket per append, and CUPTI attribution for chosen steps.
+[[bin]]
+name = "nemotron_decode_timing"
+required-features = ["nemotron-prefill-timing", "tokenizer"]
+
 [[bin]]
 name = "flint_head_repeat"
 required-features = ["flint-cuda", "tokenizer"]
