@@ -635,6 +635,10 @@ pub(in crate::models::nemotron_h) fn fixture_capacity(capacity: usize) -> (Arc<M
 }
 /// `experts` below 512 leaves the bank incomplete, so loading must refuse.
 fn fixture_experts(capacity: usize, experts: u64) -> (Arc<ModelSnapshot<impl BlobStoreGet + Send + Sync>>, Source, Vec<Id>) {
+    fixture_layers(capacity, experts, None)
+}
+/// The synthetic hybrid with an explicit layer list (e.g. a MoE in the middle).
+fn fixture_layers(capacity: usize, experts: u64, kinds: Option<&[&str]>) -> (Arc<ModelSnapshot<impl BlobStoreGet + Send + Sync>>, Source, Vec<Id>) {
     let mut repo = MemoryRepo::default();
     let key = SigningKey::generate(&mut rand::rngs::OsRng);
     let policy = CollectionPolicy::new(
@@ -645,6 +649,9 @@ fn fixture_experts(capacity: usize, experts: u64) -> (Arc<ModelSnapshot<impl Blo
         repo.collection("synthetic-hybrid", policy).unwrap();
     let mut value = configuration();
     value["max_position_embeddings"] = json!(capacity);
+    if let Some(kinds) = kinds {
+        value["layers_block_type"] = json!(kinds);
+    }
     let c: TextConfig = serde_json::from_value(value.clone()).unwrap();
     let g = mamba_config(&c).layout().unwrap();
     let mut layer_ids = Vec::new();
@@ -1332,4 +1339,131 @@ fn session_gpu_kv_rows_reserve_exactly() {
     for grown in [bare, nested] { assert!(grown < logical + (1 << 20), "{grown} vs {logical}"); }
     for grown in [after_inner, after_unwind] { assert!(grown < (600 << 20) + (1 << 20), "{grown}"); }
     assert!(outside > (600 << 20) + (1 << 20), "the default pool should be back: {outside}");
+}
+
+/// A middle MoE (layer 1) and a last MoE (layer 3), so a planted fault sits
+/// between deferred layers rather than at the chain's end.
+const MIDDLE_MOE: [&str; 4] = ["mamba", "moe", "attention", "moe"];
+/// Room for the second MoE layer's expert bank.
+fn middle_limits() -> Limits {
+    Limits { max_resident_bytes: limits().max_resident_bytes + (4 << 30), ..limits() }
+}
+
+fn moe_poisoned(session: &Session<impl BlobStoreGet>) -> Vec<bool> {
+    session.layers.iter().filter_map(|l| match &l.mixer {
+        Mixer::Moe(m) => Some(m.is_poisoned()),
+        _ => None,
+    }).collect()
+}
+
+#[test]
+#[ignore = "reserved CUDA: deferred one-token MoE decode versus the per-layer path, byte for byte"]
+fn session_gpu_deferred_decode_matches_per_layer_bytes() {
+    let (snapshot, source, ids) = fixture_layers(8, 512, Some(&MIDDLE_MOE));
+    let mut session = Session::from_snapshot(snapshot, source, &ids, CudaDevice { index: 0 }, middle_limits()).unwrap();
+    let mut run = |deferred: bool| {
+        session.reset().unwrap();
+        session.deferred_decode = deferred;
+        session.append_ids(&[1, 5]).unwrap(); // a two-token prompt: per-layer either way
+        let mut out = Vec::new();
+        for id in [7, 3, 9] {
+            out.push(session.append_ids(&[id]).unwrap().values.to_vec());
+            assert!(moe_poisoned(&session).iter().all(|p| !p), "deferred owners released after the fence");
+        }
+        out
+    };
+    let deferred = run(true); // the new path first
+    let per_layer = run(false);
+    for (step, (a, b)) in deferred.iter().zip(&per_layer).enumerate() {
+        assert!(a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits()), "decode step {step} logits differ");
+        assert!(a.iter().any(|&v| v != 0.0));
+    }
+}
+
+#[test]
+#[ignore = "reserved CUDA: a NaN residual before the middle MoE rejects and poisons the token, deferred"]
+fn session_gpu_deferred_decode_rejects_nonfinite_middle_layer() {
+    let (snapshot, source, ids) = fixture_layers(8, 512, Some(&MIDDLE_MOE));
+    let mut session = Session::from_snapshot(snapshot, source, &ids, CudaDevice { index: 0 }, middle_limits()).unwrap();
+    session.append_ids(&[1, 5]).unwrap();
+    let before = session.append_ids(&[7]).unwrap().values.to_vec();
+    session.reset().unwrap();
+    session.append_ids(&[1, 5]).unwrap();
+    session.fault = Some(Fault::NanBefore(1));
+    let error = session.append_ids(&[7]).err().expect("NaN token must be refused");
+    assert!(error.contains("MoE layer 0 of this token"), "{error}");
+    assert_eq!(session.status(), Status::Poisoned);
+    assert_eq!(session.committed_ids(), &[1, 5], "refused token not committed");
+    assert!(session.last_logits().is_none());
+    assert!(moe_poisoned(&session).iter().all(|&p| p));
+    assert!(session.append_ids(&[7]).is_err(), "poisoned session refuses further appends");
+    session.fault = None;
+    session.reset().unwrap();
+    session.append_ids(&[1, 5]).unwrap();
+    let after = session.append_ids(&[7]).unwrap().values.to_vec();
+    assert!(before.iter().zip(&after).all(|(x, y)| x.to_bits() == y.to_bits()), "recovered session differs");
+}
+
+#[test]
+#[ignore = "reserved CUDA: NaN/Inf router logits on the middle MoE: safe device schedule, token rejected"]
+fn session_gpu_deferred_decode_rejects_nonfinite_router_middle_layer() {
+    let (snapshot, source, ids) = fixture_layers(8, 512, Some(&MIDDLE_MOE));
+    let mut session = Session::from_snapshot(snapshot, source, &ids, CudaDevice { index: 0 }, middle_limits()).unwrap();
+    for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        session.reset().unwrap();
+        session.append_ids(&[1, 5]).unwrap();
+        if let Mixer::Moe(m) = &mut session.layers[1].mixer { m.set_router_override(Some(value)) } else { panic!("layer 1 is MoE") }
+        let error = session.append_ids(&[7]).err().expect("nonfinite router token must be refused");
+        assert!(error.contains("MoE layer 0 of this token") && error.contains("route flag"), "{value}: {error}");
+        assert_eq!(session.status(), Status::Poisoned);
+        assert_eq!(session.committed_ids(), &[1, 5]);
+        assert!(session.last_logits().is_none());
+        if let Mixer::Moe(m) = &mut session.layers[1].mixer { m.set_router_override(None) }
+        // No device fault: the reset's fence succeeds and the session runs again,
+        // on a fresh per-token slot buffer that may reuse the rejected one's memory.
+        session.reset().unwrap();
+        session.append_ids(&[1, 5]).unwrap();
+        session.append_ids(&[7]).unwrap();
+        session.append_ids(&[3]).unwrap();
+    }
+}
+
+#[test]
+#[ignore = "reserved CUDA: an error after deferred MoE launches settles them, keeps poison, recovers"]
+fn session_gpu_deferred_decode_error_after_launches_keeps_poison() {
+    let (snapshot, source, ids) = fixture_layers(8, 512, Some(&MIDDLE_MOE));
+    let mut session = Session::from_snapshot(snapshot, source, &ids, CudaDevice { index: 0 }, middle_limits()).unwrap();
+    session.append_ids(&[1, 5]).unwrap();
+    let clean = session.append_ids(&[7]).unwrap().values.to_vec();
+    // Unwind after the middle MoE's deferred launches: poison stays, reset settles.
+    session.reset().unwrap();
+    session.append_ids(&[1, 5]).unwrap();
+    session.fault = Some(Fault::PanicAfterLayer(2));
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = session.append_ids(&[7]);
+    })).is_err());
+    assert_eq!(session.status(), Status::Poisoned);
+    assert_eq!(session.committed_ids(), &[1, 5]);
+    assert_eq!(moe_poisoned(&session)[0], true, "the enqueued deferred MoE stays poisoned");
+    assert!(session.append_ids(&[7]).is_err());
+    session.fault = None;
+    session.reset().unwrap();
+    session.append_ids(&[1, 5]).unwrap();
+    let again = session.append_ids(&[7]).unwrap().values.to_vec();
+    assert!(clean.iter().zip(&again).all(|(x, y)| x.to_bits() == y.to_bits()), "after unwind");
+    for fault in [Fault::AfterLayer(2), Fault::AfterLayer(3), Fault::AfterCommit(2)] {
+        session.reset().unwrap();
+        session.append_ids(&[1, 5]).unwrap();
+        session.fault = Some(fault);
+        assert!(session.append_ids(&[7]).is_err(), "{fault:?}");
+        assert_eq!(session.status(), Status::Poisoned, "{fault:?}");
+        assert_eq!(session.committed_ids(), &[1, 5], "{fault:?}");
+        assert!(moe_poisoned(&session).iter().all(|&p| p), "{fault:?}: every MoE owner stays poisoned");
+        assert!(!session.pending.is_empty(), "{fault:?}: intermediates retained until reset");
+        session.fault = None;
+        session.reset().unwrap();
+        session.append_ids(&[1, 5]).unwrap();
+        let again = session.append_ids(&[7]).unwrap().values.to_vec();
+        assert!(clean.iter().zip(&again).all(|(x, y)| x.to_bits() == y.to_bits()), "{fault:?}");
+    }
 }

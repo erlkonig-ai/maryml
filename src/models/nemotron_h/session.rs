@@ -22,6 +22,7 @@ use burn::tensor::DType;
 use cubecl::{
     cuda::{CudaDevice, CudaRuntime},
     prelude::*,
+    server::Handle,
     stream_id::StreamId,
 };
 use half::bf16;
@@ -189,14 +190,19 @@ pub struct Session<S> {
     span_pending: Option<prefill::Pending>,
     #[cfg(test)]
     fault: Option<Fault>,
+    /// A one-token append runs its MoE layers without host syncs and checks
+    /// them once per token (see `run`). Tests turn it off for the per-layer path.
+    pub(super) deferred_decode: bool,
 }
 
 // Control injection except PrefixUpload, which queues the same checked CUDA
 // descriptor rejection as the existing origin-upload fixture (no invalid copy).
 #[cfg(test)]
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Fault {
     AfterLayer(usize),
+    /// Replace the residual input of this layer with NaN before it runs.
+    NanBefore(usize),
     AfterCommit(usize),
     Reset,
     PanicAfterLayer(usize),
@@ -592,6 +598,7 @@ impl<S: BlobStoreGet> Session<S> {
             committed, logits, pending: Vec::new(), span_pending: None, seed, prefix,
             #[cfg(test)]
             fault: None,
+            deferred_decode: true,
         };
         // Prefix publication has already fenced the origin. Observe allocation
         // errors here too before a fork advertises a usable boundary.
@@ -762,7 +769,7 @@ impl<S: BlobStoreGet> Session<S> {
             h.clone(),
             DType::U32,
         ));
-        let mut x = empty(&self.model.client, &self.model.device, t, H);
+        let x = empty(&self.model.client, &self.model.device, t, H);
         self.pending.push(x.clone());
         unsafe {
             embedding_kernel::launch_unchecked::<CudaRuntime>(
@@ -775,9 +782,62 @@ impl<S: BlobStoreGet> Session<S> {
                 t * H,
             );
         }
+        // One-token decode: every MoE layer writes its route record and finite
+        // flag into its slot of `checks` instead of reading them back, and
+        // skips its own fence; all are checked once, after the logits read
+        // and before any commit, and the owners are released only after the
+        // final fence. Any error after such launches settles the queued work
+        // (a fence) before returning; every intermediate is in `pending`.
+        let decode = t == 1 && self.deferred_decode;
+        #[cfg(feature = "nemotron-timing")]
+        let decode = decode && timing.is_none();
+        let moe_layers = self.layers.iter().filter(|l| matches!(l.mixer, Mixer::Moe(_))).count();
+        let checks = (decode && moe_layers > 0)
+            .then(|| self.model.client.empty(moe_layers * moe::DEFERRED_SLOT_BYTES));
+        if let Some(c) = &checks {
+            self.pending.push(CudaTensor::new_contiguous(self.model.client.clone(), self.model.device.clone(),
+                [moe_layers * moe::DEFERRED_SLOT_BYTES / 4].into(), c.clone(), DType::U32));
+        }
+        let result = self.run_layers(x, checks.as_ref(), moe_layers,
+            #[cfg(feature = "nemotron-timing")] timing);
+        if result.is_err() && checks.is_some() {
+            if let Err(fence) = self.fence() {
+                return Err(format!("{}; additionally settling deferred MoE work: {fence}",
+                    result.err().unwrap()));
+            }
+        }
+        result
+    }
+
+    fn run_layers(
+        &mut self,
+        mut x: CudaTensor,
+        checks: Option<&Handle>,
+        moe_layers: usize,
+        #[cfg(feature = "nemotron-timing")] mut timing: Option<&mut super::host_timing::Timings>,
+    ) -> Result<Vec<f32>> {
+        let mut slot = 0usize;
         for (_index, layer) in self.layers.iter_mut().enumerate() {
+            #[cfg(test)]
+            if self.fault == Some(Fault::NanBefore(_index)) {
+                let t = x.meta.shape().as_slice()[1];
+                let nan = vec![0x7fc0u16; t * H];
+                x = CudaTensor::new_contiguous(self.model.client.clone(), self.model.device.clone(),
+                    [1, t, H].into(), self.model.client.create_from_slice(u16::as_bytes(&nan)), DType::BF16);
+                self.pending.push(x.clone());
+            }
+            let deferred = match (checks, &layer.mixer) {
+                (Some(c), Mixer::Moe(_)) => {
+                    let bytes = moe::DEFERRED_SLOT_BYTES;
+                    let view = c.clone().offset_start((slot * bytes) as u64)
+                        .offset_end(((moe_layers - 1 - slot) * bytes) as u64);
+                    slot += 1;
+                    Some(view)
+                }
+                _ => None,
+            };
             x = enqueue_layer_tile(layer, &x, self.committed.len(), self.limits,
-                self.model.config.layer_norm_epsilon as f32, &mut self.pending,
+                self.model.config.layer_norm_epsilon as f32, &mut self.pending, deferred.as_ref(),
                 #[cfg(feature = "nemotron-timing")] timing.as_deref_mut(),
             )?;
             #[cfg(test)]
@@ -788,7 +848,20 @@ impl<S: BlobStoreGet> Session<S> {
                 }
             }
         }
-        let values = self.project_last_logits(&x)?;
+        let logits = self.enqueue_last_logits(&x)?;
+        let data = self.model
+            .client
+            .read_one(logits)
+            .map_err(|e| format!("session logits read: {e:?}"))?;
+        if let Some(c) = checks {
+            // Already complete: the logits read above waited for everything.
+            let raw = self.model.client.read_one(c.clone())
+                .map_err(|e| format!("deferred MoE readback: {e:?}"))?;
+            for (index, record) in raw.chunks(moe::DEFERRED_SLOT_BYTES).take(moe_layers).enumerate() {
+                moe::check_deferred(record).map_err(|e| format!("MoE layer {index} of this token: {e}"))?;
+            }
+        }
+        let values = self.decode_logits(&data)?;
         for (_index, layer) in self.layers.iter_mut().enumerate() {
             if let Mixer::Attention(a) = &mut layer.mixer {
                 a.commit()?;
@@ -797,9 +870,24 @@ impl<S: BlobStoreGet> Session<S> {
             }
         }
         self.fence()?; // Even a no-attention chain needs an explicit completion.
+        if checks.is_some() {
+            for layer in &mut self.layers {
+                if let Mixer::Moe(m) = &mut layer.mixer {
+                    m.complete_deferred();
+                }
+            }
+        }
         Ok(values)
     }
     fn project_last_logits(&mut self, x: &CudaTensor) -> Result<Vec<f32>> {
+        let logits = self.enqueue_last_logits(x)?;
+        let data = self.model
+            .client
+            .read_one(logits)
+            .map_err(|e| format!("session logits read: {e:?}"))?;
+        self.decode_logits(&data)
+    }
+    fn enqueue_last_logits(&mut self, x: &CudaTensor) -> Result<Handle> {
         let t = x.meta.shape().as_slice()[1];
         let norm = normalized(x, &self.model.final_norm, self.model.config.layer_norm_epsilon as f32);
         self.pending.push(norm.clone());
@@ -819,10 +907,9 @@ impl<S: BlobStoreGet> Session<S> {
         }
         let logits = self.model.head.project(&row, self.limits.max_chunk_bytes)?;
         self.pending.push(logits.clone());
-        let data = self.model
-            .client
-            .read_one(logits.handle.clone())
-            .map_err(|e| format!("session logits read: {e:?}"))?;
+        Ok(logits.handle.clone())
+    }
+    fn decode_logits(&self, data: &[u8]) -> Result<Vec<f32>> {
         if data.len() < self.model.config.vocab_size * 2 {
             return Err("short session logits read".into());
         }
@@ -901,12 +988,14 @@ impl<S: BlobStoreGet> Session<S> {
 // Caller owns publication and chooses when a successful tile may be retired.
 fn enqueue_layer_tile(layer: &mut Layer, x: &CudaTensor,
     start: usize, limits: Limits, epsilon: f32, pending: &mut Vec<CudaTensor>,
+    deferred: Option<&Handle>,
     #[cfg(feature = "nemotron-timing")] mut timing: Option<&mut super::host_timing::Timings>,
 ) -> Result<CudaTensor> {
     let norm = normalized(x, &layer.norm, epsilon);
     pending.push(norm.clone());
     let y = match &mut layer.mixer {
         Mixer::Attention(a) => a.enqueue(&norm, start)?.values,
+        Mixer::Moe(m) if deferred.is_some() => m.forward_deferred(&norm, deferred.unwrap(), pending)?,
         Mixer::Moe(m) => {
             #[cfg(feature = "nemotron-timing")]
             let result = match timing.as_deref_mut() {

@@ -1032,3 +1032,114 @@ fn moe_gpu_bf16_linear_row_matches_padded_bytes() {
         assert!(row[..n * 4].iter().any(|&b| b != 0));
     }
 }
+
+#[test]
+#[ignore = "reserved CUDA: deferred one-token MoE versus forward: values, route record, poison, NaN router"]
+fn moe_gpu_deferred_decode_matches_forward_bytes() {
+    let device = CudaDevice { index: 0 };
+    let client = CudaRuntime::client(&device);
+    let binding = source();
+    let mut fixed = FixedData::new();
+    fixed.bias = (0..EXPERTS).map(|e| ((e * 37 % 101) as f32 - 50.0) * 1e-4).collect();
+    let down = packed(LATENT, INTERMEDIATE, 1.0);
+    let downs = (0..EXPERTS).map(|e| {
+        let mut d = down.clone();
+        let at = d.len() - 4;
+        d[at..].copy_from_slice(&(0.0625 * 1.01f32.powi(e as i32)).to_le_bytes());
+        d
+    }).collect();
+    let provider = shared_provider(binding, downs);
+    let mut moe = Moe::upload(device.clone(), binding, fixed.operands(), &provider, limits()).unwrap();
+    for row in 0..6 {
+        let x: Vec<f32> = (0..HIDDEN)
+            .map(|i| (((i * (17 + 6 * row) + 31 * row * row + i * i % (7 + row)) % 101) as f32 - 50.0) / 64.0)
+            .collect();
+        let one = input(&client, &device, &x, 1, HIDDEN);
+        // Deferred first, on memory the per-layer path has not touched yet.
+        let slot = client.create_from_slice(&[0xa5u8; DEFERRED_SLOT_BYTES]);
+        let mut held = Vec::new();
+        let deferred = moe.forward_deferred(&one, &slot, &mut held).unwrap();
+        assert!(moe.is_poisoned(), "a deferred call leaves the owner poisoned");
+        let deferred_values = raw(&deferred);
+        let record = client.read_one(slot.clone()).unwrap().to_vec();
+        check_deferred(&record).unwrap();
+        moe.complete_deferred();
+        let mut route = Vec::new();
+        let forward = moe.forward_observed(&one, &mut |name, t| {
+            if name == "routing_record" {
+                route = client.read_one(t.handle.clone()).unwrap()[..ROUTE_WIDTH * 4].to_vec();
+            }
+            Ok(())
+        }).unwrap();
+        assert_eq!(deferred_values, raw(&forward.values), "row {row}: deferred values differ");
+        assert_eq!(&record[..ROUTE_WIDTH * 4], &route[..], "row {row}: route record differs");
+        assert!(record[(ROUTE_WIDTH + 1) * 4..].iter().all(|&b| b == 0xa5), "row {row}: slot tail overwritten");
+    }
+    // Forced router logits on both paths. Equal logits (exact ties: lowest
+    // IDs win) and -1000 (sigmoid underflow: every weight zero) are VALID
+    // routes and must match forward byte for byte; NaN/Inf are invalid: the
+    // device schedule still yields TOP_K distinct in-range IDs (no fault),
+    // the slot check rejects the token, and forward rejects it too.
+    let one = input(&client, &device, &vec![0.25; HIDDEN], 1, HIDDEN);
+    for value in [0.0f32, 3.5, -1000.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        moe.reset().unwrap();
+        moe.set_router_override(Some(value));
+        // A stale INVALID record and flag from an earlier token in the slot:
+        // the deferred call must overwrite every checked word.
+        let mut stale = vec![0u8; DEFERRED_SLOT_BYTES];
+        stale[(ROUTE_WIDTH - 1) * 4..ROUTE_WIDTH * 4].copy_from_slice(&1.0f32.to_le_bytes());
+        stale[ROUTE_WIDTH * 4..(ROUTE_WIDTH + 1) * 4].copy_from_slice(&1u32.to_le_bytes());
+        let slot = client.create_from_slice(&stale);
+        let mut held = Vec::new();
+        let values = moe.forward_deferred(&one, &slot, &mut held).unwrap();
+        fence(&client).unwrap(); // no device fault for any input
+        let ids = held.iter().find(|t| t.dtype == DType::U32 && t.meta.shape().as_slice() == [1, 1, TOP_K]).unwrap();
+        let ids: Vec<u32> = client.read_one(ids.handle.clone()).unwrap()[..TOP_K * 4].chunks_exact(4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+        assert!(ids.windows(2).all(|p| p[0] < p[1]), "{value}: ids not strictly ascending {ids:?}");
+        assert!(ids.iter().all(|&e| (e as usize) < EXPERTS), "{value}: {ids:?}");
+        let record = client.read_one(slot).unwrap().to_vec();
+        let checked = check_deferred(&record);
+        let mut route = Vec::new();
+        moe.complete_deferred();
+        let forward = moe.forward_observed(&one, &mut |name, t| {
+            if name == "routing_record" {
+                route = client.read_one(t.handle.clone()).unwrap()[..ROUTE_WIDTH * 4].to_vec();
+            }
+            Ok(())
+        });
+        if value.is_finite() {
+            checked.unwrap_or_else(|e| panic!("{value}: valid route rejected: {e}"));
+            let forward = forward.unwrap();
+            assert_eq!(raw(&values), raw(&forward.values), "{value}: values differ");
+            assert_eq!(&record[..ROUTE_WIDTH * 4], &route[..], "{value}: route record differs");
+            if value == -1000.0 {
+                assert!(forward.routing.weights.iter().all(|&w| w == 0.0), "underflow gives zero weights");
+            }
+        } else {
+            let error = checked.unwrap_err();
+            assert!(error.contains("route flag"), "{value}: {error}");
+            assert_eq!(ids, (0..TOP_K as u32).collect::<Vec<_>>(), "{value}: bounded fallback plan");
+            assert!(forward.is_err(), "{value}: forward must reject it as well");
+            assert!(moe.is_poisoned());
+        }
+    }
+    moe.set_router_override(None);
+    moe.reset().unwrap();
+    assert!(!moe.is_poisoned());
+    // Exact ties: a zero correction bias and equal logits make every biased
+    // score equal, so the route is the lowest IDs; both paths agree.
+    let mut flat = FixedData::new();
+    flat.bias = vec![0.0; EXPERTS];
+    let mut tied = Moe::upload(device.clone(), binding, flat.operands(), &provider, limits()).unwrap();
+    tied.set_router_override(Some(3.5));
+    let slot = client.create_from_slice(&[0xa5u8; DEFERRED_SLOT_BYTES]);
+    let values = tied.forward_deferred(&one, &slot, &mut Vec::new()).unwrap();
+    let record = client.read_one(slot).unwrap().to_vec();
+    check_deferred(&record).unwrap();
+    tied.complete_deferred();
+    let forward = tied.forward(&one).unwrap();
+    assert_eq!(forward.routing.ids, (0..TOP_K).collect::<Vec<_>>(), "exact ties go to the lowest IDs");
+    assert!(forward.routing.cutoff_margins.iter().all(|&m| m == 0.0), "a zero margin witnesses the tie");
+    assert_eq!(raw(&values), raw(&forward.values), "tied route values differ");
+}

@@ -181,6 +181,9 @@ struct Bank {
     shared_up_alpha: Handle,
     shared_down_input: Handle,
     shared_down_alpha: Handle,
+    /// A one-token tile's scatter rows (0..TOP_K) and per-token count (TOP_K).
+    rows: Handle,
+    counts: Handle,
 }
 
 #[cube(launch_unchecked)]
@@ -255,7 +258,9 @@ fn upload_bank<P: ExpertProvider>(
     Ok((experts, Bank { up_codes, up_scales, up_input, up_alpha, down_codes, down_scales, down_input, down_alpha,
         zero: client.create_from_slice(u32::as_bytes(&[0u32])),
         shared_up_input: one(su.input_scale), shared_up_alpha: one(su_alpha),
-        shared_down_input: one(sd.input_scale), shared_down_alpha: one(sd_alpha) }))
+        shared_down_input: one(sd.input_scale), shared_down_alpha: one(sd_alpha),
+        rows: client.create_from_slice(u32::as_bytes(&(0..TOP_K as u32).collect::<Vec<_>>())),
+        counts: client.create_from_slice(u32::as_bytes(&[TOP_K as u32])) }))
 }
 
 pub struct Moe {
@@ -271,6 +276,11 @@ pub struct Moe {
     /// Decode (t == 1) runs the selected experts as grouped launches from the
     /// bank. Tests turn it off to compare against the per-expert tiles.
     pub(super) grouped_decode: bool,
+    /// Test seam: overwrite every router logit with this value (NaN, Inf,
+    /// equal values for ties, -1000 for zero weights) on BOTH the per-layer
+    /// and the deferred path, after the router projection.
+    #[cfg(test)]
+    router_override: Option<f32>,
 }
 
 fn bytes(dims: &[usize], width: usize) -> Result<usize> {
@@ -515,7 +525,8 @@ impl Moe {
             Ok(weights)
         })();
         match uploaded {
-            Ok(weights) => Ok(Self { weights: Arc::new(weights), limits, admission, poisoned: false, grouped_decode: true }),
+            Ok(weights) => Ok(Self { weights: Arc::new(weights), limits, admission, poisoned: false, grouped_decode: true,
+                #[cfg(test)] router_override: None }),
             // Every owner made above is already dropped.
             Err(error) => {
                 abandon_uploads(&client);
@@ -527,7 +538,8 @@ impl Moe {
     /// No source payload is read or uploaded here.
     pub(super) fn from_weights(weights: Arc<Weights>, limits: Limits) -> Result<Self> {
         let admission = admission(limits)?;
-        Ok(Self { weights, limits, admission, poisoned: false, grouped_decode: true })
+        Ok(Self { weights, limits, admission, poisoned: false, grouped_decode: true,
+            #[cfg(test)] router_override: None })
     }
     pub fn source(&self) -> SourceBinding {
         self.weights.source
@@ -841,16 +853,134 @@ impl Moe {
             return Err("MoE grouped decode needs distinct in-range expert IDs".into());
         }
         let ids = client.create_from_slice(u32::as_bytes(&ids));
+        self.grouped_experts_on(&ids, latent, None)
+    }
+
+    /// The grouped decode experts for ascending, distinct, in-range device
+    /// expert IDs `ids` (TOP_K of them); `held` keeps the intermediates.
+    fn grouped_experts_on(&self, ids: &Handle, latent: &CudaTensor,
+        held: Option<&mut Vec<CudaTensor>>) -> Result<Handle>
+    {
+        let client = &self.weights.client;
         let b = &self.weights.bank;
         let up = GroupedBank { codes: &b.up_codes, scales: &b.up_scales, input_scale: &b.up_input,
             alpha: &b.up_alpha, experts: EXPERTS, n: INTERMEDIATE, k: LATENT };
         let down = GroupedBank { codes: &b.down_codes, scales: &b.down_scales, input_scale: &b.down_input,
             alpha: &b.down_alpha, experts: EXPERTS, n: LATENT, k: INTERMEDIATE };
-        let high = nvfp4_gemm::w4a4_grouped_bf16(client, &latent.handle, false, &ids, TOP_K, &up)
+        let high = nvfp4_gemm::w4a4_grouped_bf16(client, &latent.handle, false, ids, TOP_K, &up)
             .map_err(|e| e.to_string())?;
-        let active = self.relu2(&self.tensor(high, TOP_K, INTERMEDIATE, DType::BF16));
-        nvfp4_gemm::w4a4_grouped_bf16(client, &active.handle, true, &ids, TOP_K, &down)
+        let high = self.tensor(high, TOP_K, INTERMEDIATE, DType::BF16);
+        let active = self.relu2(&high);
+        if let Some(held) = held {
+            held.push(high);
+            held.push(active.clone());
+        }
+        nvfp4_gemm::w4a4_grouped_bf16(client, &active.handle, true, ids, TOP_K, &down)
             .map_err(|e| e.to_string())
+    }
+
+    /// Decode (t == 1) with no host synchronisation at all: the route stays on
+    /// the device (`schedule_kernel` turns the route record into ascending
+    /// IDs and their weights, exactly the slot order and weights `Schedule`
+    /// gives a one-token tile), the experts and shared expert run grouped, and
+    /// the route record and the finite flag are written into the caller's
+    /// `slot` (route record at word 0, flag at word ROUTE_WIDTH) for ONE
+    /// readback per token, checked there by [`check_deferred`]. Every
+    /// intermediate is pushed to `held`. The owner stays poisoned: only
+    /// [`Moe::complete_deferred`], after the caller's fence and check, clears
+    /// it. Values are byte-identical to `forward` on the same row.
+    pub(super) fn forward_deferred(&mut self, x: &CudaTensor, slot: &Handle,
+        held: &mut Vec<CudaTensor>) -> Result<CudaTensor>
+    {
+        let (t, _) = self.preflight(x)?;
+        if t != 1 || !self.grouped_decode || x.handle.offset_start.unwrap_or(0) != 0 {
+            return Err("deferred MoE takes one zero-offset token on the grouped path".into());
+        }
+        self.poisoned = true;
+        let client = &self.weights.client;
+        let route = slot.clone().offset_end(slot.size_in_used() - (ROUTE_WIDTH * 4) as u64);
+        let flag = slot.clone().offset_start((ROUTE_WIDTH * 4) as u64);
+        let logits = self.linear(x, &self.weights.router, HIDDEN, EXPERTS);
+        #[cfg(test)]
+        self.override_router(&logits, 1);
+        held.push(logits.clone());
+        // SAFETY: as route_tile with t = 1; `route` is ROUTE_WIDTH words of slot.
+        unsafe {
+            route_kernel::launch_unchecked::<CudaRuntime>(
+                client,
+                CubeCount::new_1d(1),
+                CubeDim::new_1d(EXPERTS as u32),
+                ArrayArg::from_raw_parts(x.handle.clone(), HIDDEN),
+                ArrayArg::from_raw_parts(logits.handle.clone(), EXPERTS),
+                ArrayArg::from_raw_parts(self.weights.bias.clone(), EXPERTS),
+                ArrayArg::from_raw_parts(route.clone(), ROUTE_WIDTH),
+            );
+        }
+        let ids = client.empty(TOP_K * 4);
+        let weights = client.empty(TOP_K * 4);
+        // SAFETY: one unit reads the ROUTE_WIDTH-word record and writes TOP_K
+        // IDs and weights into fresh buffers.
+        unsafe {
+            schedule_kernel::launch_unchecked::<CudaRuntime>(
+                client,
+                CubeCount::new_1d(1),
+                CubeDim::new_1d(1),
+                ArrayArg::from_raw_parts(route.clone(), ROUTE_WIDTH),
+                ArrayArg::from_raw_parts(ids.clone(), TOP_K),
+                ArrayArg::from_raw_parts(weights.clone(), TOP_K),
+            );
+        }
+        held.push(self.tensor(ids.clone(), 1, TOP_K, DType::U32));
+        held.push(self.tensor(weights.clone(), 1, TOP_K, DType::F32));
+        let latent_f32 = self.linear(x, &self.weights.fc1, HIDDEN, LATENT);
+        held.push(latent_f32.clone());
+        let latent = self.narrow(&latent_f32);
+        held.push(latent.clone());
+        let selected = self.grouped_experts_on(&ids, &latent, Some(held))?;
+        held.push(self.tensor(selected.clone(), TOP_K, LATENT, DType::BF16));
+        let b = &self.weights.bank;
+        let combined = moegroup::scatter_weighted_bf16(client, &selected, &weights, &b.rows,
+            &b.counts, TOP_K, 1, LATENT, TOP_K);
+        let combined = self.tensor(combined, 1, LATENT, DType::F32);
+        held.push(combined.clone());
+        let combined = self.narrow(&combined);
+        held.push(combined.clone());
+        let expanded_f32 = self.linear(&combined, &self.weights.fc2, LATENT, HIDDEN);
+        held.push(expanded_f32.clone());
+        let expanded = self.narrow(&expanded_f32);
+        held.push(expanded.clone());
+        let (shared_up, shared_active, shared) = self.shared_decode(x)?;
+        held.push(shared_up);
+        held.push(shared_active);
+        held.push(shared.clone());
+        let out = self.sum_tile(&expanded, &shared, 1, &flag);
+        let values = self.tensor(out, 1, HIDDEN, DType::BF16);
+        held.push(values.clone());
+        Ok(values)
+    }
+
+    /// After the caller's fence and a successful [`check_deferred`] of this
+    /// layer's slot: the deferred call is complete and the owner usable.
+    pub(super) fn complete_deferred(&mut self) {
+        self.poisoned = false;
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_router_override(&mut self, value: Option<f32>) {
+        self.router_override = value;
+    }
+    #[cfg(test)]
+    fn override_router(&self, logits: &CudaTensor, t: usize) {
+        if let Some(value) = self.router_override {
+            let client = &self.weights.client;
+            let values = vec![value; t * EXPERTS];
+            unsafe {
+                copy_words_kernel::launch_unchecked::<CudaRuntime>(client,
+                    CubeCount::new_1d(t as u32), CubeDim::new_1d(EXPERTS as u32),
+                    ArrayArg::from_raw_parts(client.create_from_slice(f32::as_bytes(&values)), t * EXPERTS),
+                    ArrayArg::from_raw_parts(logits.handle.clone(), t * EXPERTS), t * EXPERTS, 0);
+            }
+        }
     }
 
     /// Decode (t == 1): the shared expert's two projections as one-group
@@ -882,6 +1012,8 @@ impl Moe {
             if let Some(held) = held.as_deref_mut() { held.push(value.clone()); }
         };
         let logits = self.linear(x, &self.weights.router, HIDDEN, EXPERTS);
+        #[cfg(test)]
+        self.override_router(&logits, t);
         hold(&logits);
         let route = self.weights.client.empty(t * ROUTE_WIDTH * 4);
         hold(&self.tensor(route.clone(), t, ROUTE_WIDTH, DType::F32));
@@ -953,10 +1085,25 @@ impl Moe {
         observe("shared_up", &shared_up)?;
         observe("shared_relu2", &shared_active)?;
         observe("shared_down", &shared)?;
-        let out = self.weights.client.empty(t * HIDDEN * 2);
-        hold(&self.tensor(out.clone(), t, HIDDEN, DType::BF16));
         let flags = self.weights.client.empty(t * 4);
         hold(&self.tensor(flags.clone(), t, 1, DType::U32));
+        let out = self.sum_tile(&expanded, &shared, t, &flags);
+        hold(&self.tensor(out.clone(), t, HIDDEN, DType::BF16));
+        let status = self.weights
+            .client
+            .read_one(flags)
+            .map_err(|e| format!("MoE finite read: {e:?}"))?;
+        if !finite_flags_clear(&status, t) {
+            return Err("MoE nonfinite mixer result".into());
+        }
+        let values = self.tensor(out, t, HIDDEN, DType::BF16);
+        observe("output", &values)?;
+        Ok(values)
+    }
+
+    /// The final branch sum and its per-token finite flags (into `flags`).
+    fn sum_tile(&self, expanded: &CudaTensor, shared: &CudaTensor, t: usize, flags: &Handle) -> Handle {
+        let out = self.weights.client.empty(t * HIDDEN * 2);
         unsafe {
             sum_kernel::launch_unchecked::<CudaRuntime>(
                 &self.weights.client,
@@ -969,20 +1116,7 @@ impl Moe {
                 t,
             );
         }
-        let status = self.weights
-            .client
-            .read_one(flags)
-            .map_err(|e| format!("MoE finite read: {e:?}"))?;
-        if status.len() < t * 4
-            || status[..t * 4]
-                .chunks_exact(4)
-                .any(|b| u32::from_le_bytes(b.try_into().unwrap()) != 0)
-        {
-            return Err("MoE nonfinite mixer result".into());
-        }
-        let values = self.tensor(out, t, HIDDEN, DType::BF16);
-        observe("output", &values)?;
-        Ok(values)
+        out
     }
 
     // The ordinary Session owns whole-span availability. These internal tile
@@ -1153,6 +1287,76 @@ fn decode_routing(raw: &[u8], t: usize) -> Result<Routing> {
         result.cutoff_margins.push(margin);
     }
     Ok(result)
+}
+
+/// Bytes of one MoE layer's deferred slot: the route record, then the finite
+/// flag, padded to keep every slot 256-byte aligned.
+pub(super) const DEFERRED_SLOT_BYTES: usize = 256;
+const _: () = assert!((ROUTE_WIDTH + 1) * 4 <= DEFERRED_SLOT_BYTES);
+
+fn finite_flags_clear(status: &[u8], t: usize) -> bool {
+    status.len() >= t * 4
+        && status[..t * 4].chunks_exact(4).all(|b| u32::from_le_bytes(b.try_into().unwrap()) == 0)
+}
+
+/// The checks `forward` makes at its two readbacks, on one deferred slot.
+pub(super) fn check_deferred(slot: &[u8]) -> Result<()> {
+    if slot.len() < (ROUTE_WIDTH + 1) * 4 {
+        return Err("short MoE deferred readback".into());
+    }
+    decode_routing(&slot[..ROUTE_WIDTH * 4], 1)?;
+    if !finite_flags_clear(&slot[ROUTE_WIDTH * 4..], 1) {
+        return Err("MoE nonfinite mixer result".into());
+    }
+    Ok(())
+}
+
+/// One unit turns a one-token route record into the grouped path's inputs:
+/// the TOP_K expert IDs in ascending order and their weights in that order
+/// (bit for bit the record's own F32 weights), which is what `Schedule` gives
+/// a one-token tile. A record that is flagged, or whose IDs are not TOP_K
+/// distinct in-range integers, yields IDs 0..TOP_K with zero weights instead:
+/// never a sentinel, out-of-range or duplicate ID, so the grouped gathers
+/// stay safe. The token is still rejected, by `check_deferred` on the record.
+#[cube(launch_unchecked)]
+fn schedule_kernel(route: &Array<f32>, ids: &mut Array<u32>, weights: &mut Array<f32>) {
+    if UNIT_POS == 0u32 {
+        let mut id = Array::<u32>::new(TOP_K);
+        let mut w = Array::<f32>::new(TOP_K);
+        let mut bad = route[ROUTE_WIDTH - 1] != 0.0f32;
+        for j in 0..TOP_K {
+            let v = route[j];
+            let in_range = v >= 0.0f32 && v < (EXPERTS as f32) && v == v;
+            bad = bad || !in_range;
+            id[j] = select(in_range, u32::cast_from(v), 0u32);
+            if in_range && f32::cast_from(id[j]) != v {
+                bad = true;
+            }
+            w[j] = route[TOP_K + j];
+        }
+        // Ascending by ID (a fixed bubble pass count: TOP_K is 22).
+        for _pass in 0..TOP_K {
+            for j in 0..TOP_K - 1 {
+                if id[j] > id[j + 1] {
+                    let (a, b) = (id[j], id[j + 1]);
+                    id[j] = b;
+                    id[j + 1] = a;
+                    let (c, d) = (w[j], w[j + 1]);
+                    w[j] = d;
+                    w[j + 1] = c;
+                }
+            }
+        }
+        for j in 0..TOP_K - 1 {
+            if id[j] == id[j + 1] {
+                bad = true;
+            }
+        }
+        for j in 0..TOP_K {
+            ids[j] = select(bad, j as u32, id[j]);
+            weights[j] = select(bad, 0.0f32, w[j]);
+        }
+    }
 }
 
 #[cube]

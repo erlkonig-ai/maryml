@@ -775,6 +775,7 @@ impl<S: BlobStoreGet> Session<S> {
                         self.limits,
                         self.model.config.layer_norm_epsilon as f32,
                         &mut self.pending,
+                        None,
                         #[cfg(feature = "nemotron-timing")]
                         None,
                     )?;

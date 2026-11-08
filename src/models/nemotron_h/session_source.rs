@@ -468,6 +468,7 @@ pub(super) fn load<S: BlobStoreGet>(
         prefix: None,
         #[cfg(test)]
         fault: None,
+        deferred_decode: true,
     })
 }
 
