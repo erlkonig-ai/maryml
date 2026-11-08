@@ -23,7 +23,7 @@
 //! in the last 16-row tile load row `t - 1` instead of a zero pad: an MMA row
 //! reaches only its own accumulator row, and those rows are never stored, so
 //! there is no padded activation buffer at all.
-use super::nvfp4_gemv::{Nvfp4, quantize_kernel};
+use super::nvfp4_gemv::{Nvfp4, quantize_block, quantize_kernel};
 use anyhow::{Result, ensure};
 use burn::tensor::DType;
 use burn_cubecl::tensor::CubeTensor;
@@ -288,6 +288,201 @@ fn w4a4_kernel<AB: Scalar, S: Scalar, O: Scalar + Cast, NA: Size, NC: Size>(
             }
         }
     }
+}
+
+/// Grouped decode quantization: block `blk` of group `g` quantizes the
+/// 16-block `x[g * x_group_blocks + within]` with `input_scale[ids[g]]`.
+/// `x_group_blocks` is 0 when every group shares one input row.
+#[cube(launch_unchecked)]
+fn quantize_grouped_kernel<E: Scalar + Cast>(
+    x: &Array<E>,
+    codes: &mut Array<u32>,
+    scales: &mut Array<e4m3>,
+    ids: &Array<u32>,
+    input_scale: &Array<f32>,
+    group_blocks: usize,
+    total_blocks: usize,
+    x_group_blocks: usize,
+) {
+    let blk = ABSOLUTE_POS;
+    if blk < total_blocks {
+        let g = blk / group_blocks;
+        let within = blk % group_blocks;
+        let scale2 = input_scale[ids[g] as usize];
+        quantize_block::<E>(x, (g * x_group_blocks + within) * 16, codes, scales, blk, scale2);
+    }
+}
+
+/// [`w4a4_kernel`] for one activation row per group, all groups in one
+/// launch: cube z is group `g`, whose weight is expert `ids[g]` of a bank
+/// laid out as `[experts, n, k]` planes. Per group the arithmetic is
+/// exactly `w4a4_kernel`'s with `m = 1`, and its epilogue scale is
+/// `alpha[ids[g]]` (the host's f32 `scale2 * input_scale`).
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn w4a4_grouped_kernel<AB: Scalar, S: Scalar, O: Scalar + Cast, NA: Size, NC: Size>(
+    a: &Array<Vector<AB, NA>>,
+    a_sc: &Array<S>,
+    b: &Array<Vector<AB, NA>>,
+    b_sc: &Array<S>,
+    out: &mut Array<O>,
+    ids: &Array<u32>,
+    alpha: &Array<f32>,
+    #[comptime] size_k: usize,
+    #[comptime] size_n: usize,
+) {
+    let def = cmma::MmaDefinition::<AB, AB, f32>::new_scaled::<S>(MTILE, NTILE, KTILE4, 4usize);
+    let lane = UNIT_POS_PLANE;
+    let pack = AB::packing_factor();
+    let n_base = CUBE_POS_Y as usize * NTILE;
+    let g = CUBE_POS_Z as usize;
+    let e = ids[g] as usize;
+
+    let ec_a = def.elems_per_lane(MatrixIdent::A);
+    let vs_a = def.vector_size(MatrixIdent::A);
+    let vc_a = comptime!(ec_a / vs_a);
+    let ec_b = def.elems_per_lane(MatrixIdent::B);
+    let vs_b = def.vector_size(MatrixIdent::B);
+    let vc_b = comptime!(ec_b / vs_b);
+    let ec_c = def.elems_per_lane(MatrixIdent::Accumulator);
+    let vs_c = def.vector_size(MatrixIdent::Accumulator);
+    let vc_c = comptime!(ec_c / vs_c);
+
+    let mut reg_a = Array::<Vector<AB, NA>>::new(vc_a);
+    let mut reg_b = Array::<Vector<AB, NA>>::new(vc_b);
+    let mut acc = Array::<Vector<f32, NC>>::new(vc_c);
+    #[unroll]
+    for i in 0..vc_c {
+        acc[i] = Vector::<f32, NC>::cast_from(0.0f32);
+    }
+
+    let scales_count = def.scales_count();
+    let size!(NS) = def.scales_vector_size();
+    let sib = def.scales_index(lane, MatrixIdent::B) as usize + n_base;
+    let spr = comptime!(size_k / GROUP);
+    let k_tiles = comptime!(size_k / KTILE4);
+    // Every MMA row reads the group's single row (row 0 of its tile).
+    let a_row = g * size_k / 2;
+    let b_rows = e * size_n;
+
+    for t in 0..k_tiles {
+        let kbase = t * KTILE4;
+        #[unroll]
+        for i in 0..vc_a {
+            let (_row, col) = def.position_of_nth(lane, (i * vs_a * pack) as u32, MatrixIdent::A);
+            let gc = col as usize + kbase;
+            reg_a[i] = a[(a_row + gc / 2) / a.vector_size()];
+        }
+        #[unroll]
+        for i in 0..vc_b {
+            let (row, col) = def.position_of_nth(lane, (i * vs_b * pack) as u32, MatrixIdent::B);
+            let gr = col as usize + n_base + b_rows;
+            let gc = row as usize + kbase;
+            reg_b[i] = b[(gr * size_k / 2 + gc / 2) / b.vector_size()];
+        }
+        let mut sa = Vector::<S, NS>::empty();
+        let mut sb = Vector::<S, NS>::empty();
+        #[unroll]
+        for i in 0..scales_count {
+            sa[i] = a_sc[g * spr + t * 4 + i];
+            sb[i] = b_sc[(b_rows + sib) * spr + t * 4 + i];
+        }
+        let d = def.execute_scaled(&reg_a, &reg_b, &acc, sa, sb);
+        #[unroll]
+        for i in 0..vc_c {
+            acc[i] = d[i];
+        }
+    }
+
+    let scale = alpha[e];
+    #[unroll]
+    for i in 0..vc_c {
+        let (row, col) = def.position_of_nth(lane, (i * vs_c) as u32, MatrixIdent::Accumulator);
+        let gc = col as usize + n_base;
+        if row as usize == 0usize {
+            let v = acc[i];
+            #[unroll]
+            for j in 0..vs_c {
+                out[g * size_n + gc + j] = O::cast_from(v[j] * scale);
+            }
+        }
+    }
+}
+
+/// A bank of `experts` NVFP4 weights `[n, k]`, each plane contiguous
+/// `[experts, n, ...]`, with every expert's activation input scale and its
+/// f32 epilogue product `scale2 * input_scale`, both indexed by expert ID.
+pub(crate) struct GroupedBank<'a> {
+    pub codes: &'a Handle,
+    pub scales: &'a Handle,
+    pub input_scale: &'a Handle,
+    pub alpha: &'a Handle,
+    pub experts: usize,
+    pub n: usize,
+    pub k: usize,
+}
+
+/// One BF16 activation row per group (`x_per_group`) or one shared row,
+/// times bank expert `ids[g]` for each of `groups` groups, in two launches
+/// (grouped quantization, grouped W4A4). Returns BF16 `[groups, n]`.
+/// Per group this is exactly `project_w4a4_scaled` on one row.
+pub(crate) fn w4a4_grouped_bf16(
+    client: &ComputeClient<CudaRuntime>,
+    x: &Handle,
+    x_per_group: bool,
+    ids: &Handle,
+    groups: usize,
+    bank: &GroupedBank<'_>,
+) -> Result<Handle> {
+    let (n, k) = (bank.n, bank.k);
+    ensure!(k % KTILE4 == 0 && n % NTILE == 0 && groups > 0 && groups <= u16::MAX as usize,
+        "grouped W4A4 geometry [{groups} x {n}, {k}]");
+    let group_blocks = k / GROUP;
+    let blocks = groups * group_blocks;
+    let codes = client.empty(groups * k / 2);
+    let scales = client.empty(blocks);
+    // SAFETY: one thread per 16-block of `groups` rows of k; x holds one row
+    // (shared) or `groups` rows of k BF16; ids holds `groups` IDs below
+    // bank.experts (checked by the caller) indexing input_scale.
+    unsafe {
+        quantize_grouped_kernel::launch_unchecked::<bf16, CudaRuntime>(
+            client,
+            CubeCount::new_1d(blocks.div_ceil(256) as u32),
+            CubeDim::new_1d(256),
+            ArrayArg::from_raw_parts(x.clone(), if x_per_group { groups * k } else { k }),
+            ArrayArg::from_raw_parts(codes.clone(), groups * k / 8),
+            ArrayArg::from_raw_parts(scales.clone(), blocks),
+            ArrayArg::from_raw_parts(ids.clone(), groups),
+            ArrayArg::from_raw_parts(bank.input_scale.clone(), bank.experts),
+            group_blocks,
+            blocks,
+            if x_per_group { group_blocks } else { 0 },
+        );
+    }
+    let out = client.empty(groups * n * 2);
+    let vs = 32 / e2m1x2::cube_type().size_bits();
+    // SAFETY: activation planes are [groups, k/2] codes and [groups, k/16]
+    // scales; the bank planes are [experts, n, k/2] and [experts, n, k/16];
+    // each cube reads only rows of its own group and expert.
+    unsafe {
+        w4a4_grouped_kernel::launch_unchecked::<e2m1x2, e4m3, bf16, CudaRuntime>(
+            client,
+            CubeCount::Static(1, (n / NTILE) as u32, groups as u32),
+            CubeDim::new_1d(32),
+            vs,
+            2,
+            ArrayArg::from_raw_parts(codes.clone(), groups * (k / 2) / vs),
+            ArrayArg::from_raw_parts(scales.clone(), blocks),
+            ArrayArg::from_raw_parts(bank.codes.clone(), bank.experts * n * (k / 2) / vs),
+            ArrayArg::from_raw_parts(bank.scales.clone(), bank.experts * n * k / GROUP),
+            ArrayArg::from_raw_parts(out.clone(), groups * n),
+            ArrayArg::from_raw_parts(ids.clone(), groups),
+            ArrayArg::from_raw_parts(bank.alpha.clone(), bank.experts),
+            k,
+            n,
+        );
+    }
+    Ok(out)
 }
 
 /// Rows `t` of `x` if it is a contiguous `[1, t, k]` (or `[t, k]`) activation

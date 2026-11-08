@@ -119,31 +119,45 @@ pub(crate) fn quantize_kernel<E: Scalar + Cast>(
 ) {
     let blk = ABSOLUTE_POS;
     if blk < blocks {
-        let base = blk * 16;
-        let mut l0 = Vector::<f32, Const<8>>::empty();
-        let mut l1 = Vector::<f32, Const<8>>::empty();
-        #[unroll]
-        for i in 0..8usize {
-            l0[i] = f32::cast_from(w[base + i]);
-            l1[i] = f32::cast_from(w[base + 8 + i]);
-        }
-        let hi = max(l0.abs(), l1.abs());
-        let a01 = max(max(hi[0], hi[1]), max(hi[2], hi[3]));
-        let a23 = max(max(hi[4], hi[5]), max(hi[6], hi[7]));
-        let bamax = max(a01, a23);
-        let se = e4m3::cast_from(min((bamax / 6.0f32) / scale2, f32::new(448.0f32)));
-        scales[blk] = se;
-        let d = f32::cast_from(se) * scale2;
-        let mut q0 = Vector::<f32, Const<8>>::new(0.0f32);
-        let mut q1 = Vector::<f32, Const<8>>::new(0.0f32);
-        if d > 0.0f32 {
-            let dv = Vector::<f32, Const<8>>::new(d);
-            q0 = l0 / dv;
-            q1 = l1 / dv;
-        }
-        codes[blk * 2] = u32::reinterpret(Vector::<e2m1x2, Const<4>>::cast_from(q0));
-        codes[blk * 2 + 1] = u32::reinterpret(Vector::<e2m1x2, Const<4>>::cast_from(q1));
+        quantize_block::<E>(w, blk * 16, codes, scales, blk, scale2);
     }
+}
+
+/// One 16-block of `w` from `base`, written as block `blk` of the outputs.
+/// The single definition of the block quantization: every quantizing
+/// kernel calls this, so their codes and scales agree bit for bit.
+#[cube]
+pub(crate) fn quantize_block<E: Scalar + Cast>(
+    w: &Array<E>,
+    base: usize,
+    codes: &mut Array<u32>,
+    scales: &mut Array<e4m3>,
+    blk: usize,
+    scale2: f32,
+) {
+    let mut l0 = Vector::<f32, Const<8>>::empty();
+    let mut l1 = Vector::<f32, Const<8>>::empty();
+    #[unroll]
+    for i in 0..8usize {
+        l0[i] = f32::cast_from(w[base + i]);
+        l1[i] = f32::cast_from(w[base + 8 + i]);
+    }
+    let hi = max(l0.abs(), l1.abs());
+    let a01 = max(max(hi[0], hi[1]), max(hi[2], hi[3]));
+    let a23 = max(max(hi[4], hi[5]), max(hi[6], hi[7]));
+    let bamax = max(a01, a23);
+    let se = e4m3::cast_from(min((bamax / 6.0f32) / scale2, f32::new(448.0f32)));
+    scales[blk] = se;
+    let d = f32::cast_from(se) * scale2;
+    let mut q0 = Vector::<f32, Const<8>>::new(0.0f32);
+    let mut q1 = Vector::<f32, Const<8>>::new(0.0f32);
+    if d > 0.0f32 {
+        let dv = Vector::<f32, Const<8>>::new(d);
+        q0 = l0 / dv;
+        q1 = l1 / dv;
+    }
+    codes[blk * 2] = u32::reinterpret(Vector::<e2m1x2, Const<4>>::cast_from(q0));
+    codes[blk * 2 + 1] = u32::reinterpret(Vector::<e2m1x2, Const<4>>::cast_from(q1));
 }
 
 /// The E2M1 value of the low nibble of `code` (higher bits are ignored).

@@ -21,7 +21,7 @@
 use super::host_timing::{self, Phase, Timings};
 use crate::{
     models::inkling::{bf16gemm, moegroup},
-    nn::{nvfp4_gemm::calibrated_scale, nvfp4_gemv::Nvfp4},
+    nn::{nvfp4_gemm::{self, GroupedBank, calibrated_scale}, nvfp4_gemv::Nvfp4},
 };
 use burn::tensor::DType;
 use burn_cubecl::tensor::CubeTensor;
@@ -155,7 +155,92 @@ pub(super) struct Weights {
     fc2: Handle,
     shared_up: PackedWeight,
     shared_down: PackedWeight,
+    /// Every expert's (up, down); each plane is a view into `bank`.
     experts: Vec<(PackedWeight, PackedWeight)>,
+    bank: Bank,
+}
+
+/// One layer's whole expert bank as contiguous `[EXPERTS, n, ...]` planes,
+/// the same bytes the per-expert views in `Weights::experts` read (no second
+/// copy), plus every expert's activation input scale and its f32 epilogue
+/// product `scale2 * input_scale`, indexed by expert ID. A decode step runs
+/// all of its selected experts from here in one grouped launch per side.
+struct Bank {
+    up_codes: Handle,
+    up_scales: Handle,
+    up_input: Handle,
+    up_alpha: Handle,
+    down_codes: Handle,
+    down_scales: Handle,
+    down_input: Handle,
+    down_alpha: Handle,
+}
+
+#[cube(launch_unchecked)]
+fn copy_words_kernel(x: &Array<u32>, out: &mut Array<u32>, n: usize, offset: usize) {
+    let i = ABSOLUTE_POS as usize;
+    if i < n {
+        out[offset + i] = x[i];
+    }
+}
+
+/// Upload every expert pair (ascending ID, through `load_expert`) into the
+/// contiguous bank and return per-expert views of it. Each pair is uploaded
+/// on its own as before and copied on the device into its slot; the
+/// temporary is dropped and its memory reused in stream order, so at most
+/// one extra pair is resident during the upload.
+fn upload_bank<P: ExpertProvider>(
+    provider: &P,
+    client: &ComputeClient<CudaRuntime>,
+    device: &CudaDevice,
+) -> Result<(Vec<(PackedWeight, PackedWeight)>, Bank)> {
+    let (up_c, up_s) = (INTERMEDIATE * LATENT / 2, INTERMEDIATE * LATENT / 16);
+    let (down_c, down_s) = (LATENT * INTERMEDIATE / 2, LATENT * INTERMEDIATE / 16);
+    let planes = [client.empty(EXPERTS * up_c), client.empty(EXPERTS * up_s),
+        client.empty(EXPERTS * down_c), client.empty(EXPERTS * down_s)];
+    let mut scales: [Vec<f32>; 4] = Default::default(); // up input, up alpha, down input, down alpha
+    let mut experts = Vec::with_capacity(EXPERTS);
+    for index in 0..EXPERTS {
+        let pair = load_expert(provider, index, |op, n, k| {
+            let up = n == INTERMEDIATE;
+            let (codes, scales_dst, cb, sb) = if up {
+                (&planes[0], &planes[1], up_c, up_s)
+            } else {
+                (&planes[2], &planes[3], down_c, down_s)
+            };
+            let temp = PackedWeight::upload(op, n, k, device)?;
+            let alpha = calibrated_scale(temp.input_scale, temp.weight.scale2).map_err(|e| e.to_string())?;
+            for (src, dst, bytes) in [(&temp.weight.codes, codes, cb), (&temp.weight.scales, scales_dst, sb)] {
+                let words = bytes / 4;
+                // SAFETY: src holds this operation's `bytes` (whole words); the
+                // slot [index * words, (index + 1) * words) is inside dst.
+                unsafe {
+                    copy_words_kernel::launch_unchecked::<CudaRuntime>(
+                        client,
+                        CubeCount::new_1d(words.div_ceil(THREADS as usize) as u32),
+                        CubeDim::new_1d(THREADS),
+                        ArrayArg::from_raw_parts(src.clone(), words),
+                        ArrayArg::from_raw_parts(dst.clone(), EXPERTS * words),
+                        words,
+                        index * words,
+                    );
+                }
+            }
+            let view = |h: &Handle, bytes: usize| h.clone().offset_start((index * bytes) as u64)
+                .offset_end(((EXPERTS - 1 - index) * bytes) as u64);
+            let weight = Nvfp4::from_parts(view(codes, cb), view(scales_dst, sb), temp.weight.scale2,
+                n, k, DType::BF16, device.clone()).map_err(|e| e.to_string())?;
+            let side = if up { 0 } else { 2 };
+            scales[side].push(temp.input_scale);
+            scales[side + 1].push(alpha);
+            Ok(PackedWeight { weight, input_scale: temp.input_scale })
+        })?;
+        experts.push(pair);
+    }
+    let [up_codes, up_scales, down_codes, down_scales] = planes;
+    let [up_input, up_alpha, down_input, down_alpha] =
+        scales.map(|v| client.create_from_slice(f32::as_bytes(&v)));
+    Ok((experts, Bank { up_codes, up_scales, up_input, up_alpha, down_codes, down_scales, down_input, down_alpha }))
 }
 
 pub struct Moe {
@@ -168,6 +253,9 @@ pub struct Moe {
     // errors conservatively require that same explicit acknowledgement even
     // when the attempted final fence succeeded. Cross-layer commit is external.
     poisoned: bool,
+    /// Decode (t == 1) runs the selected experts as grouped launches from the
+    /// bank. Tests turn it off to compare against the per-expert tiles.
+    pub(super) grouped_decode: bool,
 }
 
 fn bytes(dims: &[usize], width: usize) -> Result<usize> {
@@ -389,6 +477,7 @@ impl Moe {
             fixed.shared_down.operation,
         ];
         let uploaded = (|| -> Result<Weights> {
+            let (experts, bank) = upload_bank(provider, &client, &device)?;
             let weights = Weights {
                 source,
                 fixed_operations,
@@ -398,7 +487,8 @@ impl Moe {
                 fc2: client.create_from_slice(fixed.fc2_bf16),
                 shared_up: PackedWeight::upload(&fixed.shared_up, SHARED, HIDDEN, &device)?,
                 shared_down: PackedWeight::upload(&fixed.shared_down, HIDDEN, SHARED, &device)?,
-                experts: load_bank(provider, |op, n, k| PackedWeight::upload(op, n, k, &device))?,
+                experts,
+                bank,
                 client: client.clone(),
                 device,
             };
@@ -408,7 +498,7 @@ impl Moe {
             Ok(weights)
         })();
         match uploaded {
-            Ok(weights) => Ok(Self { weights: Arc::new(weights), limits, admission, poisoned: false }),
+            Ok(weights) => Ok(Self { weights: Arc::new(weights), limits, admission, poisoned: false, grouped_decode: true }),
             // Every owner made above is already dropped.
             Err(error) => {
                 abandon_uploads(&client);
@@ -420,7 +510,7 @@ impl Moe {
     /// No source payload is read or uploaded here.
     pub(super) fn from_weights(weights: Arc<Weights>, limits: Limits) -> Result<Self> {
         let admission = admission(limits)?;
-        Ok(Self { weights, limits, admission, poisoned: false })
+        Ok(Self { weights, limits, admission, poisoned: false, grouped_decode: true })
     }
     pub fn source(&self) -> SourceBinding {
         self.weights.source
@@ -595,6 +685,53 @@ impl Moe {
     ) -> Result<Output> {
         let (routing, latent) = self.route_tile(x, t, observe, None)?;
         let schedule = Schedule::new(&routing)?;
+        let selected = if t == 1 && self.grouped_decode {
+            self.grouped_experts(&routing, &latent)?
+        } else {
+            self.expert_tiles(&schedule, &latent, t, observe,
+                #[cfg(feature = "nemotron-timing")] timing.as_deref_mut())?
+        };
+        let weights = self.weights
+            .client
+            .create_from_slice(f32::as_bytes(&schedule.weights));
+        let row_ids = self.weights
+            .client
+            .create_from_slice(u32::as_bytes(&schedule.token_rows));
+        let counts = vec![TOP_K as u32; t];
+        let counts = self.weights.client.create_from_slice(u32::as_bytes(&counts));
+        let combined = moegroup::scatter_weighted_bf16(
+            &self.weights.client,
+            &selected,
+            &weights,
+            &row_ids,
+            &counts,
+            t * TOP_K,
+            t,
+            LATENT,
+            TOP_K,
+        );
+        let combined = self.tensor(combined, t, LATENT, DType::F32);
+        observe("combined_f32", &combined)?;
+        let combined = self.narrow(&combined);
+        observe("combined_bf16", &combined)?;
+        let values = self.finish_tile(x, &combined, t, observe, None)?;
+        Ok(Output {
+            values,
+            routing,
+            working_bytes: working,
+        })
+    }
+
+    /// The per-expert tiles (any t): each selected expert's rows gathered,
+    /// projected and staged into the selected slab in ascending expert order.
+    fn expert_tiles(
+        &self,
+        schedule: &Schedule,
+        latent: &CudaTensor,
+        t: usize,
+        observe: &mut impl FnMut(&str, &CudaTensor) -> Result<()>,
+        #[cfg(feature = "nemotron-timing")] mut timing: Option<&mut Timings>,
+    ) -> Result<Handle> {
         let selected = self.weights.client.empty(t * TOP_K * LATENT * 2);
         for (index, rows) in schedule.by_expert.iter().enumerate() {
             if rows.is_empty() {
@@ -663,35 +800,33 @@ impl Moe {
             );
             selected_result?;
         }
-        let weights = self.weights
-            .client
-            .create_from_slice(f32::as_bytes(&schedule.weights));
-        let row_ids = self.weights
-            .client
-            .create_from_slice(u32::as_bytes(&schedule.token_rows));
-        let counts = vec![TOP_K as u32; t];
-        let counts = self.weights.client.create_from_slice(u32::as_bytes(&counts));
-        let combined = moegroup::scatter_weighted_bf16(
-            &self.weights.client,
-            &selected,
-            &weights,
-            &row_ids,
-            &counts,
-            t * TOP_K,
-            t,
-            LATENT,
-            TOP_K,
-        );
-        let combined = self.tensor(combined, t, LATENT, DType::F32);
-        observe("combined_f32", &combined)?;
-        let combined = self.narrow(&combined);
-        observe("combined_bf16", &combined)?;
-        let values = self.finish_tile(x, &combined, t, observe, None)?;
-        Ok(Output {
-            values,
-            routing,
-            working_bytes: working,
-        })
+        Ok(selected)
+    }
+
+    /// Decode (t == 1): all TOP_K selected experts in two grouped W4A4
+    /// launches per side from the contiguous bank. Groups are in ascending
+    /// expert ID, the same slot order as `Schedule` gives a one-token tile, so
+    /// the slab feeds the unchanged weighted scatter. Per expert the
+    /// arithmetic is exactly the per-expert tile's (same quantization, same
+    /// block-scaled MMA, same f32 epilogue product).
+    fn grouped_experts(&self, routing: &Routing, latent: &CudaTensor) -> Result<Handle> {
+        let client = &self.weights.client;
+        let mut ids: Vec<u32> = routing.ids[..TOP_K].iter().map(|&e| e as u32).collect();
+        ids.sort_unstable();
+        if ids.windows(2).any(|p| p[0] == p[1]) || ids.iter().any(|&e| e as usize >= EXPERTS) {
+            return Err("MoE grouped decode needs distinct in-range expert IDs".into());
+        }
+        let ids = client.create_from_slice(u32::as_bytes(&ids));
+        let b = &self.weights.bank;
+        let up = GroupedBank { codes: &b.up_codes, scales: &b.up_scales, input_scale: &b.up_input,
+            alpha: &b.up_alpha, experts: EXPERTS, n: INTERMEDIATE, k: LATENT };
+        let down = GroupedBank { codes: &b.down_codes, scales: &b.down_scales, input_scale: &b.down_input,
+            alpha: &b.down_alpha, experts: EXPERTS, n: LATENT, k: INTERMEDIATE };
+        let high = nvfp4_gemm::w4a4_grouped_bf16(client, &latent.handle, false, &ids, TOP_K, &up)
+            .map_err(|e| e.to_string())?;
+        let active = self.relu2(&self.tensor(high, TOP_K, INTERMEDIATE, DType::BF16));
+        nvfp4_gemm::w4a4_grouped_bf16(client, &active.handle, true, &ids, TOP_K, &down)
+            .map_err(|e| e.to_string())
     }
 
     fn route_tile(&self, x: &CudaTensor, t: usize,

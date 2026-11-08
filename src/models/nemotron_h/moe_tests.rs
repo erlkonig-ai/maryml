@@ -960,3 +960,52 @@ fn moe_gpu_parallel_route_matches_serial_scan_bytes() {
     assert_eq!(flag(5), 1.0, "token 5 carries a nonfinite input");
     assert!((0..t).filter(|&r| r != 5).all(|r| flag(r) == 0.0));
 }
+
+#[test]
+#[ignore = "reserved CUDA: grouped decode experts versus the per-expert tiles, byte for byte"]
+fn moe_gpu_grouped_decode_matches_expert_tiles_bytes() {
+    let device = CudaDevice { index: 0 };
+    let client = CudaRuntime::client(&device);
+    let binding = source();
+    let mut fixed = FixedData::new();
+    // No forcing bias: the selection follows the input, so rows pick
+    // different, unordered expert sets (checked below).
+    fixed.bias = (0..EXPERTS).map(|e| ((e * 37 % 101) as f32 - 50.0) * 1e-4).collect();
+    // Distinct down globals per expert: a wrong slot order or a wrong bank
+    // view changes the weighted sum, so byte equality checks both.
+    let down = packed(LATENT, INTERMEDIATE, 1.0);
+    let downs = (0..EXPERTS).map(|e| {
+        let mut d = down.clone();
+        let at = d.len() - 4;
+        d[at..].copy_from_slice(&(0.0625 * 1.01f32.powi(e as i32)).to_le_bytes());
+        d
+    }).collect();
+    let provider = shared_provider(binding, downs);
+    let mut moe = Moe::upload(device.clone(), binding, fixed.operands(), &provider, limits()).unwrap();
+    let mut selections = std::collections::HashSet::new();
+    let mut previous: Option<Vec<u8>> = None;
+    for row in 0..6 {
+        let x: Vec<f32> = (0..HIDDEN)
+            .map(|i| (((i * (17 + 6 * row) + 31 * row * row + i * i % (7 + row)) % 101) as f32 - 50.0) / 64.0)
+            .collect();
+        let one = input(&client, &device, &x, 1, HIDDEN);
+        // Grouped FIRST, on memory last written by a different row's tiles:
+        // a grouped launch that never ran cannot pass by reading the
+        // per-expert path's slab back from a reused pool slice.
+        moe.grouped_decode = true;
+        let grouped = moe.forward(&one).unwrap();
+        moe.grouped_decode = false;
+        let tiles = moe.forward(&one).unwrap();
+        if let Some(previous) = &previous {
+            assert_ne!(previous, &raw(&grouped.values), "row {row} repeats the previous row");
+        }
+        previous = Some(raw(&tiles.values));
+        assert_eq!(tiles.routing.ids, grouped.routing.ids, "row {row}");
+        assert_eq!(raw(&tiles.values), raw(&grouped.values), "row {row}: grouped decode differs");
+        assert!(numbers(&grouped.values).iter().all(|v| v.is_finite()));
+        selections.insert(grouped.routing.ids.clone());
+    }
+    println!("GROUPED_DECODE {}", serde_json::json!({"rows": 6, "distinct_selections": selections.len(),
+        "selections": selections.iter().collect::<Vec<_>>()}));
+    assert!(selections.len() > 1, "fixture never varied the selection");
+}
