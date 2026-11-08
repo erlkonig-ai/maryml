@@ -161,11 +161,46 @@ fn embed(args: &[String]) -> Result<()> {
         say!("steady_forward\tids\t{ids}\tbest_of_3_ms\t{best:.1}");
     }
 
-    let mut tsv = String::from("text\twindow\tchars\tids\twindow_cut_ms\tforward_ms\tencode_ms\n");
-    let mut embeddings = Vec::new();
-    let mut rows_bytes = Vec::new();
-    let (mut cut_total, mut fwd_total, mut enc_total, mut ids_total, mut n_windows) = (0.0, 0.0, 0.0, 0usize, 0usize);
+    // WEMM_BATCH=N runs windows N at a time through NativeWemm::embed_texts;
+    // unset is the one-window embed_text path. WEMM_BATCH_SCOPE=all batches
+    // across texts (as one bulk commit would), sorted longest first; the
+    // default batches within each text (one file per commit).
+    let batch: usize = std::env::var("WEMM_BATCH").ok().map(|s| s.parse()).transpose()?.unwrap_or(0);
+    let across = std::env::var("WEMM_BATCH_SCOPE").as_deref() == Ok("all");
+    if let Ok(list) = std::env::var("WEMM_BATCH_SCAN") {
+        // Steady forward and device memory per batch size: B copies of a
+        // 248-ID window. Pool memory is cleaned before each size, so
+        // bytes_reserved after it is that size's pool high-water mark;
+        // MemAvailable falls with device allocations on a GB10.
+        let text = "word ".repeat(248);
+        let window = windows(&text, 1, |w| codec.text(w).is_ok_and(|ids| ids.as_slice().len() <= 248))[0];
+        let client = warm.client.clone();
+        let avail = || -> u64 { fs::read_to_string("/proc/meminfo").ok().and_then(|m| m.lines()
+            .find(|l| l.starts_with("MemAvailable")).and_then(|l| l.split_whitespace().nth(1)?.parse().ok())).unwrap_or(0) };
+        for b in list.split(',').map(|s| s.parse::<usize>()).collect::<Result<Vec<_>, _>>()? {
+            client.memory_cleanup();
+            let before = avail();
+            let texts = vec![window; b];
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let t = Instant::now();
+                let es = native.embed_texts(&texts).map_err(anyhow::Error::msg)?;
+                for e in &es { sync(e)?; }
+                best = best.min(ms(t));
+            }
+            let usage = client.memory_usage().map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            say!("steady_batch\tB\t{b}\tids_each\t248\tbest_of_3_ms\t{best:.1}\tms_per_window\t{:.1}\tpool_reserved_mib\t{:.0}\tpool_in_use_mib\t{:.0}\tmemavail_drop_mib\t{:.0}",
+                best / b as f64, usage.bytes_reserved as f64 / 1048576.0, usage.bytes_in_use as f64 / 1048576.0,
+                (before as f64 - avail() as f64) / 1024.0);
+        }
+        client.memory_cleanup();
+    }
+
+    let mut tsv = String::from("text\twindow\tchars\tids\twindow_cut_ms\tforward_ms\tencode_ms\tbatch\n");
+    let (mut cut_total, mut fwd_total, mut enc_total, mut ids_total) = (0.0, 0.0, 0.0, 0usize);
     let all = Instant::now();
+    // (text, window index, window text, ids, cut ms for the text's first window)
+    let mut cut_windows: Vec<(usize, usize, &str, usize, f64)> = Vec::new();
     for (index, (path, text)) in texts.iter().enumerate() {
         let t = Instant::now();
         let mut calls = 0usize;
@@ -175,34 +210,77 @@ fn embed(args: &[String]) -> Result<()> {
         });
         let cut_ms = ms(t);
         cut_total += cut_ms;
-        let mut text_fwd = 0.0;
         for (w, window) in cut.iter().enumerate() {
             let ids = codec.text(window).map_err(anyhow::Error::msg)?.as_slice().len();
-            let t = Instant::now();
-            let e = native.embed_text(window).map_err(anyhow::Error::msg)?;
-            sync(&e)?;
-            let fwd = ms(t);
-            let t = Instant::now();
-            let row = encoder.encode(&e).map_err(|e| anyhow::anyhow!("{e}"))?;
-            let enc = ms(t);
-            for stage in row.stages() {
-                rows_bytes.extend(stage.global_scale_bytes());
-                rows_bytes.extend(stage.block_scales());
-                rows_bytes.extend(stage.codes());
-            }
-            rows_bytes.extend(row.reconstruction_norm_bytes());
-            rows_bytes.extend(row.error_bound_bytes());
-            embeddings.extend(bits(&e)?);
-            writeln!(tsv, "{index}\t{w}\t{}\t{ids}\t{}\t{fwd:.2}\t{enc:.2}", window.len(),
-                if w == 0 { format!("{cut_ms:.2}") } else { String::new() })?;
-            fwd_total += fwd;
-            enc_total += enc;
-            text_fwd += fwd;
             ids_total += ids;
-            n_windows += 1;
+            cut_windows.push((index, w, window, ids, if w == 0 { cut_ms } else { -1.0 }));
         }
-        println!("text {index} {} bytes {} windows {} tokenizer calls {calls} cut {cut_ms:.1} ms forward {text_fwd:.1} ms", path, text.len(), cut.len());
+        println!("text {index} {} bytes {} windows {} tokenizer calls {calls} cut {cut_ms:.1} ms", path, text.len(), cut.len());
     }
+    let n_windows = cut_windows.len();
+    // Groups of global window indices, each one forward.
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    if batch == 0 {
+        groups = (0..n_windows).map(|i| vec![i]).collect();
+    } else if across {
+        let mut order: Vec<usize> = (0..n_windows).collect();
+        order.sort_by_key(|&i| std::cmp::Reverse(cut_windows[i].3));
+        groups = order.chunks(batch).map(|c| c.to_vec()).collect();
+    } else {
+        let mut start = 0;
+        while start < n_windows {
+            let text = cut_windows[start].0;
+            let mut end = start;
+            while end < n_windows && cut_windows[end].0 == text { end += 1; }
+            for chunk in (start..end).collect::<Vec<_>>().chunks(batch) { groups.push(chunk.to_vec()); }
+            start = end;
+        }
+    }
+    let mut out_emb: Vec<Vec<u8>> = vec![Vec::new(); n_windows];
+    let mut out_row: Vec<Vec<u8>> = vec![Vec::new(); n_windows];
+    let mut fwd_ms = vec![0f64; n_windows];
+    let mut enc_ms = vec![0f64; n_windows];
+    let mut sizes: std::collections::BTreeMap<usize, usize> = Default::default();
+    let mut padded_ids = 0usize;
+    for group in &groups {
+        *sizes.entry(group.len()).or_default() += 1;
+        padded_ids += group.len() * group.iter().map(|&i| cut_windows[i].3).max().unwrap_or(0);
+        let t = Instant::now();
+        let es = if batch == 0 {
+            vec![native.embed_text(cut_windows[group[0]].2).map_err(anyhow::Error::msg)?]
+        } else {
+            let texts: Vec<&str> = group.iter().map(|&i| cut_windows[i].2).collect();
+            native.embed_texts(&texts).map_err(anyhow::Error::msg)?
+        };
+        for e in &es { sync(e)?; }
+        let f = ms(t);
+        fwd_total += f;
+        for (&i, e) in group.iter().zip(&es) {
+            fwd_ms[i] = f / group.len() as f64;
+            let t = Instant::now();
+            let row = encoder.encode(e).map_err(|e| anyhow::anyhow!("{e}"))?;
+            enc_ms[i] = ms(t);
+            enc_total += enc_ms[i];
+            let mut bytes = Vec::new();
+            for stage in row.stages() {
+                bytes.extend(stage.global_scale_bytes());
+                bytes.extend(stage.block_scales());
+                bytes.extend(stage.codes());
+            }
+            bytes.extend(row.reconstruction_norm_bytes());
+            bytes.extend(row.error_bound_bytes());
+            out_row[i] = bytes;
+            out_emb[i] = bits(e)?;
+        }
+    }
+    for (i, (text, w, window, ids, cut_ms)) in cut_windows.iter().enumerate() {
+        writeln!(tsv, "{text}\t{w}\t{}\t{ids}\t{}\t{:.2}\t{:.2}\t{}", window.len(),
+            if *cut_ms >= 0.0 { format!("{cut_ms:.2}") } else { String::new() }, fwd_ms[i], enc_ms[i], batch.max(1))?;
+    }
+    let embeddings: Vec<u8> = out_emb.concat();
+    let rows_bytes: Vec<u8> = out_row.concat();
+    say!("batch\t{}\tscope\t{}\tforwards\t{}\tbatch_sizes\t{sizes:?}\tpadded_ids\t{padded_ids}\tvalid_ids\t{ids_total}",
+        batch.max(1), if across { "all" } else { "text" }, groups.len());
     let wall = ms(all);
     say!("texts\t{}\twindows\t{n_windows}\tids\t{ids_total}\tcap\t{cap}", texts.len());
     say!("wall_ms\t{wall:.1}\twindow_cut_ms\t{cut_total:.1}\tforward_ms\t{fwd_total:.1}\tencode_ms\t{enc_total:.1}\tother_ms\t{:.1}", wall - cut_total - fwd_total - enc_total);
