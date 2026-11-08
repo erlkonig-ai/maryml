@@ -985,9 +985,13 @@ impl<S: BlobStoreGet> Session<S> {
 }
 
 /// Dropping a session that still owns queued work (poisoned after an error
-/// or unwind, or with pending intermediates) first settles it: a fence on
-/// the session's stream, so no launch can still be reading or writing a
-/// buffer this drop is about to free. Errors are logged, never raised.
+/// or unwind, or with pending intermediates) first attempts to settle it: a
+/// fence on the session's stream while every retained buffer is still owned.
+/// When the fence succeeds, no launch can still be reading or writing a
+/// buffer this drop frees. When it fails, the error is logged (never raised)
+/// and the buffers are dropped anyway, so settlement is then NOT established.
+/// Buffers a nested helper held only locally are not covered if that helper
+/// itself unwinds before returning them.
 impl<S> Drop for Session<S> {
     fn drop(&mut self) {
         if self.status == Status::Ready && self.pending.is_empty() && self.span_pending.is_none() {
