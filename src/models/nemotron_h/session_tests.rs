@@ -1467,3 +1467,29 @@ fn session_gpu_deferred_decode_error_after_launches_keeps_poison() {
         assert!(clean.iter().zip(&again).all(|(x, y)| x.to_bits() == y.to_bits()), "{fault:?}");
     }
 }
+
+#[test]
+#[ignore = "reserved CUDA: an error between the grouped expert launches keeps poison and recovers bit-equal"]
+fn session_gpu_deferred_decode_error_between_grouped_launches() {
+    let (snapshot, source, ids) = fixture_layers(8, 512, Some(&MIDDLE_MOE));
+    let mut session = Session::from_snapshot(snapshot, source, &ids, CudaDevice { index: 0 }, middle_limits()).unwrap();
+    session.append_ids(&[1, 5]).unwrap();
+    let clean = session.append_ids(&[7]).unwrap().values.to_vec();
+    session.reset().unwrap();
+    session.append_ids(&[1, 5]).unwrap();
+    let held_before = session.pending.len();
+    if let Mixer::Moe(m) = &mut session.layers[1].mixer { m.fail_between_grouped = true } else { panic!("layer 1 is MoE") }
+    let error = session.append_ids(&[7]).err().expect("injected failure must refuse the token");
+    assert!(error.contains("between the grouped expert launches"), "{error}");
+    assert_eq!(session.status(), Status::Poisoned);
+    assert_eq!(session.committed_ids(), &[1, 5]);
+    assert!(session.last_logits().is_none());
+    assert!(moe_poisoned(&session)[0], "the failed deferred MoE stays poisoned");
+    // The up launch's activation planes, output and ReLU2 were retained at creation.
+    assert!(session.pending.len() > held_before + 4, "intermediates of the failed layer retained");
+    if let Mixer::Moe(m) = &mut session.layers[1].mixer { m.fail_between_grouped = false }
+    session.reset().unwrap();
+    session.append_ids(&[1, 5]).unwrap();
+    let again = session.append_ids(&[7]).unwrap().values.to_vec();
+    assert!(clean.iter().zip(&again).all(|(x, y)| x.to_bits() == y.to_bits()), "recovery differs");
+}

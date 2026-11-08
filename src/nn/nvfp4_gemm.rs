@@ -456,7 +456,9 @@ pub(crate) struct GroupedBank<'a> {
 /// One BF16 activation row per group (`x_per_group`) or one shared row,
 /// times bank expert `ids[g]` for each of `groups` groups, in two launches
 /// (grouped quantization, grouped W4A4). Returns BF16 `[groups, n]`.
-/// Per group this is exactly `project_w4a4_scaled` on one row.
+/// Per group this is exactly `project_w4a4_scaled` on one row. The
+/// quantized activation planes are pushed to `retain` as they are made, so a
+/// caller that settles work late can keep everything the launches read.
 pub(crate) fn w4a4_grouped_bf16(
     client: &ComputeClient<CudaRuntime>,
     x: &Handle,
@@ -464,6 +466,7 @@ pub(crate) fn w4a4_grouped_bf16(
     ids: &Handle,
     groups: usize,
     bank: &GroupedBank<'_>,
+    retain: &mut Vec<Handle>,
 ) -> Result<Handle> {
     let (n, k) = (bank.n, bank.k);
     ensure!(k % KTILE4 == 0 && n % NTILE == 0 && groups > 0 && groups <= u16::MAX as usize,
@@ -471,7 +474,9 @@ pub(crate) fn w4a4_grouped_bf16(
     let group_blocks = k / GROUP;
     let blocks = groups * group_blocks;
     let codes = client.empty(groups * k / 2);
+    retain.push(codes.clone());
     let scales = client.empty(blocks);
+    retain.push(scales.clone());
     // SAFETY: one thread per 16-block of `groups` rows of k; x holds one row
     // (shared) or `groups` rows of k BF16; ids holds `groups` IDs below
     // bank.experts (checked by the caller) indexing input_scale.

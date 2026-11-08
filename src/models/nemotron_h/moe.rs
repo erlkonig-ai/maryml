@@ -281,6 +281,9 @@ pub struct Moe {
     /// and the deferred path, after the router projection.
     #[cfg(test)]
     router_override: Option<f32>,
+    /// Test seam: fail between the grouped up and down launches.
+    #[cfg(test)]
+    pub(super) fail_between_grouped: bool,
 }
 
 fn bytes(dims: &[usize], width: usize) -> Result<usize> {
@@ -526,7 +529,7 @@ impl Moe {
         })();
         match uploaded {
             Ok(weights) => Ok(Self { weights: Arc::new(weights), limits, admission, poisoned: false, grouped_decode: true,
-                #[cfg(test)] router_override: None }),
+                #[cfg(test)] router_override: None, #[cfg(test)] fail_between_grouped: false }),
             // Every owner made above is already dropped.
             Err(error) => {
                 abandon_uploads(&client);
@@ -539,7 +542,7 @@ impl Moe {
     pub(super) fn from_weights(weights: Arc<Weights>, limits: Limits) -> Result<Self> {
         let admission = admission(limits)?;
         Ok(Self { weights, limits, admission, poisoned: false, grouped_decode: true,
-            #[cfg(test)] router_override: None })
+            #[cfg(test)] router_override: None, #[cfg(test)] fail_between_grouped: false })
     }
     pub fn source(&self) -> SourceBinding {
         self.weights.source
@@ -853,13 +856,25 @@ impl Moe {
             return Err("MoE grouped decode needs distinct in-range expert IDs".into());
         }
         let ids = client.create_from_slice(u32::as_bytes(&ids));
-        self.grouped_experts_on(&ids, latent, None)
+        // forward() fences before returning, so these may go at its end.
+        self.grouped_experts_on(&ids, latent, &mut Vec::new())
+    }
+
+    /// Keep a raw handle a queued launch uses, as a byte tensor.
+    fn keep(&self, held: &mut Vec<CudaTensor>, handles: Vec<Handle>) {
+        for h in handles {
+            let bytes = h.size_in_used() as usize;
+            held.push(self.tensor(h, 1, bytes, DType::U8));
+        }
     }
 
     /// The grouped decode experts for ascending, distinct, in-range device
     /// expert IDs `ids` (TOP_K of them); `held` keeps the intermediates.
+    /// Every buffer a queued launch reads or writes is pushed to `held` the
+    /// moment it exists, so an error or unwind between the launches cannot
+    /// free one before the caller settles the queue.
     fn grouped_experts_on(&self, ids: &Handle, latent: &CudaTensor,
-        held: Option<&mut Vec<CudaTensor>>) -> Result<Handle>
+        held: &mut Vec<CudaTensor>) -> Result<Handle>
     {
         let client = &self.weights.client;
         let b = &self.weights.bank;
@@ -867,16 +882,22 @@ impl Moe {
             alpha: &b.up_alpha, experts: EXPERTS, n: INTERMEDIATE, k: LATENT };
         let down = GroupedBank { codes: &b.down_codes, scales: &b.down_scales, input_scale: &b.down_input,
             alpha: &b.down_alpha, experts: EXPERTS, n: LATENT, k: INTERMEDIATE };
-        let high = nvfp4_gemm::w4a4_grouped_bf16(client, &latent.handle, false, ids, TOP_K, &up)
-            .map_err(|e| e.to_string())?;
-        let high = self.tensor(high, TOP_K, INTERMEDIATE, DType::BF16);
+        let mut retain = Vec::new();
+        let high = nvfp4_gemm::w4a4_grouped_bf16(client, &latent.handle, false, ids, TOP_K, &up, &mut retain);
+        self.keep(held, std::mem::take(&mut retain));
+        let high = self.tensor(high.map_err(|e| e.to_string())?, TOP_K, INTERMEDIATE, DType::BF16);
+        held.push(high.clone());
         let active = self.relu2(&high);
-        if let Some(held) = held {
-            held.push(high);
-            held.push(active.clone());
+        held.push(active.clone());
+        #[cfg(test)]
+        if self.fail_between_grouped {
+            return Err("injected failure between the grouped expert launches".into());
         }
-        nvfp4_gemm::w4a4_grouped_bf16(client, &active.handle, true, ids, TOP_K, &down)
-            .map_err(|e| e.to_string())
+        let low = nvfp4_gemm::w4a4_grouped_bf16(client, &active.handle, true, ids, TOP_K, &down, &mut retain);
+        self.keep(held, retain);
+        let low = low.map_err(|e| e.to_string())?;
+        held.push(self.tensor(low.clone(), TOP_K, LATENT, DType::BF16));
+        Ok(low)
     }
 
     /// Decode (t == 1) with no host synchronisation at all: the route stays on
@@ -917,7 +938,9 @@ impl Moe {
             );
         }
         let ids = client.empty(TOP_K * 4);
+        held.push(self.tensor(ids.clone(), 1, TOP_K, DType::U32));
         let weights = client.empty(TOP_K * 4);
+        held.push(self.tensor(weights.clone(), 1, TOP_K, DType::F32));
         // SAFETY: one unit reads the ROUTE_WIDTH-word record and writes TOP_K
         // IDs and weights into fresh buffers.
         unsafe {
@@ -930,14 +953,11 @@ impl Moe {
                 ArrayArg::from_raw_parts(weights.clone(), TOP_K),
             );
         }
-        held.push(self.tensor(ids.clone(), 1, TOP_K, DType::U32));
-        held.push(self.tensor(weights.clone(), 1, TOP_K, DType::F32));
         let latent_f32 = self.linear(x, &self.weights.fc1, HIDDEN, LATENT);
         held.push(latent_f32.clone());
         let latent = self.narrow(&latent_f32);
         held.push(latent.clone());
-        let selected = self.grouped_experts_on(&ids, &latent, Some(held))?;
-        held.push(self.tensor(selected.clone(), TOP_K, LATENT, DType::BF16));
+        let selected = self.grouped_experts_on(&ids, &latent, held)?;
         let b = &self.weights.bank;
         let combined = moegroup::scatter_weighted_bf16(client, &selected, &weights, &b.rows,
             &b.counts, TOP_K, 1, LATENT, TOP_K);
@@ -949,10 +969,7 @@ impl Moe {
         held.push(expanded_f32.clone());
         let expanded = self.narrow(&expanded_f32);
         held.push(expanded.clone());
-        let (shared_up, shared_active, shared) = self.shared_decode(x)?;
-        held.push(shared_up);
-        held.push(shared_active);
-        held.push(shared.clone());
+        let (_up, _active, shared) = self.shared_decode(x, held)?;
         let out = self.sum_tile(&expanded, &shared, 1, &flag);
         let values = self.tensor(out, 1, HIDDEN, DType::BF16);
         held.push(values.clone());
@@ -987,7 +1004,9 @@ impl Moe {
     /// launches of the staged grouped W4A4 kernel over a one-expert bank (the
     /// shared weight's own planes), byte-identical to `project_w4a4_scaled`
     /// on that row. Returns (up, ReLU2, down).
-    fn shared_decode(&self, x: &CudaTensor) -> Result<(CudaTensor, CudaTensor, CudaTensor)> {
+    fn shared_decode(&self, x: &CudaTensor, held: &mut Vec<CudaTensor>)
+        -> Result<(CudaTensor, CudaTensor, CudaTensor)>
+    {
         let client = &self.weights.client;
         let b = &self.weights.bank;
         let (su, sd) = (&self.weights.shared_up.weight, &self.weights.shared_down.weight);
@@ -995,13 +1014,18 @@ impl Moe {
             alpha: &b.shared_up_alpha, experts: 1, n: SHARED, k: HIDDEN };
         let down = GroupedBank { codes: &sd.codes, scales: &sd.scales, input_scale: &b.shared_down_input,
             alpha: &b.shared_down_alpha, experts: 1, n: HIDDEN, k: SHARED };
-        let high = nvfp4_gemm::w4a4_grouped_bf16(client, &x.handle, false, &b.zero, 1, &up)
-            .map_err(|e| e.to_string())?;
-        let high = self.tensor(high, 1, SHARED, DType::BF16);
+        let mut retain = Vec::new();
+        let high = nvfp4_gemm::w4a4_grouped_bf16(client, &x.handle, false, &b.zero, 1, &up, &mut retain);
+        self.keep(held, std::mem::take(&mut retain));
+        let high = self.tensor(high.map_err(|e| e.to_string())?, 1, SHARED, DType::BF16);
+        held.push(high.clone());
         let active = self.relu2(&high);
-        let low = nvfp4_gemm::w4a4_grouped_bf16(client, &active.handle, true, &b.zero, 1, &down)
-            .map_err(|e| e.to_string())?;
-        Ok((high, active, self.tensor(low, 1, HIDDEN, DType::BF16)))
+        held.push(active.clone());
+        let low = nvfp4_gemm::w4a4_grouped_bf16(client, &active.handle, true, &b.zero, 1, &down, &mut retain);
+        self.keep(held, retain);
+        let low = self.tensor(low.map_err(|e| e.to_string())?, 1, HIDDEN, DType::BF16);
+        held.push(low.clone());
+        Ok((high, active, low))
     }
 
     fn route_tile(&self, x: &CudaTensor, t: usize,
@@ -1071,7 +1095,8 @@ impl Moe {
         let (shared_up, shared_active, shared) = if t == 1 && self.grouped_decode
             && x.handle.offset_start.unwrap_or(0) == 0
         {
-            self.shared_decode(x)?
+            // finish_tile reads the flags back (a fence) before these go.
+            self.shared_decode(x, &mut Vec::new())?
         } else {
             let up = self.weights.shared_up.project(x)?;
             let active = self.relu2(&up);
