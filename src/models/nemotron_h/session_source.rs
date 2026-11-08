@@ -464,6 +464,7 @@ pub(super) fn load<S: BlobStoreGet>(
         logits: Vec::new(),
         pending: Vec::new(),
         span_pending: None,
+        reseedable: seed.is_some(),
         seed,
         prefix: None,
         #[cfg(test)]

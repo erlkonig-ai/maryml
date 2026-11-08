@@ -256,16 +256,76 @@ impl<S: BlobStoreGet> Session<S> {
     /// Complete caller-side prompt validation precedes reset/restore. An exact
     /// seed prompt uses saved last_logits; a mismatch gets full-C empty backing.
     pub fn reset_for_prompt(&mut self, ids: &[u32]) -> Result<()> {
+        self.reset_for_prompt_sealed(ids, 0).map(|_| ())
+    }
+
+    /// [`Self::reset_for_prompt`] with an offered SEAL: the first `seal` IDs of
+    /// `ids` are the boundary the caller wants its one saved prefix kept at
+    /// (Drive: the end of the cover's sealed head).
+    ///
+    /// An exact saved prefix still restores, whatever the seal. On a mismatch
+    /// the old seed/prefix is cleared exactly as before, and, when
+    /// [`reseal_plan`] admits it, the reset installs `ids[..seal]` as the
+    /// pending seed: attention reserves exactly `seal` rows (as `from_state`
+    /// does for a seeded owner), the next ordinary prefill must reproduce
+    /// those IDs, and publication seals them at the same origin fence as a
+    /// startup seed. Nothing is computed here, so the reseal costs no extra
+    /// model work beyond the prompt the caller was going to prefill anyway.
+    /// All validation, including the reseal's own admission, precedes any
+    /// mutation; a refused reseal falls back to today's cleared reset.
+    pub fn reset_for_prompt_sealed(&mut self, ids: &[u32], seal: usize) -> Result<PromptReset> {
         if ids.is_empty() || ids.len() > self.capacity() || ids.iter().any(|&id| id as usize >= self.vocab_size()) {
             return Err("invalid prompt before prefix reset".into());
         }
-        if self.seed.is_none() && self.prefix.as_ref().is_some_and(|p| ids.starts_with(&p.ids)) {
-            self.restore_prefix()
-        } else {
-            let reason = if self.prefix.is_some() || self.seed.is_some() { "token_mismatch" } else { "no_saved_prefix" };
-            self.reset()?;
-            self.observe_prefix(reason, 0);
-            Ok(())
+        let saved = self.prefix.as_ref().filter(|_| self.seed.is_none()).map(|p| &p.ids[..]);
+        let plan = reseal_plan(saved, self.seed.is_some(), self.reseedable, ids, seal,
+            |prompt, seal| prefix_admission(&self.model.config, self.limits, prompt, seal).is_ok());
+        match plan {
+            PromptReset::Restored { .. } => self.restore_prefix()?,
+            PromptReset::Resealed { tokens } => {
+                self.stream.executes(|| self.reset_on_stream(tokens))?;
+                self.seed = Some(Arc::from(&ids[..tokens]));
+                self.observe_prefix("resealed", 0);
+            }
+            PromptReset::Cleared => {
+                let reason = if self.prefix.is_some() || self.seed.is_some() { "token_mismatch" } else { "no_saved_prefix" };
+                self.reset()?;
+                self.observe_prefix(reason, 0);
+            }
         }
+        Ok(plan)
+    }
+}
+
+/// What [`Session::reset_for_prompt_sealed`] did, in tokens of the prompt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PromptReset {
+    /// The saved prefix was an exact token prefix of the prompt and was restored.
+    Restored { tokens: usize },
+    /// Cleared, with `ids[..tokens]` installed as the pending seed the next
+    /// prefill will publish as the new saved prefix.
+    Resealed { tokens: usize },
+    /// Cleared with no seed: nothing is saved until a later reseal.
+    Cleared,
+}
+
+/// The decision alone, host-visible so it can be tested without a device.
+///
+/// Restore wins whenever the saved prefix is an exact token prefix of the
+/// prompt: reuse never depends on the seal. Otherwise reseal only when a seal
+/// is offered inside the prompt (`0 < seal <= ids.len()`), the owner was
+/// admitted as seeded (`reseedable`), and the seed and suffix spans are
+/// admitted for THIS prompt at THIS boundary (`admitted(prompt, seal)`, which
+/// is `prefix_admission`). Anything else clears, exactly as an unsealed reset.
+pub fn reseal_plan(saved: Option<&[u32]>, seed_pending: bool, reseedable: bool, ids: &[u32],
+    seal: usize, admitted: impl FnOnce(usize, usize) -> bool) -> PromptReset
+{
+    if let Some(saved) = saved.filter(|saved| !seed_pending && ids.starts_with(saved)) {
+        return PromptReset::Restored { tokens: saved.len() };
+    }
+    if reseedable && seal > 0 && seal <= ids.len() && admitted(ids.len(), seal) {
+        PromptReset::Resealed { tokens: seal }
+    } else {
+        PromptReset::Cleared
     }
 }
