@@ -99,7 +99,20 @@ fn embed(args: &[String]) -> Result<()> {
         .collect();
 
     let t = Instant::now();
-    let model = mary::persist::read_model_pile_read_only(Path::new(&args[0]))?;
+    // WEMM_COLLECTION names the `models` collection explicitly (a working pile
+    // carries several); without it the pile must hold exactly one.
+    let model = match std::env::var("WEMM_COLLECTION") {
+        Ok(hex) => {
+            let store = mary::persist::read_model_pile_snapshot_read_only(Path::new(&args[0]))?;
+            let handle = mary::model_collection::parse_collection_handle(&hex)?;
+            let collection = mary::model_collection::ModelCollection::open(&store, handle)
+                .map_err(|e| anyhow::anyhow!("open the model collection: {e}"))?;
+            let snapshot = mary::model_collection::snapshot_model_collection_for(&store, collection)?;
+            let (facts, _, store) = snapshot.into_parts();
+            mary::persist::ModelPileSource { facts, store, collection }
+        }
+        Err(_) => mary::persist::read_model_pile_read_only(Path::new(&args[0]))?,
+    };
     let root = match args.get(6) {
         Some(hex) => Id::from_hex(hex).context("ROOT")?,
         None => mary::selection::select_model_root(
@@ -150,6 +163,7 @@ fn embed(args: &[String]) -> Result<()> {
 
     let mut tsv = String::from("text\twindow\tchars\tids\twindow_cut_ms\tforward_ms\tencode_ms\n");
     let mut embeddings = Vec::new();
+    let mut rows_bytes = Vec::new();
     let (mut cut_total, mut fwd_total, mut enc_total, mut ids_total, mut n_windows) = (0.0, 0.0, 0.0, 0usize, 0usize);
     let all = Instant::now();
     for (index, (path, text)) in texts.iter().enumerate() {
@@ -169,8 +183,15 @@ fn embed(args: &[String]) -> Result<()> {
             sync(&e)?;
             let fwd = ms(t);
             let t = Instant::now();
-            encoder.encode(&e).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let row = encoder.encode(&e).map_err(|e| anyhow::anyhow!("{e}"))?;
             let enc = ms(t);
+            for stage in row.stages() {
+                rows_bytes.extend(stage.global_scale_bytes());
+                rows_bytes.extend(stage.block_scales());
+                rows_bytes.extend(stage.codes());
+            }
+            rows_bytes.extend(row.reconstruction_norm_bytes());
+            rows_bytes.extend(row.error_bound_bytes());
             embeddings.extend(bits(&e)?);
             writeln!(tsv, "{index}\t{w}\t{}\t{ids}\t{}\t{fwd:.2}\t{enc:.2}", window.len(),
                 if w == 0 { format!("{cut_ms:.2}") } else { String::new() })?;
@@ -192,6 +213,7 @@ fn embed(args: &[String]) -> Result<()> {
     say!("decoder_tflops_effective\t{:.1}", 2.0 * 6.92e9 * ids_total as f64 / (fwd_total / 1e3) / 1e12);
     fs::write(out.join("windows.tsv"), tsv)?;
     fs::write(out.join("windows.bf16"), &embeddings)?;
+    fs::write(out.join("rows.nvfp4"), &rows_bytes)?;
     let mut q = Vec::new();
     let t = Instant::now();
     for query in &queries {
@@ -249,6 +271,13 @@ fn compare(args: &[String]) -> Result<()> {
     let mean = cos.iter().sum::<f64>() / cos.len() as f64;
     println!("windows {} bit_identical {identical} cosine min {:.6} p01 {:.6} median {:.6} mean {:.6}",
         cos.len(), cos[0], cos[cos.len() / 100], cos[cos.len() / 2], mean);
+    match (fs::read(a.join("rows.nvfp4")), fs::read(b.join("rows.nvfp4"))) {
+        (Ok(x), Ok(y)) => {
+            let same = x.chunks(4624).zip(y.chunks(4624)).filter(|(p, q)| p == q).count();
+            println!("nvfp4 rows {} byte_identical {same}", x.len() / 4624);
+        }
+        _ => println!("nvfp4 rows: not recorded in both runs"),
+    }
     let (qa, qb) = (rows(&a.join("queries.bf16"))?, rows(&b.join("queries.bf16"))?);
     let names: Vec<String> = fs::read_to_string(a.join("queries.txt"))?.lines().map(str::to_owned).collect();
     let mut same_top1 = 0;
@@ -263,11 +292,149 @@ fn compare(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+// ---- gemm: the decoder's projection shapes, production vs forced tilings ----
+
+type Tensor = mary::models::qwen3_5::multimodal::CudaTensor;
+
+fn upload_bf16(client: &cubecl::client::ComputeClient<cubecl::cuda::CudaRuntime>, n: usize, seed: u64, scale: f32) -> cubecl::server::Handle {
+    let mut x = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    let mut bytes = Vec::with_capacity(n * 2);
+    for _ in 0..n {
+        x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let u = ((x >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0;
+        bytes.extend(bf16::from_f32(u * scale).to_le_bytes());
+    }
+    client.create_from_slice(&bytes)
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Routine { Simple, Double, SimpleAsync, DoubleAsync }
+
+fn forced(routine: Routine, m: usize, n: usize, k: usize, part: (u32, u32, u32), stage: (u32, u32), double_partition: bool, swizzle: bool)
+    -> Result<cubek::matmul::launch::Strategy, String> {
+    use cubek::matmul::{components::{stage::PartitionBuffering, tile::TileMatmulKind},
+        definition::{MatmulGlobalElems, MatmulProblem, TilingBlueprint, TilingScheme}, launch::Strategy,
+        routines::BlueprintStrategy};
+    use cubek::std::cube_count::{CubeCountStrategy, GlobalOrder, HypercubeBlueprint};
+    use cubecl::ir::{ElemType, FloatKind, StorageType};
+    let bf = StorageType::Scalar(ElemType::Float(FloatKind::BF16));
+    let globals = MatmulGlobalElems { lhs: bf, rhs: bf, out: StorageType::Scalar(ElemType::Float(FloatKind::F32)) };
+    let problem = MatmulProblem::from_shapes_and_strides(
+        [m, k].into(), [k, n].into(), [m, n].into(), [k, 1].into(), [1, k].into(), [n, 1].into(),
+        globals, cubecl::ir::AddressType::U32, None, None).map_err(|e| format!("{e:?}"))?;
+    let scheme = TilingScheme::builder().with_tile_size((16, 8, 16).into())
+        .with_partition_size(part.into()).with_stage_size((stage.0, stage.1, 1).into()).build()?;
+    let grid = HypercubeBlueprint::builder()
+        .global_order(if swizzle { GlobalOrder::SwizzleRow(4) } else { GlobalOrder::RowMajor })
+        .cube_count_strategy(CubeCountStrategy::FromProblem).build();
+    let mut bp = TilingBlueprint::builder(TileMatmulKind::Mma, scheme, 32, &problem)
+        .partition_buffering(if double_partition { PartitionBuffering::Double } else { PartitionBuffering::Single })
+        .hypercube_blueprint(grid).build();
+    bp.check_m_bounds = true; bp.check_n_bounds = true; bp.check_k_bounds = true;
+    Ok(match routine {
+        Routine::Simple => Strategy::SimpleCyclicMma(BlueprintStrategy::Forced(bp)),
+        Routine::Double => Strategy::DoubleCyclicMma(BlueprintStrategy::Forced(bp)),
+        Routine::SimpleAsync => Strategy::SimpleAsyncCyclicMma(BlueprintStrategy::Forced(bp)),
+        Routine::DoubleAsync => Strategy::DoubleAsyncCyclicMma(BlueprintStrategy::Forced(bp)),
+    })
+}
+
+fn gemm(args: &[String]) -> Result<()> {
+    use burn::tensor::DType;
+    use cubecl::{Runtime, cuda::CudaRuntime, prelude::TensorBinding};
+    use cubek::matmul::definition::{MatmulElems, MatmulGlobalElems};
+    use cubek::std::InputBinding;
+    use cubecl::ir::{ElemType, FloatKind, StorageType};
+    let m: usize = args.first().map(|s| s.parse()).transpose()?.unwrap_or(248);
+    let iters: usize = args.get(1).map(|s| s.parse()).transpose()?.unwrap_or(10);
+    let only: Option<String> = args.get(2).cloned();
+    let device = CudaDevice { index: 0 };
+    let client = CudaRuntime::client(&device);
+    let bf = StorageType::Scalar(ElemType::Float(FloatKind::BF16));
+    let f32s = StorageType::Scalar(ElemType::Float(FloatKind::F32));
+    // (k, n, uses per 32-layer forward)
+    let shapes: &[(usize, usize, usize)] = &[(4096, 12288, 64), (12288, 4096, 32), (4096, 8192, 32),
+        (4096, 4096, 56), (4096, 1024, 16), (4096, 32, 48)];
+    type C = (&'static str, Routine, (u32, u32, u32), (u32, u32), bool, bool);
+    let candidates: &[C] = &[
+        ("simple p2x1x4 s2x2 (=prod)", Routine::Simple, (2, 1, 4), (2, 2), false, false),
+        ("simple p2x8x2 s4x1", Routine::Simple, (2, 8, 2), (4, 1), false, false),
+        ("simple p2x8x2 s8x1", Routine::Simple, (2, 8, 2), (8, 1), false, false),
+        ("simple p2x8x2 s2x1", Routine::Simple, (2, 8, 2), (2, 1), false, false),
+        ("simple p2x8x2 s4x2", Routine::Simple, (2, 8, 2), (4, 2), false, false),
+        ("simple p4x8x2 s2x1", Routine::Simple, (4, 8, 2), (2, 1), false, false),
+        ("simple p4x8x2 s4x1", Routine::Simple, (4, 8, 2), (4, 1), false, false),
+        ("simple p2x16x2 s4x1", Routine::Simple, (2, 16, 2), (4, 1), false, false),
+        ("simple p4x4x2 s4x1", Routine::Simple, (4, 4, 2), (4, 1), false, false),
+        ("simple p2x4x2 s4x1", Routine::Simple, (2, 4, 2), (4, 1), false, false),
+        ("simple p2x8x1 s4x1", Routine::Simple, (2, 8, 1), (4, 1), false, false),
+        ("simple p2x8x2 s4x1 swz", Routine::Simple, (2, 8, 2), (4, 1), false, true),
+        ("sasync p4x8x2 s2x1", Routine::SimpleAsync, (4, 8, 2), (2, 1), false, false),
+        ("dasync p2x8x2 s4x1", Routine::DoubleAsync, (2, 8, 2), (4, 1), false, false),
+        ("dasync p4x8x2 s2x1", Routine::DoubleAsync, (4, 8, 2), (2, 1), false, false),
+        ("dasync p2x8x2 s8x1", Routine::DoubleAsync, (2, 8, 2), (8, 1), false, false),
+        ("dasync p2x8x4 s4x1", Routine::DoubleAsync, (2, 8, 4), (4, 1), false, false),
+    ];
+    let time = |f: &mut dyn FnMut() -> Result<()>| -> Result<f64> {
+        f()?; f()?;
+        cubecl::future::block_on(client.sync()).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        let t = Instant::now();
+        for _ in 0..iters { f()?; }
+        cubecl::future::block_on(client.sync()).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        Ok(ms(t) / iters as f64)
+    };
+    let mut totals = vec![0f64; candidates.len() + 1];
+    let mut valid = vec![true; candidates.len() + 1];
+    println!("m {m} iters {iters}");
+    for &(k, n, uses) in shapes {
+        let a = upload_bf16(&client, m * k, 1 + k as u64, 1.0);
+        let w = upload_bf16(&client, n * k, 7 + n as u64, 0.02);
+        let input = Tensor::new_contiguous(client.clone(), device.clone(), [1, m, k].as_slice().into(), a.clone(), DType::BF16);
+        let weight = Tensor::new_contiguous(client.clone(), device.clone(), [n, k].as_slice().into(), w.clone(), DType::BF16);
+        let project = || mary::models::qwen3_5::gdn_mixer::project(&input, &weight).map_err(anyhow::Error::msg);
+        let reference = project()?;
+        let reference = client.read_one(reference.handle.clone()).map_err(|e| anyhow::anyhow!("{e:?}"))?.to_vec();
+        let t = time(&mut || { project()?; Ok(()) })?;
+        let flops = 2.0 * (m * n * k) as f64;
+        println!("k {k} n {n} uses {uses}: production {t:.3} ms {:.1} TFLOP/s -> {:.1} ms/forward", flops / t / 1e9, t * uses as f64);
+        totals[0] += t * uses as f64;
+        for (ci, &(name, routine, part, stage, dpart, swz)) in candidates.iter().enumerate() {
+            if only.as_deref().is_some_and(|o| !name.contains(o)) { valid[ci + 1] = false; continue; }
+            let strategy = match forced(routine, m, n, k, part, stage, dpart, swz) {
+                Ok(s) => s,
+                Err(e) => { println!("  {name}: setup {e}"); valid[ci + 1] = false; continue; }
+            };
+            let out = client.empty(m * n * 4);
+            let mut run = || -> Result<()> {
+                let bind = |h: &cubecl::server::Handle, shape: [usize; 2], strides: [usize; 2]| TensorBinding::<CudaRuntime> {
+                    handle: h.clone().binding(), shape: shape.into(), strides: strides.into(), runtime: core::marker::PhantomData };
+                let mut dtypes = MatmulElems::from_globals(&MatmulGlobalElems { lhs: bf, rhs: bf, out: f32s });
+                cubek::matmul::launch::launch_ref(&strategy, &client,
+                    InputBinding::new(bind(&a, [m, k], [k, 1]), bf), InputBinding::new(bind(&w, [k, n], [1, k]), bf),
+                    bind(&out, [m, n], [n, 1]), &mut dtypes).map_err(|e| anyhow::anyhow!("{e:?}"))
+            };
+            if let Err(e) = run() { println!("  {name}: launch {e}"); valid[ci + 1] = false; continue; }
+            let got = client.read_one(out.clone()).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            let rounded: Vec<u8> = got.chunks_exact(4).flat_map(|c| bf16::from_f32(f32::from_le_bytes(c.try_into().unwrap())).to_le_bytes()).collect();
+            let differ = rounded.chunks_exact(2).zip(reference.chunks_exact(2)).filter(|(x, y)| x != y).count();
+            let t = time(&mut run)?;
+            println!("  {name}: {t:.3} ms {:.1} TFLOP/s bf16_differ {differ}/{}", flops / t / 1e9, m * n);
+            totals[ci + 1] += t * uses as f64;
+        }
+    }
+    println!("per-forward projection total (m {m}): production {:.1} ms", totals[0]);
+    for (ci, c) in candidates.iter().enumerate() {
+        if valid[ci + 1] { println!("  {}: {:.1} ms (excl. f32->bf16 round)", c.0, totals[ci + 1]); }
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("embed") => embed(&args[1..]),
         Some("compare") => compare(&args[1..]),
+        Some("gemm") => gemm(&args[1..]),
         _ => bail!("usage: wemm_timing embed ... | compare OLD NEW"),
     }
 }
