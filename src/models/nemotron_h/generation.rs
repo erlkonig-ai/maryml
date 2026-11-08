@@ -205,11 +205,13 @@ impl<S: BlobStoreGet> Generator<S> {
         history: &History,
         options: TurnOptions,
     ) -> ReplacementOutcome {
-        self.prepare_history_replacement_sealed(history, options, 0)
+        let admission = self.preflight(history, options);
+        replace_admitted(&mut self.session, admission, 0)
     }
 
     /// [`Self::prepare_history_replacement`], offering to keep the one saved
-    /// prefix at the end of the first `sealed_messages` messages of `history`.
+    /// prefix at the end of the first `sealed_messages` messages of `history`
+    /// (`0`: at the end of the system frame).
     ///
     /// The seal is the exact token rendering of that message prefix
     /// ([`prefix_token_ids`]: whole messages, no generation prompt), and is
@@ -226,7 +228,7 @@ impl<S: BlobStoreGet> Generator<S> {
     ) -> ReplacementOutcome {
         let admission = self.preflight(history, options);
         let seal = match &admission {
-            Ok(admission) if sealed_messages > 0 => prefix_token_ids(
+            Ok(admission) => prefix_token_ids(
                 &self.codec, history, &admission.prompt.token_ids, sealed_messages,
                 options.enable_thinking, options.tools_enabled,
             ).map_or(0, |ids| ids.len()),
@@ -403,11 +405,11 @@ fn admit_prompt(
 /// messages, no generation prompt, the same render options. Refused unless
 /// they are an exact token prefix of `full_ids`, since an adapted rendering
 /// may change earlier tokens and equal text does not imply equal tokens.
-/// `messages == 0` is the empty prefix.
+/// `messages == 0` is the SYSTEM FRAME: the system turn with its tool
+/// schemas, which is a whole-message boundary like any other.
 pub fn prefix_token_ids(codec: &ChatCodec, history: &History, full_ids: &[u32], messages: usize,
     enable_thinking: bool, tools_enabled: bool) -> Result<Vec<u32>>
 {
-    if messages == 0 { return Ok(Vec::new()); }
     ensure!(messages <= history.messages.len(), "prefix boundary exceeds history");
     let mut prefix = history.clone();
     prefix.messages.truncate(messages);
