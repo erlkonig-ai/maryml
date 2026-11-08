@@ -232,6 +232,128 @@ pub fn bf16_linear_launch<R: Runtime>(
     out
 }
 
+/// [`bf16_linear`] for ONE activation row (decode): one plane per 8 output
+/// columns, the whole K in order as m16n8k16 MMAs into one f32 fragment, so
+/// the stored row is byte-identical to row 0 of `bf16_linear` on that row
+/// zero-padded to 16 (every MMA row here reads the single input row; MMA rows
+/// never mix, and only row 0 is stored). Each step stages the 8 weight rows'
+/// next 16*unroll elements through shared memory, so every warp load reads
+/// one row's contiguous 128 bytes. Writes f32 `[n]`.
+#[cube(launch_unchecked)]
+pub fn bf16_linear_row<NA: Size, NC: Size>(
+    a: &Array<Vector<bf16, NA>>,
+    b: &Array<Vector<bf16, NA>>,
+    out: &mut Array<f32>,
+    #[comptime] size_k: usize,
+    #[comptime] unroll: usize,
+) {
+    let def = cmma::MmaDefinition::<bf16, bf16, f32>::new(MTILE, NTILE, KTILE);
+    let lane = UNIT_POS_PLANE;
+    let n_base = CUBE_POS_X as usize * NTILE;
+    let vec = b.vector_size();
+    // 4-byte elements per row per step, and a stride padded by 4 so a
+    // fragment read's 8 rows x 4 lanes land on 32 distinct banks.
+    let row = comptime!(KTILE * unroll / 2);
+    let stride = comptime!(KTILE * unroll / 2 + 4);
+    let mut slab = SharedMemory::<Vector<bf16, NA>>::new(comptime!(8 * (KTILE * unroll / 2 + 4)));
+    let ec_a = def.elems_per_lane(MatrixIdent::A);
+    let vs_a = def.vector_size(MatrixIdent::A);
+    let vc_a = comptime!(ec_a / vs_a);
+    let ec_b = def.elems_per_lane(MatrixIdent::B);
+    let vs_b = def.vector_size(MatrixIdent::B);
+    let vc_b = comptime!(ec_b / vs_b);
+    let ec_c = def.elems_per_lane(MatrixIdent::Accumulator);
+    let vs_c = def.vector_size(MatrixIdent::Accumulator);
+    let vc_c = comptime!(ec_c / vs_c);
+    let mut reg_a = Array::<Vector<bf16, NA>>::new(vc_a);
+    let mut reg_b = Array::<Vector<bf16, NA>>::new(vc_b);
+    let mut acc = Array::<Vector<f32, NC>>::new(vc_c);
+    #[unroll]
+    for i in 0..vc_c {
+        acc[i] = Vector::<f32, NC>::cast_from(0.0f32);
+    }
+    let steps = comptime!(size_k / (KTILE * unroll));
+    let row_elems = size_k / vec;
+    for s in 0..steps {
+        let k0 = s * row;
+        #[unroll]
+        for j in 0..comptime!(KTILE * unroll / 2 * 8 / 32) {
+            let e = j * 32usize + lane as usize;
+            let r = e / row;
+            let c = e % row;
+            slab[r * stride + c] = b[(n_base + r) * row_elems + k0 + c];
+        }
+        sync_cube();
+        #[unroll]
+        for u in 0..unroll {
+            let kbase = (s * unroll + u) * KTILE;
+            #[unroll]
+            for i in 0..vc_a {
+                let (_r, col) = def.position_of_nth(lane, (i * vs_a) as u32, MatrixIdent::A);
+                reg_a[i] = a[(col as usize + kbase) / a.vector_size()];
+            }
+            #[unroll]
+            for i in 0..vc_b {
+                let (k_in, n_in) = def.position_of_nth(lane, (i * vs_b) as u32, MatrixIdent::B);
+                reg_b[i] = slab[n_in as usize * stride + (u * KTILE + k_in as usize) / vec];
+            }
+            let d = def.execute(&reg_a, &reg_b, &acc);
+            #[unroll]
+            for i in 0..vc_c {
+                acc[i] = d[i];
+            }
+        }
+        sync_cube();
+    }
+    #[unroll]
+    for i in 0..vc_c {
+        let (r, col) = def.position_of_nth(lane, (i * vs_c) as u32, MatrixIdent::Accumulator);
+        if r as usize == 0usize {
+            let v = acc[i];
+            let gc = col as usize + n_base;
+            #[unroll]
+            for j in 0..vs_c {
+                out[gc + j] = v[j];
+            }
+        }
+    }
+}
+
+/// K granule of [`bf16_linear_row_launch`].
+pub const ROW_UNROLL: usize = 8;
+
+/// One BF16 row `[k]` times `[n, k]` into fresh f32 `[n]`, byte-identical to
+/// row 0 of [`bf16_linear_launch`]. Requires n % 8 == 0 and k % (16 * 8) == 0.
+pub fn bf16_linear_row_launch<R: Runtime>(
+    client: &ComputeClient<R>,
+    a: &Handle,
+    b: &Handle,
+    k: usize,
+    n: usize,
+) -> Handle {
+    assert_eq!(n % NTILE, 0, "n {n} is not a multiple of {NTILE}");
+    assert_eq!(k % (KTILE * ROW_UNROLL), 0, "k {k} is not a multiple of {}", KTILE * ROW_UNROLL);
+    let out = client.empty(n * core::mem::size_of::<f32>());
+    let vs = 32 / bf16::cube_type().size_bits();
+    // SAFETY: a holds k BF16, b the [n, k] weight; every fragment and slab
+    // load is inside them by the asserts; each plane owns 8 output columns.
+    unsafe {
+        bf16_linear_row::launch_unchecked::<R>(
+            client,
+            CubeCount::new_1d((n / NTILE) as u32),
+            CubeDim::new_1d(32),
+            vs,
+            2,
+            ArrayArg::from_raw_parts(a.clone(), k / vs),
+            ArrayArg::from_raw_parts(b.clone(), n * k / vs),
+            ArrayArg::from_raw_parts(out.clone(), n),
+            k,
+            ROW_UNROLL,
+        );
+    }
+    out
+}
+
 /// Launch [`to_bf16`] over `n_in` f32 elements into an `n_out`-element BF16
 /// buffer, zeroing the tail.
 ///

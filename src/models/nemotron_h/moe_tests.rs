@@ -1009,3 +1009,26 @@ fn moe_gpu_grouped_decode_matches_expert_tiles_bytes() {
         "selections": selections.iter().collect::<Vec<_>>()}));
     assert!(selections.len() > 1, "fixture never varied the selection");
 }
+
+#[test]
+#[ignore = "reserved CUDA: one-row BF16 linear versus row 0 of the padded MMA linear, byte for byte"]
+fn moe_gpu_bf16_linear_row_matches_padded_bytes() {
+    let device = CudaDevice { index: 0 };
+    let client = CudaRuntime::client(&device);
+    for (n, k, seed) in [(EXPERTS, HIDDEN, 3usize), (LATENT, HIDDEN, 5), (HIDDEN, LATENT, 7)] {
+        // Dense weights: every product contributes, so summation order shows.
+        let weight: Vec<u8> = (0..n * k).flat_map(|i| {
+            let v = (((i * 2654435761usize + seed) >> 7) % 2001) as f32 / 1000.0 - 1.0;
+            bf16::from_f32(v * 0.05).to_bits().to_le_bytes()
+        }).collect();
+        let w = client.create_from_slice(&weight);
+        let x: Vec<f32> = (0..k).map(|i| (((i * 29 + seed * 13) % 97) as f32 - 48.0) / 31.0).collect();
+        let x = input(&client, &device, &x, 1, k);
+        // One-row kernel first: it cannot pass on the padded path's freed buffer.
+        let row = client.read_one(bf16gemm::bf16_linear_row_launch(&client, &x.handle, &w, k, n)).unwrap();
+        let padded = bf16gemm::pad_bf16_launch(&client, &x.handle, k, 16 * k);
+        let full = client.read_one(bf16gemm::bf16_linear_launch(&client, &padded, &w, 16, k, n)).unwrap();
+        assert_eq!(&row[..n * 4], &full[..n * 4], "[{n}, {k}] one-row output differs from row 0");
+        assert!(row[..n * 4].iter().any(|&b| b != 0));
+    }
+}

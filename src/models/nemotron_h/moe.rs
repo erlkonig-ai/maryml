@@ -584,6 +584,13 @@ impl Moe {
     }
     fn linear(&self, x: &CudaTensor, weight: &Handle, k: usize, n: usize) -> CudaTensor {
         let t = x.meta.shape().as_slice()[1];
+        if t == 1 && n % bf16gemm::NTILE == 0 && k % (bf16gemm::KTILE * bf16gemm::ROW_UNROLL) == 0
+            && x.handle.offset_start.unwrap_or(0) == 0
+        {
+            // Decode: the one-row kernel, byte-identical to row 0 below.
+            let out = bf16gemm::bf16_linear_row_launch(&self.weights.client, &x.handle, weight, k, n);
+            return self.tensor(out, 1, n, DType::F32);
+        }
         let p = t.div_ceil(16) * 16;
         let padded = bf16gemm::pad_bf16_launch(&self.weights.client, &x.handle, t * k, p * k);
         let out = bf16gemm::bf16_linear_launch(&self.weights.client, &padded, weight, p, k, n);
