@@ -11,7 +11,8 @@
 //! Upload copies every one of the 512 expert pairs into device memory once,
 //! beside the fixed operands, and fences. Forward and prefill only read that
 //! bank; no expert is looked up, validated or uploaded per call.
-//! Each selected expert is fenced after its tile, as is the final result.
+//! Selected experts are enqueued back to back on the one stream; the final
+//! result is fenced once per call (not once per expert).
 //! After dispatch any error/panic poisons this owner until reset succeeds.
 //! An outer hybrid owner must also discard/reset attention AND Mamba history;
 //! resetting this stateless mixer alone cannot undo another layer's effects.
@@ -645,20 +646,12 @@ impl Moe {
                     0,
                     result.is_ok(),
                 );
-                // Retire this expert's scratch, including after setup/observer
-                // failures following the first projection.
-                #[cfg(feature = "nemotron-timing")]
-                let fence_started = host_timing::clock(timing.as_deref());
-                let completion = fence(&self.weights.client);
-                #[cfg(feature = "nemotron-timing")]
-                host_timing::record(
-                    timing.as_deref_mut(),
-                    Phase::ExpertFence,
-                    fence_started,
-                    0,
-                    completion.is_ok(),
-                );
-                finish(result, completion)
+                // No per-expert fence: the bank is resident, so an expert tile
+                // only reads device memory and its scratch is reused in stream
+                // order (one stream), never concurrently live. The mixer fence
+                // in forward_inner still observes every expert's completion
+                // before this call returns, and any queued failure there.
+                result
             })();
             #[cfg(feature = "nemotron-timing")]
             host_timing::record(
