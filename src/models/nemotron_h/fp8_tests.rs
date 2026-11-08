@@ -207,3 +207,117 @@ fn gpu_descriptor_refusals() {
     input.handle.offset_start = Some(u64::MAX);
     assert!(projection.project(&input, 4096).is_err());
 }
+
+#[test]
+#[ignore = "reserved CUDA: one-row decode kernel versus the general MMA path, byte for byte"]
+fn gpu_one_row_decode_matches_general_mma_bytes() {
+    let device = CudaDevice { index: 0 };
+    let client = CudaRuntime::client(&device);
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    // Shapes of the real decode projections' classes, scaled down where N is
+    // large: K 4096/8192 (Mamba in/out, attention), small N (K/V), wide N.
+    for (n, k, input_scale, weight_scale) in [
+        (256usize, 4096usize, 0.0371f32, 0.00213f32),
+        (4096, 8192, 0.0118, 0.00087),
+        (1032, 4096, 0.25, 0.0042),
+        (24, 256, 0.5, 0.25),
+    ] {
+        // Every finite E4M3FN code (0x7f/0xff are NaN; keep them out).
+        let weight: Vec<u8> = (0..n * k).map(|_| {
+            let b = (next() >> 32) as u8;
+            if b & 0x7f == 0x7f { b ^ 0x01 } else { b }
+        }).collect();
+        let values: Vec<f32> = (0..k).map(|_| ((next() >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 6.0).collect();
+        let input = tensor(&client, &device, &values, &[1, 1, k]);
+        let projection = Projection::upload(device.clone(), [n, k], &weight, input_scale, weight_scale, weight.len()).unwrap();
+        let budget = working_bytes(1, [n, k]).unwrap();
+        // One-row kernel first, so it cannot pass on the general path's freed output.
+        let one_row = read_bf16(&projection.project_with(&input, budget, true).unwrap());
+        let general = read_bf16(&projection.project_with(&input, budget, false).unwrap());
+        assert!(one_row.iter().any(|&b| b != 0), "[{n}, {k}] produced all zero bits");
+        let differing = one_row.iter().zip(&general).filter(|(a, b)| a != b).count();
+        assert_eq!(differing, 0, "[{n}, {k}]: {differing} of {n} outputs differ from the general MMA path");
+    }
+}
+
+#[cube(launch_unchecked)]
+fn stream_read(x: &Array<Vector<u32, Const<4>>>, out: &mut Array<u32>, per_thread: usize) {
+    let threads = (CUBE_COUNT_X * CUBE_DIM_X) as usize;
+    let i = ABSOLUTE_POS as usize;
+    let mut acc = 0u32;
+    for j in 0..per_thread {
+        let v = x[i + j * threads];
+        acc ^= v[0] ^ v[1] ^ v[2] ^ v[3];
+    }
+    out[i] = acc;
+}
+
+#[test]
+#[ignore = "reserved CUDA: decode GEMV bandwidth sweep on the real projection shapes, diagnostic only"]
+fn gpu_one_row_gemv_bandwidth_sweep() {
+    use std::time::Instant;
+    let device = CudaDevice { index: 0 };
+    let client = CudaRuntime::client(&device);
+    let fence = || cubecl::future::block_on(client.sync()).unwrap();
+    // Streaming-read ceiling over 1 GiB.
+    let (threads, per) = (48 * 1024 * 8, 128usize);
+    let words = threads * per;
+    let big = client.create_from_slice(&vec![0x5au8; words * 16]);
+    let sink = client.empty(threads * 4);
+    let run_stream = || unsafe {
+        stream_read::launch_unchecked::<CudaRuntime>(&client, CubeCount::new_1d((threads / 256) as u32),
+            CubeDim::new_1d(256), ArrayArg::from_raw_parts(big.clone(), words),
+            ArrayArg::from_raw_parts(sink.clone(), threads), per);
+    };
+    for _ in 0..3 { run_stream(); }
+    fence();
+    let t = Instant::now();
+    for _ in 0..10 { run_stream(); }
+    fence();
+    let s = t.elapsed().as_secs_f64() / 10.0;
+    println!("SWEEP stream_read {:.1} GB/s ({} MiB per pass)", (words * 16) as f64 / s / 1e9, words * 16 >> 20);
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = || { state ^= state << 13; state ^= state >> 7; state ^= state << 17; state };
+    let mut total_bytes = 0f64;
+    let mut best_total = 0f64;
+    let mut general_total = 0f64;
+    let counts = [(18560usize, 4096usize, 40usize), (4096, 8192, 40), (4096, 4096, 16), (256, 4096, 16), (131072, 4096, 1)];
+    let variants = [(4usize, 0usize), (8, 0), (16, 0)];
+    let mut per_variant = vec![0f64; variants.len()];
+    for (n, k, calls) in counts {
+        let weight: Vec<u8> = (0..n * k).map(|_| { let b = (next() >> 32) as u8; if b & 0x7f == 0x7f { b ^ 1 } else { b } }).collect();
+        let w = client.create_from_slice(&weight);
+        let act: Vec<u8> = (0..k).map(|_| { let b = (next() >> 32) as u8; if b & 0x7f == 0x7f { b ^ 1 } else { b } }).collect();
+        let a = client.create_from_slice(&act);
+        let bytes = (n * k) as f64;
+        total_bytes += bytes * calls as f64;
+        let time = |f: &dyn Fn()| { for _ in 0..3 { f(); } fence(); let t = Instant::now(); for _ in 0..20 { f(); } fence(); t.elapsed().as_secs_f64() / 20.0 };
+        let scratch = client.empty(n * 4);
+        let g = time(&|| launch_mma(&client, &a, &w, &scratch, 1, n, k).unwrap());
+        general_total += g * calls as f64;
+        let reference = { let o = client.empty(n * 2); launch_gemv_staged(&client, &a, &w, &o, 0.001, n, k, 8); client.read_one(o).unwrap() };
+        let mut line = format!("SWEEP [{n},{k}] general {:.1} GB/s {:.1} us", bytes / g / 1e9, g * 1e6);
+        let mut best = f64::MAX;
+        for (vi, &(u, p)) in variants.iter().enumerate() {
+            let o = client.empty(n * 2);
+            let _ = p;
+            let s = time(&|| launch_gemv_staged(&client, &a, &w, &o, 0.001, n, k, u));
+            assert_eq!(client.read_one(o).unwrap(), reference, "staged u{u} differs on [{n},{k}]");
+            per_variant[vi] += s * calls as f64;
+            best = best.min(s);
+            line += &format!(" | staged u{u} {:.1} GB/s", bytes / s / 1e9);
+        }
+        best_total += best * calls as f64;
+        println!("{line}");
+    }
+    println!("SWEEP per-token dense FP8 bytes {:.2} GB: general {:.2} ms; per variant {}; best-per-shape {:.2} ms",
+        total_bytes / 1e9, general_total * 1e3,
+        variants.iter().zip(&per_variant).map(|(&(u, _), t)| format!("staged u{u} {:.2} ms", t * 1e3)).collect::<Vec<_>>().join(", "),
+        best_total * 1e3);
+}

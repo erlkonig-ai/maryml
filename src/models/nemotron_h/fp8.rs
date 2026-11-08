@@ -20,7 +20,7 @@ use cubecl::{
     cuda::{CudaDevice, CudaRuntime},
     e4m3,
     features::{MmaConfig, TypeUsage},
-    ir::{ElemType, FloatKind, StorageType},
+    ir::{ElemType, FloatKind, MatrixIdent, StorageType},
     prelude::*,
     server::Handle,
 };
@@ -94,6 +94,12 @@ impl Projection {
     /// Forced native MMA only; unsupported geometry/capability has no fallback.
     /// No caller padding is required: all three MMA bounds checks stay enabled.
     pub fn project(&self, input: &CudaTensor, max_working_bytes: usize) -> Result<CudaTensor> {
+        self.project_with(input, max_working_bytes, true)
+    }
+
+    /// `one_row`: a one-row input whose K is a multiple of GEMV_K takes the
+    /// decode kernel; false forces the general MMA path (the test oracle).
+    fn project_with(&self, input: &CudaTensor, max_working_bytes: usize, one_row: bool) -> Result<CudaTensor> {
         let dims = input.meta.shape().as_slice();
         if dims.len() != 3 || dims[2] != self.shape[1] || input.dtype != DType::BF16
             || input.qparams.is_some() || input.device != self.device
@@ -128,7 +134,6 @@ impl Projection {
         let client = &self.client;
         capability(client)?;
         let quantized = client.empty(input_len);
-        let scratch = client.empty(output_len * 4);
         let output = client.empty(output_len * 2);
         let cube = CubeDim::new_1d(THREADS);
         // SAFETY: checked extents/client/contiguity, fresh destinations; each
@@ -140,6 +145,12 @@ impl Projection {
                 ArrayArg::from_raw_parts(quantized.clone(), input_len), input_len, self.input_scale,
             );
         }
+        if one_row && rows == 1 && k % GEMV_K == 0 {
+            launch_gemv_staged(client, &quantized, &self.weight, &output, self.alpha, n, k, GEMV_UNROLL);
+            return Ok(CubeTensor::new_contiguous(client.clone(), self.device.clone(),
+                [dims[0], dims[1], n].into(), output, DType::BF16));
+        }
+        let scratch = client.empty(output_len * 4);
         launch_mma(client, &quantized, &self.weight, &scratch, rows, n, k)?;
         unsafe {
             finish::launch_unchecked::<CudaRuntime>(
@@ -229,6 +240,121 @@ fn quantize(input: &Array<bf16>, output: &mut Array<e4m3>, len: usize, scale: f3
 fn finish(input: &Array<f32>, output: &mut Array<bf16>, len: usize, alpha: f32) {
     let i = ABSOLUTE_POS as usize;
     if i < len { output[i] = bf16::cast_from(input[i] * alpha); }
+}
+
+/// K-tiles of 32 each decode step stages before its MMAs.
+const GEMV_UNROLL: usize = 8;
+/// The decode kernel's K granule.
+const GEMV_K: usize = 32 * GEMV_UNROLL;
+/// One row times `[n, k]` (decode): one plane per 8 output columns, the
+/// whole K in order, as E4M3 m16n8k32 MMAs into one F32 fragment: the same
+/// instruction and K order as the general path's tiles, so the result is
+/// byte-identical (every MMA row reads the single input row; only row 0 is
+/// stored). Each step stages the 8 weight rows' next 32*unroll bytes through
+/// shared memory so that every warp load reads one row's contiguous 128
+/// bytes; fragments are then read from shared memory at the positions the
+/// MMA definition gives. The epilogue is the general path's `finish` fused
+/// in: BF16(dot * alpha). Measured on GB10 at 220-236 GB/s on the decode
+/// shapes, against a 236 GB/s streaming read.
+#[cube(launch_unchecked)]
+fn gemv_staged<NA: Size, NC: Size>(
+    a: &Array<Vector<e4m3, NA>>,
+    b: &Array<Vector<e4m3, NA>>,
+    out: &mut Array<bf16>,
+    alpha: f32,
+    #[comptime] size_k: usize,
+    #[comptime] unroll: usize,
+) {
+    let def = cmma::MmaDefinition::<e4m3, e4m3, f32>::new(16usize, 8usize, 32usize);
+    let lane = UNIT_POS_PLANE;
+    let n_base = CUBE_POS_X as usize * 8usize;
+    let vec = b.vector_size();
+    // Elements (one 4-byte vector each) per row per step, and the padded row
+    // stride: 4 extra elements put a fragment read's 8 rows x 4 lanes on 32
+    // distinct banks.
+    let row = comptime!(8 * unroll);
+    let stride = comptime!(8 * unroll + 4);
+    let mut slab = SharedMemory::<Vector<e4m3, NA>>::new(comptime!(8 * (8 * unroll + 4)));
+    let ec_a = def.elems_per_lane(MatrixIdent::A);
+    let vs_a = def.vector_size(MatrixIdent::A);
+    let vc_a = comptime!(ec_a / vs_a);
+    let ec_b = def.elems_per_lane(MatrixIdent::B);
+    let vs_b = def.vector_size(MatrixIdent::B);
+    let vc_b = comptime!(ec_b / vs_b);
+    let ec_c = def.elems_per_lane(MatrixIdent::Accumulator);
+    let vs_c = def.vector_size(MatrixIdent::Accumulator);
+    let vc_c = comptime!(ec_c / vs_c);
+    let mut reg_a = Array::<Vector<e4m3, NA>>::new(vc_a);
+    let mut reg_b = Array::<Vector<e4m3, NA>>::new(vc_b);
+    let mut acc = Array::<Vector<f32, NC>>::new(vc_c);
+    #[unroll]
+    for i in 0..vc_c {
+        acc[i] = Vector::<f32, NC>::cast_from(0.0f32);
+    }
+    let steps = comptime!(size_k / (32 * unroll));
+    let row_elems = size_k / vec;
+    for s in 0..steps {
+        let k0 = s * row; // first element of this step in each row
+        #[unroll]
+        for j in 0..comptime!(2 * unroll) {
+            // 8 rows x 8*unroll elements = 2*unroll loads per lane; load j
+            // covers slab elements j*32 .. j*32+31, a quarter row each.
+            let e = j * 32usize + lane as usize;
+            let r = e / row;
+            let c = e % row;
+            slab[r * stride + c] = b[(n_base + r) * row_elems + k0 + c];
+        }
+        sync_cube();
+        #[unroll]
+        for u in 0..unroll {
+            let kbase = (s * unroll + u) * 32usize;
+            #[unroll]
+            for i in 0..vc_a {
+                let (_r, col) = def.position_of_nth(lane, (i * vs_a) as u32, MatrixIdent::A);
+                reg_a[i] = a[(col as usize + kbase) / a.vector_size()];
+            }
+            #[unroll]
+            for i in 0..vc_b {
+                let (k_in, n_in) = def.position_of_nth(lane, (i * vs_b) as u32, MatrixIdent::B);
+                reg_b[i] = slab[n_in as usize * stride + (u * 32usize + k_in as usize) / vec];
+            }
+            let d = def.execute(&reg_a, &reg_b, &acc);
+            #[unroll]
+            for i in 0..vc_c {
+                acc[i] = d[i];
+            }
+        }
+        sync_cube();
+    }
+    #[unroll]
+    for i in 0..vc_c {
+        let (r, col) = def.position_of_nth(lane, (i * vs_c) as u32, MatrixIdent::Accumulator);
+        if r as usize == 0usize {
+            let v = acc[i];
+            let gc = col as usize + n_base;
+            #[unroll]
+            for j in 0..vs_c {
+                out[gc + j] = bf16::cast_from(v[j] * alpha);
+            }
+        }
+    }
+}
+
+fn launch_gemv_staged(client: &ComputeClient<CudaRuntime>, a: &Handle, weight: &Handle, out: &Handle,
+    alpha: f32, n: usize, k: usize, unroll: usize)
+{
+    let vs = 32 / e4m3::cube_type().size_bits();
+    // SAFETY: n % 8 == 0 and k % (32 * unroll) == 0 bound every fragment and
+    // slab load; each plane owns 8 output columns; the slab holds 8 rows of
+    // one step, and every lane syncs before and after reading it.
+    unsafe {
+        gemv_staged::launch_unchecked::<CudaRuntime>(
+            client, CubeCount::new_1d((n / 8) as u32), CubeDim::new_1d(32), vs, 2,
+            ArrayArg::from_raw_parts(a.clone(), k / vs),
+            ArrayArg::from_raw_parts(weight.clone(), n * k / vs),
+            ArrayArg::from_raw_parts(out.clone(), n), alpha, k, unroll,
+        );
+    }
 }
 
 fn blueprint(m: usize, n: usize, k: usize) -> Result<TilingBlueprint> {
