@@ -1493,3 +1493,41 @@ fn session_gpu_deferred_decode_error_between_grouped_launches() {
     let again = session.append_ids(&[7]).unwrap().values.to_vec();
     assert!(clean.iter().zip(&again).all(|(x, y)| x.to_bits() == y.to_bits()), "recovery differs");
 }
+
+#[test]
+#[ignore = "reserved CUDA: dropping a session with queued work drains it first; a clean drop does not"]
+fn session_gpu_drop_settles_queued_work() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (snapshot, source, ids) = fixture_layers(8, 512, Some(&MIDDLE_MOE));
+    let open = || Session::from_snapshot(snapshot.clone(), source, &ids, CudaDevice { index: 0 }, middle_limits()).unwrap();
+    let clean = {
+        let mut s = open();
+        s.append_ids(&[1, 5]).unwrap();
+        s.append_ids(&[7]).unwrap().values.to_vec()
+    };
+    let start = DROP_DRAINS.load(Relaxed);
+    assert_eq!(start, DROP_DRAINS.load(Relaxed), "a clean, ready session drops without a drain");
+    {
+        let mut s = open();
+        s.append_ids(&[1, 5]).unwrap();
+        s.fault = Some(Fault::NanBefore(1));
+        assert!(s.append_ids(&[7]).is_err());
+        assert!(!s.pending.is_empty());
+    } // dropped poisoned, with pending queued work
+    assert_eq!(DROP_DRAINS.load(Relaxed), start + 1, "poisoned drop drains");
+    {
+        let mut s = open();
+        s.append_ids(&[1, 5]).unwrap();
+        s.fault = Some(Fault::PanicAfterLayer(2));
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| { let _ = s.append_ids(&[7]); })).is_err());
+        assert_eq!(s.status(), Status::Poisoned);
+    } // dropped after an unwind mid-token
+    assert_eq!(DROP_DRAINS.load(Relaxed), start + 2, "drop after unwind drains");
+    // The device is healthy: a new session gives the clean result bit for bit.
+    let mut s = open();
+    s.append_ids(&[1, 5]).unwrap();
+    let again = s.append_ids(&[7]).unwrap().values.to_vec();
+    assert!(clean.iter().zip(&again).all(|(x, y)| x.to_bits() == y.to_bits()));
+    drop(s);
+    assert_eq!(DROP_DRAINS.load(Relaxed), start + 2, "a clean drop does not drain");
+}

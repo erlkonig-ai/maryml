@@ -984,6 +984,28 @@ impl<S: BlobStoreGet> Session<S> {
     }
 }
 
+/// Dropping a session that still owns queued work (poisoned after an error
+/// or unwind, or with pending intermediates) first settles it: a fence on
+/// the session's stream, so no launch can still be reading or writing a
+/// buffer this drop is about to free. Errors are logged, never raised.
+impl<S> Drop for Session<S> {
+    fn drop(&mut self) {
+        if self.status == Status::Ready && self.pending.is_empty() && self.span_pending.is_none() {
+            return;
+        }
+        let client = &self.model.client;
+        let settled = self.stream.executes(|| cubecl::future::block_on(client.sync()));
+        #[cfg(test)]
+        DROP_DRAINS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Err(error) = settled {
+            tracing::warn!(target: "mary.nemotron.session",
+                "dropping a session with queued work: settling fence failed: {error:?}");
+        }
+    }
+}
+#[cfg(test)]
+pub(super) static DROP_DRAINS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 // Both ordinary short append and span prefill share this exact layer dispatch.
 // Caller owns publication and chooses when a successful tile may be retired.
 fn enqueue_layer_tile(layer: &mut Layer, x: &CudaTensor,
