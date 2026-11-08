@@ -174,6 +174,13 @@ struct Bank {
     down_scales: Handle,
     down_input: Handle,
     down_alpha: Handle,
+    /// The shared expert as two one-expert banks for the decode path: ID 0
+    /// plus each side's input scale and epilogue product.
+    zero: Handle,
+    shared_up_input: Handle,
+    shared_up_alpha: Handle,
+    shared_down_input: Handle,
+    shared_down_alpha: Handle,
 }
 
 #[cube(launch_unchecked)]
@@ -193,6 +200,7 @@ fn upload_bank<P: ExpertProvider>(
     provider: &P,
     client: &ComputeClient<CudaRuntime>,
     device: &CudaDevice,
+    shared: [&PackedWeight; 2],
 ) -> Result<(Vec<(PackedWeight, PackedWeight)>, Bank)> {
     let (up_c, up_s) = (INTERMEDIATE * LATENT / 2, INTERMEDIATE * LATENT / 16);
     let (down_c, down_s) = (LATENT * INTERMEDIATE / 2, LATENT * INTERMEDIATE / 16);
@@ -240,7 +248,14 @@ fn upload_bank<P: ExpertProvider>(
     let [up_codes, up_scales, down_codes, down_scales] = planes;
     let [up_input, up_alpha, down_input, down_alpha] =
         scales.map(|v| client.create_from_slice(f32::as_bytes(&v)));
-    Ok((experts, Bank { up_codes, up_scales, up_input, up_alpha, down_codes, down_scales, down_input, down_alpha }))
+    let one = |v: f32| client.create_from_slice(f32::as_bytes(&[v]));
+    let (su, sd) = (shared[0], shared[1]);
+    let su_alpha = calibrated_scale(su.input_scale, su.weight.scale2).map_err(|e| e.to_string())?;
+    let sd_alpha = calibrated_scale(sd.input_scale, sd.weight.scale2).map_err(|e| e.to_string())?;
+    Ok((experts, Bank { up_codes, up_scales, up_input, up_alpha, down_codes, down_scales, down_input, down_alpha,
+        zero: client.create_from_slice(u32::as_bytes(&[0u32])),
+        shared_up_input: one(su.input_scale), shared_up_alpha: one(su_alpha),
+        shared_down_input: one(sd.input_scale), shared_down_alpha: one(sd_alpha) }))
 }
 
 pub struct Moe {
@@ -477,7 +492,9 @@ impl Moe {
             fixed.shared_down.operation,
         ];
         let uploaded = (|| -> Result<Weights> {
-            let (experts, bank) = upload_bank(provider, &client, &device)?;
+            let shared_up = PackedWeight::upload(&fixed.shared_up, SHARED, HIDDEN, &device)?;
+            let shared_down = PackedWeight::upload(&fixed.shared_down, HIDDEN, SHARED, &device)?;
+            let (experts, bank) = upload_bank(provider, &client, &device, [&shared_up, &shared_down])?;
             let weights = Weights {
                 source,
                 fixed_operations,
@@ -485,8 +502,8 @@ impl Moe {
                 bias: client.create_from_slice(f32::as_bytes(fixed.correction_bias)),
                 fc1: client.create_from_slice(fixed.fc1_bf16),
                 fc2: client.create_from_slice(fixed.fc2_bf16),
-                shared_up: PackedWeight::upload(&fixed.shared_up, SHARED, HIDDEN, &device)?,
-                shared_down: PackedWeight::upload(&fixed.shared_down, HIDDEN, SHARED, &device)?,
+                shared_up,
+                shared_down,
                 experts,
                 bank,
                 client: client.clone(),
@@ -836,6 +853,27 @@ impl Moe {
             .map_err(|e| e.to_string())
     }
 
+    /// Decode (t == 1): the shared expert's two projections as one-group
+    /// launches of the staged grouped W4A4 kernel over a one-expert bank (the
+    /// shared weight's own planes), byte-identical to `project_w4a4_scaled`
+    /// on that row. Returns (up, ReLU2, down).
+    fn shared_decode(&self, x: &CudaTensor) -> Result<(CudaTensor, CudaTensor, CudaTensor)> {
+        let client = &self.weights.client;
+        let b = &self.weights.bank;
+        let (su, sd) = (&self.weights.shared_up.weight, &self.weights.shared_down.weight);
+        let up = GroupedBank { codes: &su.codes, scales: &su.scales, input_scale: &b.shared_up_input,
+            alpha: &b.shared_up_alpha, experts: 1, n: SHARED, k: HIDDEN };
+        let down = GroupedBank { codes: &sd.codes, scales: &sd.scales, input_scale: &b.shared_down_input,
+            alpha: &b.shared_down_alpha, experts: 1, n: HIDDEN, k: SHARED };
+        let high = nvfp4_gemm::w4a4_grouped_bf16(client, &x.handle, false, &b.zero, 1, &up)
+            .map_err(|e| e.to_string())?;
+        let high = self.tensor(high, 1, SHARED, DType::BF16);
+        let active = self.relu2(&high);
+        let low = nvfp4_gemm::w4a4_grouped_bf16(client, &active.handle, true, &b.zero, 1, &down)
+            .map_err(|e| e.to_string())?;
+        Ok((high, active, self.tensor(low, 1, HIDDEN, DType::BF16)))
+    }
+
     fn route_tile(&self, x: &CudaTensor, t: usize,
         observe: &mut impl FnMut(&str, &CudaTensor) -> Result<()>,
         mut held: Option<&mut Vec<CudaTensor>>) -> Result<(Routing, CudaTensor)>
@@ -898,11 +936,18 @@ impl Moe {
         hold(&expanded_f32);
         let expanded = self.narrow(&expanded_f32);
         hold(&expanded);
-        let shared_up = self.weights.shared_up.project(x)?;
+        let (shared_up, shared_active, shared) = if t == 1 && self.grouped_decode
+            && x.handle.offset_start.unwrap_or(0) == 0
+        {
+            self.shared_decode(x)?
+        } else {
+            let up = self.weights.shared_up.project(x)?;
+            let active = self.relu2(&up);
+            let down = self.weights.shared_down.project(&active)?;
+            (up, active, down)
+        };
         hold(&shared_up);
-        let shared_active = self.relu2(&shared_up);
         hold(&shared_active);
-        let shared = self.weights.shared_down.project(&shared_active)?;
         hold(&shared);
         observe("expanded", &expanded)?;
         observe("shared_up", &shared_up)?;
