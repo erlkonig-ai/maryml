@@ -31,7 +31,7 @@ impl CudaRowEncoder4096 {
         Ok(Self {
             client: CudaRuntime::client(&device), device,
             kernel: RawCudaKernel::new("encode_nvfp4_4096",
-                include_str!("cuda_encode.cu"), CubeDim::new_1d(1)),
+                include_str!("cuda_encode.cu"), CubeDim::new_1d(256)),
         })
     }
 

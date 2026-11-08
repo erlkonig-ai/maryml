@@ -87,34 +87,48 @@ __device__ double distance(const double* left, const double* right) {
     }
     return up(__dsqrt_rn(squared));
 }
-__device__ bool quantize(const double* values, unsigned char* out) {
+// One block per unit (256 units, 256 blocks of 16). The maximum is
+// order-free, and every byte is the same expression of the same values as in
+// the one-unit recipe this replaces, so the encoding is unchanged.
+__device__ bool quantize(const double* values, unsigned char* out, double* red, float* unused) {
+    const int t = threadIdx.x;
     double a = 0.0;
-    for (int i = 0; i < 4096; ++i) {
+    for (int i = t; i < 4096; i += 256) {
         double v = magnitude(values[i]); a = v > a ? v : a;
     }
+    red[t] = a;
+    __syncthreads();
+    if (t == 0) {
+        double m = 0.0;
+        for (int i = 0; i < 256; ++i) m = red[i] > m ? red[i] : m;
+        red[256] = m;
+    }
+    __syncthreads();
+    a = red[256];
     if (a == 0.0) {
-        for (int i = 0; i < 2308; ++i) out[i] = 0;
+        for (int i = t; i < 2308; i += 256) out[i] = 0;
+        __syncthreads();
         return true;
     }
     float global = __double2float_rn(__ddiv_rn(a, 2688.0));
     if (!(global > 0.0f) || (__float_as_uint(global) & 0x7f800000u) == 0x7f800000u)
         return false;
-    put_f32(out, global);
-    for (int block = 0; block < 256; ++block) {
-        a = 0.0;
-        for (int j = 0; j < 16; ++j) {
-            double v = magnitude(values[block * 16 + j]); a = v > a ? v : a;
-        }
-        unsigned char scale = a == 0.0 ? 0 : encode4(__ddiv_rn(a, __dmul_rn(6.0, (double)global)));
-        out[4 + block] = scale;
-        double decoded = __dmul_rn((double)global, e4(scale));
-        for (int j = 0; j < 8; ++j) {
-            int i = block * 16 + j * 2;
-            unsigned char low = decoded == 0.0 ? 0 : encode2(__ddiv_rn(values[i], decoded));
-            unsigned char high = decoded == 0.0 ? 0 : encode2(__ddiv_rn(values[i + 1], decoded));
-            out[260 + block * 8 + j] = low | (high << 4);
-        }
+    if (t == 0) put_f32(out, global);
+    int block = t;
+    a = 0.0;
+    for (int j = 0; j < 16; ++j) {
+        double v = magnitude(values[block * 16 + j]); a = v > a ? v : a;
     }
+    unsigned char scale = a == 0.0 ? 0 : encode4(__ddiv_rn(a, __dmul_rn(6.0, (double)global)));
+    out[4 + block] = scale;
+    double decoded = __dmul_rn((double)global, e4(scale));
+    for (int j = 0; j < 8; ++j) {
+        int i = block * 16 + j * 2;
+        unsigned char low = decoded == 0.0 ? 0 : encode2(__ddiv_rn(values[i], decoded));
+        unsigned char high = decoded == 0.0 ? 0 : encode2(__ddiv_rn(values[i + 1], decoded));
+        out[260 + block * 8 + j] = low | (high << 4);
+    }
+    __syncthreads();
     return true;
 }
 __device__ double decode(const unsigned char* stage, int i) {
@@ -129,26 +143,38 @@ __device__ float decode32(const unsigned char* out, int i) {
     float first = __fmaf_rn((float)e2(i & 1 ? pb >> 4 : pb & 15), p, 0.0f);
     return __fmaf_rn((float)e2(i & 1 ? cb >> 4 : cb & 15), c, first);
 }
-extern "C" __global__ void __launch_bounds__(1) encode_nvfp4_4096(
+// 256 units. Sums whose order the certificate depends on (the row norm and
+// the three error sums) stay on unit 0 in their original order; everything
+// elementwise is spread over the block.
+extern "C" __global__ void __launch_bounds__(256) encode_nvfp4_4096(
     const unsigned short* __restrict__ input,
     double* __restrict__ scratch,
     unsigned char* __restrict__ out,
     unsigned int* __restrict__ status
 ) {
+    __shared__ double red[257];
+    __shared__ int failed;
+    const int t = threadIdx.x;
     double* normalized = scratch;
     double* transformed = scratch + 4096;
     double* residual = scratch + 8192;
     double* reconstruction = scratch + 12288;
-    status[0] = 1;
-    double sum = 0.0;
-    for (int i = 0; i < 4096; ++i) {
-        unsigned int bits = ((unsigned int)input[i]) << 16;
-        if ((bits & 0x7f800000u) == 0x7f800000u) return;
-        double value = (double)__uint_as_float(bits);
-        sum = __dadd_rn(sum, __dmul_rn(value, value));
+    if (t == 0) {
+        status[0] = 1;
+        failed = 0;
+        double sum = 0.0;
+        for (int i = 0; i < 4096; ++i) {
+            unsigned int bits = ((unsigned int)input[i]) << 16;
+            if ((bits & 0x7f800000u) == 0x7f800000u) { failed = 1; break; }
+            double value = (double)__uint_as_float(bits);
+            sum = __dadd_rn(sum, __dmul_rn(value, value));
+        }
+        red[0] = __dsqrt_rn(sum);
     }
-    double denominator = __dsqrt_rn(sum);
-    for (int i = 0; i < 4096; ++i) {
+    __syncthreads();
+    if (failed) return;
+    double denominator = red[0];
+    for (int i = t; i < 4096; i += 256) {
         double value = (double)__uint_as_float(((unsigned int)input[i]) << 16);
         normalized[i] = denominator == 0.0 ? 0.0 : __ddiv_rn(value, denominator);
         unsigned long long sign = ((unsigned long long)i) ^ 0x6B3F7B4CDA9E0673ULL;
@@ -158,33 +184,46 @@ extern "C" __global__ void __launch_bounds__(1) encode_nvfp4_4096(
         sign ^= sign >> 31;
         transformed[i] = sign & 1 ? -normalized[i] : normalized[i];
     }
-    for (int block = 0; block < 4096; block += 256) {
-        for (int width = 1; width < 256; width *= 2) {
-            for (int start = 0; start < 256; start += width * 2) {
-                for (int j = 0; j < width; ++j) {
-                    double low = transformed[block + start + j];
-                    double high = transformed[block + start + width + j];
-                    transformed[block + start + j] = __dadd_rn(low, high);
-                    transformed[block + start + width + j] = __dsub_rn(low, high);
-                }
-            }
+    __syncthreads();
+    // 16 independent 256-point butterflies; each level's 2048 pairs are
+    // disjoint, so a level is one parallel step.
+    for (int width = 1; width < 256; width *= 2) {
+        for (int p = t; p < 2048; p += 256) {
+            int block = (p / 128) * 256;
+            int q = p % 128;
+            int start = (q / width) * width * 2;
+            int j = q % width;
+            double low = transformed[block + start + j];
+            double high = transformed[block + start + width + j];
+            transformed[block + start + j] = __dadd_rn(low, high);
+            transformed[block + start + width + j] = __dsub_rn(low, high);
         }
-        for (int i = 0; i < 256; ++i) transformed[block + i] = __dmul_rn(transformed[block + i], 0.0625);
+        __syncthreads();
     }
-    status[0] = 2;
-    if (!quantize(transformed, out)) return;
-    for (int i = 0; i < 4096; ++i) residual[i] = __dsub_rn(transformed[i], decode(out, i));
-    if (!quantize(residual, out + 2308)) return;
-    for (int i = 0; i < 4096; ++i) reconstruction[i] = __dadd_rn(decode(out, i), decode(out + 2308, i));
+    for (int i = t; i < 4096; i += 256) transformed[i] = __dmul_rn(transformed[i], 0.0625);
+    __syncthreads();
+    if (t == 0) status[0] = 2;
+    if (!quantize(transformed, out, red, 0)) return;
+    for (int i = t; i < 4096; i += 256) residual[i] = __dsub_rn(transformed[i], decode(out, i));
+    __syncthreads();
+    if (!quantize(residual, out + 2308, red, 0)) return;
+    for (int i = t; i < 4096; i += 256) reconstruction[i] = __dadd_rn(decode(out, i), decode(out + 2308, i));
+    __syncthreads();
     double numerator = mul_up(8.0, 0x1p-53);
     double gamma_denominator = __dsub_rn(1.0, numerator);
     gamma_denominator = __longlong_as_double(__double_as_longlong(gamma_denominator) - 1LL);
     double gamma = up(__ddiv_rn(numerator, gamma_denominator));
-    double allowance = mul_up(mul_up(16.0, gamma), norm(normalized));
-    double source_error = add_up(distance(transformed, reconstruction), allowance);
-    for (int i = 0; i < 4096; ++i) residual[i] = (double)decode32(out, i);
-    double decode_error = distance(reconstruction, residual);
-    put_f32(out + 4616, upward_f32(norm(reconstruction)));
-    put_f32(out + 4620, upward_f32(source_error > decode_error ? source_error : decode_error));
-    status[0] = 0;
+    if (t == 0) {
+        double allowance = mul_up(mul_up(16.0, gamma), norm(normalized));
+        red[0] = add_up(distance(transformed, reconstruction), allowance);
+    }
+    for (int i = t; i < 4096; i += 256) residual[i] = (double)decode32(out, i);
+    __syncthreads();
+    if (t == 0) {
+        double source_error = red[0];
+        double decode_error = distance(reconstruction, residual);
+        put_f32(out + 4616, upward_f32(norm(reconstruction)));
+        put_f32(out + 4620, upward_f32(source_error > decode_error ? source_error : decode_error));
+        status[0] = 0;
+    }
 }
