@@ -1143,3 +1143,42 @@ fn moe_gpu_deferred_decode_matches_forward_bytes() {
     assert!(forward.routing.cutoff_margins.iter().all(|&m| m == 0.0), "a zero margin witnesses the tie");
     assert_eq!(raw(&values), raw(&forward.values), "tied route values differ");
 }
+
+#[test]
+#[ignore = "reserved CUDA: parallel branch sum versus the one-thread sum, outputs and flags byte for byte"]
+fn moe_gpu_parallel_sum_matches_serial_bytes() {
+    let device = CudaDevice { index: 0 };
+    let client = CudaRuntime::client(&device);
+    for t in [1usize, 3, 17] {
+        let mut a: Vec<f32> = (0..t * HIDDEN).map(|i| (((i * 7919) % 2003) as f32 - 1001.0) / 97.0).collect();
+        let b: Vec<f32> = (0..t * HIDDEN).map(|i| (((i * 104729) % 1999) as f32 - 999.0) / 89.0).collect();
+        // Nonfinite rows: a NaN in row 1, an Inf in the last row.
+        if t > 1 { a[HIDDEN + 4000] = f32::NAN; }
+        if t > 2 { a[(t - 1) * HIDDEN + 17] = f32::INFINITY; }
+        let (a, b) = (input(&client, &device, &a, t, HIDDEN), input(&client, &device, &b, t, HIDDEN));
+        let run = |serial: bool| {
+            let out = client.create_from_slice(&vec![if serial { 0x11u8 } else { 0x22u8 }; t * HIDDEN * 2]);
+            let flags = client.create_from_slice(&vec![if serial { 7u8 } else { 9u8 }; t * 4]);
+            unsafe {
+                let args = (ArrayArg::from_raw_parts(a.handle.clone(), t * HIDDEN),
+                    ArrayArg::from_raw_parts(b.handle.clone(), t * HIDDEN),
+                    ArrayArg::from_raw_parts(out.clone(), t * HIDDEN), ArrayArg::from_raw_parts(flags.clone(), t));
+                if serial {
+                    sum_kernel_serial::launch_unchecked::<CudaRuntime>(&client, CubeCount::new_1d(t.div_ceil(THREADS as usize) as u32),
+                        CubeDim::new_1d(THREADS), args.0, args.1, args.2, args.3, t);
+                } else {
+                    sum_kernel::launch_unchecked::<CudaRuntime>(&client, CubeCount::new_1d(t as u32),
+                        CubeDim::new_1d(SUM_UNITS as u32), args.0, args.1, args.2, args.3, t);
+                }
+            }
+            (client.read_one(out).unwrap()[..t * HIDDEN * 2].to_vec(), client.read_one(flags).unwrap()[..t * 4].to_vec())
+        };
+        let (parallel, serial) = (run(false), run(true)); // the new kernel first
+        assert_eq!(parallel.0, serial.0, "t {t}: sums differ");
+        assert_eq!(parallel.1, serial.1, "t {t}: flags differ");
+        let flag = |r: usize| u32::from_le_bytes(serial.1[r * 4..r * 4 + 4].try_into().unwrap());
+        assert_eq!(flag(0), 0);
+        if t > 1 { assert_eq!(flag(1), 1, "NaN row flagged"); }
+        if t > 2 { assert_eq!(flag(t - 1), 1, "Inf row flagged"); }
+    }
+}

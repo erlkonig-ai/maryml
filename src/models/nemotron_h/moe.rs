@@ -1132,8 +1132,8 @@ impl Moe {
         unsafe {
             sum_kernel::launch_unchecked::<CudaRuntime>(
                 &self.weights.client,
-                CubeCount::new_1d(t.div_ceil(THREADS as usize) as u32),
-                CubeDim::new_1d(THREADS),
+                CubeCount::new_1d(t as u32),
+                CubeDim::new_1d(SUM_UNITS as u32),
                 ArrayArg::from_raw_parts(expanded.handle.clone(), t * HIDDEN),
                 ArrayArg::from_raw_parts(shared.handle.clone(), t * HIDDEN),
                 ArrayArg::from_raw_parts(out.clone(), t * HIDDEN),
@@ -1564,8 +1564,48 @@ fn copy_kernel(x: &Array<bf16>, out: &mut Array<bf16>, n: usize, offset: usize) 
         out[offset + i] = x[i];
     }
 }
+/// One cube of SUM_UNITS per token. Every output element is the same single
+/// BF16(F32(a) + F32(b)) as before (elements are independent; there is no
+/// cross-element sum), so the outputs are byte-identical; the per-token flag
+/// is the OR of the units' nonfinite flags, written by unit 0.
 #[cube(launch_unchecked)]
 fn sum_kernel(
+    a: &Array<bf16>,
+    b: &Array<bf16>,
+    out: &mut Array<bf16>,
+    flags: &mut Array<u32>,
+    t: usize,
+) {
+    let row = CUBE_POS_X as usize;
+    let u = UNIT_POS_X as usize;
+    let mut seen = SharedMemory::<u32>::new(SUM_UNITS);
+    let mut bad = 0u32;
+    if row < t {
+        for j in 0..HIDDEN / SUM_UNITS {
+            let at = row * HIDDEN + j * SUM_UNITS + u;
+            let v = bf16::cast_from(f32::cast_from(a[at]) + f32::cast_from(b[at]));
+            out[at] = v;
+            if !finite(f32::cast_from(v)) {
+                bad = 1u32;
+            }
+        }
+    }
+    seen[u] = bad;
+    sync_cube();
+    if u == 0usize && row < t {
+        let mut any = 0u32;
+        for i in 0..SUM_UNITS {
+            any |= seen[i];
+        }
+        flags[row] = any;
+    }
+}
+const SUM_UNITS: usize = 256;
+
+/// The original one-thread-per-token sum, kept as the test oracle.
+#[cfg(test)]
+#[cube(launch_unchecked)]
+fn sum_kernel_serial(
     a: &Array<bf16>,
     b: &Array<bf16>,
     out: &mut Array<bf16>,
