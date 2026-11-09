@@ -79,10 +79,29 @@ impl InputCodec {
         content.len() > limit && content.bytes().filter(|&b| b != b'\n').nth(limit).is_some()
     }
 
+    /// True only if [`Self::text`] of `longer` returns exactly what it
+    /// returns for `shorter`, decided without tokenizing, where `longer`
+    /// starts with `shorter` (the caller's promise). [`Self::text`] reads its
+    /// argument twice: its raw length against [`MAX_TEXT_BYTES`], and
+    /// otherwise only `template_trim` of it. Characters the template trims
+    /// at the end change neither trimmed result, so when every character
+    /// `longer` adds is one of them, both texts give one answer unless the
+    /// added bytes carry `longer` past [`MAX_TEXT_BYTES`]. When `shorter` is
+    /// already past it, both are the same refusal. [`Self::surely_exceeds`]
+    /// reads only the trimmed content too, so it agrees as well. False says
+    /// nothing. The cost is the added bytes, not the whole text.
+    pub fn same_text(shorter: &str, longer: &str) -> bool {
+        shorter.len() > MAX_TEXT_BYTES
+            || (longer.len() <= MAX_TEXT_BYTES
+                && longer
+                    .get(shorter.len()..)
+                    .is_some_and(|added| added.chars().all(template_space)))
+    }
+
     /// Supported template: one user text message, no generation prompt/tools.
     /// Trim semantics match this exact template's render_content|trim branch.
     pub fn text(&self, text: &str) -> Result<Tokens, String> {
-        if text.len() > 1024 * 1024 {
+        if text.len() > MAX_TEXT_BYTES {
             return Err("bounded WeMM text exceeds1MiB; nothing truncated".into());
         }
         let content = template_trim(text);
@@ -131,8 +150,14 @@ impl InputCodec {
 /// which also includes the four ASCII separators not in Rust's Unicode
 /// White_Space property.
 fn template_trim(text: &str) -> &str {
-    text.trim_matches(|c: char| c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c))
+    text.trim_matches(template_space)
 }
+fn template_space(c: char) -> bool {
+    c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
+}
+
+/// The longest text [`InputCodec::text`] reads, in bytes, before trimming.
+pub const MAX_TEXT_BYTES: usize = 1024 * 1024;
 
 /// Twice the most UTF-8 bytes NFC can turn into one byte: 7, so the ratio is
 /// 3.5. [`tests::nfc_shrinks_utf8_at_most_three_and_a_half_times`] proves it
@@ -286,6 +311,32 @@ mod tests {
     }
 
     #[test]
+    fn same_text_only_for_trimmed_additions_within_the_size_bound() {
+        assert!(InputCodec::same_text("a b", "a b"));
+        assert!(InputCodec::same_text(
+            "a b",
+            "a b \n\t\r\u{1c}\u{1f}\u{85}\u{3000}"
+        ));
+        assert!(!InputCodec::same_text("a b", "a b c"));
+        assert!(!InputCodec::same_text("a", "a\n\u{200b}"));
+        let x = "x".repeat(MAX_TEXT_BYTES + 2);
+        let at = |n: usize| &x[..n];
+        let padded = |n: usize, pad: usize| format!("{}{}", at(n), "\n".repeat(pad));
+        assert!(InputCodec::same_text(
+            at(MAX_TEXT_BYTES - 2),
+            &padded(MAX_TEXT_BYTES - 2, 2)
+        ));
+        assert!(!InputCodec::same_text(
+            at(MAX_TEXT_BYTES - 2),
+            &padded(MAX_TEXT_BYTES - 2, 3)
+        ));
+        assert!(InputCodec::same_text(
+            at(MAX_TEXT_BYTES + 1),
+            at(MAX_TEXT_BYTES + 2)
+        ));
+    }
+
+    #[test]
     #[ignore = "requires exact local checkpoint assets, metadata only; no GPU"]
     fn surely_exceeds_is_proven_for_the_checkpoint_and_agrees_with_text() {
         let root = std::path::PathBuf::from(
@@ -311,6 +362,21 @@ mod tests {
         let spaces = format!("x{}x", " ".repeat(448 * 248));
         assert!(codec.surely_exceeds(&format!("{spaces}y"), 248));
         assert!(ids(&spaces).map_or(true, |n| n > 248));
+        // Wherever same_text says yes, text gives the same answer.
+        let answer = |s: &str| codec.text(s).map(|t| t.as_slice().to_vec());
+        let near = "y".repeat(MAX_TEXT_BYTES - 3);
+        for (shorter, added) in [
+            ("one two", "\n\n\n"),
+            ("one two\n", " \t\u{1c}\u{3000}\n"),
+            ("", "\n"),
+            (near.as_str(), "\n\n\n"),
+            (near.as_str(), "\n\n\n\n"),
+        ] {
+            let longer = format!("{shorter}{added}");
+            if InputCodec::same_text(shorter, &longer) {
+                assert_eq!(answer(shorter), answer(&longer), "{added:?}");
+            }
+        }
         // Wherever it says yes, text agrees, on a few shapes near the bound.
         for unit in [
             "word ",
