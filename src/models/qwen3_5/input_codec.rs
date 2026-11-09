@@ -27,6 +27,8 @@ impl Tokens {
 #[derive(Clone)]
 pub struct InputCodec {
     tokenizer: tokenizers::Tokenizer,
+    /// [`content_bytes_per_id`] of `tokenizer`, for [`Self::surely_exceeds`].
+    content_bytes_per_id: Option<usize>,
 }
 impl InputCodec {
     /// From the checkpoint's own `tokenizer.json` bytes, pinned by
@@ -54,7 +56,27 @@ impl InputCodec {
         if tokenizer.get_truncation().is_some() || tokenizer.get_padding().is_some() {
             return Err("pinned tokenizer unexpectedly enables padding/truncation".into());
         }
-        Ok(Self { tokenizer })
+        let content_bytes_per_id = content_bytes_per_id(&tokenizer);
+        Ok(Self {
+            tokenizer,
+            content_bytes_per_id,
+        })
+    }
+
+    /// True only if [`Self::text`] of `text` refuses or frames more than
+    /// `max_ids` IDs, decided without tokenizing: the content [`Self::text`]
+    /// encodes holds more bytes other than `\n` than `max_ids` IDs can stand
+    /// for ([`content_bytes_per_id`]). False says nothing. A caller may skip
+    /// [`Self::text`] when this is true and gets exactly the answer it would
+    /// have computed; it is never true for a tokenizer the bound is not
+    /// proven for.
+    pub fn surely_exceeds(&self, text: &str, max_ids: usize) -> bool {
+        let Some(per_id) = self.content_bytes_per_id else {
+            return false;
+        };
+        let limit = per_id.saturating_mul(max_ids);
+        let content = template_trim(text);
+        content.len() > limit && content.bytes().filter(|&b| b != b'\n').nth(limit).is_some()
     }
 
     /// Supported template: one user text message, no generation prompt/tools.
@@ -63,10 +85,7 @@ impl InputCodec {
         if text.len() > 1024 * 1024 {
             return Err("bounded WeMM text exceeds1MiB; nothing truncated".into());
         }
-        // Jinja's trim uses Python's whitespace predicate, which also includes
-        // the four ASCII separators not in Rust's Unicode White_Space property.
-        let content =
-            text.trim_matches(|c: char| c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c));
+        let content = template_trim(text);
         if content.starts_with("<tool_response>") && content.ends_with("</tool_response>") {
             return Err(
                 "the pinned template rejects a tool response as its only user query".into(),
@@ -107,6 +126,114 @@ impl InputCodec {
     }
 }
 
+/// The content of a user message as the pinned template renders it:
+/// `render_content|trim`. Jinja's trim uses Python's whitespace predicate,
+/// which also includes the four ASCII separators not in Rust's Unicode
+/// White_Space property.
+fn template_trim(text: &str) -> &str {
+    text.trim_matches(|c: char| c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c))
+}
+
+/// Twice the most UTF-8 bytes NFC can turn into one byte: 7, so the ratio is
+/// 3.5. [`tests::nfc_shrinks_utf8_at_most_three_and_a_half_times`] proves it
+/// against the tables of the NFC the tokenizer itself runs.
+const NFC_SHRINK_TWICE: usize = 7;
+
+/// The most content bytes other than `\n` that one ID of `tokenizer` can
+/// stand for, or `None` unless the tokenizer has a shape this is proven for.
+///
+/// The bound is `ceil(3.5 * max(L, A))`, where `L` is the longest vocabulary
+/// entry in bytes and `A` the longest added token. It holds because every
+/// step of the shape below keeps every byte other than `\n` or shrinks it by
+/// at most 3.5:
+/// - Added tokens are split out first, each one ID for at most `A` bytes
+///   (raw, or normalized when the token is). Every one must have
+///   `lstrip` and `rstrip` off, which would let it swallow whitespace.
+/// - The normalizer is absent, NFC, the checkpoint's `Replace("\n$", "")`,
+///   or a sequence of those. The Replace deletes newlines: under Oniguruma
+///   `$` is end of LINE, so every `\n` before another `\n` goes, and a run
+///   of newlines of any length becomes at most one. That is why the measure
+///   leaves out `\n` and a plain byte length would be unsound. It deletes
+///   nothing else. NFC never makes or consumes `\n`, and turns `b` bytes into
+///   at least `2b / 7` ([`NFC_SHRINK_TWICE`]).
+/// - The pre-tokenizer is a sequence of non-removing Splits ending in
+///   ByteLevel, so the model sees one character per byte and nothing is
+///   dropped.
+/// - The model is BPE whose every vocabulary entry is ByteLevel characters
+///   and which holds all 256 of them, so no character is unknown or
+///   dropped and every token covers at most `L` bytes.
+/// - The post-processor, if any, is a template, which only adds IDs.
+///
+/// So the normalized text, which holds at least `2/7` of the content's
+/// bytes other than `\n`, is exactly covered by the IDs, each at most
+/// `max(L, A)` bytes. For the pinned checkpoint `L = 128`, `A = 21`: 448.
+fn content_bytes_per_id(tokenizer: &tokenizers::Tokenizer) -> Option<usize> {
+    use serde_json::{Value, json};
+    fn as_json<T: serde::Serialize>(value: &T) -> Option<Value> {
+        serde_json::to_value(value).ok()
+    }
+    let nfc = json!({ "type": "NFC" });
+    let newline = json!({ "type": "Replace", "pattern": { "Regex": "\\n$" }, "content": "" });
+    let normalizer_ok = match tokenizer.get_normalizer().map(as_json) {
+        None => true,
+        Some(Some(n)) if n == nfc || n == newline => true,
+        Some(Some(n)) if n["type"] == "Sequence" => n["normalizers"]
+            .as_array()
+            .is_some_and(|steps| steps.iter().all(|s| *s == nfc || *s == newline)),
+        _ => false,
+    };
+    let split_ok = |s: &Value| {
+        s["type"] == "Split"
+            && matches!(
+                s["behavior"].as_str(),
+                Some("Isolated" | "MergedWithPrevious" | "MergedWithNext" | "Contiguous")
+            )
+    };
+    let pre_ok = match tokenizer.get_pre_tokenizer().map(as_json) {
+        Some(Some(p)) if p["type"] == "ByteLevel" => true,
+        Some(Some(p)) if p["type"] == "Sequence" => p["pretokenizers"]
+            .as_array()
+            .and_then(|steps| steps.split_last())
+            .is_some_and(|(last, splits)| {
+                last["type"] == "ByteLevel" && splits.iter().all(split_ok)
+            }),
+        _ => false,
+    };
+    let post_ok = match tokenizer.get_post_processor().map(as_json) {
+        None => true,
+        Some(p) => p.is_some_and(|p| p["type"] == "TemplateProcessing"),
+    };
+    if !(normalizer_ok && pre_ok && post_ok) {
+        return None;
+    }
+    let tokenizers::ModelWrapper::BPE(bpe) = tokenizer.get_model() else {
+        return None;
+    };
+    let alphabet = tokenizers::pre_tokenizers::byte_level::ByteLevel::alphabet();
+    let vocab = bpe.get_vocab();
+    let mut longest = 0;
+    for entry in vocab.keys() {
+        let mut chars = 0;
+        for c in entry.chars() {
+            if !alphabet.contains(&c) {
+                return None;
+            }
+            chars += 1;
+        }
+        longest = longest.max(chars);
+    }
+    if !alphabet.iter().all(|c| vocab.contains_key(&c.to_string())) {
+        return None;
+    }
+    for token in tokenizer.get_added_tokens_decoder().values() {
+        if token.lstrip || token.rstrip {
+            return None;
+        }
+        longest = longest.max(token.content.len());
+    }
+    Some((longest * NFC_SHRINK_TWICE).div_ceil(2))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,6 +241,93 @@ mod tests {
     fn refuses_unpinned_assets() {
         assert!(InputCodec::from_assets(b"{}", b"template").is_err());
     }
+    /// [`NFC_SHRINK_TWICE`], against the NFC the tokenizer runs (its own
+    /// tables, Unicode 9). NFC is the canonical decomposition of every input
+    /// character followed by composition, and a composed output character's
+    /// full decomposition is exactly the decomposed characters it absorbed.
+    /// Give each input character to the output character that receives the
+    /// first character of its decomposition: an output character `o` then
+    /// gets at most one input character per character `d` of `o`'s
+    /// decomposition, each no longer than the longest character whose
+    /// decomposition starts with `d`. So no string shrinks by more than the
+    /// largest such sum over `o`'s length, which this computes over every
+    /// code point.
+    #[test]
+    fn nfc_shrinks_utf8_at_most_three_and_a_half_times() {
+        use std::collections::HashMap;
+        use tokenizers::NormalizedString;
+        let nfd = |c: char| NormalizedString::from(c.to_string()).nfd().get().to_owned();
+        let chars = || (0..=0x10FFFFu32).filter_map(char::from_u32);
+        let mut longest_into: HashMap<char, usize> = HashMap::new();
+        for c in chars() {
+            let first = nfd(c)
+                .chars()
+                .next()
+                .expect("a decomposition is never empty");
+            let at = longest_into.entry(first).or_default();
+            *at = (*at).max(c.len_utf8());
+        }
+        let mut worst = (0, 1, '\0');
+        for o in chars() {
+            let absorbed: usize = nfd(o)
+                .chars()
+                .map(|d| longest_into.get(&d).copied().unwrap_or(d.len_utf8()))
+                .sum();
+            if absorbed * worst.1 > worst.0 * o.len_utf8() {
+                worst = (absorbed, o.len_utf8(), o);
+            }
+        }
+        eprintln!(
+            "worst NFC shrink {} bytes into {} at U+{:04X}",
+            worst.0, worst.1, worst.2 as u32
+        );
+        assert!(2 * worst.0 <= NFC_SHRINK_TWICE * worst.1, "{worst:?}");
+        assert_eq!(longest_into.get(&'\n'), Some(&1));
+    }
+
+    #[test]
+    #[ignore = "requires exact local checkpoint assets, metadata only; no GPU"]
+    fn surely_exceeds_is_proven_for_the_checkpoint_and_agrees_with_text() {
+        let root = std::path::PathBuf::from(
+            std::env::var("WEMM_CHECKPOINT_DIR").expect("checkpoint directory"),
+        );
+        let codec = InputCodec::from_assets(
+            &std::fs::read(root.join("tokenizer.json")).unwrap(),
+            &std::fs::read(root.join("chat_template.jinja")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(codec.content_bytes_per_id, Some(448));
+        let ids = |s: &str| codec.text(s).map(|t| t.as_slice().len());
+        // A run of newlines is deleted by the normalizer: bytes alone bound
+        // nothing, which is why `\n` is not counted.
+        let runs = format!("a{}b", "\n".repeat(200_000));
+        assert!(ids(&runs).unwrap() <= 16);
+        assert!(!codec.surely_exceeds(&runs, 248));
+        // Whitespace the template trims is not content.
+        let padded = format!("a{}", " ".repeat(200_000));
+        assert!(!codec.surely_exceeds(&padded, 248));
+        assert_eq!(ids(&padded).unwrap(), ids("a").unwrap());
+        // The longest token, repeated: the densest ordinary content there is.
+        let spaces = format!("x{}x", " ".repeat(448 * 248));
+        assert!(codec.surely_exceeds(&format!("{spaces}y"), 248));
+        assert!(ids(&spaces).map_or(true, |n| n > 248));
+        // Wherever it says yes, text agrees, on a few shapes near the bound.
+        for unit in [
+            "word ",
+            "\u{1ee8}",
+            "U\u{308}\u{304}",
+            "<|endoftext|>",
+            "\u{ac00}\n\n",
+        ] {
+            for n in [10, 1000, 30_000, 120_000] {
+                let s = unit.repeat(n);
+                if codec.surely_exceeds(&s, 248) {
+                    assert!(ids(&s).map_or(true, |n| n > 248), "{unit:?} x{n}");
+                }
+            }
+        }
+    }
+
     #[test]
     #[ignore = "requires exact local checkpoint assets, metadata only; no GPU"]
     fn pinned_tokens_match_the_frozen_behavior_fixture() {
