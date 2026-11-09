@@ -2,8 +2,12 @@
 //!
 //! Query the required typed leaf at the consuming model slot, fetch its
 //! `Blob<Tensor<BF16, R>>` from the frozen store, then bind it here. This module
-//! owns CUDA registrations, not a catalogue of model facts. There is no upload,
-//! dtype conversion, source-file reopen, or CPU model path.
+//! owns CUDA registrations, not a catalogue of model facts. There is no dtype
+//! conversion, source-file reopen, or CPU model path. By default nothing is
+//! uploaded either: the GPU reads the pile's mapped pages in place. A caller
+//! may instead choose [`WeightResidence::DeviceCopy`], which copies each
+//! payload once into device memory at bind. That is an explicit choice, never
+//! a fallback for a refused alias.
 //!
 //! Reuse one binder per device/session. Each (actual owner, payload offset,
 //! payload size) is registered once, up to an explicit registration budget.
@@ -44,6 +48,25 @@ pub struct AliasStats {
     pub registered_span_bytes: u64,
     pub bindings: u64,
     pub aliased_bytes: u64,
+    /// Payload bytes copied into device memory under
+    /// [`WeightResidence::DeviceCopy`], once per registration. Zero when the
+    /// weights are read in place.
+    pub copied_bytes: u64,
+}
+
+/// Where a bound weight lives while the model runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WeightResidence {
+    /// The GPU reads the payload from the pile's mapped pages in place
+    /// (pageable host memory through the host page tables). No copy is made.
+    #[default]
+    PileAliased,
+    /// Each payload is copied once into device memory when it is registered.
+    /// Forwards then never read the pile mapping. This costs device memory
+    /// equal to the payloads and a slower bind. The source-pile premise of
+    /// [`CudaBf16Aliases::bind_pile_leaf`] is unchanged, because the same
+    /// checks run and the bytes are read from the same mapping at bind.
+    DeviceCopy,
 }
 
 struct Registration {
@@ -61,13 +84,15 @@ pub struct CudaBf16Aliases {
     device: CudaDevice,
     page_size: usize,
     max_registrations: usize,
+    residence: WeightResidence,
     registrations: Vec<Registration>,
     stats: AliasStats,
 }
 
 impl CudaBf16Aliases {
     /// Initialize the selected CUDA runtime and require host-page-table access.
-    /// Unsupported aliasing returns an error, never an upload path. CUDA runtime
+    /// Unsupported aliasing returns an error, never an upload path (copying is
+    /// only ever chosen explicitly, with [`Self::with_residence`]). CUDA runtime
     /// initialization/driver failures retain the upstream runtime's panic policy.
     pub fn new(device: CudaDevice, max_registrations: usize) -> Result<Self, String> {
         if max_registrations == 0 {
@@ -95,9 +120,21 @@ impl CudaBf16Aliases {
             device,
             page_size,
             max_registrations,
+            residence: WeightResidence::default(),
             registrations: Vec::new(),
             stats: AliasStats::default(),
         })
+    }
+
+    /// Choose where weights registered from now on live. Choose it before the
+    /// first bind: registrations already made keep their residence.
+    pub fn with_residence(mut self, residence: WeightResidence) -> Self {
+        self.residence = residence;
+        self
+    }
+
+    pub fn residence(&self) -> WeightResidence {
+        self.residence
     }
 
     pub fn stats(&self) -> AliasStats {
@@ -191,6 +228,7 @@ impl CudaBf16Aliases {
         let bindings = self.stats.bindings.checked_add(1).ok_or("bind counter overflow")?;
         let aliased_bytes = self.stats.aliased_bytes.checked_add(size)
             .ok_or("alias-byte counter overflow")?;
+        let copy = self.residence == WeightResidence::DeviceCopy;
 
         let index = if let Some(index) = self.registrations.iter().position(|entry| {
             Arc::ptr_eq(&entry.owner, &owner)
@@ -210,7 +248,8 @@ impl CudaBf16Aliases {
                 .ok_or("owner-capacity counter overflow")?;
             let registered_span_bytes = self.stats.registered_span_bytes.checked_add(span_size)
                 .ok_or("registered-span counter overflow")?;
-            let keepalive: Arc<dyn std::any::Any + Send + Sync> = owner.clone();
+            let copied_bytes = self.stats.copied_bytes.checked_add(if copy { size } else { 0 })
+                .ok_or("copied-byte counter overflow")?;
             // SAFETY: the caller establishes a genuine immutable pile prefix.
             // page_start is page-aligned and in this actual owner; the span
             // ends exactly at the checked span end, never beyond EOF.
@@ -219,20 +258,28 @@ impl CudaBf16Aliases {
             // the CUDA implementation or the generic client's safety clause.
             // The private client was created for self.device, whose host-page
             // access was checked. CubeCL stores keepalive in external storage.
-            let handle = unsafe {
-                self.client.register_external_aliased(
-                    page_start as *mut core::ffi::c_void,
-                    span_size,
-                    offset,
-                    size,
-                    keepalive,
-                )
+            let handle = if copy {
+                // DeviceCopy: the same checked payload bytes, read once by the
+                // CPU from the mapping and copied into device memory.
+                self.client.create_from_slice(&payload[start..start + size as usize])
+            } else {
+                let keepalive: Arc<dyn std::any::Any + Send + Sync> = owner.clone();
+                unsafe {
+                    self.client.register_external_aliased(
+                        page_start as *mut core::ffi::c_void,
+                        span_size,
+                        offset,
+                        size,
+                        keepalive,
+                    )
+                }
             };
             self.registrations.push(Registration { owner, payload_offset, payload_size: size, handle });
             self.stats.registrations = self.registrations.len();
             self.stats.owners = owners;
             self.stats.owner_capacity_bytes = owner_capacity_bytes;
             self.stats.registered_span_bytes = registered_span_bytes;
+            self.stats.copied_bytes = copied_bytes;
             self.registrations.len() - 1
         };
         // CUDA storage has ALREADY applied offset and returned a size-byte
