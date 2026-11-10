@@ -56,6 +56,11 @@ impl PreparedMultimodal {
         self.decoder.embed_padded(sequences)
     }
 
+    /// See `Stack::projection_bytes`.
+    pub fn projection_bytes(&self) -> (usize, u64, u64) {
+        self.decoder.projection_bytes()
+    }
+
     /// Decoder linear projections only; the vision tower stays BF16.
     pub fn quantize_decoder(&mut self, precision: super::gdn_mixer::DecoderPrecision) -> Result<u64, String> {
         self.decoder.quantize_decoder(precision)
@@ -79,7 +84,25 @@ impl PreparedMultimodal {
         root: Id,
         config: &Qwen3_5Config,
         aliases: &mut CudaBf16Aliases,
+        selected: impl FnMut(&str, [u8; 32], &[u64], &[u8]) -> Result<(), String>,
+    ) -> Result<Self, String> {
+        // SAFETY: forwarded unchanged.
+        unsafe { Self::from_pile_with(facts, snapshot, root, config, aliases, selected, super::gdn_mixer::DecoderPrecision::Bf16) }
+    }
+
+    /// [`Self::from_pile`] with the decoder's linear projections bound for
+    /// `precision`; the vision tower always binds BF16.
+    ///
+    /// # Safety
+    /// As [`Self::from_pile`].
+    pub unsafe fn from_pile_with<R: BlobStoreGet>(
+        facts: &TribleSet,
+        snapshot: &R,
+        root: Id,
+        config: &Qwen3_5Config,
+        aliases: &mut CudaBf16Aliases,
         mut selected: impl FnMut(&str, [u8; 32], &[u64], &[u8]) -> Result<(), String>,
+        precision: super::gdn_mixer::DecoderPrecision,
     ) -> Result<Self, String> {
         multimodal_layout::validate_model(config)?;
         let vision_config = vision_tower::Config::from_model(config)?;
@@ -87,7 +110,7 @@ impl PreparedMultimodal {
             vision_tower::Slots::resolve(facts, snapshot, root, vision_config, &mut selected)?;
         // SAFETY: same genuine frozen source, same caller-owned binder.
         let decoder =
-            unsafe { PreparedDecoder::from_pile(facts, snapshot, root, aliases, &mut selected)? };
+            unsafe { PreparedDecoder::from_pile_with(facts, snapshot, root, aliases, &mut selected, precision)? };
         let vision = unsafe { Tower::from_pile(snapshot, vision_slots, vision_config, aliases)? };
         Ok(Self { decoder, vision })
     }

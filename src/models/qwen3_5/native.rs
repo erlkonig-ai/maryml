@@ -181,6 +181,27 @@ impl NativeWemm {
         aliases: &mut CudaBf16Aliases,
         selected: impl FnMut(&str, [u8; 32], &[u64], &[u8]) -> Result<(), String>,
     ) -> Result<Self, LoadError> {
+        // SAFETY: forwarded unchanged.
+        unsafe { Self::from_frozen_with(facts, reader, root, assets, aliases, selected, super::gdn_mixer::DecoderPrecision::Bf16) }
+    }
+
+    /// [`Self::from_frozen`] with the decoder's linear projections bound for
+    /// `precision`. An NVFP4 precision quantizes each BF16 projection on the
+    /// device as it is selected (`gdn_mixer::bind_linear`) and keeps only its
+    /// NVFP4 planes, in device memory; the binder never registers those
+    /// projections. Everything else binds exactly as `from_frozen` binds it.
+    ///
+    /// # Safety
+    /// As [`Self::from_frozen`].
+    pub unsafe fn from_frozen_with<R: BlobStoreGet>(
+        facts: &TribleSet,
+        reader: &R,
+        root: Id,
+        assets: Assets,
+        aliases: &mut CudaBf16Aliases,
+        selected: impl FnMut(&str, [u8; 32], &[u64], &[u8]) -> Result<(), String>,
+        precision: super::gdn_mixer::DecoderPrecision,
+    ) -> Result<Self, LoadError> {
         let before = aliases.stats();
         let pixels = GpuPreparer::new(aliases.device().clone()).map_err(|message| LoadError {
             phase: "image preparation initialization",
@@ -191,7 +212,7 @@ impl NativeWemm {
         // SAFETY: exactly the caller's frozen genuine-pile premise above;
         // same supplied binder and no independent model selection.
         let model = unsafe {
-            PreparedMultimodal::from_pile(facts, reader, root, &assets.config, aliases, selected)
+            PreparedMultimodal::from_pile_with(facts, reader, root, &assets.config, aliases, selected, precision)
         }
         .map_err(|message| LoadError {
             phase: "model binding",
@@ -206,6 +227,12 @@ impl NativeWemm {
             root,
             device: aliases.device().clone(),
         })
+    }
+
+    /// (decoder linear projections, their BF16 bytes, their NVFP4 plane
+    /// bytes) as bound now.
+    pub fn projection_bytes(&self) -> (usize, u64, u64) {
+        self.model.projection_bytes()
     }
 
     /// Run the decoder's linear projections on `precision` from now on

@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use triblespace::core::{blob::{Blob, encodings::tensor::{Tensor as NativeTensor, elements::BF16}},
     inline::{Inline, encodings::hash::Handle}, repo::BlobStoreGet};
 use crate::nn::cuda_bf16_alias::CudaBf16Aliases;
-use super::gdn_mixer::{DecoderPrecision, Linear, project_linear};
+use super::gdn_mixer::{DecoderPrecision, Linear, bind_linear, project_linear};
 use super::decoder_ops::{norm, elementwise};
 
 pub type CudaTensor = CubeTensor<CudaRuntime>;
@@ -90,23 +90,39 @@ impl Block {
     /// teardown. Same obligation as bind_pile_leaf. Late failure can retain
     /// earlier registrations; no transactional/last-handle reclamation claim.
     pub unsafe fn from_pile<R: BlobStoreGet>(snapshot: &R, s: Slots, config: Config, aliases: &mut CudaBf16Aliases) -> Result<Self, String> {
+        // SAFETY: forwarded unchanged.
+        unsafe { Self::from_pile_with(snapshot, s, config, aliases, DecoderPrecision::Bf16) }
+    }
+    /// [`Self::from_pile`] with the seven projections bound for `precision`
+    /// (see `gdn_mixer::bind_linear`).
+    ///
+    /// # Safety
+    /// As [`Self::from_pile`].
+    pub unsafe fn from_pile_with<R: BlobStoreGet>(snapshot: &R, s: Slots, config: Config, aliases: &mut CudaBf16Aliases,
+        precision: DecoderPrecision) -> Result<Self, String> {
         config.validate()?;
         macro_rules! bind { ($slot:expr, $rank:literal) => {{
             let blob: Blob<NativeTensor<BF16, $rank>> = snapshot.get($slot).map_err(|e| e.to_string())?;
             // SAFETY: caller establishes genuine immutable file-prefix lifetime.
             unsafe { aliases.bind_pile_leaf(blob)? }
         }}; }
+        macro_rules! linear { ($slot:expr) => {
+            // SAFETY: caller establishes genuine immutable file-prefix lifetime.
+            unsafe { bind_linear(snapshot, $slot, aliases, precision)? }
+        }; }
         let b = Self { config, input_norm: bind!(s.input_norm,1), post_norm: bind!(s.post_norm,1),
-            q_norm: bind!(s.q_norm,1), k_norm: bind!(s.k_norm,1), q: Linear::Bf16(bind!(s.q,2)),
-            k: Linear::Bf16(bind!(s.k,2)), v: Linear::Bf16(bind!(s.v,2)), o: Linear::Bf16(bind!(s.o,2)),
-            gate: Linear::Bf16(bind!(s.gate,2)), up: Linear::Bf16(bind!(s.up,2)), down: Linear::Bf16(bind!(s.down,2)) };
+            q_norm: bind!(s.q_norm,1), k_norm: bind!(s.k_norm,1), q: linear!(s.q),
+            k: linear!(s.k), v: linear!(s.v), o: linear!(s.o),
+            gate: linear!(s.gate), up: linear!(s.up), down: linear!(s.down) };
         let c = config;
+        for (name, w, shape) in [("q",&b.q,[2*c.heads*c.head_dim,c.hidden]),("k",&b.k,[c.kv_heads*c.head_dim,c.hidden]),
+            ("v",&b.v,[c.kv_heads*c.head_dim,c.hidden]),("o",&b.o,[c.hidden,c.heads*c.head_dim]),
+            ("gate",&b.gate,[c.intermediate,c.hidden]),("up",&b.up,[c.intermediate,c.hidden]),
+            ("down",&b.down,[c.hidden,c.intermediate])] {
+            w.check(name, shape, &b.input_norm)?;
+        }
         for (t, shape) in [(&b.input_norm,vec![c.hidden]),(&b.post_norm,vec![c.hidden]),
-            (&b.q_norm,vec![c.head_dim]),(&b.k_norm,vec![c.head_dim]),
-            (b.q.bf16()?,vec![2*c.heads*c.head_dim,c.hidden]),(b.k.bf16()?,vec![c.kv_heads*c.head_dim,c.hidden]),
-            (b.v.bf16()?,vec![c.kv_heads*c.head_dim,c.hidden]),(b.o.bf16()?,vec![c.hidden,c.heads*c.head_dim]),
-            (b.gate.bf16()?,vec![c.intermediate,c.hidden]),(b.up.bf16()?,vec![c.intermediate,c.hidden]),
-            (b.down.bf16()?,vec![c.hidden,c.intermediate])] {
+            (&b.q_norm,vec![c.head_dim]),(&b.k_norm,vec![c.head_dim])] {
             check(t, &b.input_norm, &shape)?;
             if t.handle.can_mut() { return Err("immutable pile weights required".into()); }
         }
@@ -120,6 +136,9 @@ impl Block {
             bytes += w.quantize(precision)?;
         }
         Ok(bytes)
+    }
+    pub(crate) fn projections(&self) -> [&Linear; 7] {
+        [&self.q, &self.k, &self.v, &self.o, &self.gate, &self.up, &self.down]
     }
     pub fn prefill(&self, x: &CudaTensor, positions: Positions, mask: Option<&CudaTensor>) -> Result<Output,String> {
         self.forward(x, positions, None, mask)

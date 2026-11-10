@@ -48,7 +48,22 @@ impl PreparedDecoder {
     pub unsafe fn from_pile<R: BlobStoreGet>(
         facts: &TribleSet, snapshot: &R, root: Id,
         aliases: &mut CudaBf16Aliases,
+        selected: impl FnMut(&str, [u8; 32], &[u64], &[u8]) -> Result<(), String>,
+    ) -> Result<Self, String> {
+        // SAFETY: forwarded unchanged.
+        unsafe { Self::from_pile_with(facts, snapshot, root, aliases, selected, super::gdn_mixer::DecoderPrecision::Bf16) }
+    }
+
+    /// [`Self::from_pile`] with the decoder's linear projections bound for
+    /// `precision` (`Stack::from_pile_with`).
+    ///
+    /// # Safety
+    /// As [`Self::from_pile`].
+    pub unsafe fn from_pile_with<R: BlobStoreGet>(
+        facts: &TribleSet, snapshot: &R, root: Id,
+        aliases: &mut CudaBf16Aliases,
         mut selected: impl FnMut(&str, [u8; 32], &[u64], &[u8]) -> Result<(), String>,
+        precision: super::gdn_mixer::DecoderPrecision,
     ) -> Result<Self, String> {
         let embedding = roles::resolve(facts, snapshot, root,
             "model.language_model.embed_tokens.weight", &[VOCAB as u64, 4096], &mut selected)?;
@@ -75,9 +90,14 @@ impl PreparedDecoder {
             || token_embedding.dtype != DType::BF16 || token_embedding.handle.can_mut() {
             return Err("immutable BF16 token embedding [248078,4096] required".into());
         }
-        let stack = unsafe { Stack::from_pile(snapshot,
-            decoder_stack::Slots { groups, final_norm }, aliases)? };
+        let stack = unsafe { Stack::from_pile_with(snapshot,
+            decoder_stack::Slots { groups, final_norm }, aliases, precision)? };
         Ok(Self { token_embedding, stack })
+    }
+
+    /// See [`Stack::projection_bytes`].
+    pub fn projection_bytes(&self) -> (usize, u64, u64) {
+        self.stack.projection_bytes()
     }
 
     /// See [`Stack::quantize_projections`].

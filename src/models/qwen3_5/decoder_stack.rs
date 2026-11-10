@@ -85,6 +85,20 @@ impl Stack {
     pub unsafe fn from_pile<R: BlobStoreGet>(
         snapshot: &R, slots: Slots, aliases: &mut CudaBf16Aliases,
     ) -> Result<Self, String> {
+        // SAFETY: forwarded unchanged.
+        unsafe { Self::from_pile_with(snapshot, slots, aliases, super::gdn_mixer::DecoderPrecision::Bf16) }
+    }
+
+    /// [`Self::from_pile`] with every decoder linear projection bound for
+    /// `precision` (see `gdn_mixer::bind_linear`); the final norm and every
+    /// other weight bind as before.
+    ///
+    /// # Safety
+    /// As [`Self::from_pile`].
+    pub unsafe fn from_pile_with<R: BlobStoreGet>(
+        snapshot: &R, slots: Slots, aliases: &mut CudaBf16Aliases,
+        precision: super::gdn_mixer::DecoderPrecision,
+    ) -> Result<Self, String> {
         let Slots { groups, final_norm } = slots;
         // SAFETY: same reader, same supplied binder, same immutable prefixes.
         let endpoint = unsafe { Boundary::from_pile(snapshot, final_norm, aliases)? };
@@ -100,7 +114,7 @@ impl Stack {
         let mut bound = Vec::with_capacity(GROUPS);
         for (index, group) in groups.into_iter().enumerate() {
             // SAFETY: forwards the caller's same genuine-prefix obligation.
-            bound.push(unsafe { bind_group(snapshot, group, index * 4, aliases)? });
+            bound.push(unsafe { bind_group(snapshot, group, index * 4, aliases, precision)? });
         }
         let groups = bound.into_boxed_slice().try_into()
             .map_err(|_| "internal fixed group count mismatch".to_string())?;
@@ -121,6 +135,26 @@ impl Stack {
                 .map_err(|e| format!("layer {}: {e}", index * 4 + 3))?;
         }
         Ok(bytes)
+    }
+
+    /// (projections, BF16 bytes, NVFP4 plane bytes) over every decoder linear
+    /// projection: what the decoder's projection weights hold resident.
+    pub fn projection_bytes(&self) -> (usize, u64, u64) {
+        let (mut n, mut bf16, mut fp4) = (0, 0, 0);
+        for group in self.groups.iter() {
+            let mut all: Vec<&super::gdn_mixer::Linear> = Vec::new();
+            for block in &group.gdn {
+                all.extend(block.projections());
+            }
+            all.extend(group.attention.projections());
+            for w in all {
+                let (b, f) = w.bytes();
+                n += 1;
+                bf16 += b;
+                fp4 += f;
+            }
+        }
+        (n, bf16, fp4)
     }
 
     /// One fresh, unpadded sequence. Same existing affine three-axis positions
@@ -249,18 +283,18 @@ fn attention_config() -> full_attention::Config {
 
 unsafe fn bind_group<R: BlobStoreGet>(
     snapshot: &R, slots: GroupSlots, first_layer: usize,
-    aliases: &mut CudaBf16Aliases,
+    aliases: &mut CudaBf16Aliases, precision: super::gdn_mixer::DecoderPrecision,
 ) -> Result<Group, String> {
     let [s0, s1, s2] = slots.gdn;
     // SAFETY: all calls forward from_pile's same snapshot/prefix lifetime.
-    let g0 = unsafe { gdn_decoder::Block::from_pile(snapshot, s0, gdn_config(), aliases) }
+    let g0 = unsafe { gdn_decoder::Block::from_pile_with(snapshot, s0, gdn_config(), aliases, precision) }
         .map_err(|e| format!("layer {first_layer}: {e}"))?;
-    let g1 = unsafe { gdn_decoder::Block::from_pile(snapshot, s1, gdn_config(), aliases) }
+    let g1 = unsafe { gdn_decoder::Block::from_pile_with(snapshot, s1, gdn_config(), aliases, precision) }
         .map_err(|e| format!("layer {}: {e}", first_layer + 1))?;
-    let g2 = unsafe { gdn_decoder::Block::from_pile(snapshot, s2, gdn_config(), aliases) }
+    let g2 = unsafe { gdn_decoder::Block::from_pile_with(snapshot, s2, gdn_config(), aliases, precision) }
         .map_err(|e| format!("layer {}: {e}", first_layer + 2))?;
     let attention = unsafe {
-        full_attention::Block::from_pile(snapshot, slots.attention, attention_config(), aliases)
+        full_attention::Block::from_pile_with(snapshot, slots.attention, attention_config(), aliases, precision)
     }.map_err(|e| format!("layer {}: {e}", first_layer + 3))?;
     Ok(Group { gdn: [g0, g1, g2], attention })
 }

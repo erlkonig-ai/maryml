@@ -17,7 +17,7 @@ use triblespace::core::{
 };
 use crate::nn::cuda_bf16_alias::CudaBf16Aliases;
 use super::{decoder_ops::{norm, elementwise},
-    gdn_mixer::{DecoderPrecision, GdnConfig, GdnMixer, GdnSlots, GdnState, Linear, project_linear}};
+    gdn_mixer::{DecoderPrecision, GdnConfig, GdnMixer, GdnSlots, GdnState, Linear, bind_linear, project_linear}};
 
 pub type CudaTensor = CubeTensor<CudaRuntime>;
 pub type Slot<const R: usize> = Inline<Handle<NativeTensor<BF16, R>>>;
@@ -58,6 +58,19 @@ impl Block {
     pub unsafe fn from_pile<R: BlobStoreGet>(
         snapshot: &R, slots: Slots, config: Config, aliases: &mut CudaBf16Aliases,
     ) -> Result<Self, String> {
+        // SAFETY: forwarded unchanged.
+        unsafe { Self::from_pile_with(snapshot, slots, config, aliases, DecoderPrecision::Bf16) }
+    }
+
+    /// [`Self::from_pile`] with the mixer's and MLP's projections bound for
+    /// `precision` (see `gdn_mixer::bind_linear`).
+    ///
+    /// # Safety
+    /// As [`Self::from_pile`].
+    pub unsafe fn from_pile_with<R: BlobStoreGet>(
+        snapshot: &R, slots: Slots, config: Config, aliases: &mut CudaBf16Aliases,
+        precision: DecoderPrecision,
+    ) -> Result<Self, String> {
         config.validate()?;
         macro_rules! bind { ($slot:expr, $rank:literal) => {{
             let blob: Blob<NativeTensor<BF16, $rank>> = snapshot.get($slot).map_err(|e| e.to_string())?;
@@ -65,15 +78,22 @@ impl Block {
             unsafe { aliases.bind_pile_leaf(blob)? }
         }}; }
         // SAFETY: same genuine snapshot and immutable lifetime as the outer leaves.
-        let mixer = unsafe { GdnMixer::from_pile(snapshot, slots.mixer, config.mixer, aliases)? };
+        let mixer = unsafe { GdnMixer::from_pile_with(snapshot, slots.mixer, config.mixer, aliases, precision)? };
+        // SAFETY: same genuine snapshot and immutable lifetime.
+        let (gate, up, down) = unsafe { (
+            bind_linear(snapshot, slots.gate, aliases, precision)?,
+            bind_linear(snapshot, slots.up, aliases, precision)?,
+            bind_linear(snapshot, slots.down, aliases, precision)?,
+        ) };
         let result = Self { config, mixer,
             input_norm: bind!(slots.input_norm, 1), post_norm: bind!(slots.post_norm, 1),
-            gate: Linear::Bf16(bind!(slots.gate, 2)), up: Linear::Bf16(bind!(slots.up, 2)),
-            down: Linear::Bf16(bind!(slots.down, 2)) };
+            gate, up, down };
         let (h, m) = (config.mixer.hidden, config.intermediate);
+        for (name, linear, shape) in [("gate", &result.gate, [m, h]), ("up", &result.up, [m, h]), ("down", &result.down, [h, m])] {
+            linear.check(name, shape, &result.input_norm)?;
+        }
         for (name, tensor, shape) in [
             ("input norm", &result.input_norm, vec![h]), ("post norm", &result.post_norm, vec![h]),
-            ("gate", result.gate.bf16()?, vec![m,h]), ("up", result.up.bf16()?, vec![m,h]), ("down", result.down.bf16()?, vec![h,m]),
         ] {
             check(tensor, &result.input_norm, name, &shape, DType::BF16)?;
             if tensor.handle.can_mut() { return Err(format!("{name}: immutable pile weight required")); }
@@ -89,6 +109,12 @@ impl Block {
             bytes += w.quantize(precision)?;
         }
         Ok(bytes)
+    }
+
+    pub(crate) fn projections(&self) -> Vec<&Linear> {
+        let mut all = self.mixer.projections().to_vec();
+        all.extend([&self.gate, &self.up, &self.down]);
+        all
     }
 
     pub fn prefill(&self, hidden: &CudaTensor, mask: Option<&CudaTensor>) -> Result<Output, String> {

@@ -1001,3 +1001,68 @@ impl Nvfp4 {
         ))
     }
 }
+
+#[cfg(test)]
+mod rows_tests {
+    use super::*;
+    use cubecl::cuda::CudaDevice;
+
+    struct Rng(u64);
+    impl Rng {
+        fn unit(&mut self) -> f32 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            ((z ^ (z >> 31)) >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0
+        }
+    }
+
+    fn bf16_tensor(client: &ComputeClient<CudaRuntime>, device: &CudaDevice, v: &[f32], shape: [usize; 2]) -> Tensor {
+        let bytes: Vec<u8> = v.iter().flat_map(|x| bf16::from_f32(*x).to_bits().to_le_bytes()).collect();
+        Tensor::new_contiguous(client.clone(), device.clone(), shape.as_slice().into(), client.create_from_slice(&bytes), DType::BF16)
+    }
+
+    /// Bug detector for the register-blocked per-row W4A4 lane: its output
+    /// against an f64 product of the host packing (`nvfp4::pack_nearest`,
+    /// the device recipe) of each activation row under its own global scale
+    /// and of the weight. Rows span six decades of magnitude; t and n cross
+    /// partial plane tiles. A layout or scale-index bug is an O(1) error.
+    #[test]
+    #[ignore = "reserved CUDA: W4A4-rows kernel against its host-packed f64 oracle"]
+    fn w4a4_rows_matches_host_packed_oracle() {
+        let device = CudaDevice { index: 0 };
+        let client = CudaRuntime::client(&device);
+        for (t, n, k) in [(1usize, 32usize, 64usize), (17, 64, 256), (150, 96, 512), (70, 4096, 4096)] {
+            let mut rng = Rng(t as u64 * 7919 + n as u64);
+            let x: Vec<f32> = (0..t * k)
+                .map(|i| rng.unit() * 10f32.powi((i / k) as i32 % 7 - 3))
+                .map(|v| bf16::from_f32(v).to_f32())
+                .collect();
+            let w: Vec<f32> = (0..n * k).map(|_| bf16::from_f32(rng.unit() * 0.05).to_f32()).collect();
+            let weight = Nvfp4::quantize(&bf16_tensor(&client, &device, &w, [n, k])).unwrap();
+            let out = weight.project_w4a4_rows(&bf16_tensor(&client, &device, &x, [t, k])).unwrap();
+            assert_eq!(out.meta.shape().as_slice(), &[1, t, n]);
+            let got: Vec<f32> = client.read_one(out.handle.clone()).unwrap()[..t * n * 2]
+                .chunks_exact(2).map(|c| bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32()).collect();
+            let wq = crate::nvfp4::pack_nearest(&w, k).unwrap();
+            let (codes, scales) = weight.read_planes(&client).unwrap();
+            assert_eq!((codes, scales, weight.scale2.to_bits()), (wq.codes.clone(), wq.scales.clone(), wq.scale2.to_bits()),
+                "host packing differs from the device quantizer");
+            let wd = wq.decode();
+            let mut worst = 0f64;
+            for r in 0..t {
+                let xq = crate::nvfp4::pack_nearest(&x[r * k..(r + 1) * k], k).unwrap().decode();
+                let want: Vec<f64> = (0..n).map(|c| (0..k).map(|j| xq[j] as f64 * wd[c * k + j] as f64).sum()).collect();
+                let scale = want.iter().map(|v| v * v).sum::<f64>().sqrt() / (n as f64).sqrt();
+                for c in 0..n {
+                    let e = (got[r * n + c] as f64 - want[c]).abs() / (scale + 1e-30);
+                    worst = worst.max(e);
+                }
+            }
+            eprintln!("w4a4_rows t {t} n {n} k {k}: worst |error| / row rms {worst:.5}");
+            // BF16 output rounding is 2^-9 relative; allow 2^-6 of the row rms.
+            assert!(worst < 1.0 / 64.0, "t {t} n {n} k {k}: worst {worst}");
+        }
+    }
+}

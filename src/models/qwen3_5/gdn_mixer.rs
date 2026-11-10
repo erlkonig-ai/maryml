@@ -133,14 +133,26 @@ impl GdnMixer {
         config: GdnConfig,
         aliases: &mut CudaBf16Aliases,
     ) -> Result<Self, String> {
+        // SAFETY: forwarded unchanged.
+        unsafe { Self::from_pile_with(snapshot, slots, config, aliases, DecoderPrecision::Bf16) }
+    }
+
+    /// [`Self::from_pile`] with the five projections bound for `precision`
+    /// ([`bind_linear`]): an NVFP4 precision never leaves a BF16 projection
+    /// registered or resident.
+    ///
+    /// # Safety
+    /// As [`Self::from_pile`].
+    pub unsafe fn from_pile_with<R: BlobStoreGet>(
+        snapshot: &R,
+        slots: GdnSlots,
+        config: GdnConfig,
+        aliases: &mut CudaBf16Aliases,
+        precision: DecoderPrecision,
+    ) -> Result<Self, String> {
         config.validate()?;
         // Typed handles are consumed here, without erasure, legacy fallback,
         // upload, F16 conversion, hash-join lookup, or whole-model enumeration.
-        let qkv: Blob<NativeTensor<BF16, 2>> = snapshot.get(slots.qkv).map_err(|e| e.to_string())?;
-        let z: Blob<NativeTensor<BF16, 2>> = snapshot.get(slots.z).map_err(|e| e.to_string())?;
-        let a: Blob<NativeTensor<BF16, 2>> = snapshot.get(slots.a).map_err(|e| e.to_string())?;
-        let b: Blob<NativeTensor<BF16, 2>> = snapshot.get(slots.b).map_err(|e| e.to_string())?;
-        let out: Blob<NativeTensor<BF16, 2>> = snapshot.get(slots.out).map_err(|e| e.to_string())?;
         let conv: Blob<NativeTensor<BF16, 3>> = snapshot.get(slots.conv).map_err(|e| e.to_string())?;
         let a_log: Blob<NativeTensor<BF16, 1>> = snapshot.get(slots.a_log).map_err(|e| e.to_string())?;
         let dt_bias: Blob<NativeTensor<BF16, 1>> = snapshot.get(slots.dt_bias).map_err(|e| e.to_string())?;
@@ -150,11 +162,11 @@ impl GdnMixer {
         let result = unsafe {
             Self {
                 config,
-                qkv: Linear::Bf16(aliases.bind_pile_leaf(qkv)?),
-                z: Linear::Bf16(aliases.bind_pile_leaf(z)?),
-                a: Linear::Bf16(aliases.bind_pile_leaf(a)?),
-                b: Linear::Bf16(aliases.bind_pile_leaf(b)?),
-                out: Linear::Bf16(aliases.bind_pile_leaf(out)?),
+                qkv: bind_linear(snapshot, slots.qkv, aliases, precision)?,
+                z: bind_linear(snapshot, slots.z, aliases, precision)?,
+                a: bind_linear(snapshot, slots.a, aliases, precision)?,
+                b: bind_linear(snapshot, slots.b, aliases, precision)?,
+                out: bind_linear(snapshot, slots.out, aliases, precision)?,
                 conv: aliases.bind_pile_leaf(conv)?,
                 a_log: aliases.bind_pile_leaf(a_log)?,
                 dt_bias: aliases.bind_pile_leaf(dt_bias)?,
@@ -167,13 +179,17 @@ impl GdnMixer {
 
     fn check_weights(&self) -> Result<(), String> {
         let c = self.config;
-        let anchor = self.qkv.bf16()?;
+        let anchor = &self.conv;
+        for (name, linear, shape) in [
+            ("qkv", &self.qkv, [c.channels(), c.hidden]),
+            ("z", &self.z, [c.value_width(), c.hidden]),
+            ("a", &self.a, [c.value_heads, c.hidden]),
+            ("b", &self.b, [c.value_heads, c.hidden]),
+            ("out", &self.out, [c.hidden, c.value_width()]),
+        ] {
+            linear.check(name, shape, anchor)?;
+        }
         for (name, tensor, shape) in [
-            ("qkv", self.qkv.bf16()?, vec![c.channels(), c.hidden]),
-            ("z", self.z.bf16()?, vec![c.value_width(), c.hidden]),
-            ("a", self.a.bf16()?, vec![c.value_heads, c.hidden]),
-            ("b", self.b.bf16()?, vec![c.value_heads, c.hidden]),
-            ("out", self.out.bf16()?, vec![c.hidden, c.value_width()]),
             ("conv", &self.conv, vec![c.channels(), 1, c.conv_kernel]),
             ("A_log", &self.a_log, vec![c.value_heads]),
             ("dt_bias", &self.dt_bias, vec![c.value_heads]),
@@ -195,6 +211,10 @@ impl GdnMixer {
             bytes += w.quantize(precision)?;
         }
         Ok(bytes)
+    }
+
+    pub(crate) fn projections(&self) -> [&Linear; 5] {
+        [&self.qkv, &self.z, &self.a, &self.b, &self.out]
     }
 
     /// Fresh unmasked sequence, T in 1..=256.
@@ -357,6 +377,34 @@ impl Linear {
         Ok(Self::Nvfp4 { weight, precision })
     }
 
+    /// (BF16 bytes, NVFP4 plane bytes) this projection holds.
+    pub(crate) fn bytes(&self) -> (u64, u64) {
+        match self {
+            Self::Bf16(t) => (t.meta.shape().as_slice().iter().product::<usize>() as u64 * 2, 0),
+            Self::Nvfp4 { weight, .. } => (0, weight.bytes()),
+        }
+    }
+
+    /// Shape `[O, I]` and device check; a BF16 weight must also be an
+    /// immutable contiguous binding.
+    pub(crate) fn check(&self, name: &str, shape: [usize; 2], like: &CudaTensor) -> Result<(), String> {
+        match self {
+            Self::Bf16(t) => {
+                check(t, like, name, &shape, DType::BF16)?;
+                if t.handle.can_mut() {
+                    return Err(format!("{name}: read-only pile alias required"));
+                }
+                Ok(())
+            }
+            Self::Nvfp4 { weight, .. } => {
+                if [weight.n(), weight.k()] != shape || weight.device() != &like.device {
+                    return Err(format!("{name}: NVFP4 weight is [{}, {}], wants {shape:?} on the same device", weight.n(), weight.k()));
+                }
+                Ok(())
+            }
+        }
+    }
+
     /// Quantize a BF16 weight on the device with the NVFP4 recipe of
     /// `nn::nvfp4_gemv` (the same codes `models_import` gates stored
     /// projections against) and drop this handle to the BF16 weight. Returns
@@ -370,6 +418,43 @@ impl Linear {
         *self = Self::Nvfp4 { weight, precision };
         Ok(bytes)
     }
+}
+
+/// Bind one decoder projection for `precision`. BF16 binds the leaf through
+/// the caller's binder (aliased or copied, as the binder chooses). An NVFP4
+/// precision copies the BF16 payload into a transient device buffer,
+/// quantizes it there with the `nn::nvfp4_gemv` recipe (the codes a stored
+/// NVFP4 leaf is gated against), and drops the transient buffer: only the
+/// code and scale planes stay resident, and the binder registers nothing.
+///
+/// # Safety
+/// The binder's genuine immutable pile-prefix premise for the BF16 path.
+pub(crate) unsafe fn bind_linear<R: BlobStoreGet>(
+    snapshot: &R,
+    slot: Inline<Handle<NativeTensor<BF16, 2>>>,
+    aliases: &mut CudaBf16Aliases,
+    precision: DecoderPrecision,
+) -> Result<Linear, String> {
+    let blob: Blob<NativeTensor<BF16, 2>> = snapshot.get(slot).map_err(|e| e.to_string())?;
+    if precision == DecoderPrecision::Bf16 {
+        // SAFETY: forwarded genuine immutable-prefix contract.
+        return Ok(Linear::Bf16(unsafe { aliases.bind_pile_leaf(blob)? }));
+    }
+    let shape = crate::nn::cuda_bf16_alias::checked_shape(&blob)?;
+    let view = crate::leaf::read_leaf(blob).map_err(|e| e.to_string())?;
+    let device = aliases.device().clone();
+    let client = CudaRuntime::client(&device);
+    let staged = client.create_from_slice(view.payload().as_ref());
+    let source = CubeTensor::new_contiguous(client.clone(), device, shape.as_slice().into(), staged, DType::BF16);
+    // Quantize reads the tensor amax back, which orders the upload before it.
+    let weight = Nvfp4::quantize(&source).map_err(|e| format!("NVFP4 quantize at load: {e}"))?;
+    drop(source);
+    // Free the upload's host staging and the transient device copy now (see
+    // CudaBf16Aliases' DeviceCopy note: two flushes release the host copy).
+    for _ in 0..2 {
+        client.flush().map_err(|e| format!("flush after an NVFP4 load: {e:?}"))?;
+    }
+    Linear::nvfp4(weight, precision)
 }
 
 /// [`project`] for any decoder [`Linear`]: `[B,T,I] x [O,I]^T -> [B,T,O]`.

@@ -12,7 +12,10 @@
 //!   (default 8) through `NativeWemm::embed_texts`, longest first; images run
 //!   one at a time. `WEMM_PASSES` (default 2) repeats the whole set in-process;
 //!   pass 1 includes kernel compilation and is reported apart. `WEMM_COPY=1`
-//!   copies the BF16 weights into device memory at bind.
+//!   copies the bound BF16 weights into device memory at bind. An NVFP4
+//!   precision quantizes each decoder projection on the device as it is
+//!   selected and keeps only its NVFP4 planes (`NativeWemm::from_frozen_with`);
+//!   `WEMM_POST_BIND=1` instead binds BF16 and quantizes afterwards.
 //!   OUT_DIR receives `embeddings.pass<P>.bf16` ([n, 4096] BF16 in item
 //!   order), `items.tsv`, `batches.tsv` and `summary.txt`.
 //!
@@ -142,6 +145,9 @@ fn embed(args: &[String]) -> Result<()> {
     let batch: usize = std::env::var("WEMM_BATCH").ok().map(|s| s.parse()).transpose()?.unwrap_or(8);
     let passes: usize = std::env::var("WEMM_PASSES").ok().map(|s| s.parse()).transpose()?.unwrap_or(2);
     let copy = std::env::var("WEMM_COPY").as_deref() == Ok("1");
+    // Default: an NVFP4 precision quantizes each projection at load and never
+    // holds it in BF16. WEMM_POST_BIND=1 binds BF16 first and quantizes after.
+    let post_bind = std::env::var("WEMM_POST_BIND").as_deref() == Ok("1");
     let items = read_items(Path::new(&args[3]))?;
     let mut summary = String::new();
     macro_rules! say { ($($t:tt)*) => {{ let line = format!($($t)*); println!("{line}"); writeln!(summary, "{line}").unwrap(); }}; }
@@ -171,18 +177,22 @@ fn embed(args: &[String]) -> Result<()> {
     // SAFETY: the pile is append-only; this process never writes it, and the
     // snapshot's prefix stays valid while the mapping lives.
     let mut native = unsafe {
-        NativeWemm::from_frozen(&facts, &reader, root, assets, &mut aliases, |_, _, _, payload| {
+        NativeWemm::from_frozen_with(&facts, &reader, root, assets, &mut aliases, |_, _, _, payload| {
             selected += 1;
             selected_bytes += payload.len() as u64;
             Ok(())
-        })
+        }, if post_bind { DecoderPrecision::Bf16 } else { precision })
     }?;
     let stats = aliases.stats();
     say!("bind_ms\t{:.1}\troles\t{selected}\tselected_bytes\t{selected_bytes}\tcopied_bytes\t{}\tregistrations\t{}",
         ms(t), stats.copied_bytes, stats.registrations);
-    let t = Instant::now();
-    let nvfp4_bytes = native.quantize_decoder(precision).map_err(anyhow::Error::msg)?;
-    say!("quantize_ms\t{:.1}\tnvfp4_plane_bytes\t{nvfp4_bytes}", ms(t));
+    if post_bind {
+        let t = Instant::now();
+        let nvfp4_bytes = native.quantize_decoder(precision).map_err(anyhow::Error::msg)?;
+        say!("post_bind_quantize_ms\t{:.1}\tnvfp4_plane_bytes\t{nvfp4_bytes}", ms(t));
+    }
+    let (projections, bf16_bytes, fp4_bytes) = native.projection_bytes();
+    say!("decoder_projections\t{projections}\tresident_bf16_bytes\t{bf16_bytes}\tresident_nvfp4_plane_bytes\t{fp4_bytes}");
     let (name, major, minor) = native.device_identity().map_err(anyhow::Error::msg)?;
     say!("device\t{name}\tcompute\t{major}.{minor}\tmemavail_drop_after_bind_bytes\t{}", avail0 as i64 - mem_available() as i64);
 
