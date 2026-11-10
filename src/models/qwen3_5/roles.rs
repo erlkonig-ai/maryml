@@ -41,10 +41,8 @@ pub fn resolve_linear(
     shape: &[u64; 2],
     selected: &mut impl FnMut(&str, [u8; 32], &[u64], &[u8]) -> Result<(), String>,
 ) -> Result<LinearSlot, String> {
-    match resolve(facts, snapshot, root, name, shape, selected) {
-        Ok(slot) => return Ok(LinearSlot::Bf16(slot)),
-        Err(e) if e.contains("no supported native BF16") => {}
-        Err(e) => return Err(e),
+    if let Found::Bf16(slot) = find_bf16(facts, snapshot, root, name, shape, selected)? {
+        return Ok(LinearSlot::Bf16(slot));
     }
     for (path, handle) in find!(
         (path: Inline<Handle<blobencodings::UTF8String>>, handle: Nvfp4Slot),
@@ -79,6 +77,30 @@ pub fn resolve<const R: usize>(
     shape: &[u64; R],
     selected: &mut impl FnMut(&str, [u8; 32], &[u64], &[u8]) -> Result<(), String>,
 ) -> Result<Slot<R>, String> {
+    match find_bf16(facts, snapshot, root, name, shape, selected)? {
+        Found::Bf16(slot) => Ok(slot),
+        Found::None { wrong_shape } => Err(format!(
+            "{name}: no supported native BF16 rank-{R} role {shape:?} under root {root:?}; {wrong_shape} shape-incompatible candidates (no F16/CPU fallback)"
+        )),
+    }
+}
+
+/// What [`find_bf16`] found: the leaf, or no BF16 leaf of this name and
+/// shape (with how many of that name had another shape). A read fault or an
+/// invalid leaf is an error, never "none".
+enum Found<const R: usize> {
+    Bf16(Slot<R>),
+    None { wrong_shape: usize },
+}
+
+fn find_bf16<const R: usize>(
+    facts: &TribleSet,
+    snapshot: &impl BlobStoreGet,
+    root: Id,
+    name: &str,
+    shape: &[u64; R],
+    selected: &mut impl FnMut(&str, [u8; 32], &[u64], &[u8]) -> Result<(), String>,
+) -> Result<Found<R>, String> {
     let mut wrong_shape = 0;
     for (path, handle) in find!(
         (path: Inline<Handle<blobencodings::UTF8String>>, handle: Slot<R>),
@@ -104,11 +126,9 @@ pub fn resolve<const R: usize>(
             continue;
         }
         selected(name, handle.raw, shape, view.payload().as_ref())?;
-        return Ok(handle);
+        return Ok(Found::Bf16(handle));
     }
-    Err(format!(
-        "{name}: no supported native BF16 rank-{R} role {shape:?} under root {root:?}; {wrong_shape} shape-incompatible candidates (no F16/CPU fallback)"
-    ))
+    Ok(Found::None { wrong_shape })
 }
 
 #[cfg(test)]
