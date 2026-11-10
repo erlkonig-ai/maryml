@@ -735,7 +735,8 @@ const ROWS_TM: usize = 4;
 const ROWS_TN: usize = 8;
 const ROWS_TN_NARROW: usize = 4;
 
-/// `rowscale[r] = amax(|x[r, :]|) / (6 * 448)`, or 1.0 for an all-zero row.
+/// `rowscale[r] = amax(|x[r, :]|) / (6 * 448)`, or 1.0 for an all-zero row,
+/// or NaN for a row holding a NaN.
 #[cube(launch_unchecked)]
 fn row_scale_kernel<E: Scalar + Cast>(
     x: &Array<E>,
@@ -746,22 +747,42 @@ fn row_scale_kernel<E: Scalar + Cast>(
     let r = CUBE_POS_X as usize;
     let lane = UNIT_POS_X as usize;
     let mut m = 0.0f32;
+    // `max` drops a NaN operand and E2M1 saturates, so a NaN activation would
+    // come out finite. A row holding one gets a NaN scale instead, which the
+    // epilogue multiplies into every output of that row.
+    // The NaN is the value read, never a literal.
+    let mut nan = 0.0f32;
     let mut j = lane;
     while j < width {
-        m = max(m, Abs::abs(f32::cast_from(x[r * width + j])));
+        let v = Abs::abs(f32::cast_from(x[r * width + j]));
+        if v != v {
+            nan = v;
+        }
+        m = max(m, v);
         j += threads;
+    }
+    if nan != nan {
+        m = nan;
     }
     let mut shared = SharedMemory::<f32>::new(threads);
     shared[lane] = m;
     sync_cube();
     if lane == 0 {
         let mut a = 0.0f32;
+        let mut seen = 0.0f32;
         for i in 0..threads {
-            a = max(a, shared[i]);
+            let p = shared[i];
+            if p != p {
+                seen = p;
+            }
+            a = max(a, p);
         }
         let mut s = 1.0f32;
         if a > 0.0f32 {
             s = a / 2688.0f32;
+        }
+        if seen != seen {
+            s = seen;
         }
         rowscale[r] = s;
     }
@@ -1083,5 +1104,50 @@ mod rows_tests {
             // BF16 output rounding is 2^-9 relative; allow 2^-6 of the row rms.
             assert!(worst < 1.0 / 64.0, "t {t} n {n} k {k}: worst {worst}");
         }
+    }
+
+    /// A NaN never comes out finite. A NaN activation makes every output of
+    /// its row NaN and leaves the other rows' bits exactly as without it; a
+    /// NaN weight is refused by the quantizer (load time and storage alike).
+    #[test]
+    #[ignore = "reserved CUDA: NaN propagation through the W4A4 row scale and the weight amax"]
+    fn w4a4_rows_and_the_weight_quantizer_carry_nan() {
+        let device = CudaDevice { index: 0 };
+        let client = CudaRuntime::client(&device);
+        let (t, n, k) = (5usize, 64usize, 256usize);
+        let mut rng = Rng(4242);
+        let x: Vec<f32> = (0..t * k).map(|_| bf16::from_f32(rng.unit()).to_f32()).collect();
+        let w: Vec<f32> = (0..n * k).map(|_| bf16::from_f32(rng.unit() * 0.05).to_f32()).collect();
+        let weight = Nvfp4::quantize(&bf16_tensor(&client, &device, &w, [n, k])).unwrap();
+        let rows = |x: &[f32], tn: Option<usize>| -> Vec<u16> {
+            let input = bf16_tensor(&client, &device, x, [t, k]);
+            let out = match tn {
+                Some(tn) => weight.project_w4a4_rows_tn(&input, tn).unwrap(),
+                None => weight.project_w4a4_rows(&input).unwrap(),
+            };
+            client.read_one(out.handle.clone()).unwrap()[..t * n * 2]
+                .chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect()
+        };
+        let mut poisoned = x.clone();
+        poisoned[2 * k + 77] = f32::NAN;
+        for tn in [None, Some(ROWS_TN_NARROW)] {
+            let clean = rows(&x, tn);
+            let got = rows(&poisoned, tn);
+            for r in 0..t {
+                for c in 0..n {
+                    let v = bf16::from_bits(got[r * n + c]).to_f32();
+                    if r == 2 {
+                        assert!(v.is_nan(), "row {r} col {c} is {v}, not NaN (tn {tn:?})");
+                    } else {
+                        assert_eq!(got[r * n + c], clean[r * n + c], "row {r} col {c} changed (tn {tn:?})");
+                    }
+                }
+            }
+        }
+        let mut bad = w.clone();
+        bad[3 * k + 5] = f32::NAN;
+        let refused = Nvfp4::quantize(&bf16_tensor(&client, &device, &bad, [n, k]));
+        assert!(refused.is_err(), "a NaN weight was quantized");
+        eprintln!("nan: row 2 all NaN, other rows unchanged; NaN weight refused: {}", refused.err().unwrap());
     }
 }

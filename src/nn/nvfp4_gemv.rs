@@ -98,10 +98,21 @@ fn amax_kernel<E: Scalar + Cast>(
 ) {
     let t = ABSOLUTE_POS;
     let mut m = 0.0f32;
+    // `max` drops a NaN operand, so a NaN weight is carried separately: the
+    // partial becomes that NaN (`nan_max` folds it), and `scale2_of` refuses
+    // the tensor. The NaN is the value read, never a literal.
+    let mut nan = 0.0f32;
     let mut i = t;
     while i < len {
-        m = max(m, Abs::abs(f32::cast_from(w[i])));
+        let a = Abs::abs(f32::cast_from(w[i]));
+        if a != a {
+            nan = a;
+        }
+        m = max(m, a);
         i += threads;
+    }
+    if nan != nan {
+        m = nan;
     }
     partial[t] = m;
 }
@@ -309,7 +320,7 @@ impl Nvfp4 {
         let amax = bytes
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-            .fold(0.0f32, f32::max);
+            .fold(0.0f32, nan_max);
         let scale2 = scale2_of(amax)?;
         let blocks = len / GROUP;
         let codes = w.client.empty(len / 2);
@@ -564,6 +575,16 @@ impl Nvfp4 {
             );
         }
         out
+    }
+}
+
+/// `f32::max`, except that a NaN on either side is the result: the amax of a
+/// tensor holding a NaN is NaN, never the largest finite magnitude.
+pub(crate) fn nan_max(m: f32, v: f32) -> f32 {
+    if m.is_nan() || v.is_nan() {
+        f32::NAN
+    } else {
+        m.max(v)
     }
 }
 
