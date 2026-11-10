@@ -16,6 +16,10 @@
 //!   precision quantizes each decoder projection on the device as it is
 //!   selected and keeps only its NVFP4 planes (`NativeWemm::from_frozen_with`);
 //!   `WEMM_POST_BIND=1` instead binds BF16 and quantizes afterwards.
+//!   `WEMM_VISION_PRECISION` (bf16 or w4a4; default bf16) puts the vision
+//!   tower's block and merger linears on that precision at load
+//!   (`NativeWemm::from_frozen_with_vision`); linears the W4A4 kernel cannot
+//!   take stay BF16, and the summary counts both.
 //!   OUT_DIR receives `embeddings.pass<P>.bf16` ([n, 4096] BF16 in item
 //!   order), `items.tsv`, `batches.tsv` and `summary.txt`.
 //!
@@ -145,14 +149,16 @@ fn embed(args: &[String]) -> Result<()> {
     let batch: usize = std::env::var("WEMM_BATCH").ok().map(|s| s.parse()).transpose()?.unwrap_or(8);
     let passes: usize = std::env::var("WEMM_PASSES").ok().map(|s| s.parse()).transpose()?.unwrap_or(2);
     let copy = std::env::var("WEMM_COPY").as_deref() == Ok("1");
+    let vision = DecoderPrecision::parse(&std::env::var("WEMM_VISION_PRECISION").unwrap_or_else(|_| "bf16".into()))
+        .map_err(anyhow::Error::msg)?;
     // Default: an NVFP4 precision quantizes each projection at load and never
     // holds it in BF16. WEMM_POST_BIND=1 binds BF16 first and quantizes after.
     let post_bind = std::env::var("WEMM_POST_BIND").as_deref() == Ok("1");
     let items = read_items(Path::new(&args[3]))?;
     let mut summary = String::new();
     macro_rules! say { ($($t:tt)*) => {{ let line = format!($($t)*); println!("{line}"); writeln!(summary, "{line}").unwrap(); }}; }
-    say!("precision\t{}\tbatch\t{batch}\tpasses\t{passes}\tresidence\t{}\titems\t{}", precision.label(),
-        if copy { "device-copy" } else { "pile-aliased" }, items.len());
+    say!("precision\t{}\tvision_precision\t{}\tbatch\t{batch}\tpasses\t{passes}\tresidence\t{}\titems\t{}", precision.label(),
+        vision.label(), if copy { "device-copy" } else { "pile-aliased" }, items.len());
 
     let t = Instant::now();
     let store = mary::persist::read_model_pile_snapshot_read_only(Path::new(&args[0]))?;
@@ -177,11 +183,11 @@ fn embed(args: &[String]) -> Result<()> {
     // SAFETY: the pile is append-only; this process never writes it, and the
     // snapshot's prefix stays valid while the mapping lives.
     let mut native = unsafe {
-        NativeWemm::from_frozen_with(&facts, &reader, root, assets, &mut aliases, |_, _, _, payload| {
+        NativeWemm::from_frozen_with_vision(&facts, &reader, root, assets, &mut aliases, |_, _, _, payload| {
             selected += 1;
             selected_bytes += payload.len() as u64;
             Ok(())
-        }, if post_bind { DecoderPrecision::Bf16 } else { precision })
+        }, if post_bind { DecoderPrecision::Bf16 } else { precision }, vision)
     }?;
     let stats = aliases.stats();
     say!("bind_ms\t{:.1}\troles\t{selected}\tselected_bytes\t{selected_bytes}\tcopied_bytes\t{}\tregistrations\t{}",
@@ -193,6 +199,8 @@ fn embed(args: &[String]) -> Result<()> {
     }
     let (projections, bf16_bytes, fp4_bytes) = native.projection_bytes();
     say!("decoder_projections\t{projections}\tresident_bf16_bytes\t{bf16_bytes}\tresident_nvfp4_plane_bytes\t{fp4_bytes}");
+    let (vl, vl_bf16, vl_bf16_bytes, vl_fp4, vl_fp4_bytes, vl_kinds) = native.vision_linear_bytes();
+    say!("vision_linears\t{vl}\tbf16\t{vl_bf16}\tresident_bf16_bytes\t{vl_bf16_bytes}\tnvfp4\t{vl_fp4}\tresident_nvfp4_plane_bytes\t{vl_fp4_bytes}\tbound\t{vl_kinds:?}");
     let (name, major, minor) = native.device_identity().map_err(anyhow::Error::msg)?;
     say!("device\t{name}\tcompute\t{major}.{minor}\tmemavail_drop_after_bind_bytes\t{}", avail0 as i64 - mem_available() as i64);
 

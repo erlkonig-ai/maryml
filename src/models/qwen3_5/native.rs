@@ -202,6 +202,31 @@ impl NativeWemm {
         selected: impl FnMut(&str, [u8; 32], &[u64], &[u8]) -> Result<(), String>,
         precision: super::gdn_mixer::DecoderPrecision,
     ) -> Result<Self, LoadError> {
+        // SAFETY: forwarded unchanged.
+        unsafe {
+            Self::from_frozen_with_vision(facts, reader, root, assets, aliases, selected, precision,
+                super::gdn_mixer::DecoderPrecision::Bf16)
+        }
+    }
+
+    /// [`Self::from_frozen_with`] with the vision tower's linears on `vision`
+    /// as well: `W4a4` quantizes each block and merger linear the W4A4-rows
+    /// kernel takes at load, exactly as the decoder's (`Tower::from_pile_with`).
+    /// No kernel profile names such a model; it is for evaluation.
+    ///
+    /// # Safety
+    /// As [`Self::from_frozen`].
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn from_frozen_with_vision<R: BlobStoreGet>(
+        facts: &TribleSet,
+        reader: &R,
+        root: Id,
+        assets: Assets,
+        aliases: &mut CudaBf16Aliases,
+        selected: impl FnMut(&str, [u8; 32], &[u64], &[u8]) -> Result<(), String>,
+        precision: super::gdn_mixer::DecoderPrecision,
+        vision: super::gdn_mixer::DecoderPrecision,
+    ) -> Result<Self, LoadError> {
         let before = aliases.stats();
         let pixels = GpuPreparer::new(aliases.device().clone()).map_err(|message| LoadError {
             phase: "image preparation initialization",
@@ -212,7 +237,7 @@ impl NativeWemm {
         // SAFETY: exactly the caller's frozen genuine-pile premise above;
         // same supplied binder and no independent model selection.
         let model = unsafe {
-            PreparedMultimodal::from_pile_with(facts, reader, root, &assets.config, aliases, selected, precision)
+            PreparedMultimodal::from_pile_with_vision(facts, reader, root, &assets.config, aliases, selected, precision, vision)
         }
         .map_err(|message| LoadError {
             phase: "model binding",
@@ -241,6 +266,14 @@ impl NativeWemm {
     /// identity is derived from this, never from the precision asked for.
     pub fn decoder_bound(&self) -> Option<super::gdn_mixer::BoundProjection> {
         self.model.decoder_bound()
+    }
+
+    /// The vision tower's linears as bound (`Tower::linear_bytes`): (count,
+    /// BF16 count, BF16 bytes, NVFP4 count, NVFP4 plane bytes, kinds seen).
+    /// A kernel profile must read this as well as `decoder_bound` before it
+    /// names a model whose vision linears are NVFP4.
+    pub fn vision_linear_bytes(&self) -> (usize, usize, u64, usize, u64, Vec<super::gdn_mixer::BoundProjection>) {
+        self.model.vision_linear_bytes()
     }
 
     /// Run the decoder's linear projections on `precision` from now on

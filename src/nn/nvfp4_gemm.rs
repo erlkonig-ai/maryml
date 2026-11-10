@@ -731,9 +731,16 @@ pub(crate) fn calibrated_scale(input: f32, weight: f32) -> Result<f32> {
 const ROW_THREADS: usize = 256;
 /// MMA tiles one W4A4-rows plane owns along M and along N.
 const ROWS_TM: usize = 4;
-/// N tiles per plane where N allows it, else [`ROWS_TN_NARROW`].
-const ROWS_TN: usize = 8;
-const ROWS_TN_NARROW: usize = 4;
+/// N tiles per plane: the widest of these that divides N's 8-column tiles.
+/// Every decoder projection takes 8 or 4; the vision tower's fc1 (N 4304)
+/// takes 2. The tiling never changes a tile's MMAs or their order.
+const ROWS_TNS: [usize; 4] = [8, 4, 2, 1];
+
+/// Whether [`Nvfp4::project_w4a4_rows`] takes a weight `[n, k]`: K in whole
+/// 64-wide block-scaled MMA steps and N in whole 8-column tiles.
+pub(crate) fn w4a4_rows_takes(n: usize, k: usize) -> bool {
+    k % KTILE4 == 0 && n % NTILE == 0 && k % GROUP == 0
+}
 
 /// `rowscale[r] = amax(|x[r, :]|) / (6 * 448)`, or 1.0 for an all-zero row,
 /// or NaN for a row holding a NaN.
@@ -943,7 +950,7 @@ impl Nvfp4 {
     /// scales, row-scaled quantization, the register-blocked block-scaled
     /// MMA). Every quantity stays on the device; nothing is read back.
     pub(crate) fn project_w4a4_rows(&self, x: &Tensor) -> Result<Tensor> {
-        let tn = if self.n() % (NTILE * ROWS_TN) == 0 { ROWS_TN } else { ROWS_TN_NARROW };
+        let tn = ROWS_TNS.into_iter().find(|tn| self.n() % (NTILE * tn) == 0).unwrap_or(1);
         self.project_w4a4_rows_tn(x, tn)
     }
 
@@ -1066,7 +1073,10 @@ mod rows_tests {
     fn w4a4_rows_matches_host_packed_oracle() {
         let device = CudaDevice { index: 0 };
         let client = CudaRuntime::client(&device);
-        for (t, n, k) in [(1usize, 32usize, 64usize), (17, 64, 256), (150, 96, 512), (70, 4096, 4096), (300, 128, 128)] {
+        // The last three are the vision tower's shapes: fc1 [4304, 1152] (tn 2),
+        // qkv [3456, 1152] and the merger's fc2 [4096, 4608].
+        for (t, n, k) in [(1usize, 32usize, 64usize), (17, 64, 256), (150, 96, 512), (70, 4096, 4096), (300, 128, 128),
+            (100, 4304, 1152), (90, 3456, 1152), (40, 4096, 4608)] {
             let mut rng = Rng(t as u64 * 7919 + n as u64);
             let x: Vec<f32> = (0..t * k)
                 .map(|i| rng.unit() * 10f32.powi((i / k) as i32 % 7 - 3))
@@ -1075,14 +1085,18 @@ mod rows_tests {
             let w: Vec<f32> = (0..n * k).map(|_| bf16::from_f32(rng.unit() * 0.05).to_f32()).collect();
             let weight = Nvfp4::quantize(&bf16_tensor(&client, &device, &w, [n, k])).unwrap();
             let input = bf16_tensor(&client, &device, &x, [t, k]);
-            let out = weight.project_w4a4_rows_tn(&input, ROWS_TN_NARROW).unwrap();
+            let out = weight.project_w4a4_rows_tn(&input, 1).unwrap();
             assert_eq!(out.meta.shape().as_slice(), &[1, t, n]);
-            if n % (NTILE * ROWS_TN) == 0 {
-                // Wider plane tiles issue the same MMAs in the same order.
-                let wide = weight.project_w4a4_rows(&input).unwrap();
+            // Wider plane tiles issue the same MMAs in the same order, and the
+            // default choice is one of them.
+            for tn in ROWS_TNS.into_iter().filter(|tn| n % (NTILE * tn) == 0) {
+                let wide = weight.project_w4a4_rows_tn(&input, tn).unwrap();
                 assert_eq!(client.read_one(wide.handle.clone()).unwrap()[..t * n * 2],
-                    client.read_one(out.handle.clone()).unwrap()[..t * n * 2], "tn 8 != tn 4 at t {t} n {n} k {k}");
+                    client.read_one(out.handle.clone()).unwrap()[..t * n * 2], "tn {tn} != tn 1 at t {t} n {n} k {k}");
             }
+            let default = weight.project_w4a4_rows(&input).unwrap();
+            assert_eq!(client.read_one(default.handle.clone()).unwrap()[..t * n * 2],
+                client.read_one(out.handle.clone()).unwrap()[..t * n * 2], "default tn != tn 1 at t {t} n {n} k {k}");
             let got: Vec<f32> = client.read_one(out.handle.clone()).unwrap()[..t * n * 2]
                 .chunks_exact(2).map(|c| bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32()).collect();
             let wq = crate::nvfp4::pack_nearest(&w, k).unwrap();
@@ -1130,7 +1144,7 @@ mod rows_tests {
         };
         let mut poisoned = x.clone();
         poisoned[2 * k + 77] = f32::NAN;
-        for tn in [None, Some(ROWS_TN_NARROW)] {
+        for tn in [None, Some(4), Some(2), Some(1)] {
             let clean = rows(&x, tn);
             let got = rows(&poisoned, tn);
             for r in 0..t {

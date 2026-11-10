@@ -9,12 +9,14 @@ use serde::{Deserialize,Serialize};
 use triblespace::core::{blob::{Blob,encodings::tensor::{Tensor as NativeTensor,elements::BF16}},
     inline::{Inline,encodings::hash::Handle},repo::BlobStoreGet};
 use crate::nn::cuda_bf16_alias::CudaBf16Aliases;
+use super::gdn_mixer::{DecoderPrecision,Linear,bind_linear};
+use super::roles::LinearSlot;
 pub type CudaTensor=CubeTensor<CudaRuntime>;
 pub type Slot<const R:usize>=Inline<Handle<NativeTensor<BF16,R>>>;
 #[derive(Clone,Copy,Debug,Deserialize,Serialize)]
 pub struct Config {pub hidden:usize,pub output:usize}
 pub struct Slots {pub norm:Slot<1>,pub norm_bias:Slot<1>,pub fc1:Slot<2>,pub bias1:Slot<1>,pub fc2:Slot<2>,pub bias2:Slot<1>}
-pub struct Merger {c:Config,norm:CudaTensor,norm_bias:CudaTensor,fc1:CudaTensor,bias1:CudaTensor,fc2:CudaTensor,bias2:CudaTensor}
+pub struct Merger {c:Config,norm:CudaTensor,norm_bias:CudaTensor,fc1:Linear,bias1:CudaTensor,fc2:Linear,bias2:CudaTensor}
 pub struct Output {pub norm:CudaTensor,pub grouped:CudaTensor,pub fc1:CudaTensor,pub activated:CudaTensor,pub hidden:CudaTensor}
 impl Config {
     pub fn validate(self)->Result<(),String> {
@@ -28,21 +30,43 @@ impl Merger {
     /// partial pages, must remain unmodified/untruncated through CUDA runtime
     /// teardown. No generic owner proves provenance. Late errors may retain aliases.
     pub unsafe fn from_pile<R: BlobStoreGet>(snapshot:&R,s:Slots,c:Config,a:&mut CudaBf16Aliases)->Result<Self,String> {
+        // SAFETY: forwarded unchanged.
+        unsafe {Self::from_pile_with(snapshot,s,c,a,DecoderPrecision::Bf16)}
+    }
+    /// [`Self::from_pile`] with both linears on `precision`, as
+    /// `vision_block::Block::from_pile_with` binds a block's.
+    ///
+    /// # Safety
+    /// As [`Self::from_pile`].
+    pub unsafe fn from_pile_with<R: BlobStoreGet>(snapshot:&R,s:Slots,c:Config,a:&mut CudaBf16Aliases,precision:DecoderPrecision)->Result<Self,String> {
         c.validate()?;
+        if precision==DecoderPrecision::W4a16{return Err("the vision merger runs bf16 or w4a4, not w4a16".into());}
         macro_rules! bind {($h:expr,$r:literal)=>{{
             let b:Blob<NativeTensor<BF16,$r>>=snapshot.get($h).map_err(|e|e.to_string())?;
             // SAFETY: caller supplies the genuine immutable-prefix premise.
             unsafe {a.bind_pile_leaf(b)?}
         }};}
-        let out=Self{c,norm:bind!(s.norm,1),norm_bias:bind!(s.norm_bias,1),fc1:bind!(s.fc1,2),bias1:bind!(s.bias1,1),fc2:bind!(s.fc2,2),bias2:bind!(s.bias2,1)};
         let w=4*c.hidden;
+        macro_rules! bind_lin {($slot:expr,$n:expr,$k:expr)=>{{
+            if precision==DecoderPrecision::W4a4&&crate::nn::nvfp4_gemm::w4a4_rows_takes($n,$k){
+                // SAFETY: forwarded genuine immutable-prefix contract.
+                unsafe {bind_linear(snapshot,LinearSlot::Bf16($slot),a,precision)?}
+            } else {Linear::Bf16(bind!($slot,2))}
+        }};}
+        let out=Self{c,norm:bind!(s.norm,1),norm_bias:bind!(s.norm_bias,1),fc1:bind_lin!(s.fc1,w,w),bias1:bind!(s.bias1,1),fc2:bind_lin!(s.fc2,c.output,w),bias2:bind!(s.bias2,1)};
         for (name,t,shape) in [("norm",&out.norm,vec![c.hidden]),("norm bias",&out.norm_bias,vec![c.hidden]),
-            ("fc1",&out.fc1,vec![w,w]),("bias1",&out.bias1,vec![w]),("fc2",&out.fc2,vec![c.output,w]),("bias2",&out.bias2,vec![c.output])] {
+            ("bias1",&out.bias1,vec![w]),("bias2",&out.bias2,vec![c.output])] {
             check(t,&out.norm,name,&shape)?;
             if t.handle.can_mut(){return Err(format!("{name}: immutable native weight required"));}
         }
+        for (name,l,shape) in [("fc1",&out.fc1,[w,w]),("fc2",&out.fc2,[c.output,w])] {
+            if let Linear::Bf16(t)=l {check(t,&out.norm,name,&shape)?;}
+            l.check(name,shape,&out.norm)?;
+        }
         Ok(out)
     }
+    /// The two linears as bound, in order fc1, fc2.
+    pub(crate) fn linears(&self)->[&Linear;2]{[&self.fc1,&self.fc2]}
     /// Input already has frontend merge-major row order. Each declared frame/
     /// group must end on a complete four-row unit; no reordering is performed.
     pub fn forward(&self,x:&CudaTensor,groups:&[usize])->Result<Output,String>{self.run(x,groups,false)}
@@ -61,7 +85,7 @@ impl Merger {
         let new=|shape:Vec<usize>,size|CudaTensor::new_contiguous(x.client.clone(),x.device.clone(),shape.into(),x.client.empty(size*2),DType::BF16);
         let norm=new(vec![n,h],cells);
         let grouped=CudaTensor::new_contiguous(x.client.clone(),x.device.clone(),[n/4,w].into(),norm.handle.clone(),DType::BF16);
-        let fc1=new(vec![n/4,w],cells);let activated=new(vec![n/4,w],cells);let hidden=new(vec![n/4,self.c.output],final_cells);
+        let mut fc1=new(vec![n/4,w],cells);let activated=new(vec![n/4,w],cells);let mut hidden=new(vec![n/4,self.c.output],final_cells);
         let cube=CubeDim::new_1d(64);let norm_width=if postshuffle{w}else{h};let rows=cells/norm_width;
         // SAFETY: all source descriptors/strides/devices/bounds checked before
         // launch; fresh disjoint destinations except the read-only grouped view.
@@ -70,14 +94,25 @@ impl Merger {
             norm_kernel::launch_unchecked::<CudaRuntime>(&x.client,cubecl::calculate_cube_count_elemwise(&x.client,rows,cube),cube,
                 ArrayArg::from_raw_parts(x.handle.clone(),cells),ArrayArg::from_raw_parts(self.norm.handle.clone(),h),
                 ArrayArg::from_raw_parts(self.norm_bias.handle.clone(),h),ArrayArg::from_raw_parts(norm.handle.clone(),cells),rows,norm_width,h);
-            linear_kernel::launch_unchecked::<CudaRuntime>(&x.client,cubecl::calculate_cube_count_elemwise(&x.client,cells,cube),cube,
-                ArrayArg::from_raw_parts(grouped.handle.clone(),cells),ArrayArg::from_raw_parts(self.fc1.handle.clone(),w*w),
-                ArrayArg::from_raw_parts(self.bias1.handle.clone(),w),ArrayArg::from_raw_parts(fc1.handle.clone(),cells),cells,w,w);
+        }
+        match &self.fc1 {
+            Linear::Bf16(fc1w)=>unsafe{linear_kernel::launch_unchecked::<CudaRuntime>(&x.client,cubecl::calculate_cube_count_elemwise(&x.client,cells,cube),cube,
+                ArrayArg::from_raw_parts(grouped.handle.clone(),cells),ArrayArg::from_raw_parts(fc1w.handle.clone(),w*w),
+                ArrayArg::from_raw_parts(self.bias1.handle.clone(),w),ArrayArg::from_raw_parts(fc1.handle.clone(),cells),cells,w,w);},
+            Linear::Nvfp4{weight,precision:DecoderPrecision::W4a4,..}=>fc1=super::vision_block::biased_w4a4(&grouped,weight,&self.bias1)?,
+            Linear::Nvfp4{..}=>return Err("vision merger: only W4A4 runs NVFP4 here".into()),
+        }
+        // SAFETY: as above; fc1 is complete [n/4, w] BF16 and activated fresh.
+        unsafe {
             gelu_kernel::launch_unchecked::<CudaRuntime>(&x.client,cubecl::calculate_cube_count_elemwise(&x.client,cells,cube),cube,
                 ArrayArg::from_raw_parts(fc1.handle.clone(),cells),ArrayArg::from_raw_parts(activated.handle.clone(),cells),cells);
-            linear_kernel::launch_unchecked::<CudaRuntime>(&x.client,cubecl::calculate_cube_count_elemwise(&x.client,final_cells,cube),cube,
-                ArrayArg::from_raw_parts(activated.handle.clone(),cells),ArrayArg::from_raw_parts(self.fc2.handle.clone(),self.c.output*w),
-                ArrayArg::from_raw_parts(self.bias2.handle.clone(),self.c.output),ArrayArg::from_raw_parts(hidden.handle.clone(),final_cells),final_cells,w,self.c.output);
+        }
+        match &self.fc2 {
+            Linear::Bf16(fc2w)=>unsafe{linear_kernel::launch_unchecked::<CudaRuntime>(&x.client,cubecl::calculate_cube_count_elemwise(&x.client,final_cells,cube),cube,
+                ArrayArg::from_raw_parts(activated.handle.clone(),cells),ArrayArg::from_raw_parts(fc2w.handle.clone(),self.c.output*w),
+                ArrayArg::from_raw_parts(self.bias2.handle.clone(),self.c.output),ArrayArg::from_raw_parts(hidden.handle.clone(),final_cells),final_cells,w,self.c.output);},
+            Linear::Nvfp4{weight,precision:DecoderPrecision::W4a4,..}=>hidden=super::vision_block::biased_w4a4(&activated,weight,&self.bias2)?,
+            Linear::Nvfp4{..}=>return Err("vision merger: only W4A4 runs NVFP4 here".into()),
         }
         Ok(Output{norm,grouped,fc1,activated,hidden})
     }

@@ -3,7 +3,14 @@
 //! Rotary follows the pinned actual HF constructor: F32 inverse frequencies,
 //! angles and trigonometric tables; F32 rotation with only its Q/K result BF16.
 //! Biased linear uses F32 dot+bias then BF16; parity is deliberately unproven.
+//! Under `DecoderPrecision::W4a4` (`Block::from_pile_with`) every linear whose
+//! shape the W4A4-rows kernel takes (K in 64s, N in 8s: qkv, proj and fc1;
+//! fc2 has K 4304 and stays BF16) is quantized on the device at load to
+//! NVFP4 and runs `Nvfp4::project_w4a4_rows` (the decoder's kernel), then a
+//! BF16 bias add (`bias_kernel`). Everything else is unchanged.
 pub use super::vision_frontend::Grid;
+use super::gdn_mixer::{DecoderPrecision, Linear, bind_linear};
+use super::roles::LinearSlot;
 use crate::nn::cuda_bf16_alias::CudaBf16Aliases;
 use burn::tensor::DType;
 use burn_cubecl::tensor::CubeTensor;
@@ -64,13 +71,13 @@ pub struct Block {
     n1b: CudaTensor,
     n2w: CudaTensor,
     n2b: CudaTensor,
-    qw: CudaTensor,
+    qw: Linear,
     qb: CudaTensor,
-    pw: CudaTensor,
+    pw: Linear,
     pb: CudaTensor,
-    w1: CudaTensor,
+    w1: Linear,
     b1: CudaTensor,
-    w2: CudaTensor,
+    w2: Linear,
     b2: CudaTensor,
 }
 pub struct Output {
@@ -131,12 +138,46 @@ impl Block {
         c: Config,
         a: &mut CudaBf16Aliases,
     ) -> Result<Self, String> {
+        // SAFETY: forwarded unchanged.
+        unsafe { Self::from_pile_with(snapshot, s, c, a, DecoderPrecision::Bf16) }
+    }
+
+    /// [`Self::from_pile`] with the block's linears on `precision`: `Bf16`
+    /// binds exactly as `from_pile`; `W4a4` quantizes every linear the
+    /// W4A4-rows kernel takes on the device at load (`gdn_mixer::bind_linear`,
+    /// the binder registers none of them) and binds the rest BF16. W4A16 is
+    /// refused: no vision kernel runs it.
+    ///
+    /// # Safety
+    /// As [`Self::from_pile`].
+    pub unsafe fn from_pile_with<R: BlobStoreGet>(
+        snapshot: &R,
+        s: Slots,
+        c: Config,
+        a: &mut CudaBf16Aliases,
+        precision: DecoderPrecision,
+    ) -> Result<Self, String> {
         c.validate()?;
+        if precision == DecoderPrecision::W4a16 {
+            return Err("the vision tower runs bf16 or w4a4, not w4a16".into());
+        }
         macro_rules! bind {
             ($slot:expr,$r:literal) => {{
                 let b: Blob<NativeTensor<BF16, $r>> =
                     snapshot.get($slot).map_err(|e| e.to_string())?;
                 unsafe { a.bind_pile_leaf(b)? }
+            }};
+        }
+        let h = c.hidden;
+        let m = c.intermediate;
+        macro_rules! bind_lin {
+            ($slot:expr, $n:expr, $k:expr) => {{
+                if precision == DecoderPrecision::W4a4 && crate::nn::nvfp4_gemm::w4a4_rows_takes($n, $k) {
+                    // SAFETY: forwarded genuine immutable-prefix contract.
+                    unsafe { bind_linear(snapshot, LinearSlot::Bf16($slot), a, precision)? }
+                } else {
+                    Linear::Bf16(bind!($slot, 2))
+                }
             }};
         }
         let b = Self {
@@ -145,29 +186,23 @@ impl Block {
             n1b: bind!(s.norm1_bias, 1),
             n2w: bind!(s.norm2_weight, 1),
             n2b: bind!(s.norm2_bias, 1),
-            qw: bind!(s.qkv_weight, 2),
+            qw: bind_lin!(s.qkv_weight, 3 * h, h),
             qb: bind!(s.qkv_bias, 1),
-            pw: bind!(s.proj_weight, 2),
+            pw: bind_lin!(s.proj_weight, h, h),
             pb: bind!(s.proj_bias, 1),
-            w1: bind!(s.fc1_weight, 2),
+            w1: bind_lin!(s.fc1_weight, m, h),
             b1: bind!(s.fc1_bias, 1),
-            w2: bind!(s.fc2_weight, 2),
+            w2: bind_lin!(s.fc2_weight, h, m),
             b2: bind!(s.fc2_bias, 1),
         };
-        let h = c.hidden;
-        let m = c.intermediate;
         for (name, t, shape) in [
             ("n1w", &b.n1w, vec![h]),
             ("n1b", &b.n1b, vec![h]),
             ("n2w", &b.n2w, vec![h]),
             ("n2b", &b.n2b, vec![h]),
-            ("qw", &b.qw, vec![3 * h, h]),
             ("qb", &b.qb, vec![3 * h]),
-            ("pw", &b.pw, vec![h, h]),
             ("pb", &b.pb, vec![h]),
-            ("w1", &b.w1, vec![m, h]),
             ("b1", &b.b1, vec![m]),
-            ("w2", &b.w2, vec![h, m]),
             ("b2", &b.b2, vec![h]),
         ] {
             check(t, &b.n1w, name, &shape)?;
@@ -175,7 +210,23 @@ impl Block {
                 return Err(format!("{name}: immutable alias required"));
             }
         }
+        for (name, w, shape) in [
+            ("qw", &b.qw, [3 * h, h]),
+            ("pw", &b.pw, [h, h]),
+            ("w1", &b.w1, [m, h]),
+            ("w2", &b.w2, [h, m]),
+        ] {
+            if let Linear::Bf16(t) = w {
+                check(t, &b.n1w, name, &shape)?;
+            }
+            w.check(name, shape, &b.n1w)?;
+        }
         Ok(b)
+    }
+
+    /// The four linears as bound, in order qkv, proj, fc1, fc2.
+    pub(crate) fn linears(&self) -> [&Linear; 4] {
+        [&self.qw, &self.pw, &self.w1, &self.w2]
     }
     pub fn forward(&self, x: &CudaTensor, grids: &[Grid]) -> Result<Output, String> {
         self.forward_inner(x, grids, false)
@@ -206,7 +257,7 @@ impl Block {
         // Ephemeral metadata plan only. No host tensor values or numeric masks.
         let frames = super::vision_geometry::frames(grids, n, c.heads)?;
         let norm1 = norm(x, &self.n1w, &self.n1b, h);
-        let qkv = linear(&norm1, &self.qw, &self.qb, 3 * h);
+        let qkv = linear(&norm1, &self.qw, &self.qb, 3 * h)?;
         let q = channel(&qkv, 0, h);
         let k = channel(&qkv, h, h);
         let v = channel(&qkv, 2 * h, h);
@@ -262,12 +313,12 @@ impl Block {
             }
             attention_frame(&q_rot, &k_rot, &v, &attended, offset, len, c.heads, d);
         }
-        let projected = linear(&attended, &self.pw, &self.pb, h);
+        let projected = linear(&attended, &self.pw, &self.pb, h)?;
         let residual = element(x, &projected, false);
         let norm2 = norm(&residual, &self.n2w, &self.n2b, h);
-        let fc1 = linear(&norm2, &self.w1, &self.b1, c.intermediate);
+        let fc1 = linear(&norm2, &self.w1, &self.b1, c.intermediate)?;
         let activated = element(&fc1, &fc1, true);
-        let fc2 = linear(&activated, &self.w2, &self.b2, h);
+        let fc2 = linear(&activated, &self.w2, &self.b2, h)?;
         let hidden = element(&residual, &fc2, false);
         Ok(Output {
             norm1,
@@ -464,7 +515,53 @@ fn linear_kernel(
         y[i] = bf16::cast_from(sum + f32::cast_from(b[o]));
     }
 }
-fn linear(x: &CudaTensor, w: &CudaTensor, b: &CudaTensor, ow: usize) -> CudaTensor {
+fn linear(x: &CudaTensor, w: &Linear, b: &CudaTensor, ow: usize) -> Result<CudaTensor, String> {
+    let w = match w {
+        Linear::Bf16(w) => w,
+        Linear::Nvfp4 { weight, precision: DecoderPrecision::W4a4, .. } => return biased_w4a4(x, weight, b),
+        Linear::Nvfp4 { .. } => return Err("vision linear: only W4A4 runs NVFP4 here".into()),
+    };
+    Ok(linear_bf16(x, w, b, ow))
+}
+/// `[t, k] x [n, k]^T + bias -> [t, n]` BF16 on the decoder's W4A4-rows
+/// kernel (NVFP4 activations per row, f32 accumulation, one BF16 cast), then
+/// the bias in f32 and a second BF16 cast.
+pub(super) fn biased_w4a4(
+    x: &CudaTensor,
+    w: &crate::nn::nvfp4_gemv::Nvfp4,
+    b: &CudaTensor,
+) -> Result<CudaTensor, String> {
+    let s = x.meta.shape().as_slice();
+    let n = w.n();
+    if s.len() != 2 || s[1] != w.k() || len(b) != n {
+        return Err(format!("W4A4 vision linear: input {s:?}, weight [{n}, {}], bias {}", w.k(), len(b)));
+    }
+    let p = w.project_w4a4_rows(x).map_err(|e| format!("W4A4 vision linear [{}, {}] x [{n}, {}]: {e}", s[0], s[1], w.k()))?;
+    let y = empty(x, &[s[0], n]);
+    // SAFETY: p is a fresh contiguous [1, t, n] BF16 output, b holds n BF16,
+    // y is fresh [t, n]; each thread owns one output element.
+    unsafe {
+        bias_kernel::launch_unchecked::<CudaRuntime>(
+            &x.client,
+            grid(x, len(&y)),
+            CubeDim::new_1d(64),
+            ArrayArg::from_raw_parts(p.handle.clone(), len(&y)),
+            arg(b),
+            arg(&y),
+            len(&y),
+            n,
+        );
+    }
+    Ok(y)
+}
+#[cube(launch_unchecked)]
+fn bias_kernel(p: &Array<bf16>, b: &Array<bf16>, y: &mut Array<bf16>, n: usize, ow: usize) {
+    let i = ABSOLUTE_POS as usize;
+    if i < n {
+        y[i] = bf16::cast_from(f32::cast_from(p[i]) + f32::cast_from(b[i % ow]));
+    }
+}
+fn linear_bf16(x: &CudaTensor, w: &CudaTensor, b: &CudaTensor, ow: usize) -> CudaTensor {
     let s = x.meta.shape().as_slice();
     let y = empty(x, &[s[0], ow]);
     unsafe {

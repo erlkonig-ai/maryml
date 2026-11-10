@@ -19,6 +19,7 @@ use crate::nn::cuda_bf16_alias::CudaBf16Aliases;
 
 use super::{
     config::{Dtype, Qwen3_5Config},
+    gdn_mixer::{BoundProjection, DecoderPrecision},
     vision_block::{self, Block},
     vision_frontend::{self, CudaTensor, Frontend},
     vision_geometry::{self, Grid},
@@ -210,6 +211,23 @@ impl Tower {
         config: Config,
         aliases: &mut CudaBf16Aliases,
     ) -> Result<Self, String> {
+        // SAFETY: forwarded unchanged.
+        unsafe { Self::from_pile_with(source, slots, config, aliases, DecoderPrecision::Bf16) }
+    }
+
+    /// [`Self::from_pile`] with the blocks' and the merger's linears on
+    /// `precision` (`vision_block::Block::from_pile_with`). The frontend's
+    /// patch convolution stays BF16 in every precision.
+    ///
+    /// # Safety
+    /// As [`Self::from_pile`].
+    pub unsafe fn from_pile_with<R: BlobStoreGet>(
+        source: &R,
+        slots: Slots,
+        config: Config,
+        aliases: &mut CudaBf16Aliases,
+        precision: DecoderPrecision,
+    ) -> Result<Self, String> {
         config.validate()?;
         if slots.blocks.len() != config.depth {
             return Err(format!(
@@ -225,17 +243,36 @@ impl Tower {
         let mut blocks = Vec::with_capacity(config.depth);
         for (index, block) in slots.blocks.into_iter().enumerate() {
             blocks.push(
-                unsafe { Block::from_pile(source, block, config.block, aliases) }
+                unsafe { Block::from_pile_with(source, block, config.block, aliases, precision) }
                     .map_err(|e| format!("vision block {index}: {e}"))?,
             );
         }
-        let merger = unsafe { Merger::from_pile(source, slots.merger, config.merger, aliases)? };
+        let merger = unsafe { Merger::from_pile_with(source, slots.merger, config.merger, aliases, precision)? };
         Ok(Self {
             config,
             frontend,
             blocks,
             merger,
         })
+    }
+
+    /// The blocks' and the merger's linears as bound: (count, BF16 count,
+    /// BF16 weight bytes, NVFP4 count, NVFP4 plane bytes, bound kinds seen).
+    pub fn linear_bytes(&self) -> (usize, usize, u64, usize, u64, Vec<BoundProjection>) {
+        let mut out = (0, 0, 0, 0, 0, Vec::new());
+        let all = self.blocks.iter().flat_map(|b| b.linears()).chain(self.merger.linears());
+        for l in all {
+            out.0 += 1;
+            let (b, f) = l.bytes();
+            match l.bound() {
+                BoundProjection::Bf16 => { out.1 += 1; out.2 += b; }
+                BoundProjection::Nvfp4 { .. } => { out.3 += 1; out.4 += f; }
+            }
+            if !out.5.contains(&l.bound()) {
+                out.5.push(l.bound());
+            }
+        }
+        out
     }
 
     /// All grid/frame/score extents are checked before any GPU allocation.
