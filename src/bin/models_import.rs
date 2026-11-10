@@ -75,8 +75,9 @@ enum Model {
     /// WeMM-Embedding-9B: the 248 decoder projections as NVFP4 leaves.
     #[cfg(feature = "wemm-input")]
     Wemm {
-        /// The checkpoint's assets directory (tokenizer.json, config.json,
-        /// chat_template.jinja), stored as the new root's parts.
+        /// The checkpoint's assets directory. Only its tokenizer.json is
+        /// read, and refused unless it is the source root's own tokenizer;
+        /// the configuration and chat template come from the source root.
         #[arg(long)]
         assets: PathBuf,
     },
@@ -517,9 +518,13 @@ pub(super) fn voxtral(
 /// gates the host packing byte for byte against the device quantizer the
 /// runtime's load-time NVFP4 path runs; every other tensor (vision tower,
 /// token table, norms, conv, DeltaNet parameters) copied unchanged in BF16.
-/// The root's parts are stored from the checkpoint's own assets, as
-/// `model_collection_migrate` completes a root: tokenizer.json as tokenizer
-/// facts, config.json as JSON facts, chat_template.jinja as a blob.
+/// The root's parts are the SOURCE ROOT's own: its configuration and chat
+/// template are read from its core and stored again, and the tokenizer is
+/// stored from `--assets`'s tokenizer.json only once that file rebuilds,
+/// through the tokenizer graph, exactly the tokenizer the source root's graph
+/// rebuilds ([`source_parts`]). A wrong directory is refused before any
+/// weight is packed, instead of minting a plausible root that frames text
+/// differently.
 #[cfg(feature = "wemm-input")]
 pub(super) fn wemm(
     assets: &Path,
@@ -532,6 +537,18 @@ pub(super) fn wemm(
     // The runtime binds 759 of them; any other tensor member (open world) is
     // carried over unchanged with the rest.
     eprintln!("[wemm] source root {:X}: {} tensor members", source.root, index.len());
+    let mut sources: Vec<String> = Vec::new();
+    for (handle,) in find!(
+        (handle: Inline<inlineencodings::Handle<blobencodings::UTF8String>>),
+        pattern!(&source.facts, [{ source.root @ attrs::source: ?handle }])
+    ) {
+        let label: anybytes::View<str> = source.store.get(handle).map_err(|e| anyhow::anyhow!("source label: {e}"))?;
+        sources.push(label.to_string());
+    }
+    sources.sort();
+    let source_label = sources.first().cloned().unwrap_or_else(|| "WeMM-Embedding-9B".to_owned());
+    let (tokenizer_json, config, template) = source_parts(source, assets, &source_label)?;
+    eprintln!("[wemm] parts: configuration and chat template from the source root; {} matches its tokenizer", assets.join("tokenizer.json").display());
     let device = cubecl::cuda::CudaDevice { index: 0 };
     let started = Instant::now();
     let mut stored = BTreeMap::new();
@@ -550,20 +567,6 @@ pub(super) fn wemm(
     eprintln!("[wemm] {} projections packed and gated in {export_seconds:.1}s", stored.len());
     let (members, mut facts, dense, packed) = members(pile, &index, &stored, &BTreeSet::new())?;
 
-    let read = |name: &str| std::fs::read(assets.join(name)).with_context(|| format!("{}", assets.join(name).display()));
-    let tokenizer_json = read("tokenizer.json")?;
-    let config: serde_json::Value = serde_json::from_slice(&read("config.json")?).context("config.json")?;
-    let template = String::from_utf8(read("chat_template.jinja")?).context("chat_template.jinja is not UTF-8")?;
-    let mut sources: Vec<String> = Vec::new();
-    for (handle,) in find!(
-        (handle: Inline<inlineencodings::Handle<blobencodings::UTF8String>>),
-        pattern!(&source.facts, [{ source.root @ attrs::source: ?handle }])
-    ) {
-        let label: anybytes::View<str> = source.store.get(handle).map_err(|e| anyhow::anyhow!("source label: {e}"))?;
-        sources.push(label.to_string());
-    }
-    sources.sort();
-    let source_label = sources.first().cloned().unwrap_or_else(|| "WeMM-Embedding-9B".to_owned());
     let tokenizer = mary::tokenizer::save_tokenizer_json(&tokenizer_json, &source_label, pile)
         .map_err(|e| anyhow::anyhow!("store the tokenizer: {e}"))?;
     let tokenizer_id = tokenizer.root();
@@ -593,6 +596,47 @@ pub(super) fn wemm(
             "tensors": index.len(), "export_seconds": export_seconds,
         }),
     ))
+}
+
+/// The source root's parts for its NVFP4 root: (tokenizer.json bytes, the
+/// configuration, the chat template). The configuration and template are
+/// the source root's own facts and blob. The tokenizer graph has no inverse
+/// to tokenizer.json, so `assets/tokenizer.json` is taken only when the
+/// tokenizer it saves to rebuilds to the same tokenizer (serialized) as the
+/// source root's graph; anything else is refused, naming the difference.
+#[cfg(feature = "wemm-input")]
+fn source_parts(source: &Source, assets: &Path, label: &str) -> Result<(Vec<u8>, serde_json::Value, String)> {
+    use triblespace::core::blob::MemoryBlobStore;
+    use triblespace::core::repo::SnapshotSource;
+    let parts = mary::selection::model_root_parts(&source.facts, source.root)?;
+    let missing = |what: &str| anyhow::anyhow!("source root {:X} has no {what} in its core", source.root);
+    let config = mary::jsonfacts::load_json(&source.facts, &source.store, parts.config.ok_or_else(|| missing("configuration"))?)
+        .map_err(|e| anyhow::anyhow!("read the source root's configuration: {e}"))?;
+    let template: anybytes::View<str> = source.store.get(parts.chat_template.ok_or_else(|| missing("chat template"))?)
+        .map_err(|e| anyhow::anyhow!("read the source root's chat template: {e}"))?;
+    let theirs = mary::tokenizer::build_tokenizer(&source.facts, &source.store, parts.tokenizer.ok_or_else(|| missing("tokenizer"))?)
+        .map_err(|e| anyhow::anyhow!("rebuild the source root's tokenizer: {e}"))?;
+    let path = assets.join("tokenizer.json");
+    let json = std::fs::read(&path).with_context(|| format!("{}", path.display()))?;
+    let mut scratch = MemoryBlobStore::new();
+    let saved = mary::tokenizer::save_tokenizer_json(&json, label, &mut scratch)
+        .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+    let id = saved.root().context("tokenizer root")?;
+    let facts: TribleSet = saved.into();
+    let reader = SnapshotSource::snapshot(&mut scratch).map_err(|e| anyhow::anyhow!("scratch tokenizer store: {e:?}"))?;
+    let ours = mary::tokenizer::build_tokenizer(&facts, &reader, id)
+        .map_err(|e| anyhow::anyhow!("rebuild {}'s tokenizer: {e}", path.display()))?;
+    let serialized = |t: &tokenizers::Tokenizer| t.to_string(false).map_err(|e| anyhow::anyhow!("serialize a tokenizer: {e}"));
+    let (theirs, ours) = (serialized(&theirs)?, serialized(&ours)?);
+    if theirs != ours {
+        let at = theirs.bytes().zip(ours.bytes()).take_while(|(a, b)| a == b).count();
+        let near = |s: &str| s.get(at.saturating_sub(40)..(at + 40).min(s.len())).unwrap_or("").to_owned();
+        anyhow::bail!(
+            "{} is not the source root {:X}'s tokenizer: rebuilt through the tokenizer graph they first differ at byte {at} (source {:?}, file {:?}); give --assets the directory of the checkpoint this root was imported from",
+            path.display(), source.root, near(&theirs), near(&ours)
+        );
+    }
+    Ok((json, config, template.to_string()))
 }
 
 } // native
