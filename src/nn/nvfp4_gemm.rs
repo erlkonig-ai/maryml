@@ -704,3 +704,300 @@ pub(crate) fn calibrated_scale(input: f32, weight: f32) -> Result<f32> {
         "W4A4 calibrated globals/product must be finite positive");
     Ok(product)
 }
+
+// ---------------------------------------------------------------------------
+// W4A4 with a per-row activation global scale, register-blocked.
+//
+// The prompt lane above quantizes activations with block scales alone (unit
+// second-level scale), so an activation block whose largest magnitude is
+// below 6 * 2^-6 lands its E4M3 scale in the subnormal binade and one above
+// 6 * 448 saturates. WeMM's decoder activations span both (post-norm rows
+// of O(1), SiLU products of O(0.01)), so this lane gives every activation row
+// its own f32 second-level scale, `amax_row / (6 * 448)`, exactly as the
+// weight's tensor scale is chosen: the row's largest block lands on E4M3's top
+// code. The epilogue multiplies each output row by its row scale and the
+// weight's scale2, in f32, before the single narrowing cast. Rows are tokens,
+// so the scale never mixes sequences of a batch.
+//
+// One plane owns `tm` x `tn` MMA tiles (16 x 8 each) and loads each A and B
+// fragment once per k-step for all of them; the instruction, its k order and
+// the f32 accumulation are those of `w4a4_kernel`.
+// ---------------------------------------------------------------------------
+
+/// Threads of the row-scale launch.
+const ROW_THREADS: usize = 256;
+/// MMA tiles one W4A4-rows plane owns along M and along N.
+const ROWS_TM: usize = 4;
+const ROWS_TN: usize = 4;
+
+/// `rowscale[r] = amax(|x[r, :]|) / (6 * 448)`, or 1.0 for an all-zero row.
+#[cube(launch_unchecked)]
+fn row_scale_kernel<E: Scalar + Cast>(
+    x: &Array<E>,
+    rowscale: &mut Array<f32>,
+    #[comptime] width: usize,
+    #[comptime] threads: usize,
+) {
+    let r = CUBE_POS_X as usize;
+    let lane = UNIT_POS_X as usize;
+    let mut m = 0.0f32;
+    let mut j = lane;
+    while j < width {
+        m = max(m, Abs::abs(f32::cast_from(x[r * width + j])));
+        j += threads;
+    }
+    let mut shared = SharedMemory::<f32>::new(threads);
+    shared[lane] = m;
+    sync_cube();
+    if lane == 0 {
+        let mut a = 0.0f32;
+        for i in 0..threads {
+            a = max(a, shared[i]);
+        }
+        let mut s = 1.0f32;
+        if a > 0.0f32 {
+            s = a / 2688.0f32;
+        }
+        rowscale[r] = s;
+    }
+}
+
+/// One 16-block per thread under its row's second-level scale.
+#[cube(launch_unchecked)]
+fn quantize_rows_kernel<E: Scalar + Cast>(
+    x: &Array<E>,
+    codes: &mut Array<u32>,
+    scales: &mut Array<e4m3>,
+    rowscale: &Array<f32>,
+    row_blocks: usize,
+    blocks: usize,
+) {
+    let blk = ABSOLUTE_POS;
+    if blk < blocks {
+        quantize_block::<E>(x, blk * 16, codes, scales, blk, rowscale[blk / row_blocks]);
+    }
+}
+
+/// `out[r, c] = O(acc[r, c] * (rowscale[r] * scale))` for `r < m`, with
+/// `acc` the block-scaled FP4 product of the quantized row and weight row.
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn w4a4_rows_kernel<AB: Scalar, S: Scalar, O: Scalar + Cast, NA: Size, NC: Size>(
+    a: &Array<Vector<AB, NA>>,
+    a_sc: &Array<S>,
+    rowscale: &Array<f32>,
+    b: &Array<Vector<AB, NA>>,
+    b_sc: &Array<S>,
+    out: &mut Array<O>,
+    m: u32,
+    #[comptime] size_k: usize,
+    #[comptime] size_n: usize,
+    #[comptime] tm: usize,
+    #[comptime] tn: usize,
+    scale: f32,
+) {
+    let def = cmma::MmaDefinition::<AB, AB, f32>::new_scaled::<S>(MTILE, NTILE, KTILE4, 4usize);
+    let lane = UNIT_POS_PLANE;
+    let pack = AB::packing_factor();
+    let m_base = CUBE_POS_X as usize * comptime!(MTILE * tm);
+    let n_base = CUBE_POS_Y as usize * comptime!(NTILE * tn);
+    let last = m as usize - 1;
+
+    let ec_a = def.elems_per_lane(MatrixIdent::A);
+    let vs_a = def.vector_size(MatrixIdent::A);
+    let vc_a = comptime!(ec_a / vs_a);
+    let ec_b = def.elems_per_lane(MatrixIdent::B);
+    let vs_b = def.vector_size(MatrixIdent::B);
+    let vc_b = comptime!(ec_b / vs_b);
+    let ec_c = def.elems_per_lane(MatrixIdent::Accumulator);
+    let vs_c = def.vector_size(MatrixIdent::Accumulator);
+    let vc_c = comptime!(ec_c / vs_c);
+
+    let mut all_a = Array::<Vector<AB, NA>>::new(comptime!(tm * vc_a));
+    let mut all_b = Array::<Vector<AB, NA>>::new(comptime!(tn * vc_b));
+    let mut reg_a = Array::<Vector<AB, NA>>::new(vc_a);
+    let mut reg_b = Array::<Vector<AB, NA>>::new(vc_b);
+    let mut cur = Array::<Vector<f32, NC>>::new(vc_c);
+    let mut acc = Array::<Vector<f32, NC>>::new(comptime!(tm * tn * vc_c));
+    #[unroll]
+    for i in 0..comptime!(tm * tn * vc_c) {
+        acc[i] = Vector::<f32, NC>::cast_from(0.0f32);
+    }
+
+    let scales_count = def.scales_count();
+    let size!(NS) = def.scales_vector_size();
+    let sia = def.scales_index(lane, MatrixIdent::A) as usize + m_base;
+    let sib = def.scales_index(lane, MatrixIdent::B) as usize + n_base;
+    let spr = comptime!(size_k / GROUP);
+    let k_tiles = comptime!(size_k / KTILE4);
+
+    for t in 0..k_tiles {
+        let kbase = t * KTILE4;
+        #[unroll]
+        for mt in 0..tm {
+            #[unroll]
+            for i in 0..vc_a {
+                let (row, col) = def.position_of_nth(lane, (i * vs_a * pack) as u32, MatrixIdent::A);
+                let gr = min(row as usize + m_base + mt * MTILE, last);
+                let gc = col as usize + kbase;
+                all_a[mt * vc_a + i] = a[(gr * size_k / 2 + gc / 2) / a.vector_size()];
+            }
+        }
+        #[unroll]
+        for nt in 0..tn {
+            #[unroll]
+            for i in 0..vc_b {
+                let (row, col) = def.position_of_nth(lane, (i * vs_b * pack) as u32, MatrixIdent::B);
+                let gr = col as usize + n_base + nt * NTILE;
+                let gc = row as usize + kbase;
+                all_b[nt * vc_b + i] = b[(gr * size_k / 2 + gc / 2) / b.vector_size()];
+            }
+        }
+        #[unroll]
+        for mt in 0..tm {
+            let ra = min(sia + mt * MTILE, last);
+            let mut sa = Vector::<S, NS>::empty();
+            #[unroll]
+            for i in 0..scales_count {
+                sa[i] = a_sc[ra * spr + t * 4 + i];
+            }
+            #[unroll]
+            for i in 0..vc_a {
+                reg_a[i] = all_a[mt * vc_a + i];
+            }
+            #[unroll]
+            for nt in 0..tn {
+                let mut sb = Vector::<S, NS>::empty();
+                #[unroll]
+                for i in 0..scales_count {
+                    sb[i] = b_sc[(sib + nt * NTILE) * spr + t * 4 + i];
+                }
+                #[unroll]
+                for i in 0..vc_b {
+                    reg_b[i] = all_b[nt * vc_b + i];
+                }
+                #[unroll]
+                for i in 0..vc_c {
+                    cur[i] = acc[(mt * tn + nt) * vc_c + i];
+                }
+                let d = def.execute_scaled(&reg_a, &reg_b, &cur, sa, sb);
+                #[unroll]
+                for i in 0..vc_c {
+                    acc[(mt * tn + nt) * vc_c + i] = d[i];
+                }
+            }
+        }
+    }
+
+    #[unroll]
+    for mt in 0..tm {
+        #[unroll]
+        for nt in 0..tn {
+            #[unroll]
+            for i in 0..vc_c {
+                let (row, col) = def.position_of_nth(lane, (i * vs_c) as u32, MatrixIdent::Accumulator);
+                let gr = row as usize + m_base + mt * MTILE;
+                let gc = col as usize + n_base + nt * NTILE;
+                if gr < m as usize {
+                    let f = rowscale[gr] * scale;
+                    let v = acc[(mt * tn + nt) * vc_c + i];
+                    #[unroll]
+                    for j in 0..vs_c {
+                        out[gr * size_n + gc + j] = O::cast_from(v[j] * f);
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Nvfp4 {
+    /// W4A4 with a per-row activation global scale (see the section header):
+    /// `[t, k]` or `[1, t, k]` BF16 -> `[1, t, n]` BF16, three launches (row
+    /// scales, row-scaled quantization, the register-blocked block-scaled
+    /// MMA). Every quantity stays on the device; nothing is read back.
+    pub(crate) fn project_w4a4_rows(&self, x: &Tensor) -> Result<Tensor> {
+        ensure!(self.dtype() == DType::BF16, "W4A4-rows takes BF16 weights");
+        let packed;
+        let x = if x.is_contiguous() && x.handle.offset_start.unwrap_or(0) % 4 == 0 {
+            x
+        } else {
+            packed = burn_cubecl::kernel::into_contiguous_aligned(x.clone());
+            &packed
+        };
+        let t = rows_of(self, x)?;
+        let (n, k) = (self.n(), self.k());
+        let tn = ROWS_TN;
+        ensure!(
+            k % KTILE4 == 0 && n % (NTILE * tn) == 0,
+            "W4A4-rows needs k a multiple of {KTILE4} and n of {}, got [{n}, {k}]",
+            NTILE * tn
+        );
+        let client = &x.client;
+        let rowscale = client.empty(t * 4);
+        // SAFETY: one cube per row of the checked contiguous [t, k] BF16
+        // activation; each writes only its own row's scale.
+        unsafe {
+            row_scale_kernel::launch_unchecked::<bf16, CudaRuntime>(
+                client,
+                CubeCount::Static(t as u32, 1, 1),
+                CubeDim::new_1d(ROW_THREADS as u32),
+                ArrayArg::from_raw_parts(x.handle.clone(), t * k),
+                ArrayArg::from_raw_parts(rowscale.clone(), t),
+                k,
+                ROW_THREADS,
+            );
+        }
+        let blocks = t * k / GROUP;
+        let codes = client.empty(t * k / 2);
+        let scales = client.empty(blocks);
+        // SAFETY: one thread per complete 16-block of [t, k]; each writes its
+        // own two code words and scale byte; rowscale holds t entries.
+        unsafe {
+            quantize_rows_kernel::launch_unchecked::<bf16, CudaRuntime>(
+                client,
+                CubeCount::new_1d(blocks.div_ceil(256) as u32),
+                CubeDim::new_1d(256),
+                ArrayArg::from_raw_parts(x.handle.clone(), t * k),
+                ArrayArg::from_raw_parts(codes.clone(), t * k / 8),
+                ArrayArg::from_raw_parts(scales.clone(), blocks),
+                ArrayArg::from_raw_parts(rowscale.clone(), t),
+                k / GROUP,
+                blocks,
+            );
+        }
+        let out = client.empty(t * n * 2);
+        let vs = 32 / e2m1x2::cube_type().size_bits();
+        // SAFETY: activation planes [t, k/2] and [t, k/16] in the weight's
+        // row-major layout; k % 64 == 0 and n % (8 tn) == 0 bound every tile;
+        // rows past t are clamped to row t - 1 on load and never stored.
+        unsafe {
+            w4a4_rows_kernel::launch_unchecked::<e2m1x2, e4m3, bf16, CudaRuntime>(
+                client,
+                CubeCount::Static(t.div_ceil(MTILE * ROWS_TM) as u32, (n / (NTILE * tn)) as u32, 1),
+                CubeDim::new_1d(32),
+                vs,
+                2,
+                ArrayArg::from_raw_parts(codes.clone(), t * (k / 2) / vs),
+                ArrayArg::from_raw_parts(scales.clone(), blocks),
+                ArrayArg::from_raw_parts(rowscale.clone(), t),
+                ArrayArg::from_raw_parts(self.codes.clone(), n * (k / 2) / vs),
+                ArrayArg::from_raw_parts(self.scales.clone(), n * k / GROUP),
+                ArrayArg::from_raw_parts(out.clone(), t * n),
+                t as u32,
+                k,
+                n,
+                ROWS_TM,
+                tn,
+                self.scale2,
+            );
+        }
+        Ok(Tensor::new_contiguous(
+            x.client.clone(),
+            x.device.clone(),
+            [1, t, n].into(),
+            out,
+            DType::BF16,
+        ))
+    }
+}

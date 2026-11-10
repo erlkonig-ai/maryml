@@ -208,6 +208,15 @@ impl NativeWemm {
         })
     }
 
+    /// Run the decoder's linear projections on `precision` from now on
+    /// (`Bf16` changes nothing). The BF16 weights are quantized on the device
+    /// with the NVFP4 recipe of `nn::nvfp4_gemv`; their bound BF16 handles
+    /// stay registered in the caller's binder. Returns the NVFP4 plane bytes
+    /// created. The vision tower is not touched.
+    pub fn quantize_decoder(&mut self, precision: super::gdn_mixer::DecoderPrecision) -> Result<u64, String> {
+        self.model.quantize_decoder(precision)
+    }
+
     /// Actual selected root. The contributing collection is external store
     /// provenance and must be established separately by the caller.
     pub fn model_root(&self) -> Id {

@@ -107,6 +107,22 @@ impl Stack {
         Ok(Self { groups, endpoint, input_anchor })
     }
 
+    /// Put every decoder linear projection (all 32 layers' mixer, attention
+    /// and MLP projections; never the token table, norms or the vision
+    /// tower) on `precision`. Returns the NVFP4 plane bytes created.
+    pub fn quantize_projections(&mut self, precision: super::gdn_mixer::DecoderPrecision) -> Result<u64, String> {
+        let mut bytes = 0;
+        for (index, group) in self.groups.iter_mut().enumerate() {
+            for (offset, block) in group.gdn.iter_mut().enumerate() {
+                bytes += block.quantize_projections(precision)
+                    .map_err(|e| format!("layer {}: {e}", index * 4 + offset))?;
+            }
+            bytes += group.attention.quantize_projections(precision)
+                .map_err(|e| format!("layer {}: {e}", index * 4 + 3))?;
+        }
+        Ok(bytes)
+    }
+
     /// One fresh, unpadded sequence. Same existing affine three-axis positions
     /// reach all eight attention blocks. Their GPU producer computes
     /// p[axis,0,t] = start + axis_base[axis] + t*axis_step[axis].

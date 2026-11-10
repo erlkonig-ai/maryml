@@ -31,6 +31,7 @@ use triblespace::core::{
 };
 use super::{deltanet::{self, DeltaNetInputs}, gdn_ops};
 use crate::nn::cuda_bf16_alias::CudaBf16Aliases;
+use crate::nn::nvfp4_gemv::Nvfp4;
 
 pub type CudaTensor = CubeTensor<CudaRuntime>;
 
@@ -90,11 +91,11 @@ pub struct GdnSlots {
 /// Private fields prevent replacement of a validated, read-only weight.
 pub struct GdnMixer {
     config: GdnConfig,
-    qkv: CudaTensor,
-    z: CudaTensor,
-    a: CudaTensor,
-    b: CudaTensor,
-    out: CudaTensor,
+    qkv: Linear,
+    z: Linear,
+    a: Linear,
+    b: Linear,
+    out: Linear,
     conv: CudaTensor,
     a_log: CudaTensor,
     dt_bias: CudaTensor,
@@ -149,11 +150,11 @@ impl GdnMixer {
         let result = unsafe {
             Self {
                 config,
-                qkv: aliases.bind_pile_leaf(qkv)?,
-                z: aliases.bind_pile_leaf(z)?,
-                a: aliases.bind_pile_leaf(a)?,
-                b: aliases.bind_pile_leaf(b)?,
-                out: aliases.bind_pile_leaf(out)?,
+                qkv: Linear::Bf16(aliases.bind_pile_leaf(qkv)?),
+                z: Linear::Bf16(aliases.bind_pile_leaf(z)?),
+                a: Linear::Bf16(aliases.bind_pile_leaf(a)?),
+                b: Linear::Bf16(aliases.bind_pile_leaf(b)?),
+                out: Linear::Bf16(aliases.bind_pile_leaf(out)?),
                 conv: aliases.bind_pile_leaf(conv)?,
                 a_log: aliases.bind_pile_leaf(a_log)?,
                 dt_bias: aliases.bind_pile_leaf(dt_bias)?,
@@ -166,23 +167,34 @@ impl GdnMixer {
 
     fn check_weights(&self) -> Result<(), String> {
         let c = self.config;
+        let anchor = self.qkv.bf16()?;
         for (name, tensor, shape) in [
-            ("qkv", &self.qkv, vec![c.channels(), c.hidden]),
-            ("z", &self.z, vec![c.value_width(), c.hidden]),
-            ("a", &self.a, vec![c.value_heads, c.hidden]),
-            ("b", &self.b, vec![c.value_heads, c.hidden]),
-            ("out", &self.out, vec![c.hidden, c.value_width()]),
+            ("qkv", self.qkv.bf16()?, vec![c.channels(), c.hidden]),
+            ("z", self.z.bf16()?, vec![c.value_width(), c.hidden]),
+            ("a", self.a.bf16()?, vec![c.value_heads, c.hidden]),
+            ("b", self.b.bf16()?, vec![c.value_heads, c.hidden]),
+            ("out", self.out.bf16()?, vec![c.hidden, c.value_width()]),
             ("conv", &self.conv, vec![c.channels(), 1, c.conv_kernel]),
             ("A_log", &self.a_log, vec![c.value_heads]),
             ("dt_bias", &self.dt_bias, vec![c.value_heads]),
             ("norm", &self.norm, vec![c.value_dim]),
         ] {
-            check(tensor, &self.qkv, name, &shape, DType::BF16)?;
+            check(tensor, anchor, name, &shape, DType::BF16)?;
             if tensor.handle.can_mut() {
                 return Err(format!("{name}: read-only pile alias required"));
             }
         }
         Ok(())
+    }
+
+    /// Replace the five projections by their NVFP4 form for `precision`
+    /// (see [`Linear::quantize`]); returns the NVFP4 plane bytes created.
+    pub(crate) fn quantize_projections(&mut self, precision: DecoderPrecision) -> Result<u64, String> {
+        let mut bytes = 0;
+        for w in [&mut self.qkv, &mut self.z, &mut self.a, &mut self.b, &mut self.out] {
+            bytes += w.quantize(precision)?;
+        }
+        Ok(bytes)
     }
 
     /// Fresh unmasked sequence, T in 1..=256.
@@ -204,7 +216,7 @@ impl GdnMixer {
         if !(1..=256).contains(&tokens) || (state.is_some() && tokens != 1) {
             return Err("prefill requires T=1..256; decode requires exactly T=1".into());
         }
-        check(hidden, &self.qkv, "hidden", &[batch, tokens, c.hidden], DType::BF16)?;
+        check(hidden, &self.conv, "hidden", &[batch, tokens, c.hidden], DType::BF16)?;
         // Check ALL derived allocations and incoming state before any launch.
         count(&[batch, tokens, c.channels()])?;
         count(&[batch, c.channels(), c.conv_kernel])?;
@@ -213,10 +225,10 @@ impl GdnMixer {
             check(&s.conv, hidden, "conv state", &[batch, c.channels(), c.conv_kernel], DType::BF16)?;
             check(&s.recurrent, hidden, "recurrent state", &[batch, c.value_heads, c.key_dim, c.value_dim], DType::F32)?;
         }
-        let qkv = project(hidden, &self.qkv)?;
-        let z = reshape(project(hidden, &self.z)?, &[batch, tokens, c.value_heads, c.value_dim]);
-        let a = project(hidden, &self.a)?;
-        let b = project(hidden, &self.b)?;
+        let qkv = project_linear(hidden, &self.qkv)?;
+        let z = reshape(project_linear(hidden, &self.z)?, &[batch, tokens, c.value_heads, c.value_dim]);
+        let a = project_linear(hidden, &self.a)?;
+        let b = project_linear(hidden, &self.b)?;
         let conv = gdn_ops::causal_conv_silu(&qkv, &self.conv, state.map(|s| &s.conv))?;
         let query = reshape(channels(&conv.output, 0, c.key_width())?, &[batch, tokens, c.key_heads, c.key_dim]);
         let key = reshape(channels(&conv.output, c.key_width(), c.key_width())?, &[batch, tokens, c.key_heads, c.key_dim]);
@@ -228,7 +240,7 @@ impl GdnMixer {
         })?;
         let gated = gdn_ops::gated_rms_norm(&core.output, &z, &self.norm, c.epsilon)?;
         let gated = reshape(gated, &[batch, tokens, c.value_width()]);
-        let output = project(&gated, &self.out)?;
+        let output = project_linear(&gated, &self.out)?;
         Ok(GdnOutput { hidden: output, state: GdnState { conv: conv.history, recurrent: core.state } })
     }
 }
@@ -285,6 +297,103 @@ fn projection_kernel(
 /// K/N-only dispatch; no CPU fallback, autotuning, or split-K reduction.
 pub fn project(input: &CudaTensor, weight: &CudaTensor) -> Result<CudaTensor, String> {
     project_impl(input, weight, false)
+}
+
+/// How the decoder's linear projections compute. Only the decoder's linear
+/// layers change; the vision tower, norms, convolution, DeltaNet scan,
+/// attention scores and the token table are BF16 in every arm.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub enum DecoderPrecision {
+    /// The fixed BF16 MMA blueprint above.
+    #[default]
+    Bf16,
+    /// NVFP4 weights and NVFP4 activations (E2M1, E4M3 per 16, and an f32
+    /// per activation row) into the block-scaled `mma.sync ... kind::mxf4nvf4`
+    /// instruction, f32 accumulation (`Nvfp4::project_w4a4_rows`).
+    W4a4,
+    /// NVFP4 weights decoded to BF16 in registers for the BF16 `m16n8k16`
+    /// MMA, BF16 activations (`Nvfp4::project`, `PromptLane::W4a16`).
+    W4a16,
+}
+
+impl DecoderPrecision {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "bf16" => Ok(Self::Bf16),
+            "w4a4" => Ok(Self::W4a4),
+            "w4a16" => Ok(Self::W4a16),
+            other => Err(format!("decoder precision must be bf16, w4a4 or w4a16, not {other:?}")),
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Bf16 => "bf16",
+            Self::W4a4 => "w4a4",
+            Self::W4a16 => "w4a16",
+        }
+    }
+}
+
+/// One decoder linear weight `[O, I]` and the arithmetic it runs on.
+pub(crate) enum Linear {
+    Bf16(CudaTensor),
+    Nvfp4 { weight: Nvfp4, precision: DecoderPrecision },
+}
+
+impl Linear {
+    /// The bound BF16 weight; refused once quantized.
+    pub(crate) fn bf16(&self) -> Result<&CudaTensor, String> {
+        match self {
+            Self::Bf16(t) => Ok(t),
+            Self::Nvfp4 { .. } => Err("projection is NVFP4, not BF16".into()),
+        }
+    }
+
+    /// A stored NVFP4 weight already on the device.
+    pub(crate) fn nvfp4(weight: Nvfp4, precision: DecoderPrecision) -> Result<Self, String> {
+        if precision == DecoderPrecision::Bf16 {
+            return Err("an NVFP4 weight needs an NVFP4 precision".into());
+        }
+        Ok(Self::Nvfp4 { weight, precision })
+    }
+
+    /// Quantize a BF16 weight on the device with the NVFP4 recipe of
+    /// `nn::nvfp4_gemv` (the same codes `models_import` gates stored
+    /// projections against) and drop this handle to the BF16 weight. Returns
+    /// the NVFP4 plane bytes created; `Bf16` is a no-op.
+    pub(crate) fn quantize(&mut self, precision: DecoderPrecision) -> Result<u64, String> {
+        if precision == DecoderPrecision::Bf16 {
+            return Ok(0);
+        }
+        let weight = Nvfp4::quantize(self.bf16()?).map_err(|e| format!("NVFP4 quantize: {e}"))?;
+        let bytes = weight.bytes();
+        *self = Self::Nvfp4 { weight, precision };
+        Ok(bytes)
+    }
+}
+
+/// [`project`] for any decoder [`Linear`]: `[B,T,I] x [O,I]^T -> [B,T,O]`.
+/// An NVFP4 weight takes the B*T rows as one activation matrix; every row is
+/// computed independently of the others, as in the BF16 blueprint.
+pub(crate) fn project_linear(input: &CudaTensor, weight: &Linear) -> Result<CudaTensor, String> {
+    let (weight, precision) = match weight {
+        Linear::Bf16(t) => return project(input, t),
+        Linear::Nvfp4 { weight, precision } => (weight, *precision),
+    };
+    let s = input.meta.shape().as_slice().to_vec();
+    if s.len() != 3 || s[2] != weight.k() {
+        return Err("NVFP4 projection requires [B,T,I] with I the weight's input width".into());
+    }
+    check(input, input, "projection input", &s, DType::BF16)?;
+    let rows = count(&[s[0], s[1]])?;
+    let flat = reshape(input.clone(), &[rows, s[2]]);
+    let out = match precision {
+        DecoderPrecision::W4a4 => weight.project_w4a4_rows(&flat),
+        DecoderPrecision::W4a16 => weight.project(&flat, crate::nvfp4::PromptLane::W4a16),
+        DecoderPrecision::Bf16 => return Err("BF16 precision on an NVFP4 weight".into()),
+    }
+    .map_err(|e| format!("NVFP4 {} projection [{rows},{}] x [{},{}]: {e}", precision.label(), s[2], weight.n(), weight.k()))?;
+    Ok(reshape(out, &[s[0], s[1], weight.n()]))
 }
 
 fn project_impl(input: &CudaTensor, weight: &CudaTensor, serial: bool) -> Result<CudaTensor, String> {

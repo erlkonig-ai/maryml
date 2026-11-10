@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use triblespace::core::{blob::{Blob, encodings::tensor::{Tensor as NativeTensor, elements::BF16}},
     inline::{Inline, encodings::hash::Handle}, repo::BlobStoreGet};
 use crate::nn::cuda_bf16_alias::CudaBf16Aliases;
-use super::gdn_mixer::project;
+use super::gdn_mixer::{DecoderPrecision, Linear, project_linear};
 use super::decoder_ops::{norm, elementwise};
 
 pub type CudaTensor = CubeTensor<CudaRuntime>;
@@ -74,8 +74,8 @@ pub struct Slots {
     pub gate: Slot<2>, pub up: Slot<2>, pub down: Slot<2>,
 }
 pub struct Block { config: Config, input_norm: CudaTensor, post_norm: CudaTensor,
-    q_norm: CudaTensor, k_norm: CudaTensor, q: CudaTensor, k: CudaTensor, v: CudaTensor,
-    o: CudaTensor, gate: CudaTensor, up: CudaTensor, down: CudaTensor }
+    q_norm: CudaTensor, k_norm: CudaTensor, q: Linear, k: Linear, v: Linear,
+    o: Linear, gate: Linear, up: Linear, down: Linear }
 /// Contiguous BF16 [B,L,Nkv,D], rotated normalized K and plain projected V.
 /// Both are fresh output allocations. Input state is never modified.
 pub struct State { pub key: CudaTensor, pub value: CudaTensor, positions: Positions, length: usize }
@@ -97,20 +97,29 @@ impl Block {
             unsafe { aliases.bind_pile_leaf(blob)? }
         }}; }
         let b = Self { config, input_norm: bind!(s.input_norm,1), post_norm: bind!(s.post_norm,1),
-            q_norm: bind!(s.q_norm,1), k_norm: bind!(s.k_norm,1), q: bind!(s.q,2),
-            k: bind!(s.k,2), v: bind!(s.v,2), o: bind!(s.o,2), gate: bind!(s.gate,2),
-            up: bind!(s.up,2), down: bind!(s.down,2) };
+            q_norm: bind!(s.q_norm,1), k_norm: bind!(s.k_norm,1), q: Linear::Bf16(bind!(s.q,2)),
+            k: Linear::Bf16(bind!(s.k,2)), v: Linear::Bf16(bind!(s.v,2)), o: Linear::Bf16(bind!(s.o,2)),
+            gate: Linear::Bf16(bind!(s.gate,2)), up: Linear::Bf16(bind!(s.up,2)), down: Linear::Bf16(bind!(s.down,2)) };
         let c = config;
         for (t, shape) in [(&b.input_norm,vec![c.hidden]),(&b.post_norm,vec![c.hidden]),
             (&b.q_norm,vec![c.head_dim]),(&b.k_norm,vec![c.head_dim]),
-            (&b.q,vec![2*c.heads*c.head_dim,c.hidden]),(&b.k,vec![c.kv_heads*c.head_dim,c.hidden]),
-            (&b.v,vec![c.kv_heads*c.head_dim,c.hidden]),(&b.o,vec![c.hidden,c.heads*c.head_dim]),
-            (&b.gate,vec![c.intermediate,c.hidden]),(&b.up,vec![c.intermediate,c.hidden]),
-            (&b.down,vec![c.hidden,c.intermediate])] {
-            check(t, &b.q, &shape)?;
+            (b.q.bf16()?,vec![2*c.heads*c.head_dim,c.hidden]),(b.k.bf16()?,vec![c.kv_heads*c.head_dim,c.hidden]),
+            (b.v.bf16()?,vec![c.kv_heads*c.head_dim,c.hidden]),(b.o.bf16()?,vec![c.hidden,c.heads*c.head_dim]),
+            (b.gate.bf16()?,vec![c.intermediate,c.hidden]),(b.up.bf16()?,vec![c.intermediate,c.hidden]),
+            (b.down.bf16()?,vec![c.hidden,c.intermediate])] {
+            check(t, &b.input_norm, &shape)?;
             if t.handle.can_mut() { return Err("immutable pile weights required".into()); }
         }
         Ok(b)
+    }
+    /// Put the seven projections on `precision`; returns the NVFP4 plane
+    /// bytes created.
+    pub(crate) fn quantize_projections(&mut self, precision: DecoderPrecision) -> Result<u64, String> {
+        let mut bytes = 0;
+        for w in [&mut self.q, &mut self.k, &mut self.v, &mut self.o, &mut self.gate, &mut self.up, &mut self.down] {
+            bytes += w.quantize(precision)?;
+        }
+        Ok(bytes)
     }
     pub fn prefill(&self, x: &CudaTensor, positions: Positions, mask: Option<&CudaTensor>) -> Result<Output,String> {
         self.forward(x, positions, None, mask)
@@ -128,13 +137,13 @@ impl Block {
     }
     #[cfg(feature="qwen3_5-real-layer-trace")]
     pub fn replay_outer(&self,x:&CudaTensor,hf:&super::outer_trace::OuterTrace)->Result<[CudaTensor;7],String> {
-        super::outer_trace::replay(x,hf,&self.post_norm,&self.gate,&self.up,&self.down,
+        super::outer_trace::replay(x,hf,&self.post_norm,self.gate.bf16()?,self.up.bf16()?,self.down.bf16()?,
             self.config.hidden,self.config.intermediate,self.config.epsilon)
     }
     #[cfg(feature="qwen3_5-real-layer-trace")]
     pub fn replay_mlp_suffix(&self,hf:&super::outer_trace::OuterTrace,controls:&[CudaTensor;7])
         ->Result<super::outer_trace::MlpSuffixPair,String> {
-        super::outer_trace::replay_mlp_suffix(hf,controls,&self.gate,&self.up,&self.down,
+        super::outer_trace::replay_mlp_suffix(hf,controls,self.gate.bf16()?,self.up.bf16()?,self.down.bf16()?,
             self.config.hidden,self.config.intermediate)
     }
     fn forward(&self,x:&CudaTensor,positions:Positions,old:Option<&State>,mask:Option<&CudaTensor>)->Result<Output,String> {
@@ -149,7 +158,7 @@ impl Block {
         let past=old.map_or(0, |s| s.length);
         let end=past.checked_add(t).ok_or("cache length overflow")?;
         if t==0 || end>c.capacity || (old.is_some() && t!=1) { return Err("prefill/cache capacity exceeded or decode is not T1".into()); }
-        check(x,&self.q,&[b,t,c.hidden])?;
+        check(x,&self.input_norm,&[b,t,c.hidden])?;
         positions.validate(b,end)?;
         // Prove every derived allocation before any dispatch.
         for shape in [vec![b,t,2*c.heads*c.head_dim],vec![b,end,c.kv_heads,c.head_dim],
@@ -161,30 +170,30 @@ impl Block {
         }
         let normalized=norm(x,&self.input_norm,c.hidden,c.epsilon);
         if let Some(t)=trace.as_deref_mut(){t.record(0,&normalized);}
-        let packed=project(&normalized,&self.q)?;
+        let packed=project_linear(&normalized,&self.q)?;
         let (q,gate)=split(&packed,b,t,c.heads,c.head_dim);
         let q=norm(&q,&self.q_norm,c.head_dim,c.epsilon);
-        let k=reshape(project(&normalized,&self.k)?, &[b,t,c.kv_heads,c.head_dim]);
+        let k=reshape(project_linear(&normalized,&self.k)?, &[b,t,c.kv_heads,c.head_dim]);
         let k=norm(&k,&self.k_norm,c.head_dim,c.epsilon);
-        let v=reshape(project(&normalized,&self.v)?, &[b,t,c.kv_heads,c.head_dim]);
+        let v=reshape(project_linear(&normalized,&self.v)?, &[b,t,c.kv_heads,c.head_dim]);
         let q=rope(&q,c,positions,past); let k=rope(&k,c,positions,past);
         let key=append(&k,old.map(|s| &s.key),past);
         let value=append(&v,old.map(|s| &s.value),past);
         let attended=attention(&q,&key,&value,past,c);
         let gated=elementwise(&attended,&gate,2);
-        let output=project(&reshape(gated,&[b,t,c.heads*c.head_dim]),&self.o)?;
+        let output=project_linear(&reshape(gated,&[b,t,c.heads*c.head_dim]),&self.o)?;
         if let Some(t)=trace.as_deref_mut(){t.record(1,&output);}
         let residual=elementwise(x,&output,0);
         if let Some(t)=trace.as_deref_mut(){t.record(2,&residual);}
         let post=norm(&residual,&self.post_norm,c.hidden,c.epsilon);
         if let Some(t)=trace.as_deref_mut(){t.record(3,&post);}
-        let gate=project(&post,&self.gate)?;
+        let gate=project_linear(&post,&self.gate)?;
         if let Some(t)=trace.as_deref_mut(){t.record(4,&gate);}
-        let up=project(&post,&self.up)?;
+        let up=project_linear(&post,&self.up)?;
         if let Some(t)=trace.as_deref_mut(){t.record(5,&up);}
         let mlp=elementwise(&gate,&up,1);
         if let Some(t)=trace.as_deref_mut(){t.record(6,&mlp);}
-        let down=project(&mlp,&self.down)?;
+        let down=project_linear(&mlp,&self.down)?;
         if let Some(t)=trace.as_deref_mut(){t.record(7,&down);}
         let hidden=elementwise(&residual,&down,0);
         Ok(Output { hidden, state: State { key,value,positions,length:end } })
@@ -333,31 +342,31 @@ impl Block {
             return Err("position-table prefill requires B1, nonempty bounded unpadded tokens".into());
         }
         let tokens = shape[1];
-        check(x, &self.q, &[1,tokens,c.hidden])?;
-        if !std::ptr::eq(x.client.properties(), self.q.client.properties()) {
+        check(x, &self.input_norm, &[1,tokens,c.hidden])?;
+        if !std::ptr::eq(x.client.properties(), self.input_norm.client.properties()) {
             return Err("position-table input and weights require the same CUDA client".into());
         }
         positions.validate(x, tokens)?;
         for shape in [vec![1,tokens,2*c.heads*c.head_dim], vec![1,tokens,c.kv_heads,c.head_dim],
             vec![1,tokens,c.intermediate], vec![1,tokens,c.heads,tokens]] { count(&shape)?; }
         let normalized = norm(x, &self.input_norm, c.hidden, c.epsilon);
-        let packed = project(&normalized, &self.q)?;
+        let packed = project_linear(&normalized, &self.q)?;
         let (q, gate) = split(&packed, 1, tokens, c.heads, c.head_dim);
         let q = norm(&q, &self.q_norm, c.head_dim, c.epsilon);
-        let k = reshape(project(&normalized, &self.k)?, &[1,tokens,c.kv_heads,c.head_dim]);
+        let k = reshape(project_linear(&normalized, &self.k)?, &[1,tokens,c.kv_heads,c.head_dim]);
         let k = norm(&k, &self.k_norm, c.head_dim, c.epsilon);
-        let v = reshape(project(&normalized, &self.v)?, &[1,tokens,c.kv_heads,c.head_dim]);
+        let v = reshape(project_linear(&normalized, &self.v)?, &[1,tokens,c.kv_heads,c.head_dim]);
         let q = positioned_rope(&q, c, positions);
         let k = positioned_rope(&k, c, positions);
         let attended = attention(&q, &k, &v, 0, c);
         let gated = elementwise(&attended, &gate, 2);
-        let output = project(&reshape(gated, &[1,tokens,c.heads*c.head_dim]), &self.o)?;
+        let output = project_linear(&reshape(gated, &[1,tokens,c.heads*c.head_dim]), &self.o)?;
         let residual = elementwise(x, &output, 0);
         let post = norm(&residual, &self.post_norm, c.hidden, c.epsilon);
-        let gate = project(&post, &self.gate)?;
-        let up = project(&post, &self.up)?;
+        let gate = project_linear(&post, &self.gate)?;
+        let up = project_linear(&post, &self.up)?;
         let mlp = elementwise(&gate, &up, 1);
-        let down = project(&mlp, &self.down)?;
+        let down = project_linear(&mlp, &self.down)?;
         Ok(elementwise(&residual, &down, 0))
     }
 }

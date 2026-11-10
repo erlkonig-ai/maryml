@@ -80,6 +80,11 @@ impl PreparedDecoder {
         Ok(Self { token_embedding, stack })
     }
 
+    /// See [`Stack::quantize_projections`].
+    pub fn quantize_decoder(&mut self, precision: super::gdn_mixer::DecoderPrecision) -> Result<u64, String> {
+        self.stack.quantize_projections(precision)
+    }
+
     /// IDs are control input, not CPU model tensors. Only at most 1 KiB of
     /// integer IDs is uploaded. The weight lookup and ALL model arithmetic run
     /// on GPU; BF16 weight bytes never pass through F16 or host float buffers.

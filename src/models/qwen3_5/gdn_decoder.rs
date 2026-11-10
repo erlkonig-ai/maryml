@@ -17,7 +17,7 @@ use triblespace::core::{
 };
 use crate::nn::cuda_bf16_alias::CudaBf16Aliases;
 use super::{decoder_ops::{norm, elementwise},
-    gdn_mixer::{GdnConfig, GdnMixer, GdnSlots, GdnState, project}};
+    gdn_mixer::{DecoderPrecision, GdnConfig, GdnMixer, GdnSlots, GdnState, Linear, project_linear}};
 
 pub type CudaTensor = CubeTensor<CudaRuntime>;
 pub type Slot<const R: usize> = Inline<Handle<NativeTensor<BF16, R>>>;
@@ -44,7 +44,7 @@ pub struct Slots {
 pub struct Block {
     config: Config, mixer: GdnMixer,
     input_norm: CudaTensor, post_norm: CudaTensor,
-    gate: CudaTensor, up: CudaTensor, down: CudaTensor,
+    gate: Linear, up: Linear, down: Linear,
 }
 pub struct Output { pub hidden: CudaTensor, pub state: GdnState }
 
@@ -68,16 +68,27 @@ impl Block {
         let mixer = unsafe { GdnMixer::from_pile(snapshot, slots.mixer, config.mixer, aliases)? };
         let result = Self { config, mixer,
             input_norm: bind!(slots.input_norm, 1), post_norm: bind!(slots.post_norm, 1),
-            gate: bind!(slots.gate, 2), up: bind!(slots.up, 2), down: bind!(slots.down, 2) };
+            gate: Linear::Bf16(bind!(slots.gate, 2)), up: Linear::Bf16(bind!(slots.up, 2)),
+            down: Linear::Bf16(bind!(slots.down, 2)) };
         let (h, m) = (config.mixer.hidden, config.intermediate);
         for (name, tensor, shape) in [
             ("input norm", &result.input_norm, vec![h]), ("post norm", &result.post_norm, vec![h]),
-            ("gate", &result.gate, vec![m,h]), ("up", &result.up, vec![m,h]), ("down", &result.down, vec![h,m]),
+            ("gate", result.gate.bf16()?, vec![m,h]), ("up", result.up.bf16()?, vec![m,h]), ("down", result.down.bf16()?, vec![h,m]),
         ] {
             check(tensor, &result.input_norm, name, &shape, DType::BF16)?;
             if tensor.handle.can_mut() { return Err(format!("{name}: immutable pile weight required")); }
         }
         Ok(result)
+    }
+
+    /// Put the mixer's and the MLP's projections on `precision`; returns the
+    /// NVFP4 plane bytes created.
+    pub(crate) fn quantize_projections(&mut self, precision: DecoderPrecision) -> Result<u64, String> {
+        let mut bytes = self.mixer.quantize_projections(precision)?;
+        for w in [&mut self.gate, &mut self.up, &mut self.down] {
+            bytes += w.quantize(precision)?;
+        }
+        Ok(bytes)
     }
 
     pub fn prefill(&self, hidden: &CudaTensor, mask: Option<&CudaTensor>) -> Result<Output, String> {
@@ -96,13 +107,13 @@ impl Block {
     }
     #[cfg(feature="qwen3_5-real-layer-trace")]
     pub fn replay_outer(&self,x:&CudaTensor,hf:&super::outer_trace::OuterTrace)->Result<[CudaTensor;7],String> {
-        super::outer_trace::replay(x,hf,&self.post_norm,&self.gate,&self.up,&self.down,
+        super::outer_trace::replay(x,hf,&self.post_norm,self.gate.bf16()?,self.up.bf16()?,self.down.bf16()?,
             self.config.mixer.hidden,self.config.intermediate,self.config.mixer.epsilon)
     }
     #[cfg(feature="qwen3_5-real-layer-trace")]
     pub fn replay_mlp_suffix(&self,hf:&super::outer_trace::OuterTrace,controls:&[CudaTensor;7])
         ->Result<super::outer_trace::MlpSuffixPair,String> {
-        super::outer_trace::replay_mlp_suffix(hf,controls,&self.gate,&self.up,&self.down,
+        super::outer_trace::replay_mlp_suffix(hf,controls,self.gate.bf16()?,self.up.bf16()?,self.down.bf16()?,
             self.config.mixer.hidden,self.config.intermediate)
     }
     fn forward(&self,hidden:&CudaTensor,state:Option<&GdnState>,mask:Option<&CudaTensor>)->Result<Output,String> {
@@ -140,13 +151,13 @@ impl Block {
         if let Some(t)=trace.as_deref_mut(){t.record(2,&residual);}
         let post = norm(&residual, &self.post_norm, c.hidden, c.epsilon);
         if let Some(t)=trace.as_deref_mut(){t.record(3,&post);}
-        let up = project(&post, &self.up)?;
+        let up = project_linear(&post, &self.up)?;
         if let Some(t)=trace.as_deref_mut(){t.record(5,&up);}
-        let gate = project(&post, &self.gate)?;
+        let gate = project_linear(&post, &self.gate)?;
         if let Some(t)=trace.as_deref_mut(){t.record(4,&gate);}
         let activated = elementwise(&gate, &up, 1);
         if let Some(t)=trace.as_deref_mut(){t.record(6,&activated);}
-        let output = project(&activated, &self.down)?;
+        let output = project_linear(&activated, &self.down)?;
         if let Some(t)=trace.as_deref_mut(){t.record(7,&output);}
         Ok(Output { hidden: elementwise(&residual, &output, 0), state: mixed.state })
     }

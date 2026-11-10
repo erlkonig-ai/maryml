@@ -56,6 +56,11 @@ impl PreparedMultimodal {
         self.decoder.embed_padded(sequences)
     }
 
+    /// Decoder linear projections only; the vision tower stays BF16.
+    pub fn quantize_decoder(&mut self, precision: super::gdn_mixer::DecoderPrecision) -> Result<u64, String> {
+        self.decoder.quantize_decoder(precision)
+    }
+
     /// All 759 roles come from this ONE opaque root and frozen observation;
     /// the constructor never discovers/reselects a model between modalities.
     /// `selected` is immediate provenance exhaust, not a retained catalogue.
