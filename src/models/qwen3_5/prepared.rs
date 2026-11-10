@@ -100,6 +100,11 @@ impl PreparedDecoder {
         self.stack.projection_bytes()
     }
 
+    /// See [`Stack::decoder_bound`].
+    pub fn decoder_bound(&self) -> Option<super::gdn_mixer::BoundProjection> {
+        self.stack.decoder_bound()
+    }
+
     /// See [`Stack::quantize_projections`].
     pub fn quantize_decoder(&mut self, precision: super::gdn_mixer::DecoderPrecision) -> Result<u64, String> {
         self.stack.quantize_projections(precision)

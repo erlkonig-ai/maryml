@@ -101,19 +101,15 @@ impl Block {
         Ok(result)
     }
 
-    /// Put the mixer's and the MLP's projections on `precision`; returns the
-    /// NVFP4 plane bytes created.
-    pub(crate) fn quantize_projections(&mut self, precision: DecoderPrecision) -> Result<u64, String> {
-        let mut bytes = self.mixer.quantize_projections(precision)?;
-        for w in [&mut self.gate, &mut self.up, &mut self.down] {
-            bytes += w.quantize(precision)?;
-        }
-        Ok(bytes)
-    }
-
     pub(crate) fn projections(&self) -> Vec<&Linear> {
         let mut all = self.mixer.projections().to_vec();
         all.extend([&self.gate, &self.up, &self.down]);
+        all
+    }
+
+    pub(crate) fn projections_mut(&mut self) -> Vec<&mut Linear> {
+        let mut all: Vec<&mut Linear> = self.mixer.projections_mut().into_iter().collect();
+        all.extend([&mut self.gate, &mut self.up, &mut self.down]);
         all
     }
 

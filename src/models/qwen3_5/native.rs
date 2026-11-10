@@ -235,6 +235,14 @@ impl NativeWemm {
         self.model.projection_bytes()
     }
 
+    /// What every decoder linear projection runs, as actually bound: BF16,
+    /// or NVFP4 on a precision, from the root's stored planes or quantized
+    /// here. `None` when they differ (no bind produces that). An index's
+    /// identity is derived from this, never from the precision asked for.
+    pub fn decoder_bound(&self) -> Option<super::gdn_mixer::BoundProjection> {
+        self.model.decoder_bound()
+    }
+
     /// Run the decoder's linear projections on `precision` from now on
     /// (`Bf16` changes nothing). The BF16 weights are quantized on the device
     /// with the NVFP4 recipe of `nn::nvfp4_gemv`; their bound BF16 handles

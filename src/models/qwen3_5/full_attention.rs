@@ -129,17 +129,11 @@ impl Block {
         }
         Ok(b)
     }
-    /// Put the seven projections on `precision`; returns the NVFP4 plane
-    /// bytes created.
-    pub(crate) fn quantize_projections(&mut self, precision: DecoderPrecision) -> Result<u64, String> {
-        let mut bytes = 0;
-        for w in [&mut self.q, &mut self.k, &mut self.v, &mut self.o, &mut self.gate, &mut self.up, &mut self.down] {
-            bytes += w.quantize(precision)?;
-        }
-        Ok(bytes)
-    }
     pub(crate) fn projections(&self) -> [&Linear; 7] {
         [&self.q, &self.k, &self.v, &self.o, &self.gate, &self.up, &self.down]
+    }
+    pub(crate) fn projections_mut(&mut self) -> [&mut Linear; 7] {
+        [&mut self.q, &mut self.k, &mut self.v, &mut self.o, &mut self.gate, &mut self.up, &mut self.down]
     }
     pub fn prefill(&self, x: &CudaTensor, positions: Positions, mask: Option<&CudaTensor>) -> Result<Output,String> {
         self.forward(x, positions, None, mask)

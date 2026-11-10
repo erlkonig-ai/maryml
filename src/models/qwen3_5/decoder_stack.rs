@@ -124,37 +124,68 @@ impl Stack {
     /// Put every decoder linear projection (all 32 layers' mixer, attention
     /// and MLP projections; never the token table, norms or the vision
     /// tower) on `precision`. Returns the NVFP4 plane bytes created.
+    ///
+    /// Every replacement is built before any is installed, so a failure
+    /// partway leaves every projection exactly as it was bound, never a
+    /// stack of mixed precision.
     pub fn quantize_projections(&mut self, precision: super::gdn_mixer::DecoderPrecision) -> Result<u64, String> {
+        let mut built = Vec::new();
+        for (at, w) in self.projections().into_iter().enumerate() {
+            built.push(w.quantized(precision).map_err(|e| format!("decoder projection {at}: {e}"))?);
+        }
         let mut bytes = 0;
-        for (index, group) in self.groups.iter_mut().enumerate() {
-            for (offset, block) in group.gdn.iter_mut().enumerate() {
-                bytes += block.quantize_projections(precision)
-                    .map_err(|e| format!("layer {}: {e}", index * 4 + offset))?;
+        for (slot, new) in self.projections_mut().into_iter().zip(built) {
+            if let Some(new) = new {
+                bytes += new.bytes().1;
+                *slot = new;
             }
-            bytes += group.attention.quantize_projections(precision)
-                .map_err(|e| format!("layer {}: {e}", index * 4 + 3))?;
         }
         Ok(bytes)
+    }
+
+    /// Every decoder linear projection, layer by layer.
+    fn projections(&self) -> Vec<&super::gdn_mixer::Linear> {
+        let mut all = Vec::new();
+        for group in self.groups.iter() {
+            for block in &group.gdn {
+                all.extend(block.projections());
+            }
+            all.extend(group.attention.projections());
+        }
+        all
+    }
+
+    /// [`Self::projections`], in the same order.
+    fn projections_mut(&mut self) -> Vec<&mut super::gdn_mixer::Linear> {
+        let mut all = Vec::new();
+        for group in self.groups.iter_mut() {
+            for block in group.gdn.iter_mut() {
+                all.extend(block.projections_mut());
+            }
+            all.extend(group.attention.projections_mut());
+        }
+        all
     }
 
     /// (projections, BF16 bytes, NVFP4 plane bytes) over every decoder linear
     /// projection: what the decoder's projection weights hold resident.
     pub fn projection_bytes(&self) -> (usize, u64, u64) {
         let (mut n, mut bf16, mut fp4) = (0, 0, 0);
-        for group in self.groups.iter() {
-            let mut all: Vec<&super::gdn_mixer::Linear> = Vec::new();
-            for block in &group.gdn {
-                all.extend(block.projections());
-            }
-            all.extend(group.attention.projections());
-            for w in all {
-                let (b, f) = w.bytes();
-                n += 1;
-                bf16 += b;
-                fp4 += f;
-            }
+        for w in self.projections() {
+            let (b, f) = w.bytes();
+            n += 1;
+            bf16 += b;
+            fp4 += f;
         }
         (n, bf16, fp4)
+    }
+
+    /// What every decoder linear projection runs, as bound, when they all
+    /// run the same; `None` when they differ.
+    pub fn decoder_bound(&self) -> Option<super::gdn_mixer::BoundProjection> {
+        let mut kinds = self.projections().into_iter().map(|w| w.bound());
+        let first = kinds.next()?;
+        kinds.all(|kind| kind == first).then_some(first)
     }
 
     /// One fresh, unpadded sequence. Same existing affine three-axis positions

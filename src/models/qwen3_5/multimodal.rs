@@ -56,6 +56,11 @@ impl PreparedMultimodal {
         self.decoder.embed_padded(sequences)
     }
 
+    /// See `Stack::decoder_bound`.
+    pub fn decoder_bound(&self) -> Option<super::gdn_mixer::BoundProjection> {
+        self.decoder.decoder_bound()
+    }
+
     /// See `Stack::projection_bytes`.
     pub fn projection_bytes(&self) -> (usize, u64, u64) {
         self.decoder.projection_bytes()

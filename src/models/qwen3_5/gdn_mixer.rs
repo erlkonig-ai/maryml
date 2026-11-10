@@ -203,18 +203,12 @@ impl GdnMixer {
         Ok(())
     }
 
-    /// Replace the five projections by their NVFP4 form for `precision`
-    /// (see [`Linear::quantize`]); returns the NVFP4 plane bytes created.
-    pub(crate) fn quantize_projections(&mut self, precision: DecoderPrecision) -> Result<u64, String> {
-        let mut bytes = 0;
-        for w in [&mut self.qkv, &mut self.z, &mut self.a, &mut self.b, &mut self.out] {
-            bytes += w.quantize(precision)?;
-        }
-        Ok(bytes)
-    }
-
     pub(crate) fn projections(&self) -> [&Linear; 5] {
         [&self.qkv, &self.z, &self.a, &self.b, &self.out]
+    }
+
+    pub(crate) fn projections_mut(&mut self) -> [&mut Linear; 5] {
+        [&mut self.qkv, &mut self.z, &mut self.a, &mut self.b, &mut self.out]
     }
 
     /// Fresh unmasked sequence, T in 1..=256.
@@ -354,10 +348,23 @@ impl DecoderPrecision {
     }
 }
 
+/// What one decoder projection runs, as it was actually bound: the identity
+/// of an embedding depends on it, so a caller reads it here rather than
+/// trusting the precision it asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoundProjection {
+    /// The BF16 leaf, through the fixed BF16 MMA blueprint.
+    Bf16,
+    /// NVFP4 planes run on `precision`. `stored` when the planes are the
+    /// root's own NVFP4 leaf, uploaded unchanged; false when this process
+    /// quantized them from the root's BF16 leaf.
+    Nvfp4 { precision: DecoderPrecision, stored: bool },
+}
+
 /// One decoder linear weight `[O, I]` and the arithmetic it runs on.
 pub(crate) enum Linear {
     Bf16(CudaTensor),
-    Nvfp4 { weight: Nvfp4, precision: DecoderPrecision },
+    Nvfp4 { weight: Nvfp4, precision: DecoderPrecision, stored: bool },
 }
 
 impl Linear {
@@ -369,12 +376,21 @@ impl Linear {
         }
     }
 
-    /// A stored NVFP4 weight already on the device.
-    pub(crate) fn nvfp4(weight: Nvfp4, precision: DecoderPrecision) -> Result<Self, String> {
+    /// An NVFP4 weight already on the device: the root's stored leaf
+    /// (`stored`), or quantized here from its BF16 leaf.
+    pub(crate) fn nvfp4(weight: Nvfp4, precision: DecoderPrecision, stored: bool) -> Result<Self, String> {
         if precision == DecoderPrecision::Bf16 {
             return Err("an NVFP4 weight needs an NVFP4 precision".into());
         }
-        Ok(Self::Nvfp4 { weight, precision })
+        Ok(Self::Nvfp4 { weight, precision, stored })
+    }
+
+    /// What this projection runs, as bound.
+    pub(crate) fn bound(&self) -> BoundProjection {
+        match self {
+            Self::Bf16(_) => BoundProjection::Bf16,
+            Self::Nvfp4 { precision, stored, .. } => BoundProjection::Nvfp4 { precision: *precision, stored: *stored },
+        }
     }
 
     /// (BF16 bytes, NVFP4 plane bytes) this projection holds.
@@ -405,18 +421,16 @@ impl Linear {
         }
     }
 
-    /// Quantize a BF16 weight on the device with the NVFP4 recipe of
+    /// This BF16 weight quantized on the device with the NVFP4 recipe of
     /// `nn::nvfp4_gemv` (the same codes `models_import` gates stored
-    /// projections against) and drop this handle to the BF16 weight. Returns
-    /// the NVFP4 plane bytes created; `Bf16` is a no-op.
-    pub(crate) fn quantize(&mut self, precision: DecoderPrecision) -> Result<u64, String> {
+    /// projections against), as a new projection on `precision`; this one is
+    /// left as it is. `None` for `Bf16`.
+    pub(crate) fn quantized(&self, precision: DecoderPrecision) -> Result<Option<Self>, String> {
         if precision == DecoderPrecision::Bf16 {
-            return Ok(0);
+            return Ok(None);
         }
         let weight = Nvfp4::quantize(self.bf16()?).map_err(|e| format!("NVFP4 quantize: {e}"))?;
-        let bytes = weight.bytes();
-        *self = Self::Nvfp4 { weight, precision };
-        Ok(bytes)
+        Self::nvfp4(weight, precision, false).map(Some)
     }
 }
 
@@ -453,7 +467,7 @@ pub(crate) unsafe fn bind_linear<R: BlobStoreGet>(
             for _ in 0..2 {
                 client.flush().map_err(|e| format!("flush after an NVFP4 upload: {e:?}"))?;
             }
-            return Linear::nvfp4(weight, precision);
+            return Linear::nvfp4(weight, precision, true);
         }
     };
     let blob: Blob<NativeTensor<BF16, 2>> = snapshot.get(slot).map_err(|e| e.to_string())?;
@@ -475,7 +489,7 @@ pub(crate) unsafe fn bind_linear<R: BlobStoreGet>(
     for _ in 0..2 {
         client.flush().map_err(|e| format!("flush after an NVFP4 load: {e:?}"))?;
     }
-    Linear::nvfp4(weight, precision)
+    Linear::nvfp4(weight, precision, false)
 }
 
 /// Pack one BF16 decoder projection `[n, k]` (its native leaf payload) for
@@ -524,7 +538,7 @@ pub fn is_decoder_projection(name: &str) -> bool {
 pub(crate) fn project_linear(input: &CudaTensor, weight: &Linear) -> Result<CudaTensor, String> {
     let (weight, precision) = match weight {
         Linear::Bf16(t) => return project(input, t),
-        Linear::Nvfp4 { weight, precision } => (weight, *precision),
+        Linear::Nvfp4 { weight, precision, .. } => (weight, *precision),
     };
     let s = input.meta.shape().as_slice().to_vec();
     if s.len() != 3 || s[2] != weight.k() {
