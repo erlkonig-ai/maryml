@@ -72,7 +72,8 @@ enum Model {
         #[arg(long)]
         tekken: PathBuf,
     },
-    /// WeMM-Embedding-9B: the 248 decoder projections as NVFP4 leaves.
+    /// WeMM-Embedding-9B: the 248 decoder projections as NVFP4 leaves, and
+    /// with `--vision-nvfp4` the 83 vision linears too.
     #[cfg(feature = "wemm-input")]
     Wemm {
         /// The checkpoint's assets directory. Only its tokenizer.json is
@@ -80,6 +81,12 @@ enum Model {
         /// the configuration and chat template come from the source root.
         #[arg(long)]
         assets: PathBuf,
+        /// Also store the vision tower's 83 NVFP4-capable linears
+        /// (`gdn_mixer::is_vision_nvfp4_linear`) as NVFP4 leaves: another
+        /// root, for a kernel profile that runs them so. Without it the root
+        /// is the decoder-only one, exactly as before.
+        #[arg(long)]
+        vision_nvfp4: bool,
     },
 }
 
@@ -518,6 +525,9 @@ pub(super) fn voxtral(
 /// gates the host packing byte for byte against the device quantizer the
 /// runtime's load-time NVFP4 path runs; every other tensor (vision tower,
 /// token table, norms, conv, DeltaNet parameters) copied unchanged in BF16.
+/// With `vision` the 83 vision linears of `gdn_mixer::is_vision_nvfp4_linear`
+/// are packed the same way (331 in all), and the blocks' fc2, the patch
+/// convolution and the rest of the tower stay BF16.
 /// The root's parts are the SOURCE ROOT's own: its configuration and chat
 /// template are read from its core and stored again, and the tokenizer is
 /// stored from `--assets`'s tokenizer.json only once that file rebuilds,
@@ -528,11 +538,12 @@ pub(super) fn voxtral(
 #[cfg(feature = "wemm-input")]
 pub(super) fn wemm(
     assets: &Path,
+    vision: bool,
     source: &Source,
     source_path: &Path,
     pile: &mut Pile,
 ) -> Result<(Id, Fragment, serde_json::Value)> {
-    use mary::models::qwen3_5::gdn_mixer::{is_decoder_projection, pack_projection_for_storage};
+    use mary::models::qwen3_5::gdn_mixer::{is_decoder_projection, is_vision_nvfp4_linear, pack_projection_for_storage};
     let index = tensors(&source.facts, &source.store, source.root)?;
     // The runtime binds 759 of them; any other tensor member (open world) is
     // carried over unchanged with the rest.
@@ -553,7 +564,7 @@ pub(super) fn wemm(
     let started = Instant::now();
     let mut stored = BTreeMap::new();
     for (name, leaf) in &index {
-        if !is_decoder_projection(name) {
+        if !(is_decoder_projection(name) || vision && is_vision_nvfp4_linear(name)) {
             continue;
         }
         ensure!(leaf.elem() == mary::leaf::Elem::Bf16 && leaf.dims().len() == 2, "{name}: not a BF16 matrix");
@@ -562,7 +573,10 @@ pub(super) fn wemm(
             .map_err(anyhow::Error::msg)?;
         stored.insert(name.clone(), projection);
     }
-    ensure!(stored.len() == 248, "{} decoder projections, not 248", stored.len());
+    let decoder = stored.keys().filter(|name| is_decoder_projection(name)).count();
+    ensure!(decoder == 248, "{decoder} decoder projections, not 248");
+    let vision_linears = stored.len() - decoder;
+    ensure!(vision_linears == if vision { 83 } else { 0 }, "{vision_linears} vision linears packed");
     let export_seconds = started.elapsed().as_secs_f64();
     eprintln!("[wemm] {} projections packed and gated in {export_seconds:.1}s", stored.len());
     let (members, mut facts, dense, packed) = members(pile, &index, &stored, &BTreeSet::new())?;
@@ -592,7 +606,7 @@ pub(super) fn wemm(
         fragment,
         serde_json::json!({
             "model": "wemm", "model_root": format!("{model_root:X}"), "source_root": format!("{:X}", source.root),
-            "projections": stored.len(), "packed_bytes": packed, "dense_bytes": dense,
+            "projections": stored.len(), "vision_projections": vision_linears, "packed_bytes": packed, "dense_bytes": dense,
             "tensors": index.len(), "export_seconds": export_seconds,
         }),
     ))
@@ -727,9 +741,9 @@ fn main() -> Result<()> {
             native::voxtral(tekken, &source, &source_path, pile)
         },
         #[cfg(feature = "wemm-input")]
-        Model::Wemm { assets } => {
+        Model::Wemm { assets, vision_nvfp4 } => {
             let source = native::open_source(&source_path, args.source_root.as_deref().context("--source-root is required")?)?;
-            native::wemm(assets, &source, &source_path, pile)
+            native::wemm(assets, *vision_nvfp4, &source, &source_path, pile)
         },
     })?;
 
