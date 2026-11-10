@@ -63,7 +63,8 @@ pub enum WeightResidence {
     PileAliased,
     /// Each payload is copied once into device memory when it is registered.
     /// Forwards then never read the pile mapping. This costs device memory
-    /// equal to the payloads and a slower bind. The source-pile premise of
+    /// equal to the payloads and a slower bind. The temporary host copy of a
+    /// payload is freed before its registration returns. The source-pile premise of
     /// [`CudaBf16Aliases::bind_pile_leaf`] is unchanged, because the same
     /// checks run and the bytes are read from the same mapping at bind.
     DeviceCopy,
@@ -261,7 +262,20 @@ impl CudaBf16Aliases {
             let handle = if copy {
                 // DeviceCopy: the same checked payload bytes, read once by the
                 // CPU from the mapping and copied into device memory.
-                self.client.create_from_slice(&payload[start..start + size as usize])
+                let handle = self.client.create_from_slice(&payload[start..start + size as usize]);
+                // CubeCL keeps the host copy of an upload in the stream's drop
+                // queue until two flushes have passed, and on its own it
+                // flushes only from a kernel launch past the queue's
+                // threshold. Bind launches nothing, so without these two
+                // flushes every weight's host copy stayed allocated after
+                // bind (16.8 GB of anon for WeMM, measured 2026-11-10). The
+                // first flush fences this upload; the second waits on that
+                // fence and frees the host copy.
+                for _ in 0..2 {
+                    self.client.flush()
+                        .map_err(|e| format!("flush after a BF16 device copy: {e:?}"))?;
+                }
+                handle
             } else {
                 let keepalive: Arc<dyn std::any::Any + Send + Sync> = owner.clone();
                 unsafe {
