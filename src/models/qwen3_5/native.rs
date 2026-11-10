@@ -210,7 +210,7 @@ impl NativeWemm {
     }
 
     /// [`Self::from_frozen_with`] with the vision tower's linears on `vision`
-    /// as well: `W4a4` quantizes each block and merger linear the W4A4-rows
+    /// as well: an NVFP4 precision quantizes each block and merger linear its
     /// kernel takes at load, exactly as the decoder's (`Tower::from_pile_with`).
     /// No kernel profile names such a model; it is for evaluation.
     ///

@@ -7,7 +7,10 @@
 //! shape the W4A4-rows kernel takes (K in 64s, N in 8s: qkv, proj and fc1;
 //! fc2 has K 4304 and stays BF16) is quantized on the device at load to
 //! NVFP4 and runs `Nvfp4::project_w4a4_rows` (the decoder's kernel), then a
-//! BF16 bias add (`bias_kernel`). Everything else is unchanged.
+//! BF16 bias add (`bias_kernel`). Under `W4a16` the same linears' NVFP4
+//! weights run the decoder's W4A16 prompt lane (`Nvfp4::project`, BF16
+//! activations, weights decoded in registers into the BF16 MMA) instead.
+//! Everything else is unchanged.
 pub use super::vision_frontend::Grid;
 use super::gdn_mixer::{DecoderPrecision, Linear, bind_linear};
 use super::roles::LinearSlot;
@@ -145,8 +148,8 @@ impl Block {
     /// [`Self::from_pile`] with the block's linears on `precision`: `Bf16`
     /// binds exactly as `from_pile`; `W4a4` quantizes every linear the
     /// W4A4-rows kernel takes on the device at load (`gdn_mixer::bind_linear`,
-    /// the binder registers none of them) and binds the rest BF16. W4A16 is
-    /// refused: no vision kernel runs it.
+    /// the binder registers none of them) and binds the rest BF16; `W4a16`
+    /// does the same for the W4A16 prompt lane.
     ///
     /// # Safety
     /// As [`Self::from_pile`].
@@ -158,9 +161,6 @@ impl Block {
         precision: DecoderPrecision,
     ) -> Result<Self, String> {
         c.validate()?;
-        if precision == DecoderPrecision::W4a16 {
-            return Err("the vision tower runs bf16 or w4a4, not w4a16".into());
-        }
         macro_rules! bind {
             ($slot:expr,$r:literal) => {{
                 let b: Blob<NativeTensor<BF16, $r>> =
@@ -172,7 +172,7 @@ impl Block {
         let m = c.intermediate;
         macro_rules! bind_lin {
             ($slot:expr, $n:expr, $k:expr) => {{
-                if precision == DecoderPrecision::W4a4 && crate::nn::nvfp4_gemm::w4a4_rows_takes($n, $k) {
+                if nvfp4_takes(precision, $n, $k) {
                     // SAFETY: forwarded genuine immutable-prefix contract.
                     unsafe { bind_linear(snapshot, LinearSlot::Bf16($slot), a, precision)? }
                 } else {
@@ -518,25 +518,31 @@ fn linear_kernel(
 fn linear(x: &CudaTensor, w: &Linear, b: &CudaTensor, ow: usize) -> Result<CudaTensor, String> {
     let w = match w {
         Linear::Bf16(w) => w,
-        Linear::Nvfp4 { weight, precision: DecoderPrecision::W4a4, .. } => return biased_w4a4(x, weight, b),
-        Linear::Nvfp4 { .. } => return Err("vision linear: only W4A4 runs NVFP4 here".into()),
+        Linear::Nvfp4 { weight, precision, .. } => return biased_nvfp4(x, weight, *precision, b),
     };
     Ok(linear_bf16(x, w, b, ow))
 }
 /// `[t, k] x [n, k]^T + bias -> [t, n]` BF16 on the decoder's W4A4-rows
 /// kernel (NVFP4 activations per row, f32 accumulation, one BF16 cast), then
 /// the bias in f32 and a second BF16 cast.
-pub(super) fn biased_w4a4(
+/// (`W4a16`: the W4A16 prompt lane instead, BF16 activations.)
+pub(super) fn biased_nvfp4(
     x: &CudaTensor,
     w: &crate::nn::nvfp4_gemv::Nvfp4,
+    precision: DecoderPrecision,
     b: &CudaTensor,
 ) -> Result<CudaTensor, String> {
     let s = x.meta.shape().as_slice();
     let n = w.n();
     if s.len() != 2 || s[1] != w.k() || len(b) != n {
-        return Err(format!("W4A4 vision linear: input {s:?}, weight [{n}, {}], bias {}", w.k(), len(b)));
+        return Err(format!("NVFP4 vision linear: input {s:?}, weight [{n}, {}], bias {}", w.k(), len(b)));
     }
-    let p = w.project_w4a4_rows(x).map_err(|e| format!("W4A4 vision linear [{}, {}] x [{n}, {}]: {e}", s[0], s[1], w.k()))?;
+    let p = match precision {
+        DecoderPrecision::W4a4 => w.project_w4a4_rows(x),
+        DecoderPrecision::W4a16 => w.project(x, crate::nvfp4::PromptLane::W4a16),
+        DecoderPrecision::Bf16 => return Err("BF16 precision on an NVFP4 vision weight".into()),
+    }
+    .map_err(|e| format!("{} vision linear [{}, {}] x [{n}, {}]: {e}", precision.label(), s[0], s[1], w.k()))?;
     let y = empty(x, &[s[0], n]);
     // SAFETY: p is a fresh contiguous [1, t, n] BF16 output, b holds n BF16,
     // y is fresh [t, n]; each thread owns one output element.
@@ -553,6 +559,16 @@ pub(super) fn biased_w4a4(
         );
     }
     Ok(y)
+}
+/// Whether a vision linear `[n, k]` runs NVFP4 on `precision`: W4A4 where
+/// the W4A4-rows kernel takes the shape, W4A16 where the prompt lane does
+/// (K in 32s, N in 8s). Otherwise it stays BF16.
+pub(super) fn nvfp4_takes(precision: DecoderPrecision, n: usize, k: usize) -> bool {
+    match precision {
+        DecoderPrecision::Bf16 => false,
+        DecoderPrecision::W4a4 => crate::nn::nvfp4_gemm::w4a4_rows_takes(n, k),
+        DecoderPrecision::W4a16 => k % 32 == 0 && n % 8 == 0,
+    }
 }
 #[cube(launch_unchecked)]
 fn bias_kernel(p: &Array<bf16>, b: &Array<bf16>, y: &mut Array<bf16>, n: usize, ow: usize) {

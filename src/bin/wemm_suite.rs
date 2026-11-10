@@ -16,9 +16,9 @@
 //!   precision quantizes each decoder projection on the device as it is
 //!   selected and keeps only its NVFP4 planes (`NativeWemm::from_frozen_with`);
 //!   `WEMM_POST_BIND=1` instead binds BF16 and quantizes afterwards.
-//!   `WEMM_VISION_PRECISION` (bf16 or w4a4; default bf16) puts the vision
+//!   `WEMM_VISION_PRECISION` (bf16, w4a4 or w4a16; default bf16) puts the vision
 //!   tower's block and merger linears on that precision at load
-//!   (`NativeWemm::from_frozen_with_vision`); linears the W4A4 kernel cannot
+//!   (`NativeWemm::from_frozen_with_vision`); linears the NVFP4 kernel cannot
 //!   take stay BF16, and the summary counts both.
 //!   OUT_DIR receives `embeddings.pass<P>.bf16` ([n, 4096] BF16 in item
 //!   order), `items.tsv`, `batches.tsv` and `summary.txt`.

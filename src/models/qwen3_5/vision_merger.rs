@@ -40,7 +40,6 @@ impl Merger {
     /// As [`Self::from_pile`].
     pub unsafe fn from_pile_with<R: BlobStoreGet>(snapshot:&R,s:Slots,c:Config,a:&mut CudaBf16Aliases,precision:DecoderPrecision)->Result<Self,String> {
         c.validate()?;
-        if precision==DecoderPrecision::W4a16{return Err("the vision merger runs bf16 or w4a4, not w4a16".into());}
         macro_rules! bind {($h:expr,$r:literal)=>{{
             let b:Blob<NativeTensor<BF16,$r>>=snapshot.get($h).map_err(|e|e.to_string())?;
             // SAFETY: caller supplies the genuine immutable-prefix premise.
@@ -48,7 +47,7 @@ impl Merger {
         }};}
         let w=4*c.hidden;
         macro_rules! bind_lin {($slot:expr,$n:expr,$k:expr)=>{{
-            if precision==DecoderPrecision::W4a4&&crate::nn::nvfp4_gemm::w4a4_rows_takes($n,$k){
+            if super::vision_block::nvfp4_takes(precision,$n,$k){
                 // SAFETY: forwarded genuine immutable-prefix contract.
                 unsafe {bind_linear(snapshot,LinearSlot::Bf16($slot),a,precision)?}
             } else {Linear::Bf16(bind!($slot,2))}
@@ -99,8 +98,7 @@ impl Merger {
             Linear::Bf16(fc1w)=>unsafe{linear_kernel::launch_unchecked::<CudaRuntime>(&x.client,cubecl::calculate_cube_count_elemwise(&x.client,cells,cube),cube,
                 ArrayArg::from_raw_parts(grouped.handle.clone(),cells),ArrayArg::from_raw_parts(fc1w.handle.clone(),w*w),
                 ArrayArg::from_raw_parts(self.bias1.handle.clone(),w),ArrayArg::from_raw_parts(fc1.handle.clone(),cells),cells,w,w);},
-            Linear::Nvfp4{weight,precision:DecoderPrecision::W4a4,..}=>fc1=super::vision_block::biased_w4a4(&grouped,weight,&self.bias1)?,
-            Linear::Nvfp4{..}=>return Err("vision merger: only W4A4 runs NVFP4 here".into()),
+            Linear::Nvfp4{weight,precision,..}=>fc1=super::vision_block::biased_nvfp4(&grouped,weight,*precision,&self.bias1)?,
         }
         // SAFETY: as above; fc1 is complete [n/4, w] BF16 and activated fresh.
         unsafe {
@@ -111,8 +109,7 @@ impl Merger {
             Linear::Bf16(fc2w)=>unsafe{linear_kernel::launch_unchecked::<CudaRuntime>(&x.client,cubecl::calculate_cube_count_elemwise(&x.client,final_cells,cube),cube,
                 ArrayArg::from_raw_parts(activated.handle.clone(),cells),ArrayArg::from_raw_parts(fc2w.handle.clone(),self.c.output*w),
                 ArrayArg::from_raw_parts(self.bias2.handle.clone(),self.c.output),ArrayArg::from_raw_parts(hidden.handle.clone(),final_cells),final_cells,w,self.c.output);},
-            Linear::Nvfp4{weight,precision:DecoderPrecision::W4a4,..}=>hidden=super::vision_block::biased_w4a4(&activated,weight,&self.bias2)?,
-            Linear::Nvfp4{..}=>return Err("vision merger: only W4A4 runs NVFP4 here".into()),
+            Linear::Nvfp4{weight,precision,..}=>hidden=super::vision_block::biased_nvfp4(&activated,weight,*precision,&self.bias2)?,
         }
         Ok(Output{norm,grouped,fc1,activated,hidden})
     }
