@@ -201,6 +201,7 @@ fn embed(args: &[String]) -> Result<()> {
     say!("decoder_projections\t{projections}\tresident_bf16_bytes\t{bf16_bytes}\tresident_nvfp4_plane_bytes\t{fp4_bytes}");
     let (vl, vl_bf16, vl_bf16_bytes, vl_fp4, vl_fp4_bytes, vl_kinds) = native.vision_linear_bytes();
     say!("vision_linears\t{vl}\tbf16\t{vl_bf16}\tresident_bf16_bytes\t{vl_bf16_bytes}\tnvfp4\t{vl_fp4}\tresident_nvfp4_plane_bytes\t{vl_fp4_bytes}\tbound\t{vl_kinds:?}");
+    say!("decoder_bound\t{:?}\tvision_bound\t{:?}", native.decoder_bound(), native.vision_bound());
     let (name, major, minor) = native.device_identity().map_err(anyhow::Error::msg)?;
     say!("device\t{name}\tcompute\t{major}.{minor}\tmemavail_drop_after_bind_bytes\t{}", avail0 as i64 - mem_available() as i64);
 

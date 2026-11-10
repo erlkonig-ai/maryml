@@ -10,6 +10,9 @@
 //! BF16 bias add (`bias_kernel`). Under `W4a16` the same linears' NVFP4
 //! weights run the decoder's W4A16 prompt lane (`Nvfp4::project`, BF16
 //! activations, weights decoded in registers into the BF16 MMA) instead.
+//! A root that stores those linears as NVFP4 leaves (`models_import wemm
+//! --vision-nvfp4`) has its planes uploaded unchanged instead of quantized
+//! (`bind_vision_linear`); a stored NVFP4 linear is never bound BF16.
 //! Everything else is unchanged.
 pub use super::vision_frontend::Grid;
 use super::gdn_mixer::{DecoderPrecision, Linear, bind_linear};
@@ -59,13 +62,13 @@ pub struct Slots {
     pub norm1_bias: Slot<1>,
     pub norm2_weight: Slot<1>,
     pub norm2_bias: Slot<1>,
-    pub qkv_weight: Slot<2>,
+    pub qkv_weight: LinearSlot,
     pub qkv_bias: Slot<1>,
-    pub proj_weight: Slot<2>,
+    pub proj_weight: LinearSlot,
     pub proj_bias: Slot<1>,
-    pub fc1_weight: Slot<2>,
+    pub fc1_weight: LinearSlot,
     pub fc1_bias: Slot<1>,
-    pub fc2_weight: Slot<2>,
+    pub fc2_weight: LinearSlot,
     pub fc2_bias: Slot<1>,
 }
 pub struct Block {
@@ -149,7 +152,8 @@ impl Block {
     /// binds exactly as `from_pile`; `W4a4` quantizes every linear the
     /// W4A4-rows kernel takes on the device at load (`gdn_mixer::bind_linear`,
     /// the binder registers none of them) and binds the rest BF16; `W4a16`
-    /// does the same for the W4A16 prompt lane.
+    /// does the same for the W4A16 prompt lane. A linear the root stores as
+    /// NVFP4 is uploaded unchanged instead (`bind_vision_linear`).
     ///
     /// # Safety
     /// As [`Self::from_pile`].
@@ -172,12 +176,8 @@ impl Block {
         let m = c.intermediate;
         macro_rules! bind_lin {
             ($slot:expr, $n:expr, $k:expr) => {{
-                if nvfp4_takes(precision, $n, $k) {
-                    // SAFETY: forwarded genuine immutable-prefix contract.
-                    unsafe { bind_linear(snapshot, LinearSlot::Bf16($slot), a, precision)? }
-                } else {
-                    Linear::Bf16(bind!($slot, 2))
-                }
+                // SAFETY: forwarded genuine immutable-prefix contract.
+                unsafe { bind_vision_linear(snapshot, $slot, $n, $k, a, precision)? }
             }};
         }
         let b = Self {
@@ -559,6 +559,40 @@ pub(super) fn biased_nvfp4(
         );
     }
     Ok(y)
+}
+/// Bind one vision linear `[n, k]` from its leaf for `precision`. A BF16
+/// leaf is quantized on the device at load where the NVFP4 kernel of
+/// `precision` takes the shape ([`nvfp4_takes`]), and bound BF16 otherwise.
+/// A stored NVFP4 leaf is uploaded unchanged (`gdn_mixer::bind_linear`), and
+/// only for a precision whose kernel takes its shape: under `Bf16`, or for a
+/// shape the kernel cannot take, it is refused, never dequantized.
+///
+/// # Safety
+/// The binder's genuine immutable pile-prefix premise for the BF16 path.
+pub(super) unsafe fn bind_vision_linear<R: BlobStoreGet>(
+    snapshot: &R,
+    slot: LinearSlot,
+    n: usize,
+    k: usize,
+    a: &mut CudaBf16Aliases,
+    precision: DecoderPrecision,
+) -> Result<Linear, String> {
+    let takes = nvfp4_takes(precision, n, k);
+    match slot {
+        LinearSlot::Nvfp4(_) if !takes => Err(format!(
+            "vision linear [{n}, {k}] is stored as NVFP4, which the {} vision precision cannot run",
+            precision.label()
+        )),
+        // SAFETY: forwarded genuine immutable-prefix contract.
+        LinearSlot::Nvfp4(_) => unsafe { bind_linear(snapshot, slot, a, precision) },
+        // SAFETY: as above.
+        LinearSlot::Bf16(_) if takes => unsafe { bind_linear(snapshot, slot, a, precision) },
+        LinearSlot::Bf16(s) => {
+            let b: Blob<NativeTensor<BF16, 2>> = snapshot.get(s).map_err(|e| e.to_string())?;
+            // SAFETY: as above.
+            Ok(Linear::Bf16(unsafe { a.bind_pile_leaf(b)? }))
+        }
+    }
 }
 /// Whether a vision linear `[n, k]` runs NVFP4 on `precision`: W4A4 where
 /// the W4A4-rows kernel takes the shape, W4A16 where the prompt lane does

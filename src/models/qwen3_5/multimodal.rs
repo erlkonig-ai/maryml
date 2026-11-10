@@ -66,6 +66,11 @@ impl PreparedMultimodal {
         self.decoder.projection_bytes()
     }
 
+    /// See `Tower::vision_bound`.
+    pub fn vision_bound(&self) -> Option<super::gdn_mixer::BoundProjection> {
+        self.vision.vision_bound()
+    }
+
     /// See `Tower::linear_bytes`.
     pub fn vision_linear_bytes(&self) -> (usize, usize, u64, usize, u64, Vec<super::gdn_mixer::BoundProjection>) {
         self.vision.linear_bytes()

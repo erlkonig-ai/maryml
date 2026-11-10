@@ -532,6 +532,22 @@ pub fn is_decoder_projection(name: &str) -> bool {
         | "mlp.gate_proj.weight" | "mlp.up_proj.weight" | "mlp.down_proj.weight")
 }
 
+/// Whether a checkpoint tensor name is one of the 83 vision tower linears an
+/// NVFP4 vision precision runs: every one of the 27 blocks' `attn.qkv`,
+/// `attn.proj` and `mlp.linear_fc1` weights and the merger's `linear_fc1` and
+/// `linear_fc2` weights. Each block's `mlp.linear_fc2` (K 4304, which no
+/// 64- or 32-wide NVFP4 step divides), the patch convolution, the position
+/// table, norms and biases are not. `models_import wemm --vision-nvfp4`
+/// stores exactly these as NVFP4 leaves.
+pub fn is_vision_nvfp4_linear(name: &str) -> bool {
+    if let Some(rest) = name.strip_prefix("model.visual.blocks.") {
+        let Some((block, role)) = rest.split_once('.') else { return false };
+        return block.parse::<usize>().is_ok_and(|b| b < 27 && b.to_string() == block)
+            && matches!(role, "attn.qkv.weight" | "attn.proj.weight" | "mlp.linear_fc1.weight");
+    }
+    matches!(name, "model.visual.merger.linear_fc1.weight" | "model.visual.merger.linear_fc2.weight")
+}
+
 /// [`project`] for any decoder [`Linear`]: `[B,T,I] x [O,I]^T -> [B,T,O]`.
 /// An NVFP4 weight takes the B*T rows as one activation matrix; every row is
 /// computed independently of the others, as in the BF16 blueprint.

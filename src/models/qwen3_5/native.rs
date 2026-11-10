@@ -211,8 +211,9 @@ impl NativeWemm {
 
     /// [`Self::from_frozen_with`] with the vision tower's linears on `vision`
     /// as well: an NVFP4 precision quantizes each block and merger linear its
-    /// kernel takes at load, exactly as the decoder's (`Tower::from_pile_with`).
-    /// No kernel profile names such a model; it is for evaluation.
+    /// kernel takes at load, exactly as the decoder's, or uploads unchanged the
+    /// NVFP4 leaf a root stores for it (`Tower::from_pile_with`). A kernel
+    /// profile names only the stored form ([`Self::vision_bound`]).
     ///
     /// # Safety
     /// As [`Self::from_frozen`].
@@ -266,6 +267,16 @@ impl NativeWemm {
     /// identity is derived from this, never from the precision asked for.
     pub fn decoder_bound(&self) -> Option<super::gdn_mixer::BoundProjection> {
         self.model.decoder_bound()
+    }
+
+    /// What the vision tower's linears run, as bound
+    /// (`vision_tower::vision_bound_of`): `Bf16` when all are BF16,
+    /// `Nvfp4 { .. }` when exactly the 83 linears of
+    /// `gdn_mixer::is_vision_nvfp4_linear` run that one NVFP4 kind and the
+    /// blocks' fc2 BF16, `None` otherwise. A kernel profile reads this as
+    /// well as [`Self::decoder_bound`].
+    pub fn vision_bound(&self) -> Option<super::gdn_mixer::BoundProjection> {
+        self.model.vision_bound()
     }
 
     /// The vision tower's linears as bound (`Tower::linear_bytes`): (count,

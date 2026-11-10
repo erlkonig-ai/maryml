@@ -119,6 +119,13 @@ impl Slots {
                 super::roles::resolve(facts, source, root, $name, &$shape, selected)?
             };
         }
+        // A block or merger linear: its BF16 leaf, or the NVFP4 leaf a root
+        // made by `models_import wemm --vision-nvfp4` stores in its place.
+        macro_rules! linear {
+            ($name:expr, $shape:expr) => {
+                super::roles::resolve_linear(facts, source, root, $name, &$shape, selected)?
+            };
+        }
         let frontend = vision_frontend::Slots {
             patch: role!(
                 "model.visual.patch_embed.proj.weight",
@@ -144,13 +151,13 @@ impl Slots {
                 norm1_bias: role!(&format!("{prefix}.norm1.bias"), [h]),
                 norm2_weight: role!(&format!("{prefix}.norm2.weight"), [h]),
                 norm2_bias: role!(&format!("{prefix}.norm2.bias"), [h]),
-                qkv_weight: role!(&format!("{prefix}.attn.qkv.weight"), [3 * h, h]),
+                qkv_weight: linear!(&format!("{prefix}.attn.qkv.weight"), [3 * h, h]),
                 qkv_bias: role!(&format!("{prefix}.attn.qkv.bias"), [3 * h]),
-                proj_weight: role!(&format!("{prefix}.attn.proj.weight"), [h, h]),
+                proj_weight: linear!(&format!("{prefix}.attn.proj.weight"), [h, h]),
                 proj_bias: role!(&format!("{prefix}.attn.proj.bias"), [h]),
-                fc1_weight: role!(&format!("{prefix}.mlp.linear_fc1.weight"), [m, h]),
+                fc1_weight: linear!(&format!("{prefix}.mlp.linear_fc1.weight"), [m, h]),
                 fc1_bias: role!(&format!("{prefix}.mlp.linear_fc1.bias"), [m]),
-                fc2_weight: role!(&format!("{prefix}.mlp.linear_fc2.weight"), [h, m]),
+                fc2_weight: linear!(&format!("{prefix}.mlp.linear_fc2.weight"), [h, m]),
                 fc2_bias: role!(&format!("{prefix}.mlp.linear_fc2.bias"), [h]),
             });
         }
@@ -158,9 +165,9 @@ impl Slots {
         let merger = vision_merger::Slots {
             norm: role!("model.visual.merger.norm.weight", [h]),
             norm_bias: role!("model.visual.merger.norm.bias", [h]),
-            fc1: role!("model.visual.merger.linear_fc1.weight", [4 * h, 4 * h]),
+            fc1: linear!("model.visual.merger.linear_fc1.weight", [4 * h, 4 * h]),
             bias1: role!("model.visual.merger.linear_fc1.bias", [4 * h]),
-            fc2: role!("model.visual.merger.linear_fc2.weight", [o, 4 * h]),
+            fc2: linear!("model.visual.merger.linear_fc2.weight", [o, 4 * h]),
             bias2: role!("model.visual.merger.linear_fc2.bias", [o]),
         };
         Ok(Self {
@@ -169,6 +176,31 @@ impl Slots {
             merger,
         })
     }
+}
+
+/// The vision tower's linears as bound, from each block's [qkv, proj, fc1,
+/// fc2] and the merger's [fc1, fc2], in the two shapes a kernel profile can
+/// name: `Bf16` when every linear is BF16, and `Nvfp4 { precision, stored }`
+/// when every block's qkv, proj and fc1 and both merger linears (the 83
+/// linears of `gdn_mixer::is_vision_nvfp4_linear`) run that one NVFP4 kind
+/// while every block's fc2 (K 4304, which no NVFP4 kernel takes) is BF16.
+/// Anything else, a mixture of NVFP4 kinds or of NVFP4 and BF16 among those
+/// 83 included, is `None`. A tower with no blocks is `None` too.
+pub fn vision_bound_of(
+    blocks: impl IntoIterator<Item = [BoundProjection; 4]>,
+    merger: [BoundProjection; 2],
+) -> Option<BoundProjection> {
+    let mut nvfp4 = merger.to_vec();
+    let mut fc2 = Vec::new();
+    for [qkv, proj, fc1, block_fc2] in blocks {
+        nvfp4.extend([qkv, proj, fc1]);
+        fc2.push(block_fc2);
+    }
+    if fc2.is_empty() || fc2.iter().any(|b| *b != BoundProjection::Bf16) {
+        return None;
+    }
+    let first = nvfp4[0];
+    nvfp4.iter().all(|b| *b == first).then_some(first)
 }
 
 /// Rows contributed by one input image/grid. Rows are contiguous and retain
@@ -254,6 +286,15 @@ impl Tower {
             blocks,
             merger,
         })
+    }
+
+    /// What the vision tower's linears run, as bound, in the two shapes a
+    /// kernel profile can name ([`vision_bound_of`]).
+    pub fn vision_bound(&self) -> Option<BoundProjection> {
+        vision_bound_of(
+            self.blocks.iter().map(|b| b.linears().map(|l| l.bound())),
+            self.merger.linears().map(|l| l.bound()),
+        )
     }
 
     /// The blocks' and the merger's linears as bound: (count, BF16 count,
@@ -357,6 +398,84 @@ mod tests {
             },
             depth: 27,
         }
+    }
+
+    /// Every block and merger linear of the checkpoint, `(name, [n, k])`.
+    fn checkpoint_linears() -> Vec<(String, [usize; 2])> {
+        let c = checkpoint_dimensions();
+        let (h, m, o) = (c.block.hidden, c.block.intermediate, c.merger.output);
+        let mut all = Vec::new();
+        for b in 0..c.depth {
+            let p = format!("model.visual.blocks.{b}");
+            all.push((format!("{p}.attn.qkv.weight"), [3 * h, h]));
+            all.push((format!("{p}.attn.proj.weight"), [h, h]));
+            all.push((format!("{p}.mlp.linear_fc1.weight"), [m, h]));
+            all.push((format!("{p}.mlp.linear_fc2.weight"), [h, m]));
+        }
+        all.push(("model.visual.merger.linear_fc1.weight".into(), [4 * h, 4 * h]));
+        all.push(("model.visual.merger.linear_fc2.weight".into(), [o, 4 * h]));
+        all
+    }
+
+    #[test]
+    fn the_stored_vision_linears_are_exactly_the_83_both_nvfp4_kernels_take() {
+        use super::super::gdn_mixer::{is_decoder_projection, is_vision_nvfp4_linear};
+        let all = checkpoint_linears();
+        assert_eq!(all.len(), 110);
+        let mut stored = 0;
+        for (name, [n, k]) in &all {
+            let named = is_vision_nvfp4_linear(name);
+            assert_eq!(named, vision_block::nvfp4_takes(DecoderPrecision::W4a4, *n, *k), "{name}");
+            assert_eq!(named, vision_block::nvfp4_takes(DecoderPrecision::W4a16, *n, *k), "{name}");
+            assert!(!vision_block::nvfp4_takes(DecoderPrecision::Bf16, *n, *k));
+            assert!(!is_decoder_projection(name), "{name}");
+            stored += named as usize;
+        }
+        assert_eq!(stored, 83);
+        for other in [
+            "model.visual.blocks.27.attn.qkv.weight",
+            "model.visual.blocks.01.attn.qkv.weight",
+            "model.visual.blocks.0.attn.qkv.bias",
+            "model.visual.blocks.0.mlp.linear_fc2.weight",
+            "model.visual.blocks.0.norm1.weight",
+            "model.visual.merger.linear_fc1.bias",
+            "model.visual.patch_embed.proj.weight",
+            "model.visual.pos_embed.weight",
+            "model.language_model.layers.0.mlp.up_proj.weight",
+        ] {
+            assert!(!is_vision_nvfp4_linear(other), "{other}");
+        }
+    }
+
+    #[test]
+    fn the_vision_tower_is_bound_in_a_profile_shape_or_in_none() {
+        use BoundProjection::{Bf16, Nvfp4};
+        let w4a16 = Nvfp4 { precision: DecoderPrecision::W4a16, stored: true };
+        let at_load = Nvfp4 { precision: DecoderPrecision::W4a16, stored: false };
+        let w4a4 = Nvfp4 { precision: DecoderPrecision::W4a4, stored: true };
+        let tower = |block: [BoundProjection; 4], merger| vision_bound_of(vec![block; 27], merger);
+        assert_eq!(tower([Bf16; 4], [Bf16; 2]), Some(Bf16));
+        assert_eq!(tower([w4a16, w4a16, w4a16, Bf16], [w4a16; 2]), Some(w4a16));
+        assert_eq!(tower([at_load, at_load, at_load, Bf16], [at_load; 2]), Some(at_load));
+        assert_eq!(tower([w4a4, w4a4, w4a4, Bf16], [w4a4; 2]), Some(w4a4));
+        for (block, merger) in [
+            // fc2 is never NVFP4 in a profile shape.
+            ([w4a16; 4], [w4a16; 2]),
+            ([Bf16, Bf16, Bf16, w4a16], [Bf16; 2]),
+            // NVFP4 blocks with a BF16 merger, and the reverse.
+            ([w4a16, w4a16, w4a16, Bf16], [Bf16; 2]),
+            ([Bf16; 4], [w4a16; 2]),
+            // Two NVFP4 kinds.
+            ([w4a16, w4a16, w4a16, Bf16], [w4a4; 2]),
+            ([w4a16, at_load, w4a16, Bf16], [w4a16; 2]),
+        ] {
+            assert_eq!(tower(block, merger), None, "{block:?} {merger:?}");
+        }
+        // One block unlike the other 26.
+        let mut blocks = vec![[w4a16, w4a16, w4a16, Bf16]; 27];
+        blocks[13] = [Bf16; 4];
+        assert_eq!(vision_bound_of(blocks, [w4a16; 2]), None);
+        assert_eq!(vision_bound_of(Vec::new(), [Bf16; 2]), None);
     }
 
     #[test]

@@ -9,13 +9,13 @@ use serde::{Deserialize,Serialize};
 use triblespace::core::{blob::{Blob,encodings::tensor::{Tensor as NativeTensor,elements::BF16}},
     inline::{Inline,encodings::hash::Handle},repo::BlobStoreGet};
 use crate::nn::cuda_bf16_alias::CudaBf16Aliases;
-use super::gdn_mixer::{DecoderPrecision,Linear,bind_linear};
+use super::gdn_mixer::{DecoderPrecision,Linear};
 use super::roles::LinearSlot;
 pub type CudaTensor=CubeTensor<CudaRuntime>;
 pub type Slot<const R:usize>=Inline<Handle<NativeTensor<BF16,R>>>;
 #[derive(Clone,Copy,Debug,Deserialize,Serialize)]
 pub struct Config {pub hidden:usize,pub output:usize}
-pub struct Slots {pub norm:Slot<1>,pub norm_bias:Slot<1>,pub fc1:Slot<2>,pub bias1:Slot<1>,pub fc2:Slot<2>,pub bias2:Slot<1>}
+pub struct Slots {pub norm:Slot<1>,pub norm_bias:Slot<1>,pub fc1:LinearSlot,pub bias1:Slot<1>,pub fc2:LinearSlot,pub bias2:Slot<1>}
 pub struct Merger {c:Config,norm:CudaTensor,norm_bias:CudaTensor,fc1:Linear,bias1:CudaTensor,fc2:Linear,bias2:CudaTensor}
 pub struct Output {pub norm:CudaTensor,pub grouped:CudaTensor,pub fc1:CudaTensor,pub activated:CudaTensor,pub hidden:CudaTensor}
 impl Config {
@@ -47,10 +47,8 @@ impl Merger {
         }};}
         let w=4*c.hidden;
         macro_rules! bind_lin {($slot:expr,$n:expr,$k:expr)=>{{
-            if super::vision_block::nvfp4_takes(precision,$n,$k){
-                // SAFETY: forwarded genuine immutable-prefix contract.
-                unsafe {bind_linear(snapshot,LinearSlot::Bf16($slot),a,precision)?}
-            } else {Linear::Bf16(bind!($slot,2))}
+            // SAFETY: forwarded genuine immutable-prefix contract.
+            unsafe {super::vision_block::bind_vision_linear(snapshot,$slot,$n,$k,a,precision)?}
         }};}
         let out=Self{c,norm:bind!(s.norm,1),norm_bias:bind!(s.norm_bias,1),fc1:bind_lin!(s.fc1,w,w),bias1:bind!(s.bias1,1),fc2:bind_lin!(s.fc2,c.output,w),bias2:bind!(s.bias2,1)};
         for (name,t,shape) in [("norm",&out.norm,vec![c.hidden]),("norm bias",&out.norm_bias,vec![c.hidden]),

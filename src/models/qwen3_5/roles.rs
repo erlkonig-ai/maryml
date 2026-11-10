@@ -15,8 +15,9 @@ use triblespace::prelude::*;
 pub type Slot<const R: usize> = Inline<Handle<Tensor<BF16, R>>>;
 pub type Nvfp4Slot = Inline<Handle<Tensor<NVFP4, 2>>>;
 
-/// A decoder projection's stored leaf: native BF16, or NVFP4 packed for
-/// storage (an `nvfp4` root, `models_import wemm`).
+/// A linear's stored leaf, for a decoder projection or a vision linear:
+/// native BF16, or NVFP4 packed for storage (an `nvfp4` root,
+/// `models_import wemm`).
 #[derive(Clone, Copy, Debug)]
 pub enum LinearSlot {
     Bf16(Slot<2>),
@@ -29,7 +30,7 @@ impl From<Slot<2>> for LinearSlot {
     }
 }
 
-/// [`resolve`] for a decoder projection `[O, I]`: the native BF16 leaf when
+/// [`resolve`] for a linear `[O, I]`: the native BF16 leaf when
 /// the root has one, else its stored NVFP4 leaf of the same logical shape.
 /// `selected` sees the leaf actually chosen (its payload is the packed
 /// planes for NVFP4).
