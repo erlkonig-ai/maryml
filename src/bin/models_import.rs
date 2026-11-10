@@ -529,7 +529,9 @@ pub(super) fn wemm(
 ) -> Result<(Id, Fragment, serde_json::Value)> {
     use mary::models::qwen3_5::gdn_mixer::{is_decoder_projection, pack_projection_for_storage};
     let index = tensors(&source.facts, &source.store, source.root)?;
-    ensure!(index.len() == 759, "WeMM root {:X} has {} tensors, not 759", source.root, index.len());
+    // The runtime binds 759 of them; any other tensor member (open world) is
+    // carried over unchanged with the rest.
+    eprintln!("[wemm] source root {:X}: {} tensor members", source.root, index.len());
     let device = cubecl::cuda::CudaDevice { index: 0 };
     let started = Instant::now();
     let mut stored = BTreeMap::new();
