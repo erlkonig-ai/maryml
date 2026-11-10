@@ -70,8 +70,9 @@ impl Positions {
 
 pub struct Slots {
     pub input_norm: Slot<1>, pub post_norm: Slot<1>, pub q_norm: Slot<1>, pub k_norm: Slot<1>,
-    pub q: Slot<2>, pub k: Slot<2>, pub v: Slot<2>, pub o: Slot<2>,
-    pub gate: Slot<2>, pub up: Slot<2>, pub down: Slot<2>,
+    pub q: super::roles::LinearSlot, pub k: super::roles::LinearSlot, pub v: super::roles::LinearSlot,
+    pub o: super::roles::LinearSlot, pub gate: super::roles::LinearSlot, pub up: super::roles::LinearSlot,
+    pub down: super::roles::LinearSlot,
 }
 pub struct Block { config: Config, input_norm: CudaTensor, post_norm: CudaTensor,
     q_norm: CudaTensor, k_norm: CudaTensor, q: Linear, k: Linear, v: Linear,

@@ -21,6 +21,8 @@
 //!     --pile <dest.pile> --key <signing.key> --collection blake3:HEX
 //!   models_import voxtral --source <voxtral.pile> --source-root HEX \
 //!     --tekken <tekken.json> --pile <dest.pile> --key <signing.key> --collection blake3:HEX
+//!   models_import wemm --source <self.pile> --source-root HEX --assets <dir> \
+//!     --pile <dest.pile> --key <signing.key> --collection blake3:HEX
 //!   models_import flint --source <flint.gguf> \
 //!     --pile <existing.pile> --key <signing.key> --collection blake3:HEX
 use anyhow::{Context, Result, ensure};
@@ -70,6 +72,14 @@ enum Model {
         #[arg(long)]
         tekken: PathBuf,
     },
+    /// WeMM-Embedding-9B: the 248 decoder projections as NVFP4 leaves.
+    #[cfg(feature = "wemm-input")]
+    Wemm {
+        /// The checkpoint's assets directory (tokenizer.json, config.json,
+        /// chat_template.jinja), stored as the new root's parts.
+        #[arg(long)]
+        assets: PathBuf,
+    },
 }
 
 impl Args {
@@ -81,13 +91,15 @@ impl Args {
             Model::Breeze => ensure!(self.source_root.is_some(), "--source-root is required"),
             #[cfg(feature = "voxtral-cuda")]
             Model::Voxtral { .. } => ensure!(self.source_root.is_some(), "--source-root is required"),
+            #[cfg(feature = "wemm-input")]
+            Model::Wemm { .. } => ensure!(self.source_root.is_some(), "--source-root is required"),
         }
         Ok(())
     }
 }
 
 // Existing native-source repacking is absent from the host-only Flint build.
-#[cfg(any(feature = "breeze-cuda", feature = "voxtral-cuda"))]
+#[cfg(any(feature = "breeze-cuda", feature = "voxtral-cuda", feature = "wemm-input"))]
 mod native {
 use super::*;
 use mary::{format::attrs, leaf::Leaf, nvfp4::StoredProjection};
@@ -499,6 +511,88 @@ pub(super) fn voxtral(
     ))
 }
 
+/// WeMM's `nvfp4` root: every decoder linear projection
+/// (`gdn_mixer::is_decoder_projection`, 248 tensors) packed as a
+/// `Tensor<NVFP4, 2>` leaf by `gdn_mixer::pack_projection_for_storage`, which
+/// gates the host packing byte for byte against the device quantizer the
+/// runtime's load-time NVFP4 path runs; every other tensor (vision tower,
+/// token table, norms, conv, DeltaNet parameters) copied unchanged in BF16.
+/// The root's parts are stored from the checkpoint's own assets, as
+/// `model_collection_migrate` completes a root: tokenizer.json as tokenizer
+/// facts, config.json as JSON facts, chat_template.jinja as a blob.
+#[cfg(feature = "wemm-input")]
+pub(super) fn wemm(
+    assets: &Path,
+    source: &Source,
+    source_path: &Path,
+    pile: &mut Pile,
+) -> Result<(Id, Fragment, serde_json::Value)> {
+    use mary::models::qwen3_5::gdn_mixer::{is_decoder_projection, pack_projection_for_storage};
+    let index = tensors(&source.facts, &source.store, source.root)?;
+    ensure!(index.len() == 759, "WeMM root {:X} has {} tensors, not 759", source.root, index.len());
+    let device = cubecl::cuda::CudaDevice { index: 0 };
+    let started = Instant::now();
+    let mut stored = BTreeMap::new();
+    for (name, leaf) in &index {
+        if !is_decoder_projection(name) {
+            continue;
+        }
+        ensure!(leaf.elem() == mary::leaf::Elem::Bf16 && leaf.dims().len() == 2, "{name}: not a BF16 matrix");
+        let dims = [leaf.dims()[0], leaf.dims()[1]];
+        let projection = pack_projection_for_storage(name, leaf.payload().as_ref(), dims, &device)
+            .map_err(anyhow::Error::msg)?;
+        stored.insert(name.clone(), projection);
+    }
+    ensure!(stored.len() == 248, "{} decoder projections, not 248", stored.len());
+    let export_seconds = started.elapsed().as_secs_f64();
+    eprintln!("[wemm] {} projections packed and gated in {export_seconds:.1}s", stored.len());
+    let (members, mut facts, dense, packed) = members(pile, &index, &stored, &BTreeSet::new())?;
+
+    let read = |name: &str| std::fs::read(assets.join(name)).with_context(|| format!("{}", assets.join(name).display()));
+    let tokenizer_json = read("tokenizer.json")?;
+    let config: serde_json::Value = serde_json::from_slice(&read("config.json")?).context("config.json")?;
+    let template = String::from_utf8(read("chat_template.jinja")?).context("chat_template.jinja is not UTF-8")?;
+    let mut sources: Vec<String> = Vec::new();
+    for (handle,) in find!(
+        (handle: Inline<inlineencodings::Handle<blobencodings::UTF8String>>),
+        pattern!(&source.facts, [{ source.root @ attrs::source: ?handle }])
+    ) {
+        let label: anybytes::View<str> = source.store.get(handle).map_err(|e| anyhow::anyhow!("source label: {e}"))?;
+        sources.push(label.to_string());
+    }
+    sources.sort();
+    let source_label = sources.first().cloned().unwrap_or_else(|| "WeMM-Embedding-9B".to_owned());
+    let tokenizer = mary::tokenizer::save_tokenizer_json(&tokenizer_json, &source_label, pile)
+        .map_err(|e| anyhow::anyhow!("store the tokenizer: {e}"))?;
+    let tokenizer_id = tokenizer.root();
+    facts += tokenizer.into_facts();
+    let config_id = mary::jsonfacts::save_json(&config, pile, &mut facts)
+        .map_err(|e| anyhow::anyhow!("store the configuration: {e}"))?;
+    let template = pile.put::<blobencodings::UTF8String, _>(template)
+        .map_err(|e| anyhow::anyhow!("store the chat template: {e}"))?;
+    let mut fragment = mary::ingest::build_model_root_with(
+        pile,
+        &source_label,
+        mary::persist::QUANTIZATION_NVFP4,
+        members,
+        facts,
+        &provenance(source)?,
+        mary::ingest::RootParts { tokenizer: tokenizer_id, config: Some(config_id), chat_template: Some(template) },
+    )
+    .map_err(|e| anyhow::anyhow!("model root: {e}"))?;
+    let model_root = fragment.root().context("model root")?;
+    derivation(pile, &mut fragment, model_root, source, source_path, stored.len(), packed)?;
+    Ok((
+        model_root,
+        fragment,
+        serde_json::json!({
+            "model": "wemm", "model_root": format!("{model_root:X}"), "source_root": format!("{:X}", source.root),
+            "projections": stored.len(), "packed_bytes": packed, "dense_bytes": dense,
+            "tensors": index.len(), "export_seconds": export_seconds,
+        }),
+    ))
+}
+
 } // native
 
 #[cfg(feature = "tokenizer")]
@@ -586,6 +680,11 @@ fn main() -> Result<()> {
             let source = native::open_source(&source_path, args.source_root.as_deref().context("--source-root is required")?)?;
             native::voxtral(tekken, &source, &source_path, pile)
         },
+        #[cfg(feature = "wemm-input")]
+        Model::Wemm { assets } => {
+            let source = native::open_source(&source_path, args.source_root.as_deref().context("--source-root is required")?)?;
+            native::wemm(assets, &source, &source_path, pile)
+        },
     })?;
 
     // Read it back the way the runtime will: the collection by handle, Flint's
@@ -618,6 +717,17 @@ fn main() -> Result<()> {
                     .count()
             );
             receipt["readback_tensors"] = serde_json::json!(index.len());
+        }
+        #[cfg(feature = "wemm-input")]
+        Model::Wemm { .. } => {
+            mary::models::qwen3_5::native::Assets::from_model_root(models.facts(), models.store(), model_root)
+                .map_err(anyhow::Error::msg)?;
+            let index = native::tensors(models.facts(), models.store(), model_root)?;
+            receipt["readback_nvfp4_leaves"] = serde_json::json!(
+                index.values().filter(|l| l.elem() == mary::leaf::Elem::Nvfp4).count()
+            );
+            receipt["readback_tensors"] = serde_json::json!(index.len());
+            receipt["readback_assets"] = serde_json::json!("tokenizer, config and template from the root's facts");
         }
         #[cfg(feature = "voxtral-cuda")]
         Model::Voxtral { .. } => {

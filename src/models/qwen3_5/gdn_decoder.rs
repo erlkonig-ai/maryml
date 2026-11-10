@@ -39,7 +39,7 @@ impl Config {
 pub struct Slots {
     pub mixer: GdnSlots,
     pub input_norm: Slot<1>, pub post_norm: Slot<1>,
-    pub gate: Slot<2>, pub up: Slot<2>, pub down: Slot<2>,
+    pub gate: super::roles::LinearSlot, pub up: super::roles::LinearSlot, pub down: super::roles::LinearSlot,
 }
 pub struct Block {
     config: Config, mixer: GdnMixer,

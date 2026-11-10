@@ -7,12 +7,66 @@
 
 use crate::{format::attrs, leaf::leaf};
 use triblespace::core::{
-    blob::{Blob, encodings::tensor::{Tensor, elements::BF16}},
+    blob::{Blob, encodings::tensor::{Tensor, elements::{BF16, NVFP4}}},
     inline::encodings::hash::Handle,
 };
 use triblespace::prelude::*;
 
 pub type Slot<const R: usize> = Inline<Handle<Tensor<BF16, R>>>;
+pub type Nvfp4Slot = Inline<Handle<Tensor<NVFP4, 2>>>;
+
+/// A decoder projection's stored leaf: native BF16, or NVFP4 packed for
+/// storage (an `nvfp4` root, `models_import wemm`).
+#[derive(Clone, Copy, Debug)]
+pub enum LinearSlot {
+    Bf16(Slot<2>),
+    Nvfp4(Nvfp4Slot),
+}
+
+impl From<Slot<2>> for LinearSlot {
+    fn from(slot: Slot<2>) -> Self {
+        Self::Bf16(slot)
+    }
+}
+
+/// [`resolve`] for a decoder projection `[O, I]`: the native BF16 leaf when
+/// the root has one, else its stored NVFP4 leaf of the same logical shape.
+/// `selected` sees the leaf actually chosen (its payload is the packed
+/// planes for NVFP4).
+pub fn resolve_linear(
+    facts: &TribleSet,
+    snapshot: &impl BlobStoreGet,
+    root: Id,
+    name: &str,
+    shape: &[u64; 2],
+    selected: &mut impl FnMut(&str, [u8; 32], &[u64], &[u8]) -> Result<(), String>,
+) -> Result<LinearSlot, String> {
+    match resolve(facts, snapshot, root, name, shape, selected) {
+        Ok(slot) => return Ok(LinearSlot::Bf16(slot)),
+        Err(e) if e.contains("no supported native BF16") => {}
+        Err(e) => return Err(e),
+    }
+    for (path, handle) in find!(
+        (path: Inline<Handle<blobencodings::UTF8String>>, handle: Nvfp4Slot),
+        pattern!(facts, [
+            { root @ attrs::member: _?member },
+            { _?member @ attrs::safetensor_path: ?path, attrs::weight: _?weight },
+            { _?weight @ leaf::<NVFP4, 2>(): ?handle }
+        ])
+    ) {
+        let observed: anybytes::View<str> = snapshot.get(path)
+            .map_err(|e| format!("{name}: read candidate path {path:?}: {e}"))?;
+        if &*observed != name { continue; }
+        let blob: Blob<Tensor<NVFP4, 2>> = snapshot.get(handle)
+            .map_err(|e| format!("{name}: read NVFP4 leaf {handle:?}: {e}"))?;
+        let view = crate::leaf::read_leaf(blob)
+            .map_err(|e| format!("{name}: invalid NVFP4 leaf {handle:?}: {e}"))?;
+        if view.dims() != shape { continue; }
+        selected(name, handle.raw, shape, view.payload().as_ref())?;
+        return Ok(LinearSlot::Nvfp4(handle));
+    }
+    Err(format!("{name}: no BF16 or NVFP4 rank-2 role {shape:?} under root {root:?}"))
+}
 
 /// Reports the selected role immediately. The callback can hash/record bytes
 /// for an audit; production need not create a second weight catalogue. The

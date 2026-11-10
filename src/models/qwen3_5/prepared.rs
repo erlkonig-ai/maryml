@@ -221,18 +221,21 @@ fn gdn_slots<R: BlobStoreGet>(
     macro_rules! role { ($name:literal, $shape:expr) => {
         roles::resolve(facts, snapshot, root, &format!("{prefix}{}", $name), &$shape, selected)?
     }; }
+    macro_rules! linear { ($name:literal, $shape:expr) => {
+        roles::resolve_linear(facts, snapshot, root, &format!("{prefix}{}", $name), &$shape, selected)?
+    }; }
     Ok(gdn_decoder::Slots {
         input_norm: role!("input_layernorm.weight", [4096]),
         post_norm: role!("post_attention_layernorm.weight", [4096]),
-        gate: role!("mlp.gate_proj.weight", [12288, 4096]),
-        up: role!("mlp.up_proj.weight", [12288, 4096]),
-        down: role!("mlp.down_proj.weight", [4096, 12288]),
+        gate: linear!("mlp.gate_proj.weight", [12288, 4096]),
+        up: linear!("mlp.up_proj.weight", [12288, 4096]),
+        down: linear!("mlp.down_proj.weight", [4096, 12288]),
         mixer: GdnSlots {
-            qkv: role!("linear_attn.in_proj_qkv.weight", [8192, 4096]),
-            z: role!("linear_attn.in_proj_z.weight", [4096, 4096]),
-            a: role!("linear_attn.in_proj_a.weight", [32, 4096]),
-            b: role!("linear_attn.in_proj_b.weight", [32, 4096]),
-            out: role!("linear_attn.out_proj.weight", [4096, 4096]),
+            qkv: linear!("linear_attn.in_proj_qkv.weight", [8192, 4096]),
+            z: linear!("linear_attn.in_proj_z.weight", [4096, 4096]),
+            a: linear!("linear_attn.in_proj_a.weight", [32, 4096]),
+            b: linear!("linear_attn.in_proj_b.weight", [32, 4096]),
+            out: linear!("linear_attn.out_proj.weight", [4096, 4096]),
             conv: role!("linear_attn.conv1d.weight", [8192, 1, 4]),
             a_log: role!("linear_attn.A_log", [32]),
             dt_bias: role!("linear_attn.dt_bias", [32]),
@@ -249,16 +252,19 @@ fn attention_slots<R: BlobStoreGet>(
     macro_rules! role { ($name:literal, $shape:expr) => {
         roles::resolve(facts, snapshot, root, &format!("{prefix}{}", $name), &$shape, selected)?
     }; }
+    macro_rules! linear { ($name:literal, $shape:expr) => {
+        roles::resolve_linear(facts, snapshot, root, &format!("{prefix}{}", $name), &$shape, selected)?
+    }; }
     Ok(full_attention::Slots {
         input_norm: role!("input_layernorm.weight", [4096]),
         post_norm: role!("post_attention_layernorm.weight", [4096]),
-        gate: role!("mlp.gate_proj.weight", [12288, 4096]),
-        up: role!("mlp.up_proj.weight", [12288, 4096]),
-        down: role!("mlp.down_proj.weight", [4096, 12288]),
-        q: role!("self_attn.q_proj.weight", [8192, 4096]),
-        k: role!("self_attn.k_proj.weight", [1024, 4096]),
-        v: role!("self_attn.v_proj.weight", [1024, 4096]),
-        o: role!("self_attn.o_proj.weight", [4096, 4096]),
+        gate: linear!("mlp.gate_proj.weight", [12288, 4096]),
+        up: linear!("mlp.up_proj.weight", [12288, 4096]),
+        down: linear!("mlp.down_proj.weight", [4096, 12288]),
+        q: linear!("self_attn.q_proj.weight", [8192, 4096]),
+        k: linear!("self_attn.k_proj.weight", [1024, 4096]),
+        v: linear!("self_attn.v_proj.weight", [1024, 4096]),
+        o: linear!("self_attn.o_proj.weight", [4096, 4096]),
         q_norm: role!("self_attn.q_norm.weight", [256]),
         k_norm: role!("self_attn.k_norm.weight", [256]),
     })

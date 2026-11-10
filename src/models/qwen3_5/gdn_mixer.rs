@@ -29,7 +29,7 @@ use triblespace::core::{
     inline::{Inline, encodings::hash::Handle},
     repo::BlobStoreGet,
 };
-use super::{deltanet::{self, DeltaNetInputs}, gdn_ops};
+use super::{deltanet::{self, DeltaNetInputs}, gdn_ops, roles::LinearSlot};
 use crate::nn::cuda_bf16_alias::CudaBf16Aliases;
 use crate::nn::nvfp4_gemv::Nvfp4;
 
@@ -77,11 +77,11 @@ impl GdnConfig {
 /// Obtain these through typed leaf queries at the consuming module's slots.
 /// Handles/IDs are opaque; no identity is reconstructed from a name or shape.
 pub struct GdnSlots {
-    pub qkv: Inline<Handle<NativeTensor<BF16, 2>>>,
-    pub z: Inline<Handle<NativeTensor<BF16, 2>>>,
-    pub a: Inline<Handle<NativeTensor<BF16, 2>>>,
-    pub b: Inline<Handle<NativeTensor<BF16, 2>>>,
-    pub out: Inline<Handle<NativeTensor<BF16, 2>>>,
+    pub qkv: LinearSlot,
+    pub z: LinearSlot,
+    pub a: LinearSlot,
+    pub b: LinearSlot,
+    pub out: LinearSlot,
     pub conv: Inline<Handle<NativeTensor<BF16, 3>>>,
     pub a_log: Inline<Handle<NativeTensor<BF16, 1>>>,
     pub dt_bias: Inline<Handle<NativeTensor<BF16, 1>>>,
@@ -431,10 +431,31 @@ impl Linear {
 /// The binder's genuine immutable pile-prefix premise for the BF16 path.
 pub(crate) unsafe fn bind_linear<R: BlobStoreGet>(
     snapshot: &R,
-    slot: Inline<Handle<NativeTensor<BF16, 2>>>,
+    slot: LinearSlot,
     aliases: &mut CudaBf16Aliases,
     precision: DecoderPrecision,
 ) -> Result<Linear, String> {
+    let slot = match slot {
+        LinearSlot::Bf16(slot) => slot,
+        LinearSlot::Nvfp4(slot) => {
+            // A stored NVFP4 projection: its code and scale planes are copied
+            // into device memory once; nothing is converted or quantized.
+            if precision == DecoderPrecision::Bf16 {
+                return Err("this projection is stored as NVFP4; bind it with an NVFP4 precision".into());
+            }
+            let blob: Blob<NativeTensor<triblespace::core::blob::encodings::tensor::elements::NVFP4, 2>> =
+                snapshot.get(slot).map_err(|e| e.to_string())?;
+            let view = crate::leaf::read_leaf(blob).map_err(|e| e.to_string())?;
+            let dims: [u64; 2] = view.dims().try_into().map_err(|_| "NVFP4 projection is not rank 2")?;
+            let weight = Nvfp4::upload(view.payload(), dims, DType::BF16, aliases.device())
+                .map_err(|e| format!("NVFP4 upload: {e}"))?;
+            let client = CudaRuntime::client(aliases.device());
+            for _ in 0..2 {
+                client.flush().map_err(|e| format!("flush after an NVFP4 upload: {e:?}"))?;
+            }
+            return Linear::nvfp4(weight, precision);
+        }
+    };
     let blob: Blob<NativeTensor<BF16, 2>> = snapshot.get(slot).map_err(|e| e.to_string())?;
     if precision == DecoderPrecision::Bf16 {
         // SAFETY: forwarded genuine immutable-prefix contract.
@@ -455,6 +476,46 @@ pub(crate) unsafe fn bind_linear<R: BlobStoreGet>(
         client.flush().map_err(|e| format!("flush after an NVFP4 load: {e:?}"))?;
     }
     Linear::nvfp4(weight, precision)
+}
+
+/// Pack one BF16 decoder projection `[n, k]` (its native leaf payload) for
+/// storage as a `Tensor<NVFP4, 2>` leaf: the host packing
+/// (`nvfp4::pack_nearest`), required to equal the device quantizer that
+/// [`bind_linear`] runs at load, code byte for code byte, scale byte for
+/// scale byte and global scale bit for bit. A stored root therefore runs
+/// exactly the weights a load-time quantization of the BF16 root runs.
+pub fn pack_projection_for_storage(
+    name: &str,
+    payload: &[u8],
+    dims: [u64; 2],
+    device: &cubecl::cuda::CudaDevice,
+) -> Result<crate::nvfp4::StoredProjection, String> {
+    let (n, k) = (dims[0] as usize, dims[1] as usize);
+    if payload.len() != n * k * 2 {
+        return Err(format!("{name}: {} payload bytes for BF16 [{n}, {k}]", payload.len()));
+    }
+    let client = CudaRuntime::client(device);
+    let source = CubeTensor::new_contiguous(client.clone(), device.clone(), [n, k].as_slice().into(),
+        client.create_from_slice(payload), DType::BF16);
+    let weight = Nvfp4::quantize(&source).map_err(|e| format!("{name}: device quantize: {e}"))?;
+    drop(source);
+    let values: Vec<f32> = payload.chunks_exact(2)
+        .map(|b| bf16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32()).collect();
+    weight.pack_matching(name, &values).map_err(|e| e.to_string())
+}
+
+/// Whether a checkpoint tensor name is one of the decoder's linear
+/// projections that the NVFP4 precisions replace (all 32 layers' GDN mixer,
+/// attention and MLP projections; never the vision tower, norms, conv or the
+/// token table).
+pub fn is_decoder_projection(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("model.language_model.layers.") else { return false };
+    let Some((layer, role)) = rest.split_once('.') else { return false };
+    layer.parse::<usize>().is_ok_and(|l| l < 32) && matches!(role,
+        "linear_attn.in_proj_qkv.weight" | "linear_attn.in_proj_z.weight" | "linear_attn.in_proj_a.weight"
+        | "linear_attn.in_proj_b.weight" | "linear_attn.out_proj.weight"
+        | "self_attn.q_proj.weight" | "self_attn.k_proj.weight" | "self_attn.v_proj.weight" | "self_attn.o_proj.weight"
+        | "mlp.gate_proj.weight" | "mlp.up_proj.weight" | "mlp.down_proj.weight")
 }
 
 /// [`project`] for any decoder [`Linear`]: `[B,T,I] x [O,I]^T -> [B,T,O]`.

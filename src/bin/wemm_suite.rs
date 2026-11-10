@@ -340,8 +340,12 @@ fn same(args: &[String]) -> Result<()> {
     let words = a.chunks_exact(2).zip(b.chunks_exact(2)).filter(|(x, y)| x != y).count();
     let rows = a.chunks_exact(8192).zip(b.chunks_exact(8192)).filter(|(x, y)| x != y).count();
     let (ra, rb) = (rows_of_bytes(&a), rows_of_bytes(&b));
-    let min_cos = ra.iter().zip(&rb).map(|(x, y)| cosine(x, y)).fold(f64::INFINITY, f64::min);
-    println!("rows\t{}\tdiffering_rows\t{rows}\tdiffering_words\t{words}\tmin_row_cosine\t{min_cos:.6}", a.len() / 8192);
+    let mut cos: Vec<f64> = ra.iter().zip(&rb).map(|(x, y)| cosine(x, y)).collect();
+    cos.sort_by(f64::total_cmp);
+    let q = |p: f64| cos[((cos.len() - 1) as f64 * p) as usize];
+    let mean = cos.iter().sum::<f64>() / cos.len() as f64;
+    println!("rows\t{}\tdiffering_rows\t{rows}\tdiffering_words\t{words}\tmin_row_cosine\t{:.6}\tp01\t{:.6}\tmedian\t{:.6}\tmean\t{mean:.6}",
+        a.len() / 8192, q(0.0), q(0.01), q(0.5));
     Ok(())
 }
 
