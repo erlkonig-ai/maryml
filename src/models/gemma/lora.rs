@@ -307,7 +307,7 @@ impl<B: Backend> LoraWeights<B> {
         blobs: &mut impl BlobStorePut,
     ) -> Result<Fragment, Box<dyn std::error::Error>> {
         let mut adapter_ids: Vec<Id> = Vec::new();
-        let mut facts = TribleSet::new();
+        let mut facts = Fragment::empty();
 
         // Deterministic order so the fragment (and thus the set entity's
         // content-derived id) is stable for identical adapter sets.
@@ -326,12 +326,12 @@ impl<B: Backend> LoraWeights<B> {
                 attrs::lora_b: blobs.put::<F32Array, _>(b_data)?,
             };
             adapter_ids.push(adapter_ent.root().expect("adapter entity has root"));
-            facts += adapter_ent.into_facts();
+            facts += adapter_ent;
         }
 
         let set_ent = entity! { _ @ crate::format::attrs::member*: adapter_ids.iter() };
         let root = set_ent.root().expect("lora set entity has root");
-        facts += set_ent.into_facts();
+        facts += set_ent;
         facts += entity! { ExclusiveId::force_ref(&root) @
             attrs::lora_rank: self.rank as u32,
             attrs::lora_alpha: self.alpha as f64,
@@ -346,7 +346,7 @@ impl<B: Backend> LoraWeights<B> {
             self.rank,
             self.alpha
         );
-        Ok(Fragment::rooted(root, facts))
+        Ok(crate::format::rooted_at(root, facts))
     }
 
     /// Load the explicitly named, opaque LoRA root from pile facts + blobs.

@@ -252,7 +252,10 @@ fn migrate(src: &Path, dst: &Path, signing_key: &ed25519_dalek::SigningKey) -> R
         .collect();
     // ...and then say each surviving fact ONCE, under the name current readers
     // query, rather than persisting the read-side projection's shadow copy.
-    let (mut facts, deduped) = mary::persist::strip_projected_legacy_attributes(&carried)?;
+    let (facts, deduped) = mary::persist::strip_projected_legacy_attributes(&carried)?;
+    // The carried facts are the source's, described by the source's own commits;
+    // the converted leaves bring the description of the typed leaf attributes.
+    let mut facts = Fragment::from(facts);
     eprintln!(
         "[migrate] carrying {} facts ({deduped} pre-epoch duplicate spellings dropped), \
          replacing {}",
@@ -316,7 +319,7 @@ fn migrate(src: &Path, dst: &Path, signing_key: &ed25519_dalek::SigningKey) -> R
             bytes,
             &name,
         )?;
-        facts += e.into_facts();
+        facts += e;
 
         if (f32n + f16n) % 200 == 0 {
             eprintln!("[migrate] {} leaves converted ...", f32n + f16n);
@@ -360,7 +363,7 @@ fn migrate(src: &Path, dst: &Path, signing_key: &ed25519_dalek::SigningKey) -> R
         .commit(
             expected,
             signing_key,
-            Fragment::new(std::iter::empty(), facts),
+            facts,
         )
         .map_err(|e| anyhow::anyhow!("publish model collection commit: {e}"))?;
     // Not a formality: if the descriptor had moved, every already-persisted

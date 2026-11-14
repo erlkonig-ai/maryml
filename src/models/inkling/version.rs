@@ -4,7 +4,7 @@
 
 use anyhow::{Context, Result};
 use triblespace::core::collection::CollectionHandle;
-use triblespace::prelude::Id;
+use triblespace::prelude::{Fragment, Id};
 
 use super::load::PackedExpert;
 pub use super::resident::{Persisted, VersionRecipe};
@@ -76,8 +76,9 @@ pub struct LearnedVersion {
     pub name: String,
     /// The facts to ADD: new leaves, the version root and its annotations.
     /// Never the parent's facts, which the
-    /// collection already holds.
-    pub facts: triblespace::core::trible::TribleSet,
+    /// collection already holds. A fragment, so the commit's metadata
+    /// describes the attributes these facts use.
+    pub facts: Fragment,
     /// Leaves whose bytes moved and were replaced by new leaf entities.
     pub replaced: usize,
     /// Members of the version root.
@@ -179,7 +180,6 @@ pub fn learned_version(
     use std::collections::{BTreeSet, HashMap};
     use triblespace::core::inline::encodings::hash::Handle;
     use triblespace::core::metadata;
-    use triblespace::core::trible::TribleSet;
     use triblespace::macros::{entity, find, pattern};
     use triblespace::prelude::*;
 
@@ -191,7 +191,7 @@ pub fn learned_version(
             .context("read the selected model collection")?;
     let facts = crate::model_collection::project_legacy_model_attributes(snapshot.facts()).facts;
     let (_, _, reader) = snapshot.into_parts();
-    let mut added = TribleSet::new();
+    let mut added = Fragment::empty();
 
     // Labels come from the selected base, not from unrelated roots in the
     // collection. Labels do not participate in the version's identity.
@@ -341,8 +341,7 @@ pub fn publish_version(
         collection.writer_is_admitted(&snapshot, key.verifying_key())?,
         "signing key is not admitted by the selected model collection's WRITE policy"
     );
-    let fragment: Fragment = version.facts.into();
-    pile.commit(collection, key, fragment)
+    pile.commit(collection, key, version.facts)
         .map_err(|e| anyhow::anyhow!("publish '{}': {e}", version.name))?;
     Ok(())
 }

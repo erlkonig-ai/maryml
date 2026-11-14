@@ -367,7 +367,7 @@ pub fn save_tokenizer_json(
     let v: serde_json::Value = serde_json::from_slice(json)?;
     let model = &v["model"];
     let model_kind = model["type"].as_str().unwrap_or("");
-    let mut facts = TribleSet::new();
+    let mut facts = Fragment::empty();
 
     // Every distinct string this tokenizer contains, put ONCE.
     //
@@ -410,7 +410,7 @@ pub fn save_tokenizer_json(
             let ph = intern!(blobs, tok);
             let e = entity! { _ @ attrs::piece: ph, attrs::token_id: id };
             vocab_ids.push(e.root().expect("vocab entry root"));
-            facts += e.into_facts();
+            facts += e;
         }
     }
 
@@ -427,7 +427,7 @@ pub fn save_tokenizer_json(
                 attrs::index: rank as u64,
             };
             merge_ids.push(e.root().expect("merge root"));
-            facts += e.into_facts();
+            facts += e;
         }
     }
 
@@ -459,7 +459,7 @@ pub fn save_tokenizer_json(
                 metadata::tag*: options.iter(),
             };
             added_ids.push(e.root().expect("added token root"));
-            facts += e.into_facts();
+            facts += e;
         }
     }
 
@@ -501,7 +501,6 @@ pub fn save_tokenizer_json(
         None => None,
     };
 
-    // The text knobs are stored here: `into_facts` below keeps only facts.
     let unk = put_optional_text(blobs, unk)?;
     let csp = put_optional_text(blobs, csp)?;
     let eows = put_optional_text(blobs, eows)?;
@@ -520,9 +519,9 @@ pub fn save_tokenizer_json(
         attrs::added*: added_ids.iter(),
     };
     let tok_id = tok.root().expect("tokenizer root");
-    facts += tok.into_facts();
-    facts += entity! { ExclusiveId::force_ref(&tok_id) @ attrs::model_name: name_h }.into_facts();
-    Ok(Fragment::rooted(tok_id, facts))
+    facts += tok;
+    facts += entity! { ExclusiveId::force_ref(&tok_id) @ attrs::model_name: name_h };
+    Ok(crate::format::rooted_at(tok_id, facts))
 }
 
 /// How many reserved special-token slots a tiktoken tokenizer appends above its
@@ -554,7 +553,7 @@ pub fn save_tiktoken(
 ) -> Result<Fragment, Err> {
     let ranks = crate::tiktoken::parse_tiktoken_model(model_file)?;
     let cfg: serde_json::Value = serde_json::from_slice(config_json)?;
-    let mut facts = TribleSet::new();
+    let mut facts = Fragment::empty();
 
     // ── the rank table: { piece_bytes, token_id = rank } per entry ──
     let mut vocab_ids: Vec<Id> = Vec::with_capacity(ranks.len());
@@ -562,7 +561,7 @@ pub fn save_tiktoken(
         let bh = blobs.put::<blobencodings::RawBytes, _>(tok.clone())?;
         let e = entity! { _ @ attrs::piece_bytes: bh, attrs::token_id: *rank as u64 };
         vocab_ids.push(e.root().expect("vocab entry root"));
-        facts += e.into_facts();
+        facts += e;
     }
 
     // ── the 256 reserved special slots: { piece, token_id, index } ──
@@ -590,7 +589,7 @@ pub fn save_tiktoken(
             metadata::tag*: tags.iter(),
         };
         added_ids.push(e.root().expect("added token root"));
-        facts += e.into_facts();
+        facts += e;
     }
 
     // ── the pre-tokenizer node: the pattern, and the fact that it is applied
@@ -601,7 +600,7 @@ pub fn save_tiktoken(
         attrs::pattern: pat_h,
     };
     let pretok_id = pretok.root().expect("pre-tokenizer root");
-    facts += pretok.into_facts();
+    facts += pretok;
 
     let name_h = blobs.put::<blobencodings::UTF8String, _>(source_name.to_string())?;
     let unk = put_optional_text(blobs, cfg["unk_token"].as_str())?;
@@ -613,9 +612,9 @@ pub fn save_tiktoken(
         attrs::added*: added_ids.iter(),
     };
     let tok_id = tok.root().expect("tokenizer root");
-    facts += tok.into_facts();
-    facts += entity! { ExclusiveId::force_ref(&tok_id) @ attrs::model_name: name_h }.into_facts();
-    Ok(Fragment::rooted(tok_id, facts))
+    facts += tok;
+    facts += entity! { ExclusiveId::force_ref(&tok_id) @ attrs::model_name: name_h };
+    Ok(crate::format::rooted_at(tok_id, facts))
 }
 
 /// Ingest one config node (a normalizer / pre-tokenizer / decoder subtree) into
@@ -626,7 +625,7 @@ pub fn save_tiktoken(
 fn save_config_node(
     v: &serde_json::Value,
     blobs: &mut impl BlobStorePut,
-    facts: &mut TribleSet,
+    facts: &mut Fragment,
 ) -> Result<Id, Err> {
     let node_type = v["type"].as_str().ok_or("config node missing type")?;
     let mut tags: Vec<Id> = Vec::new();
@@ -667,7 +666,7 @@ fn save_config_node(
             for (i, child) in children.iter().enumerate() {
                 let cid = save_config_node(child, blobs, facts)?;
                 *facts +=
-                    entity! { ExclusiveId::force_ref(&cid) @ attrs::index: i as u64 }.into_facts();
+                    entity! { ExclusiveId::force_ref(&cid) @ attrs::index: i as u64 };
                 members.push(cid);
             }
         }
@@ -716,7 +715,6 @@ fn save_config_node(
         other => return Err(format!("unknown config node type: {other:?}").into()),
     }
 
-    // The text fields are stored here: `into_facts` below keeps only facts.
     let replace_content = put_optional_text(blobs, replace_content)?;
     let behavior = put_optional_text(blobs, behavior)?;
     let prefix = put_optional_text(blobs, prefix)?;
@@ -729,7 +727,7 @@ fn save_config_node(
         attrs::member*: members.iter(),
     };
     let id = node.root().expect("config node root");
-    *facts += node.into_facts();
+    *facts += node;
     Ok(id)
 }
 
@@ -747,7 +745,7 @@ fn save_config_node(
 fn save_post_processor(
     v: &serde_json::Value,
     blobs: &mut impl BlobStorePut,
-    facts: &mut TribleSet,
+    facts: &mut Fragment,
 ) -> Result<Id, Err> {
     let node_type = v["type"].as_str().ok_or("post-processor missing type")?;
     let node = match node_type {
@@ -760,7 +758,7 @@ fn save_post_processor(
             for (i, child) in children.iter().enumerate() {
                 let cid = save_post_processor(child, blobs, facts)?;
                 *facts +=
-                    entity! { ExclusiveId::force_ref(&cid) @ attrs::index: i as u64 }.into_facts();
+                    entity! { ExclusiveId::force_ref(&cid) @ attrs::index: i as u64 };
                 members.push(cid);
             }
             entity! { _ @ metadata::tag: ty::SEQUENCE, attrs::member*: members.iter() }
@@ -810,12 +808,12 @@ fn save_post_processor(
                             attrs::index: index as u64,
                         };
                         members.push(e.root().expect("special token member root"));
-                        *facts += e.into_facts();
+                        *facts += e;
                     }
                     let name = blobs.put::<blobencodings::UTF8String, _>(name.to_owned())?;
                     let e = entity! { _ @ attrs::special_id: name, attrs::member*: members.iter() };
                     specials.push(e.root().expect("special token root"));
-                    *facts += e.into_facts();
+                    *facts += e;
                 }
             }
             entity! { _ @
@@ -828,7 +826,7 @@ fn save_post_processor(
         other => return Err(format!("unsupported post-processor type: {other:?}").into()),
     };
     let id = node.root().expect("post-processor root");
-    *facts += node.into_facts();
+    *facts += node;
     Ok(id)
 }
 
@@ -836,14 +834,14 @@ fn save_post_processor(
 fn save_cls_sep(
     pair: &serde_json::Value,
     blobs: &mut impl BlobStorePut,
-    facts: &mut TribleSet,
+    facts: &mut Fragment,
 ) -> Result<Id, Err> {
     let content = pair[0].as_str().ok_or("cls/sep token missing content")?;
     let id = pair[1].as_u64().ok_or("cls/sep token id not an integer")?;
     let piece = blobs.put::<blobencodings::UTF8String, _>(content.to_owned())?;
     let e = entity! { _ @ attrs::piece: piece, attrs::token_id: id };
     let root = e.root().expect("cls/sep token root");
-    *facts += e.into_facts();
+    *facts += e;
     Ok(root)
 }
 
@@ -851,7 +849,7 @@ fn save_cls_sep(
 fn save_template(
     template: &serde_json::Value,
     blobs: &mut impl BlobStorePut,
-    facts: &mut TribleSet,
+    facts: &mut Fragment,
 ) -> Result<Vec<Id>, Err> {
     let template = template
         .as_array()
@@ -883,7 +881,7 @@ fn save_template(
             return Err(format!("unknown template piece {piece}").into());
         };
         ids.push(e.root().expect("template piece root"));
-        *facts += e.into_facts();
+        *facts += e;
     }
     Ok(ids)
 }
@@ -2435,7 +2433,7 @@ pub fn save_spm_unigram(
     source_name: &str,
     blobs: &mut impl BlobStorePut,
 ) -> Result<Fragment, Err> {
-    let mut facts = TribleSet::new();
+    let mut facts = Fragment::empty();
     let mut vocab_ids: Vec<Id> = Vec::with_capacity(pieces.len());
 
     for (id, (bytes, score, typ)) in pieces.iter().enumerate() {
@@ -2451,7 +2449,7 @@ pub fn save_spm_unigram(
             attrs::piece_score: *score as f64,
         };
         vocab_ids.push(e.root().expect("vocab entry root"));
-        facts += e.into_facts();
+        facts += e;
     }
 
     let name_h = blobs.put::<blobencodings::UTF8String, _>(source_name.to_string())?;
@@ -2465,9 +2463,9 @@ pub fn save_spm_unigram(
         attrs::vocab*: vocab_ids.iter(),
     };
     let tok_id = tok.root().expect("tokenizer root");
-    facts += tok.into_facts();
-    facts += entity! { ExclusiveId::force_ref(&tok_id) @ attrs::model_name: name_h }.into_facts();
-    Ok(Fragment::rooted(tok_id, facts))
+    facts += tok;
+    facts += entity! { ExclusiveId::force_ref(&tok_id) @ attrs::model_name: name_h };
+    Ok(crate::format::rooted_at(tok_id, facts))
 }
 
 /// Read a UNIGRAM tokenizer back as the `(bytes, score, type)` table

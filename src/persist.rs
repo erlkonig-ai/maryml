@@ -180,7 +180,7 @@ pub fn ingest_model_fragment(
     // whose id is content-derived from members alone. Model/format labels and
     // each shard's file name become non-core provenance on that root.
     let mut members: Vec<Id> = Vec::new();
-    let mut facts = TribleSet::new();
+    let mut facts = Fragment::empty();
     let mut provenance: Vec<String> = Vec::new();
     // Ephemeral duplicate-name check for this one import operation.
     let mut tensor_names = BTreeSet::new();
@@ -298,7 +298,7 @@ pub fn derive_selected_f16_to_collection<R: BlobStoreGet>(
     let mut names: Vec<_> = index.keys().cloned().collect();
     names.sort_unstable();
     let mut members = Vec::with_capacity(names.len());
-    let mut facts = TribleSet::new();
+    let mut facts = Fragment::empty();
     let mut elements = 0;
     for (ordinal, name) in names.into_iter().enumerate() {
         let leaf = index.remove(&name).expect("name collected from index");
@@ -2296,7 +2296,7 @@ pub fn ingest_json_documents(
     }
     drop(snapshot);
 
-    let mut change = TribleSet::new();
+    let mut change = Fragment::empty();
     for (name, v) in &pending {
         if let Err(e) = crate::jsonfacts::save_document(name, v, &mut pile, &mut change) {
             pile.close()
@@ -2306,8 +2306,7 @@ pub fn ingest_json_documents(
     }
 
     let n = change.len();
-    let fragment = Fragment::new(std::iter::empty(), change);
-    crate::model_collection::publish_model_fragment(&mut pile, signing_key, fragment)
+    crate::model_collection::publish_model_fragment(&mut pile, signing_key, change)
         .map_err(|e| anyhow::anyhow!("publish checkpoint sidecars: {e}"))?;
     pile.close()
         .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
@@ -2950,14 +2949,14 @@ mod native_model_snapshot_tests {
             crate::format::put_raw(pile, &[value], &[1]).unwrap()
         };
         let leaf_id = leaf.root().unwrap();
-        let mut facts = leaf.into_facts();
+        let mut facts = leaf;
         let name = pile.put::<UTF8String, _>(tensor_name.to_owned()).unwrap();
         let member = entity! { _ @ attrs::safetensor_path: name, attrs::weight: leaf_id };
         let member_id = member.root().unwrap();
-        facts += member.into_facts();
+        facts += member;
         let root = entity! { _ @ attrs::member: member_id };
         let root_id = root.root().unwrap();
-        facts += root.into_facts();
+        facts += root;
         let source = pile.put::<UTF8String, _>(source.to_owned()).unwrap();
         let quantization = pile
             .put::<UTF8String, _>(QUANTIZATION_NATIVE.to_owned())
@@ -2965,12 +2964,11 @@ mod native_model_snapshot_tests {
         facts += entity! { ExclusiveId::force_ref(&root_id) @
             attrs::source: source,
             attrs::quantization: quantization,
-        }
-        .into_facts();
+        };
         crate::model_collection::publish_model_fragment(
             pile,
             signing_key,
-            Fragment::rooted(root_id, facts),
+            crate::format::rooted_at(root_id, facts),
         )
         .unwrap();
         root_id

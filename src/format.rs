@@ -163,6 +163,19 @@ pub mod attrs {
 
 type BlobErr = Box<dyn std::error::Error>;
 
+/// `fragment`, exporting `root` alone.
+///
+/// Builders accumulate `entity!` fragments with `+=`, which keeps each one's
+/// metafacts: the description of every attribute it used. A commit publishes
+/// those as its metadata archive, so flattening to facts (`into_facts`) before
+/// publication would leave the archive empty. `+=` also unions the parts'
+/// exports, and a builder hands back one root, so this re-roots the whole
+/// fragment without touching its facts, metafacts or blobs.
+pub fn rooted_at(root: Id, fragment: Fragment) -> Fragment {
+    let (_, facts, metafacts, blobs) = fragment.into_parts();
+    Fragment::rooted_from_parts(root, facts, metafacts, blobs)
+}
+
 fn tensor_f32<B: Backend, const D: usize>(t: &Tensor<B, D>) -> Vec<f32> {
     t.to_data().to_vec().unwrap()
 }
@@ -299,24 +312,23 @@ pub fn put_linear<B: Backend>(
 ) -> Result<Fragment, BlobErr> {
     let w = put_tensor(blobs, weight)?;
     let w_id = w.root().expect("weight leaf root");
-    let mut facts = w.into_facts();
+    let mut fragment = w;
 
     let bias_id = match bias {
         Some(b) => {
             let bf = put_tensor(blobs, b)?;
             let bid = bf.root().expect("bias leaf root");
-            facts += bf.into_facts();
+            fragment += bf;
             Some(bid)
         }
         None => None,
     };
 
-    // The kind text is stored here: `into_facts` below keeps only the facts.
     let kind_h = blobs.put::<blobencodings::UTF8String, _>("linear".to_owned())?;
     let module = entity! { _ @ attrs::kind: kind_h, attrs::weight: w_id, attrs::bias?: bias_id };
     let mid = module.root().expect("module root");
-    facts += module.into_facts();
-    Ok(Fragment::rooted(mid, facts))
+    fragment += module;
+    Ok(rooted_at(mid, fragment))
 }
 
 /// Load a Linear module by id → (weight [out,in], optional bias [out]).
@@ -348,12 +360,12 @@ pub fn put_module<B: Backend, const DW: usize>(
 ) -> Result<Fragment, BlobErr> {
     let w = put_tensor(blobs, weight)?;
     let w_id = w.root().expect("weight leaf root");
-    let mut facts = w.into_facts();
+    let mut fragment = w;
     let bias_id = match bias {
         Some(b) => {
             let bf = put_tensor(blobs, b)?;
             let bid = bf.root().expect("bias leaf root");
-            facts += bf.into_facts();
+            fragment += bf;
             Some(bid)
         }
         None => None,
@@ -362,8 +374,8 @@ pub fn put_module<B: Backend, const DW: usize>(
     let kind_h = blobs.put::<blobencodings::UTF8String, _>(kind.to_owned())?;
     let m = entity! { _ @ attrs::kind: kind_h, attrs::safetensor_path: name_h, attrs::weight: w_id, attrs::bias?: bias_id };
     let mid = m.root().expect("module root");
-    facts += m.into_facts();
-    Ok(Fragment::rooted(mid, facts))
+    fragment += m;
+    Ok(rooted_at(mid, fragment))
 }
 
 /// Load a rank-`DW` module by id → (weight, optional 1-D bias).

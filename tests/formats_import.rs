@@ -103,7 +103,7 @@ fn native_import_is_exact_selectable_and_byte_idempotent() {
     .unwrap();
     let bytes_after_retry = std::fs::metadata(&pile_path).unwrap().len();
     assert_eq!(repeated, first, "stable signer must reproduce the commit");
-    assert_eq!(first.1.to_bytes().len(), 192);
+    assert_eq!(first.1.to_bytes().len(), 224, "a COMMIT is seven 32-byte fields");
     assert_eq!(
         bytes_after_retry, bytes_after_first,
         "an identical retry must append no bytes"

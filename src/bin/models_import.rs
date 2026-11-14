@@ -186,13 +186,13 @@ fn members(
     index: &HashMap<String, Leaf>,
     stored: &BTreeMap<String, StoredProjection>,
     dropped: &BTreeSet<String>,
-) -> Result<(Vec<Id>, TribleSet, u64, u64)> {
+) -> Result<(Vec<Id>, Fragment, u64, u64)> {
     let mut names: Vec<&String> = index.keys().chain(stored.keys()).collect();
     names.sort();
     names.dedup();
     let kind = text(pile, "tensor")?;
     let (mut members, mut facts, mut dense, mut packed) =
-        (Vec::new(), TribleSet::new(), 0u64, 0u64);
+        (Vec::new(), Fragment::empty(), 0u64, 0u64);
     for name in names {
         let leaf = if let Some(projection) = stored.get(name) {
             packed += projection.payload.len() as u64;
@@ -211,12 +211,12 @@ fn members(
             mary::leaf::put_leaf(pile, leaf.elem(), leaf.dims(), leaf.payload().clone(), name)?
         };
         let weight = leaf.root().context("leaf root")?;
-        facts += leaf.into_facts();
+        facts += leaf;
         let path = text(pile, name)?;
         let member =
             entity! { _ @ attrs::safetensor_path: path, attrs::kind: kind, attrs::weight: weight };
         members.push(member.root().context("member root")?);
-        facts += member.into_facts();
+        facts += member;
     }
     Ok((members, facts, dense, packed))
 }
@@ -269,7 +269,7 @@ fn derivation(
         "packer": "mary nvfp4::pack_nearest, gated byte for byte against nn::nvfp4_gemv::Nvfp4::quantize on the same 16-bit values",
         "other_tensors": "copied unchanged at source precision",
     });
-    let root = mary::jsonfacts::save_json(&value, pile, fragment.facts_mut())
+    let root = mary::jsonfacts::save_json(&value, pile, fragment)
         .map_err(|e| anyhow::anyhow!("derivation facts: {e}"))?;
     label(pile, fragment, root, "nvfp4-derivation", model_root)
 }
@@ -331,7 +331,7 @@ pub(super) fn breeze(
     // The source root also lists the codec root as a member; it is rebuilt
     // above, not copied as a tensor.
     main_members.push(codec_root);
-    facts += codec.into_facts();
+    facts += codec;
     let mut fragment = mary::ingest::build_model_root(
         pile,
         &format!("{SOURCE}@{REVISION}"),
@@ -352,7 +352,7 @@ pub(super) fn breeze(
     ] {
         let value = mary::jsonfacts::load_json(&source.facts, &source.store, asset)
             .map_err(|e| anyhow::anyhow!("source {name}: {e}"))?;
-        let root = mary::jsonfacts::save_json(&value, pile, fragment.facts_mut())
+        let root = mary::jsonfacts::save_json(&value, pile, &mut fragment)
             .map_err(|e| anyhow::anyhow!("{name} facts: {e}"))?;
         label(pile, &mut fragment, root, name, model_root)?;
     }
@@ -372,7 +372,7 @@ pub(super) fn breeze(
     for manifest in manifests {
         let value = mary::jsonfacts::load_json(&source.facts, &source.store, manifest)
             .map_err(|e| anyhow::anyhow!("source manifest: {e}"))?;
-        let root = mary::jsonfacts::save_json(&value, pile, fragment.facts_mut())
+        let root = mary::jsonfacts::save_json(&value, pile, &mut fragment)
             .map_err(|e| anyhow::anyhow!("manifest facts: {e}"))?;
         label(
             pile,
@@ -584,7 +584,7 @@ pub(super) fn wemm(
     let tokenizer = mary::tokenizer::save_tokenizer_json(&tokenizer_json, &source_label, pile)
         .map_err(|e| anyhow::anyhow!("store the tokenizer: {e}"))?;
     let tokenizer_id = tokenizer.root();
-    facts += tokenizer.into_facts();
+    facts += tokenizer;
     let config_id = mary::jsonfacts::save_json(&config, pile, &mut facts)
         .map_err(|e| anyhow::anyhow!("store the configuration: {e}"))?;
     let template = pile.put::<blobencodings::UTF8String, _>(template)

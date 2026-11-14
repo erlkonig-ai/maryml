@@ -116,7 +116,7 @@ fn main() -> Result<()> {
 
     // ── 1. in memory ────────────────────────────────────────────────────────
     let mut blobs = MemoryBlobStore::new();
-    let mut facts = TribleSet::new();
+    let mut facts = Fragment::empty();
     let t0 = std::time::Instant::now();
     for (name, v) in &ingest {
         mary::jsonfacts::save_document(name, v, &mut blobs, &mut facts)

@@ -140,7 +140,7 @@ pub fn ingest_checkpoint(pile: &mut Pile, directory: &Path, revision: &str) -> R
         ));
     }
     let mut main_members = Vec::new();
-    let mut main_facts = TribleSet::new();
+    let mut main_facts = Fragment::empty();
     for name in &shards {
         let (members, facts) = ingest_file(pile, &mapped(&directory.join(name))?)?;
         main_members.extend(members);
@@ -161,7 +161,7 @@ pub fn ingest_checkpoint(pile: &mut Pile, directory: &Path, revision: &str) -> R
     .map_err(|e| anyhow::anyhow!("codec root: {e}"))?;
     let external_codec_root = codec.root().context("codec root absent")?;
     main_members.push(external_codec_root);
-    main_facts += codec.into_facts();
+    main_facts += codec;
     let mut provenance = shards;
     provenance.push("audio_tokenizer/model.safetensors".to_owned());
     let mut fragment = crate::ingest::build_model_root(
@@ -174,14 +174,14 @@ pub fn ingest_checkpoint(pile: &mut Pile, directory: &Path, revision: &str) -> R
     )
     .map_err(|e| anyhow::anyhow!("model root: {e}"))?;
     let model_root = fragment.root().context("model root absent")?;
-    let config_root = crate::jsonfacts::save_json(&value, pile, fragment.facts_mut())
+    let config_root = crate::jsonfacts::save_json(&value, pile, &mut fragment)
         .map_err(|e| anyhow::anyhow!("config facts: {e}"))?;
     let external_codec_config_root =
-        crate::jsonfacts::save_json(&codec_value, pile, fragment.facts_mut())
+        crate::jsonfacts::save_json(&codec_value, pile, &mut fragment)
             .map_err(|e| anyhow::anyhow!("codec config facts: {e}"))?;
     let source_value = serde_json::json!({"source":SOURCE,"revision":revision,"files":source_receipts,
         "tensor_count":count,"parameter_count":parameters,"payload_bytes":payload_bytes});
-    let source_root = crate::jsonfacts::save_json(&source_value, pile, fragment.facts_mut())
+    let source_root = crate::jsonfacts::save_json(&source_value, pile, &mut fragment)
         .map_err(|e| anyhow::anyhow!("source provenance facts: {e}"))?;
     for (asset, name) in [
         (config_root, "config.json"),
@@ -222,12 +222,12 @@ pub fn ingest_checkpoint(pile: &mut Pile, directory: &Path, revision: &str) -> R
     })
 }
 
-fn ingest_file(pile: &mut Pile, bytes: &anybytes::Bytes) -> Result<(Vec<Id>, TribleSet)> {
+fn ingest_file(pile: &mut Pile, bytes: &anybytes::Bytes) -> Result<(Vec<Id>, Fragment)> {
     let tensors = SafeTensors::deserialize(bytes)?;
     let mut names = tensors.names();
     names.sort();
     let mut members = Vec::new();
-    let mut facts = TribleSet::new();
+    let mut facts = Fragment::empty();
     for name in names {
         let tensor = tensors.tensor(name)?;
         let elem = match tensor.dtype() {
@@ -240,13 +240,13 @@ fn ingest_file(pile: &mut Pile, bytes: &anybytes::Bytes) -> Result<(Vec<Id>, Tri
         let shape: Vec<u64> = tensor.shape().iter().map(|&x| x as u64).collect();
         let leaf = crate::leaf::put_leaf(pile, elem, &shape, payload, name)?;
         let weight = leaf.root().context("leaf root absent")?;
-        facts += leaf.into_facts();
+        facts += leaf;
         let name = pile.put::<blobencodings::UTF8String, _>(name.to_owned())?;
         let kind = pile.put::<blobencodings::UTF8String, _>("tensor".to_owned())?;
         let member = entity! { _ @ crate::format::attrs::safetensor_path: name,
         crate::format::attrs::kind: kind, crate::format::attrs::weight: weight };
         members.push(member.root().context("member root absent")?);
-        facts += member.into_facts();
+        facts += member;
     }
     Ok((members, facts))
 }

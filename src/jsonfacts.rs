@@ -111,11 +111,19 @@ enum Pos<'a> {
     Index(usize),
 }
 
+/// Add a node's facts, the metafacts describing their attributes, and its
+/// blobs to `facts`, but not its export. A caller may spread the fragment it
+/// passes in (`member*: fragment`), and a JSON node is not one of its members.
+fn absorb(facts: &mut Fragment, node: Fragment) {
+    let (_, content, metafacts, blobs) = node.into_parts();
+    *facts += Fragment::from_parts(content, metafacts, blobs);
+}
+
 /// Ingest a `serde_json::Value` as facts, returning the root node's id.
 pub fn save_json(
     v: &Value,
     blobs: &mut impl BlobStorePut,
-    facts: &mut TribleSet,
+    facts: &mut Fragment,
 ) -> Result<Id, Err> {
     save_node(v, Pos::Root, blobs, facts)
 }
@@ -124,7 +132,7 @@ fn save_node(
     v: &Value,
     pos: Pos,
     blobs: &mut impl BlobStorePut,
-    facts: &mut TribleSet,
+    facts: &mut Fragment,
 ) -> Result<Id, Err> {
     let mut tags: Vec<Id> = Vec::new();
     let mut s_h = None;
@@ -189,7 +197,7 @@ fn save_node(
         attrs::member*: members.iter(),
     };
     let id = e.root().expect("json node root");
-    *facts += e.into_facts();
+    absorb(facts, e);
     Ok(id)
 }
 
@@ -201,7 +209,7 @@ pub fn save_document(
     name: &str,
     v: &Value,
     blobs: &mut impl BlobStorePut,
-    facts: &mut TribleSet,
+    facts: &mut Fragment,
 ) -> Result<Id, Err> {
     let root = save_json(v, blobs, facts)?;
     let name_h = blobs.put::<blobencodings::UTF8String, _>(name.to_string())?;
@@ -211,7 +219,7 @@ pub fn save_document(
         attrs::document_root: root,
     };
     let id = doc.root().expect("document root");
-    *facts += doc.into_facts();
+    absorb(facts, doc);
     Ok(id)
 }
 
@@ -402,7 +410,7 @@ mod tests {
         let json = std::fs::read(std::env::var("WEMM_CONFIG_JSON").unwrap()).unwrap();
         let parsed: Value = serde_json::from_slice(&json).unwrap();
         let mut blobs = MemoryBlobStore::new();
-        let mut facts = TribleSet::new();
+        let mut facts = Fragment::empty();
         let root = save_json(&parsed, &mut blobs, &mut facts).unwrap();
         let reader = blobs.snapshot().unwrap();
         let loaded = load_json(&facts, &reader, root).unwrap();
@@ -431,7 +439,7 @@ mod tests {
     fn roundtrip(src: &str) -> String {
         let v: Value = serde_json::from_str(src).expect("parse");
         let mut blobs = MemoryBlobStore::new();
-        let mut facts = TribleSet::new();
+        let mut facts = Fragment::empty();
         let root = save_json(&v, &mut blobs, &mut facts).expect("save");
         let reader = blobs.snapshot().expect("snapshot");
         let back = load_json(&facts, &reader, root).expect("load");
@@ -492,7 +500,7 @@ mod tests {
     #[test]
     fn documents_are_found_by_name() {
         let mut blobs = MemoryBlobStore::new();
-        let mut facts = TribleSet::new();
+        let mut facts = Fragment::empty();
         save_document(
             "config.json",
             &serde_json::json!({"hidden_size": 4096}),

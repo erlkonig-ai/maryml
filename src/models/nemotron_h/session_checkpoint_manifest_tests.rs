@@ -30,11 +30,11 @@ fn fixture() -> (PrefixCheckpoint, MemoryBlobStore, Inline<Handle<SimpleArchive>
             anybytes::Bytes::from_source(values)).unwrap()).unwrap();
         assert_ne!(chunk.keys, chunk.values);
     }
-    let mut facts = TribleSet::new();
+    let mut facts = Fragment::empty();
     let config = jsonfacts::save_json(&serde_json::json!({"text": configuration()}),
         &mut store, &mut facts).unwrap();
     checkpoint.provenance.source.config = config;
-    let image = store.put::<SimpleArchive, _>(facts).unwrap();
+    let image = store.put::<SimpleArchive, _>(facts.into_facts()).unwrap();
     (checkpoint, store, image)
 }
 

@@ -98,11 +98,11 @@ fn projection(w:&mut GgufWeights,pile:&mut Pile,prefix:&str,kind:&str,ni:usize,n
 }
 
 fn metadata(pile:&mut Pile,entries:&[MetadataEntry],kind:&str)->Result<Fragment> {
-    let mut facts=TribleSet::new();
+    let mut facts=Fragment::empty();
     let node=crate::jsonfacts::save_json(&serde_json::to_value(entries)?,pile,&mut facts)
         .map_err(|e|anyhow::anyhow!("store metadata facts: {e}"))?;
     let mut fragment=entity! {attrs::kind:kind,crate::jsonfacts::attrs::document_root:node};
-    *fragment.facts_mut()+=facts;
+    fragment+=facts;
     Ok(fragment)
 }
 

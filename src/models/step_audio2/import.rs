@@ -102,7 +102,7 @@ pub fn ingest_checkpoint(pile: &mut Pile, directory: &Path, revision: &str) -> R
     );
 
     let mut members = Vec::new();
-    let mut facts = TribleSet::new();
+    let mut facts = Fragment::empty();
     for path in &shards {
         let bytes = mapped(path)?;
         let (mut shard_members, shard_facts) =
@@ -125,7 +125,7 @@ pub fn ingest_checkpoint(pile: &mut Pile, directory: &Path, revision: &str) -> R
     )
     .map_err(|e| anyhow::anyhow!("build decoder root: {e}"))?;
     let model_root = fragment.root().expect("model root");
-    let config_root = crate::jsonfacts::save_json(&value, pile, fragment.facts_mut())
+    let config_root = crate::jsonfacts::save_json(&value, pile, &mut fragment)
         .map_err(|e| anyhow::anyhow!("persist config: {e}"))?;
     let text = String::from_utf8(tokenizer_bytes)?;
     let text = pile.put::<blobencodings::UTF8String, _>(text)?;

@@ -161,10 +161,10 @@ pub fn import_block0(w:&mut GgufWeights)->Result<(Fragment,Vec<ImportedTensor>)>
 
 fn model_fragment(parameters:Fragment,entries:&[MetadataEntry])->Result<Fragment> {
     let block=entity! { attrs::kind:"flint-block",attrs::index:0u64,attrs::member*:parameters };
-    let mut config=Fragment::empty(); let mut facts=TribleSet::new();
+    let mut config=Fragment::empty(); let mut facts=Fragment::empty();
     let config_root=crate::jsonfacts::save_json(&serde_json::to_value(entries)?,
         config.blobs_mut(),&mut facts).map_err(|e|anyhow::anyhow!("config facts: {e}"))?;
-    *config.facts_mut()+=facts;
+    config+=facts;
     config+=entity! { attrs::kind:"flint-config",crate::jsonfacts::attrs::document_root:config_root };
     let members=block+config;
     let root=entity! { attrs::member*:members };
@@ -556,10 +556,10 @@ mod tests {
             MetadataEntry {key:"tokenizer.ggml.add_bos_token".into(),gguf_type:7,value:crate::formats::gguf::index::MetadataValue::Bool(false)},
             MetadataEntry {key:"tokenizer.ggml.eog_token_ids".into(),gguf_type:9,value:crate::formats::gguf::index::MetadataValue::I32Array(vec![150001,150003,150005,150018])},
         ];
-        let mut metadata_fragment=Fragment::empty();let mut facts=TribleSet::new();
+        let mut metadata_fragment=Fragment::empty();let mut facts=Fragment::empty();
         let node=crate::jsonfacts::save_json(&serde_json::to_value(&tiny)?,metadata_fragment.blobs_mut(),&mut facts)
             .map_err(|e|anyhow::anyhow!("{e}"))?;
-        *metadata_fragment.facts_mut()+=facts;
+        metadata_fragment+=facts;
         metadata_fragment+=entity! {attrs::kind:"flint-tokenizer-metadata",crate::jsonfacts::attrs::document_root:node};
         fragment+=entity! {&alias @ attrs::member*:metadata_fragment,metadata::name:"unknown annotation"};
         let (_,facts,metafacts,blobs)=fragment.into_parts();

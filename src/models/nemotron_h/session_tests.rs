@@ -752,7 +752,7 @@ fn fixture_layers(capacity: usize, experts: u64, kinds: Option<&[&str]>) -> (Arc
     members += operation::<BF16, 2>(&mut repo, "embedding", [32, H as u64], embedding);
     members += operation::<BF16, 1>(&mut repo, "final-norm", [H as u64], bf(1.0, H));
     members += dense(&mut repo, "lm-head", 32, H);
-    let mut facts = TribleSet::new();
+    let mut facts = Fragment::empty();
     let config =
         jsonfacts::save_json(&json!({"text":value}), &mut repo, &mut facts).unwrap();
     members += entity! {attrs::kind:"nemotron-h-config",attrs::member:config};
@@ -767,7 +767,7 @@ fn fixture_layers(capacity: usize, experts: u64, kinds: Option<&[&str]>) -> (Arc
     members += tokenizer;
     let mut root = entity! {attrs::kind:"nemotron-h",attrs::member*:members,tokenizer::attrs::tokenizer:tokenizer_id};
     let root_id = root.root().unwrap();
-    root += Fragment::from(facts);
+    root += facts;
     repo.commit(collection, &key, root).unwrap();
     let snapshot =
         model_collection::snapshot_model_collection_for(&repo.snapshot().unwrap(), collection)

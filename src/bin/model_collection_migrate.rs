@@ -693,8 +693,12 @@ fn carry_open(
         .map_err(|e| anyhow::anyhow!("store the tokenizer: {e}"))?;
     let tokenizer_id = tokenizer.root();
     facts += tokenizer.into_facts();
-    let config_id = mary::jsonfacts::save_json(config, pile, &mut facts)
+    // `carry` signs its own COMMIT with the empty metadata archive, and its
+    // rerun check keys on exactly that pair, so only the facts are kept here.
+    let mut config_fragment = Fragment::empty();
+    let config_id = mary::jsonfacts::save_json(config, pile, &mut config_fragment)
         .map_err(|e| anyhow::anyhow!("store the configuration: {e}"))?;
+    facts += config_fragment.into_facts();
     let template = pile
         .put::<blobencodings::UTF8String, _>(template)
         .map_err(|e| anyhow::anyhow!("store the chat template: {e}"))?;
@@ -1306,7 +1310,7 @@ mod tests {
         let mut pile = Pile::open(path).unwrap();
         let leaf = mary::format::put_raw(&mut pile, &[1.0, 2.0, 3.0], &[3]).unwrap();
         let leaf_id = leaf.root().unwrap();
-        let mut facts = leaf.into_facts();
+        let mut facts = leaf;
         let kind = pile
             .put::<blobencodings::UTF8String, _>("vector".to_owned())
             .unwrap();
@@ -1316,7 +1320,7 @@ mod tests {
         let module =
             entity! { _ @ attrs::kind: kind, attrs::safetensor_path: name, attrs::weight: leaf_id };
         let members = vec![module.root().unwrap()];
-        facts += module.into_facts();
+        facts += module;
         let root = mary::ingest::build_model_root(
             &mut pile,
             "org/carry",

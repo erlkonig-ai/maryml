@@ -90,14 +90,14 @@ fn named_file_root(
     blobs: &mut impl BlobStorePut,
     model_name: &str,
     members: Vec<Id>,
-    mut facts: TribleSet,
+    mut fragment: Fragment,
 ) -> Result<Fragment, Err> {
     let mn = blobs.put::<UTF8String, _>(model_name.to_string())?;
     let model = entity! { _ @ attrs::member*: members.iter() };
     let model_root_id = model.root().expect("model root");
-    facts += model.into_facts();
-    facts += entity! { ExclusiveId::force_ref(&model_root_id) @ attrs::model_name: mn };
-    Ok(Fragment::rooted(model_root_id, facts))
+    fragment += model;
+    fragment += entity! { ExclusiveId::force_ref(&model_root_id) @ attrs::model_name: mn };
+    Ok(crate::format::rooted_at(model_root_id, fragment))
 }
 
 /// Ingest one safetensors blob's float tensors (those whose name passes `keep`)
@@ -125,7 +125,7 @@ pub fn ingest_members(
     blobs: &mut impl BlobStorePut,
     dtype: LeafDtype,
     keep: impl Fn(&str) -> bool,
-) -> Result<(Vec<Id>, TribleSet), Err> {
+) -> Result<(Vec<Id>, Fragment), Err> {
     if dtype == LeafDtype::Bf16 {
         return ingest_bf16_members_with(bytes, blobs, keep, |data| {
             anybytes::Bytes::from_source(data.to_vec())
@@ -167,7 +167,7 @@ pub fn ingest_bf16_members(
     bytes: &anybytes::Bytes,
     blobs: &mut impl BlobStorePut,
     keep: impl Fn(&str) -> bool,
-) -> Result<(Vec<Id>, TribleSet), Err> {
+) -> Result<(Vec<Id>, Fragment), Err> {
     ingest_bf16_members_with(bytes, blobs, keep, |data| {
         // SafeTensors returns slices into the same input buffer. Byte offsets
         // let Bytes retain that buffer's owner without copying the payload.
@@ -182,10 +182,10 @@ fn ingest_bf16_members_with(
     blobs: &mut impl BlobStorePut,
     keep: impl Fn(&str) -> bool,
     payload: impl Fn(&[u8]) -> anybytes::Bytes,
-) -> Result<(Vec<Id>, TribleSet), Err> {
+) -> Result<(Vec<Id>, Fragment), Err> {
     let st = SafeTensors::deserialize(bytes)?;
     let mut members = Vec::new();
-    let mut facts = TribleSet::new();
+    let mut facts = Fragment::empty();
     for name in st.names().into_iter().filter(|name| keep(name)) {
         let view = st.tensor(name)?;
         if view.dtype() != safetensors::Dtype::BF16 {
@@ -198,7 +198,7 @@ fn ingest_bf16_members_with(
         let shape: Vec<u64> = view.shape().iter().map(|&d| d as u64).collect();
         let leaf = put_raw_bf16(blobs, payload(view.data()), &shape)?;
         let leaf_id = leaf.root().expect("leaf root");
-        facts += leaf.into_facts();
+        facts += leaf;
         let kind = match shape.len() {
             1 => "vector",
             2 => "matrix",
@@ -211,7 +211,7 @@ fn ingest_bf16_members_with(
             attrs::kind: kind_h, attrs::safetensor_path: name_h, attrs::weight: leaf_id
         };
         members.push(module.root().expect("module root"));
-        facts += module.into_facts();
+        facts += module;
     }
     Ok((members, facts))
 }
@@ -230,12 +230,12 @@ pub fn ingest_tensors(
     tensors: impl Iterator<Item = (String, Vec<f32>, Vec<usize>)>,
     blobs: &mut impl BlobStorePut,
     dtype: LeafDtype,
-) -> Result<(Vec<Id>, TribleSet), Err> {
+) -> Result<(Vec<Id>, Fragment), Err> {
     if dtype == LeafDtype::Bf16 {
         return Err("native BF16 import requires safetensors bytes, not decoded f32 tensors".into());
     }
     let mut members: Vec<Id> = Vec::new();
-    let mut facts = TribleSet::new();
+    let mut facts = Fragment::empty();
     for (name, data, shape) in tensors {
         let shp: Vec<u64> = shape.iter().map(|&d| d as u64).collect();
         let leaf = match dtype {
@@ -244,7 +244,7 @@ pub fn ingest_tensors(
             LeafDtype::Bf16 => unreachable!("rejected before consuming any tensors"),
         };
         let leaf_id = leaf.root().expect("leaf root");
-        facts += leaf.into_facts();
+        facts += leaf;
         let kind = match shape.len() {
             1 => "vector",
             2 => "matrix",
@@ -255,7 +255,7 @@ pub fn ingest_tensors(
         let kind_h = blobs.put::<UTF8String, _>(kind.to_owned())?;
         let m = entity! { _ @ attrs::kind: kind_h, attrs::safetensor_path: name_h, attrs::weight: leaf_id };
         members.push(m.root().expect("module root"));
-        facts += m.into_facts();
+        facts += m;
     }
     Ok((members, facts))
 }
@@ -279,7 +279,7 @@ pub fn build_model_root(
     source: &str,
     quantization: &str,
     members: Vec<Id>,
-    member_facts: TribleSet,
+    member_facts: Fragment,
     provenance: &[String],
 ) -> Result<Fragment, Box<dyn std::error::Error>> {
     build_model_root_with(
@@ -359,14 +359,14 @@ pub fn build_model_root_with(
     source: &str,
     quantization: &str,
     members: Vec<Id>,
-    member_facts: TribleSet,
+    member_facts: Fragment,
     provenance: &[String],
     parts: RootParts,
 ) -> Result<Fragment, Box<dyn std::error::Error>> {
     let mut facts = member_facts;
     let root = model_root_core(&members, parts);
     let root_id = root.root().expect("model root");
-    facts += root.into_facts();
+    facts += root;
     // NON-core labels on the (content-derived) root id — queryable, no id
     // influence: the weight-format tag, the `source` it was imported from, and
     // which files it came from.
@@ -375,13 +375,12 @@ pub fn build_model_root_with(
     facts += entity! { ExclusiveId::force_ref(&root_id) @
         attrs::quantization: quantization_h,
         attrs::source: source_h,
-    }
-    .into_facts();
+    };
     for name in provenance {
         let mn = blobs.put::<UTF8String, _>(name.clone())?;
-        facts += entity! { ExclusiveId::force_ref(&root_id) @ attrs::model_name: mn }.into_facts();
+        facts += entity! { ExclusiveId::force_ref(&root_id) @ attrs::model_name: mn };
     }
-    Ok(Fragment::rooted(root_id, facts))
+    Ok(crate::format::rooted_at(root_id, facts))
 }
 
 pub fn read_string(
@@ -490,19 +489,19 @@ mod root_parts_tests {
         tokenizer: &str,
         config: serde_json::Value,
         template: &str,
-    ) -> (Vec<Id>, TribleSet, RootParts) {
-        let mut facts = TribleSet::new();
+    ) -> (Vec<Id>, Fragment, RootParts) {
+        let mut facts = Fragment::empty();
         let path = blobs.put::<UTF8String, _>("w".to_owned()).ok().unwrap();
         let kind = blobs.put::<UTF8String, _>(weight.to_owned()).ok().unwrap();
         let leaf = entity! { _ @ attrs::kind: kind };
         let leaf_id = leaf.root().unwrap();
-        facts += leaf.into_facts();
+        facts += leaf;
         let module = entity! { _ @ attrs::safetensor_path: path, attrs::weight: leaf_id };
         let members = vec![module.root().unwrap()];
-        facts += module.into_facts();
+        facts += module;
         let tok = crate::tokenizer::save_tokenizer_json(tokenizer.as_bytes(), "t", blobs).unwrap();
         let tokenizer = tok.root();
-        facts += tok.into_facts();
+        facts += tok;
         let config = Some(crate::jsonfacts::save_json(&config, blobs, &mut facts).unwrap());
         let chat_template = Some(blobs.put::<UTF8String, _>(template.to_owned()).ok().unwrap());
         (members, facts, RootParts { tokenizer, config, chat_template })

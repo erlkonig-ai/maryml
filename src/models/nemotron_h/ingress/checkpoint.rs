@@ -534,7 +534,7 @@ pub fn import_checkpoint_into(
     let operations = importer.operations;
     drop(importer);
     let mut config_facts = Fragment::empty();
-    let config_root = jsonfacts::save_json(&native_config, pile, config_facts.facts_mut())
+    let config_root = jsonfacts::save_json(&native_config, pile, &mut config_facts)
         .map_err(|e| anyhow::anyhow!("native config: {e}"))?;
     let mut config_member = entity! { attrs::kind: CONFIG, attrs::member: config_root };
     config_member += config_facts;

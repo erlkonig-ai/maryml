@@ -133,14 +133,14 @@ impl TekkenSource {
         source_name: &str,
         blobs: &mut impl BlobStorePut,
     ) -> anyhow::Result<Fragment> {
-        let mut facts = TribleSet::new();
+        let mut facts = Fragment::empty();
 
         let mut vocab_ids = Vec::with_capacity(self.pieces.len());
         for (id, piece) in self.piece_ids().zip(&self.pieces) {
             let bytes = blobs.put::<blobencodings::RawBytes, _>(piece.clone())?;
             let entry = entity! { _ @ attrs::piece_bytes: bytes, attrs::token_id: id as u64 };
             vocab_ids.push(entry.root().expect("vocab entry root"));
-            facts += entry.into_facts();
+            facts += entry;
         }
 
         let mut added_ids = Vec::with_capacity(self.specials.len());
@@ -154,7 +154,7 @@ impl TekkenSource {
                 metadata::tag*: tags.iter(),
             };
             added_ids.push(entry.root().expect("special token root"));
-            facts += entry.into_facts();
+            facts += entry;
         }
 
         let pattern = blobs.put::<blobencodings::UTF8String, _>(self.pattern.clone())?;
@@ -163,7 +163,7 @@ impl TekkenSource {
             attrs::pattern: pattern,
         };
         let pre_tokenizer_id = pre_tokenizer.root().expect("pre-tokenizer root");
-        facts += pre_tokenizer.into_facts();
+        facts += pre_tokenizer;
 
         let tokenizer = entity! { _ @
             metadata::tag: ty::TIKTOKEN,
@@ -172,11 +172,10 @@ impl TekkenSource {
             attrs::added*: added_ids.iter(),
         };
         let tokenizer_id = tokenizer.root().expect("tokenizer root");
-        facts += tokenizer.into_facts();
+        facts += tokenizer;
         let name = blobs.put::<blobencodings::UTF8String, _>(source_name.to_owned())?;
-        facts += entity! { ExclusiveId::force_ref(&tokenizer_id) @ attrs::model_name: name }
-            .into_facts();
-        Ok(Fragment::rooted(tokenizer_id, facts))
+        facts += entity! { ExclusiveId::force_ref(&tokenizer_id) @ attrs::model_name: name };
+        Ok(crate::format::rooted_at(tokenizer_id, facts))
     }
 }
 

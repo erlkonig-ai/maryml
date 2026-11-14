@@ -309,7 +309,7 @@ fn actual_pinned_tokenizer_cold_reopen() {
     let mut pile = Pile::open(&path).unwrap();
     let key = ed25519_dalek::SigningKey::from_bytes(&[19; 32]);
     let model = fucid();
-    let mut facts = TribleSet::new();
+    let mut facts = Fragment::empty();
     let config: serde_json::Value =
         serde_json::from_slice(&std::fs::read(checkpoint.join("config.json")).unwrap()).unwrap();
     let config_root = crate::jsonfacts::save_json(&config, &mut pile, &mut facts).unwrap();
@@ -326,7 +326,7 @@ fn actual_pinned_tokenizer_cold_reopen() {
     crate::model_collection::publish_model_fragment(
         &mut pile,
         &key,
-        Fragment::rooted(model.id, facts),
+        crate::format::rooted_at(model.id, facts),
     )
     .unwrap();
     pile.close().unwrap();
