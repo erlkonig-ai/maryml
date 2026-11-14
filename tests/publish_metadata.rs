@@ -265,3 +265,396 @@ fn print_the_anchored_tensor_attribute_ids() {
 fn hex(raw: &[u8; 32]) -> String {
     raw.iter().map(|b| format!("{b:02X}")).collect()
 }
+
+// ── model_metadata_backfill ──────────────────────────────────────────────
+
+use mary::metadata_backfill::{self, Catalog};
+use std::collections::BTreeSet;
+use triblespace::core::blob::encodings::UnknownBlob;
+use triblespace::core::collection::{CollectionRecord, CollectionRecordSelector, CollectionStore};
+use triblespace::core::collection::CollectionRead;
+use triblespace::core::repo::{BlobStoreMeta, SnapshotSource, potential_handles};
+use triblespace::core::trible::{Fragment, Trible};
+
+/// An attribute id no build knows. Minted with `trible genid` on 2026-11-14.
+const UNKNOWN_ATTRIBUTE: Id = triblespace::core::id_hex!("8760F0BCDEA0F450E79DF8477509B44E");
+/// The entity carrying it. Minted 2026-11-14.
+const UNKNOWN_ENTITY: Id = triblespace::core::id_hex!("47E9397AF3476E31C3CC9C78774EA002");
+
+type ArchiveHandle = Inline<inlineencodings::Handle<blobencodings::SimpleArchive>>;
+
+/// What the new writer published for one fixture commit, read back from its pile.
+struct Written {
+    label: &'static str,
+    data: TribleSet,
+    data_hash: triblespace::core::collection::records::CollectionData,
+    metadata: TribleSet,
+    metadata_handle: ArchiveHandle,
+    metadata_bytes: usize,
+    /// Blobs the data's tribles name (tensors, strings): what an old writer stored.
+    content: Vec<Blob<UnknownBlob>>,
+    /// Blobs the metadata names that the new writer stored.
+    described: BTreeSet<[u8; 32]>,
+}
+
+fn written(path: &Path, published: &[Published]) -> Vec<Written> {
+    let mut pile = Pile::open(path).unwrap();
+    pile.refresh().unwrap();
+    let snapshot = pile.snapshot().unwrap();
+    let mut out = Vec::new();
+    for p in published {
+        let data_handle: ArchiveHandle = p.commit.data().transmute();
+        let data: TribleSet = snapshot.get(data_handle).unwrap();
+        let metadata: TribleSet = snapshot.get(p.commit.metadata()).unwrap();
+        let metadata_blob: Blob<blobencodings::SimpleArchive> =
+            snapshot.get(p.commit.metadata()).unwrap();
+        let mut seen = BTreeSet::new();
+        let content = potential_handles(&data)
+            .filter(|handle| seen.insert(handle.raw))
+            .filter_map(|handle| snapshot.get::<Blob<UnknownBlob>, UnknownBlob>(handle).ok())
+            .collect();
+        let described = potential_handles(&metadata)
+            .filter(|handle| snapshot.metadata(*handle).unwrap().is_some())
+            .map(|handle| handle.raw)
+            .collect();
+        out.push(Written {
+            label: p.label,
+            data,
+            data_hash: p.commit.data(),
+            metadata,
+            metadata_handle: p.commit.metadata(),
+            metadata_bytes: metadata_blob.bytes.len(),
+            content,
+            described,
+        });
+    }
+    drop(snapshot);
+    pile.close().unwrap();
+    out
+}
+
+/// Commit `data` as the old writer did: its content blobs, its data archive,
+/// and an EMPTY metadata archive, signed by `key`.
+fn old_commit(
+    pile: &mut Pile,
+    collection: triblespace::core::collection::records::CollectionHandle,
+    key: &SigningKey,
+    data: &TribleSet,
+    content: &[Blob<UnknownBlob>],
+) -> CollectionCommit {
+    for blob in content {
+        pile.put::<UnknownBlob, _>(blob.clone()).unwrap();
+    }
+    let data_handle = pile.put::<blobencodings::SimpleArchive, _>(data.clone()).unwrap();
+    let empty = pile.put::<blobencodings::SimpleArchive, _>(TribleSet::new()).unwrap();
+    let commit = CollectionCommit::sign(
+        key,
+        collection,
+        inlineencodings::Handle::to_hash(data_handle),
+        empty,
+    );
+    pile.insert(CollectionRecord::Commit(commit)).unwrap();
+    commit
+}
+
+fn collection_commits(
+    path: &Path,
+    collection: triblespace::core::collection::records::CollectionHandle,
+) -> Vec<CollectionCommit> {
+    let mut pile = Pile::open(path).unwrap();
+    pile.refresh().unwrap();
+    let snapshot = pile.snapshot().unwrap();
+    let commits = snapshot
+        .select_records(&BTreeSet::from([CollectionRecordSelector::Collection(collection)]))
+        .unwrap()
+        .into_iter()
+        .filter_map(|record| match record {
+            CollectionRecord::Commit(commit) => Some(commit),
+            _ => None,
+        })
+        .collect();
+    drop(snapshot);
+    pile.close().unwrap();
+    commits
+}
+
+fn length(path: &Path) -> u64 {
+    std::fs::metadata(path).unwrap().len()
+}
+
+/// The other mary declarations of an attribute the fixture's data uses, which
+/// the new writer did not reference for that fixture. A commit's tribles do
+/// not say which declaration wrote them, so the backfill describes an id by
+/// every declaration of it (see `mary::metadata_backfill`).
+fn sibling_declarations(label: &str) -> Vec<(&'static str, Fragment)> {
+    match label {
+        "parts" => vec![
+            ("mary::format::attrs::index", mary::format::attrs::index.meta().clone()),
+            ("mary::jsonfacts::attrs::index", mary::jsonfacts::attrs::index.meta().clone()),
+        ],
+        _ => vec![
+            ("mary::jsonfacts::attrs::member", mary::jsonfacts::attrs::member.meta().clone()),
+            ("mary::tokenizer::attrs::member", mary::tokenizer::attrs::member.meta().clone()),
+            ("mary::tokenizer::attrs::model_name", mary::tokenizer::attrs::model_name.meta().clone()),
+        ],
+    }
+}
+
+/// The KEY test. Publish the fixtures through the NEW writer, re-sign each
+/// commit's data with an EMPTY metadata archive in a fresh pile (the old
+/// writer's shape), backfill, and compare the enriched archive with the one
+/// the new writer produced: byte-identical to it united with the sibling
+/// declarations' descriptions, and nothing else.
+#[test]
+fn backfill_reproduces_the_new_writers_metadata() {
+    let fixture = Fixture::new();
+    let (path, published) = publish_fixture(&fixture);
+    let written = written(&path, &published);
+    let catalog = Catalog::frozen();
+    let key = SigningKey::from_bytes(&[0x6d; 32]);
+    let other = SigningKey::from_bytes(&[0x5a; 32]);
+
+    // Every attribute the new writer's fixture commits use is in the catalog,
+    // and the catalog's description of it covers what the writer emitted.
+    for w in &written {
+        let attributes = metadata_backfill::data_attributes(&w.data);
+        let missing: Vec<String> = attributes
+            .iter()
+            .filter(|a| catalog.get(**a).is_none())
+            .map(|a| format!("{a:X}"))
+            .collect();
+        assert!(missing.is_empty(), "{}: catalog misses {missing:?}", w.label);
+    }
+
+    let old_path = fixture.0.join("old.pile");
+    std::fs::File::create(&old_path).unwrap();
+    let mut pile = Pile::open(&old_path).unwrap();
+    let collection = mary::model_collection::model_collection_or_create(&mut pile, &key)
+        .unwrap()
+        .handle();
+    let mut old = Vec::new();
+    for w in &written {
+        old.push(old_commit(&mut pile, collection, &key, &w.data, &w.content));
+    }
+    // Someone else's old commit: left alone.
+    old_commit(&mut pile, collection, &other, &written[0].data, &written[0].content);
+    // A commit whose data also uses an attribute nobody declares.
+    let mut stranger = written[0].data.clone();
+    stranger.insert(&Trible::force(
+        &UNKNOWN_ENTITY,
+        &UNKNOWN_ATTRIBUTE,
+        &Inline::<inlineencodings::U256BE>::new([7; 32]),
+    ));
+    old_commit(&mut pile, collection, &key, &stranger, &written[0].content);
+    pile.close().unwrap();
+
+    // Dry run: writes nothing.
+    let before = length(&old_path);
+    let dry = metadata_backfill::run_path(&old_path, &key, &catalog, collection, false).unwrap();
+    assert_eq!(length(&old_path), before, "a dry run wrote");
+    assert!(!dry.applied);
+    assert_eq!(dry.commits, 6);
+    assert_eq!(dry.signer_commits, 5);
+    assert_eq!(dry.other_signers, 1);
+    assert_eq!(dry.enriched_commits, 5);
+    assert_eq!(dry.new_commits, 5);
+    assert!(dry.new_blobs >= 5);
+    assert_eq!(dry.unknown.len(), 1);
+    assert_eq!(dry.unknown[&UNKNOWN_ATTRIBUTE].commits, 1);
+    assert_eq!(dry.unknown[&UNKNOWN_ATTRIBUTE].described, 0);
+
+    // Apply: exactly the plan, exactly the bytes it announced.
+    let applied = metadata_backfill::run_path(&old_path, &key, &catalog, collection, true).unwrap();
+    assert!(applied.applied);
+    assert_eq!(applied.new_commits, dry.new_commits);
+    assert_eq!(applied.new_blobs, dry.new_blobs);
+    assert_eq!(applied.enriched, dry.enriched);
+    assert_eq!(length(&old_path) - before, applied.new_bytes);
+
+    let commits = collection_commits(&old_path, collection);
+    assert_eq!(commits.len(), 11);
+    assert_eq!(
+        commits.iter().filter(|c| c.public_key().raw == other.verifying_key().to_bytes()).count(),
+        1,
+        "the other signer's commit gained a successor"
+    );
+    let mut pile = Pile::open(&old_path).unwrap();
+    pile.refresh().unwrap();
+    let snapshot = pile.snapshot().unwrap();
+    for w in &written {
+        let successor = commits
+            .iter()
+            .find(|c| {
+                c.data() == w.data_hash
+                    && c.public_key().raw == key.verifying_key().to_bytes()
+                    && !old.contains(c)
+            })
+            .unwrap_or_else(|| panic!("{}: no successor", w.label));
+        successor.verify_strict().unwrap();
+        assert_eq!(successor.collection(), collection);
+        let enriched_blob: Blob<blobencodings::SimpleArchive> =
+            snapshot.get(successor.metadata()).unwrap();
+        let enriched: TribleSet = snapshot.get(successor.metadata()).unwrap();
+        let identical = successor.metadata() == w.metadata_handle;
+        let extra = enriched.difference(&w.metadata);
+        let usage_entities: BTreeSet<Id> = find!(
+            usage: Id,
+            pattern!(&enriched, [{ ?usage @ metadata::tag: metadata::KIND_ATTRIBUTE_USAGE }])
+        )
+        .collect();
+        println!(
+            "GOLDEN {} identical={} new_writer={} ({} B, {} tribles) backfill={} ({} B, {} tribles) extra_tribles={} extra_usage_entities={}",
+            w.label,
+            identical,
+            hex(&w.metadata_handle.raw),
+            w.metadata_bytes,
+            w.metadata.len(),
+            hex(&successor.metadata().raw),
+            enriched_blob.bytes.len(),
+            enriched.len(),
+            extra.len(),
+            extra.iter().map(|t| *t.e()).collect::<BTreeSet<Id>>().len(),
+        );
+        // Name the extra usage records: `source_module::name`.
+        let mut extra_usages = Vec::new();
+        for (module, name) in find!(
+            (module: Inline<inlineencodings::Handle<blobencodings::UTF8String>>,
+             name: Inline<inlineencodings::Handle<blobencodings::UTF8String>>),
+            pattern!(&enriched, [{ _?usage @
+                metadata::source_module: ?module,
+                metadata::name: ?name,
+                metadata::attribute: _?attribute,
+            }])
+        ) {
+            let module: anybytes::View<str> = snapshot.get(module).unwrap();
+            let name: anybytes::View<str> = snapshot.get(name).unwrap();
+            extra_usages.push(format!("{}::{}", &*module, &*name));
+        }
+        let mut usages_new = Vec::new();
+        for (module, name) in find!(
+            (module: Inline<inlineencodings::Handle<blobencodings::UTF8String>>,
+             name: Inline<inlineencodings::Handle<blobencodings::UTF8String>>),
+            pattern!(&w.metadata, [{ _?usage @
+                metadata::source_module: ?module,
+                metadata::name: ?name,
+                metadata::attribute: _?attribute,
+            }])
+        ) {
+            let module: anybytes::View<str> = snapshot.get(module).unwrap();
+            let name: anybytes::View<str> = snapshot.get(name).unwrap();
+            usages_new.push(format!("{}::{}", &*module, &*name));
+        }
+        extra_usages.retain(|u| !usages_new.contains(u));
+        extra_usages.sort();
+        println!("GOLDEN {} usage records only the backfill adds: {:?}", w.label, extra_usages);
+        let siblings = sibling_declarations(w.label);
+        let mut names: Vec<String> = siblings.iter().map(|(n, _)| n.to_string()).collect();
+        names.sort();
+        assert_eq!(extra_usages, names, "{}: unexpected extra usage records", w.label);
+        // Byte identity: the new writer's archive united with exactly those
+        // declarations' metas IS the backfilled archive.
+        let mut expected = w.metadata.clone();
+        for (_, meta) in &siblings {
+            expected.union(meta.facts().clone());
+            expected.union(meta.metafacts().clone());
+        }
+        let expected_blob: Blob<blobencodings::SimpleArchive> = expected.to_blob();
+        assert_eq!(expected_blob.get_handle(), successor.metadata(), "{}: golden mismatch", w.label);
+        assert_eq!(expected_blob.bytes, enriched_blob.bytes, "{}: golden bytes differ", w.label);
+        println!("GOLDEN {} byte-identical to new writer + {} sibling declarations: true", w.label, siblings.len());
+        // Nothing the new writer wrote is missing.
+        assert!(
+            w.metadata.difference(&enriched).is_empty(),
+            "{}: the backfill lacks facts the new writer wrote",
+            w.label
+        );
+        // Anything beyond it is a usage record of another mary declaration of
+        // an attribute this data uses: never a typing fact.
+        let attributes = metadata_backfill::data_attributes(&w.data);
+        for trible in extra.iter() {
+            assert!(
+                usage_entities.contains(trible.e()),
+                "{}: extra fact on {:X} is not a usage record",
+                w.label,
+                trible.e()
+            );
+        }
+        for (usage, attribute) in find!(
+            (usage: Id, attribute: Id),
+            pattern!(&extra, [{ ?usage @ metadata::attribute: ?attribute }])
+        ) {
+            assert!(attributes.contains(&attribute), "{}: usage {usage:X} names {attribute:X}", w.label);
+        }
+        if identical {
+            assert_eq!(enriched_blob.bytes, snapshot.get::<Blob<blobencodings::SimpleArchive>, _>(w.metadata_handle).unwrap().bytes);
+        }
+        // Closure: every blob the new writer stored for its metadata is
+        // resident beside the backfilled one.
+        for raw in &w.described {
+            let handle: Inline<inlineencodings::Handle<UnknownBlob>> = Inline::new(*raw);
+            assert!(snapshot.metadata(handle).unwrap().is_some(), "{}: blob {} missing", w.label, hex(raw));
+        }
+    }
+    drop(snapshot);
+    pile.close().unwrap();
+
+    // A second apply finds every successor present and writes nothing.
+    let settled = length(&old_path);
+    let second = metadata_backfill::run_path(&old_path, &key, &catalog, collection, true).unwrap();
+    assert_eq!(second.new_commits, 0);
+    assert_eq!(second.new_blobs, 0);
+    assert_eq!(second.new_bytes, 0);
+    assert_eq!(length(&old_path), settled, "a second apply wrote");
+    assert_eq!(second.signer_commits, 10);
+    assert_eq!(second.present_commits, 5);
+    assert_eq!(second.current_commits, 5);
+}
+
+/// An archive whose bytes fail their own hash stops the run, naming it.
+#[test]
+fn a_corrupt_archive_stops_the_run_naming_it() {
+    for role in ["data", "metadata"] {
+        let fixture = Fixture::new();
+        let path = fixture.0.join("corrupt.pile");
+        std::fs::File::create(&path).unwrap();
+        let key = SigningKey::from_bytes(&[0x6d; 32]);
+        let mut pile = Pile::open(&path).unwrap();
+        let collection = mary::model_collection::model_collection_or_create(&mut pile, &key)
+            .unwrap()
+            .handle();
+        let marker = [0xA5_u8; 32];
+        let mut damaged = TribleSet::new();
+        damaged.insert(&Trible::force(
+            &UNKNOWN_ENTITY,
+            &UNKNOWN_ATTRIBUTE,
+            &Inline::<inlineencodings::U256BE>::new(marker),
+        ));
+        let damaged = pile.put::<blobencodings::SimpleArchive, _>(damaged).unwrap();
+        let plain = pile.put::<blobencodings::SimpleArchive, _>(TribleSet::new()).unwrap();
+        let (data, meta) = if role == "data" { (damaged, plain) } else { (plain, damaged) };
+        pile.insert(CollectionRecord::Commit(CollectionCommit::sign(
+            &key,
+            collection,
+            inlineencodings::Handle::to_hash(data),
+            meta,
+        )))
+        .unwrap();
+        pile.close().unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        let at = bytes.windows(32).position(|w| w == marker).expect("value stored verbatim");
+        bytes[at] ^= 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
+        let before = length(&path);
+        for apply in [false, true] {
+            let error = metadata_backfill::run_path(&path, &key, &Catalog::frozen(), collection, apply)
+                .expect_err("corrupt archive must not be skipped");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains(&format!("{role} archive {}", hex(&damaged.raw)))
+                    && message.contains("fails its hash check"),
+                "{message}"
+            );
+        }
+        assert_eq!(length(&path), before);
+    }
+}

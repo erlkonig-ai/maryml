@@ -40,6 +40,7 @@ pub mod ingest;
 /// minted attribute per config field.
 pub mod jsonfacts;
 pub mod leaf;
+pub mod metadata_backfill;
 pub mod calibrate;
 pub mod nvfp4;
 #[cfg(feature = "local-model")]

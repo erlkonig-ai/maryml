@@ -664,7 +664,7 @@ pub struct ModelAttributeProjection {
 // The eight short-text fields are plain ids rather than declarations: their
 // values are the retired 32-byte `ShortString` layout, which no runtime type
 // describes any more, and the projection only ever copies those bytes.
-mod historical {
+pub(crate) mod historical {
     use crate::f16enc::F16Array;
     use crate::format::{F32Array, U32Array, U64Array};
     use triblespace::core::id::Id;

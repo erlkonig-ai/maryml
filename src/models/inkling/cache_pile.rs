@@ -33,7 +33,7 @@ pub struct CacheConfig {
 }
 
 // All anchors/kind below were minted with `trible genid` on 2026-09-09.
-mod schema {
+pub(crate) mod schema {
     use super::*;
     pub const KIND: Id = triblespace::macros::id_hex!("2B63C12AB244407A486498721AD2295E");
     attributes! {
