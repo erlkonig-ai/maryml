@@ -133,8 +133,24 @@ fn print_report(report: &Report, catalog: &Catalog) {
     println!("unknown attributes {}:", report.unknown.len());
     for (id, unknown) in &report.unknown {
         println!(
-            "  {id:X} commits {} already described in M {}",
-            unknown.commits, unknown.described
+            "  {id:X} commits {} already described in M {} encodings [{}] usages [{}] sample {}",
+            unknown.commits,
+            unknown.described,
+            unknown
+                .encodings
+                .iter()
+                .map(|e| format!("{e:X}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+            unknown.usages.iter().cloned().collect::<Vec<_>>().join(" "),
+            unknown
+                .sample
+                .map(|(raw, blob)| format!(
+                    "{}{}",
+                    hex_upper(&raw),
+                    if blob { " (resident blob)" } else { "" }
+                ))
+                .unwrap_or_default()
         );
     }
 }

@@ -462,6 +462,7 @@ fn backfill_reproduces_the_new_writers_metadata() {
     assert_eq!(dry.unknown.len(), 1);
     assert_eq!(dry.unknown[&UNKNOWN_ATTRIBUTE].commits, 1);
     assert_eq!(dry.unknown[&UNKNOWN_ATTRIBUTE].described, 0);
+    assert_eq!(dry.unknown[&UNKNOWN_ATTRIBUTE].sample, Some(([7; 32], false)));
 
     // Apply: exactly the plan, exactly the bytes it announced.
     let applied = metadata_backfill::run_path(&old_path, &key, &catalog, collection, true).unwrap();

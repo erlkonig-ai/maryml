@@ -49,6 +49,7 @@ use ed25519_dalek::SigningKey;
 use triblespace::core::attribute::Attribute;
 use triblespace::core::blob::encodings::UnknownBlob;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace::core::blob::encodings::utf8string::UTF8String;
 use triblespace::core::blob::{Blob, IntoBlob, TryFromBlob};
 use triblespace::core::collection::covered::Covered;
 use triblespace::core::collection::records::{CollectionData, CollectionHandle};
@@ -56,13 +57,14 @@ use triblespace::core::collection::{
     CollectionCommit, CollectionRead, CollectionRecord, CollectionRecordSelector, CollectionStore,
 };
 use triblespace::core::id::Id;
+use triblespace::core::inline::encodings::UnknownInline;
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::{Inline, InlineEncoding};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{GetBlobError, Pile, PileFile, PileSnapshot};
 use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta, BlobStorePut, SnapshotSource};
 use triblespace::core::trible::TribleSet;
-use triblespace::prelude::{exists, pattern};
+use triblespace::prelude::{find, pattern};
 
 /// Pile frame sizes, for the byte estimate: every record is one 256-byte
 /// frame, and a blob is a 256-byte envelope plus its payload padded to 256.
@@ -372,6 +374,13 @@ pub struct UnknownAttribute {
     /// Of those, commits whose old metadata already has a `KIND_ATTRIBUTE`
     /// record for it.
     pub described: usize,
+    /// Value encodings the old metadata names for it.
+    pub encodings: BTreeSet<Id>,
+    /// `source_module::name` of usage records the old metadata holds for it.
+    pub usages: BTreeSet<String>,
+    /// One value it holds in the data, and whether that value is the handle
+    /// of a resident blob.
+    pub sample: Option<([u8; 32], bool)>,
 }
 
 /// Everything one collection showed.
@@ -587,25 +596,56 @@ pub fn run(
             }
         };
         let attributes = data_attributes(&data);
-        drop(data);
         let enrichment = enrich(catalog, &attributes, &metadata);
         for attribute in &enrichment.known {
             *report.known.entry(*attribute).or_default() += 1;
         }
         for attribute in &enrichment.unknown {
-            let entry = report.unknown.entry(*attribute).or_default();
-            entry.commits += 1;
             let attribute = *attribute;
-            if exists!(
-                (encoding: Id),
+            let entry = report.unknown.entry(attribute).or_default();
+            entry.commits += 1;
+            let mut described = false;
+            for encoding in find!(
+                encoding: Id,
                 pattern!(&metadata, [{ attribute @
                     metadata::tag: metadata::KIND_ATTRIBUTE,
                     metadata::value_encoding: ?encoding,
                 }])
             ) {
+                described = true;
+                entry.encodings.insert(encoding);
+            }
+            if described {
                 entry.described += 1;
             }
+            for (module, name) in find!(
+                (module: Inline<Handle<UTF8String>>, name: Inline<Handle<UTF8String>>),
+                pattern!(&metadata, [{ _?usage @
+                    metadata::attribute: attribute,
+                    metadata::source_module: ?module,
+                    metadata::name: ?name,
+                }])
+            ) {
+                let text = |handle: Inline<Handle<UTF8String>>| {
+                    snapshot
+                        .get::<anybytes::View<str>, UTF8String>(handle)
+                        .map(|view| view.to_string())
+                        .unwrap_or_else(|_| format!("<{}>", hex_upper(&handle.raw)))
+                };
+                entry
+                    .usages
+                    .insert(format!("{}::{}", text(module), text(name)));
+            }
+            if entry.sample.is_none() {
+                if let Some(trible) = data.iter().find(|trible| *trible.a() == attribute) {
+                    let raw = trible.v::<UnknownInline>().raw;
+                    let handle: Inline<Handle<UnknownBlob>> = Inline::new(raw);
+                    let resident = matches!(snapshot.metadata(handle), Ok(Some(_)));
+                    entry.sample = Some((raw, resident));
+                }
+            }
         }
+        drop(data);
         if enrichment.unchanged(&metadata) {
             report.current_commits += 1;
             continue;
