@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- WeMM's text query path runs on CubeCL's wgpu runtime as well as CUDA:
+  `qwen3_5-wgpu` (with `wemm-query-vulkan` for SPIR-V or `wemm-query-metal`
+  for MSL) builds the token gather, the 32 decoder blocks and the output
+  boundary on `WgpuRuntime`, with no cudarc, cubek or NVFP4. The decoder
+  files name their runtime and binder through `models::qwen3_5::{Rt, Binder}`
+  (CUDA unchanged when `qwen3_5-cuda` is on; the two exclude each other).
+  wgpu copies every BF16 leaf into a device buffer (`nn::wgpu_bf16_upload`),
+  runs BF16 projections on a portable 64x64 shared-memory tile kernel
+  (`qwen3_5::tiled_projection`) where CUDA uses the MMA blueprint, and
+  computes DeltaNet's softplus `log1p` with Goldberg's correction, since
+  SPIR-V and MSL lower `log1p` to `log(1 + x)`. `qwen3_5::text::TextWemm`
+  binds only the decoder and embeds a text exactly as
+  `NativeWemm::embed_text` does; `Assets` moved there (re-exported from
+  `native`), and `checked_shape` moved to `nn::bf16_extent`. `wemm_query`
+  embeds query lines on either build. On sky (GB10, Vulkan) the BF16 query
+  vectors match CUDA BF16 at mean cosine 0.9989 and 9.7/10 top-10 overlap
+  on the production wiki index. The lock gains maryml-cubecl-spirv,
+  tracel-rspirv, tracel-ash and c2rust-bitfields(-derive) for SPIR-V.
+
 - Mary has one model collection, `models`, whose members are model fact
   archives. The `mary-model-graph` / `mary-model-bundles` pair is gone, with
   the bundle shape: its one-row `metadata::archive` token, its reader branch,

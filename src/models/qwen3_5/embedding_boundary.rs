@@ -8,17 +8,18 @@
 
 use burn::tensor::DType;
 use burn_cubecl::tensor::CubeTensor;
-use cubecl::{cuda::CudaRuntime, prelude::*};
+use cubecl::prelude::*;
+use super::Rt;
 use half::bf16;
 use triblespace::core::{
     blob::{Blob, encodings::tensor::{Tensor as NativeTensor, elements::BF16}},
     inline::{Inline, encodings::hash::Handle},
     repo::BlobStoreGet,
 };
-use crate::nn::cuda_bf16_alias::CudaBf16Aliases;
+use super::Binder;
 use super::decoder_ops;
 
-pub type CudaTensor = CubeTensor<CudaRuntime>;
+pub type CudaTensor = CubeTensor<Rt>;
 pub type FinalNormSlot = Inline<Handle<NativeTensor<BF16, 1>>>;
 pub const HIDDEN: usize = 4096;
 pub const MAX_TOKENS: usize = 256;
@@ -44,7 +45,7 @@ impl Boundary {
     /// and untruncated through CUDA runtime teardown. A late descriptor error
     /// may retain the registration. Forwarded to the existing native binder.
     pub unsafe fn from_pile<R: BlobStoreGet>(
-        snapshot: &R, slot: FinalNormSlot, aliases: &mut CudaBf16Aliases,
+        snapshot: &R, slot: FinalNormSlot, aliases: &mut Binder,
     ) -> Result<Self, String> {
         let blob: Blob<NativeTensor<BF16, 1>> = snapshot.get(slot).map_err(|e| e.to_string())?;
         // SAFETY: the caller establishes the genuine immutable-prefix premise.
@@ -77,7 +78,7 @@ impl Boundary {
         // One invocation, one ascending-coordinate reduction. No autotuning,
         // subgroup-size-dependent reduction or host readback/model arithmetic.
         unsafe {
-            finish_kernel::launch_unchecked::<CudaRuntime>(
+            finish_kernel::launch_unchecked::<Rt>(
                 &hidden.client, CubeCount::Static(1, 1, 1), CubeDim::new_1d(1),
                 ArrayArg::from_raw_parts(final_hidden.handle.clone(), shape[1] * HIDDEN),
                 ArrayArg::from_raw_parts(selected_handle.clone(), HIDDEN),
@@ -115,7 +116,7 @@ impl Boundary {
         let selected = hidden.client.empty(batch * HIDDEN * 2);
         let embedding = hidden.client.empty(batch * HIDDEN * 2);
         unsafe {
-            finish_rows_kernel::launch_unchecked::<CudaRuntime>(
+            finish_rows_kernel::launch_unchecked::<Rt>(
                 &hidden.client, CubeCount::Static(batch as u32, 1, 1), CubeDim::new_1d(1),
                 ArrayArg::from_raw_parts(final_hidden.handle.clone(), batch * tokens * HIDDEN),
                 ArrayArg::from_raw_parts(offsets, batch),
@@ -195,7 +196,7 @@ fn finish_kernel(x: &Array<bf16>, selected: &mut Array<bf16>, out: &mut Array<bf
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "qwen3_5-cuda"))]
 mod reader_tests {
     use super::*;
     use std::{cell::Cell, error::Error, path::PathBuf};
@@ -232,19 +233,19 @@ mod reader_tests {
     // a CUDA client, fake aliases, uninitialized resources or model weights.
     fn constructors_accept<R: BlobStoreGet>() {
         type Observer = fn(&str, [u8; 32], &[u64], &[u8]) -> Result<(), String>;
-        let _: unsafe fn(&TribleSet, &R, Id, &Qwen3_5Config, &mut CudaBf16Aliases, Observer)
+        let _: unsafe fn(&TribleSet, &R, Id, &Qwen3_5Config, &mut Binder, Observer)
             -> Result<PreparedMultimodal, String> = PreparedMultimodal::from_pile::<R>;
-        let _: unsafe fn(&TribleSet, &R, Id, &mut CudaBf16Aliases, Observer)
+        let _: unsafe fn(&TribleSet, &R, Id, &mut Binder, Observer)
             -> Result<PreparedDecoder, String> = PreparedDecoder::from_pile::<R>;
-        let _: unsafe fn(&R, decoder_stack::Slots, &mut CudaBf16Aliases)
+        let _: unsafe fn(&R, decoder_stack::Slots, &mut Binder)
             -> Result<decoder_stack::Stack, String> = decoder_stack::Stack::from_pile::<R>;
-        let _: unsafe fn(&R, gdn_decoder::Slots, gdn_decoder::Config, &mut CudaBf16Aliases)
+        let _: unsafe fn(&R, gdn_decoder::Slots, gdn_decoder::Config, &mut Binder)
             -> Result<gdn_decoder::Block, String> = gdn_decoder::Block::from_pile::<R>;
-        let _: unsafe fn(&R, gdn_mixer::GdnSlots, gdn_mixer::GdnConfig, &mut CudaBf16Aliases)
+        let _: unsafe fn(&R, gdn_mixer::GdnSlots, gdn_mixer::GdnConfig, &mut Binder)
             -> Result<gdn_mixer::GdnMixer, String> = gdn_mixer::GdnMixer::from_pile::<R>;
-        let _: unsafe fn(&R, full_attention::Slots, full_attention::Config, &mut CudaBf16Aliases)
+        let _: unsafe fn(&R, full_attention::Slots, full_attention::Config, &mut Binder)
             -> Result<full_attention::Block, String> = full_attention::Block::from_pile::<R>;
-        let _: unsafe fn(&R, FinalNormSlot, &mut CudaBf16Aliases)
+        let _: unsafe fn(&R, FinalNormSlot, &mut Binder)
             -> Result<Boundary, String> = Boundary::from_pile::<R>;
     }
 
@@ -308,7 +309,7 @@ mod reader_tests {
         let mut pile = fixture.pile();
         let slot = pile.put::<NativeTensor<BF16, 1>, _>(norm_blob()).unwrap();
         let reader = Reader { source: pile.snapshot().unwrap(), gets: Cell::new(0) };
-        let mut aliases = CudaBf16Aliases::new(cubecl::cuda::CudaDevice { index: 0 }, 1).unwrap();
+        let mut aliases = Binder::new(cubecl::cuda::CudaDevice { index: 0 }, 1).unwrap();
         // SAFETY: this private pile and all preceding pages remain unchanged;
         // closing its handle does not truncate/rewrite its retained mmap.
         let boundary = unsafe { Boundary::from_pile(&reader, slot, &mut aliases) }.unwrap();

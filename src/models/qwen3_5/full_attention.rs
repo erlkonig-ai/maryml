@@ -9,16 +9,17 @@
 
 use burn::tensor::DType;
 use burn_cubecl::tensor::CubeTensor;
-use cubecl::{cuda::CudaRuntime, prelude::*};
+use cubecl::prelude::*;
+use super::Rt;
 use half::bf16;
 use serde::{Deserialize, Serialize};
 use triblespace::core::{blob::{Blob, encodings::tensor::{Tensor as NativeTensor, elements::BF16}},
     inline::{Inline, encodings::hash::Handle}, repo::BlobStoreGet};
-use crate::nn::cuda_bf16_alias::CudaBf16Aliases;
+use super::Binder;
 use super::gdn_mixer::{DecoderPrecision, Linear, bind_linear, project_linear};
 use super::decoder_ops::{norm, elementwise};
 
-pub type CudaTensor = CubeTensor<CudaRuntime>;
+pub type CudaTensor = CubeTensor<Rt>;
 pub type Slot<const R: usize> = Inline<Handle<NativeTensor<BF16, R>>>;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -90,7 +91,7 @@ impl Block {
     /// must remain immutable/append-only and untruncated through CUDA runtime
     /// teardown. Same obligation as bind_pile_leaf. Late failure can retain
     /// earlier registrations; no transactional/last-handle reclamation claim.
-    pub unsafe fn from_pile<R: BlobStoreGet>(snapshot: &R, s: Slots, config: Config, aliases: &mut CudaBf16Aliases) -> Result<Self, String> {
+    pub unsafe fn from_pile<R: BlobStoreGet>(snapshot: &R, s: Slots, config: Config, aliases: &mut Binder) -> Result<Self, String> {
         // SAFETY: forwarded unchanged.
         unsafe { Self::from_pile_with(snapshot, s, config, aliases, DecoderPrecision::Bf16) }
     }
@@ -99,7 +100,7 @@ impl Block {
     ///
     /// # Safety
     /// As [`Self::from_pile`].
-    pub unsafe fn from_pile_with<R: BlobStoreGet>(snapshot: &R, s: Slots, config: Config, aliases: &mut CudaBf16Aliases,
+    pub unsafe fn from_pile_with<R: BlobStoreGet>(snapshot: &R, s: Slots, config: Config, aliases: &mut Binder,
         precision: DecoderPrecision) -> Result<Self, String> {
         config.validate()?;
         macro_rules! bind { ($slot:expr, $rank:literal) => {{
@@ -237,7 +238,7 @@ fn split_kernel(x:&Array<bf16>,q:&mut Array<bf16>,gate:&mut Array<bf16>,n:usize,
 }
 fn split(x:&CudaTensor,b:usize,t:usize,h:usize,d:usize)->(CudaTensor,CudaTensor) {
     let n=b*t*h*d; let q=x.client.empty(n*2); let g=x.client.empty(n*2);
-    unsafe { split_kernel::launch_unchecked::<CudaRuntime>(&x.client,grid(x,n),CubeDim::new_1d(64),
+    unsafe { split_kernel::launch_unchecked::<Rt>(&x.client,grid(x,n),CubeDim::new_1d(64),
         ArrayArg::from_raw_parts(x.handle.clone(),2*n),ArrayArg::from_raw_parts(q.clone(),n),ArrayArg::from_raw_parts(g.clone(),n),n,d); }
     (tensor(x,&[b,t,h,d],q),tensor(x,&[b,t,h,d],g))
 }
@@ -264,7 +265,7 @@ fn rope_kernel(x:&Array<bf16>,y:&mut Array<bf16>,n:usize,tokens:usize,heads:usiz
 }
 fn rope(x:&CudaTensor,c:Config,p:Positions,past:usize)->CudaTensor {
     let s=x.meta.shape().as_slice(); let n=len(x); let out=x.client.empty(n*2);
-    unsafe { rope_kernel::launch_unchecked::<CudaRuntime>(&x.client,grid(x,n),CubeDim::new_1d(64),
+    unsafe { rope_kernel::launch_unchecked::<Rt>(&x.client,grid(x,n),CubeDim::new_1d(64),
         ArrayArg::from_raw_parts(x.handle.clone(),n),ArrayArg::from_raw_parts(out.clone(),n),
         n,s[1],s[2],c.head_dim,c.rotary_dim,c.sections[1],c.sections[2],c.theta,past as u32,p.start,p.batch_stride,
         p.axis_base[0],p.axis_base[1],p.axis_base[2],p.axis_step[0],p.axis_step[1],p.axis_step[2]); }
@@ -279,7 +280,7 @@ fn append_kernel(old:&Array<bf16>,new:&Array<bf16>,out:&mut Array<bf16>,n:usize,
 fn append(new:&CudaTensor,old:Option<&CudaTensor>,past:usize)->CudaTensor {
     let s=new.meta.shape().as_slice(); let shape=[s[0],past+s[1],s[2],s[3]];
     let n=shape.iter().product(); let out=new.client.empty(n*2); let oldh=old.map(|x|x.handle.clone()).unwrap_or_else(||out.clone());
-    unsafe { append_kernel::launch_unchecked::<CudaRuntime>(&new.client,grid(new,n),CubeDim::new_1d(64),
+    unsafe { append_kernel::launch_unchecked::<Rt>(&new.client,grid(new,n),CubeDim::new_1d(64),
         ArrayArg::from_raw_parts(oldh,old.map_or(n,len)),ArrayArg::from_raw_parts(new.handle.clone(),len(new)),
         ArrayArg::from_raw_parts(out.clone(),n),n,past,s[1],s[2]*s[3]); }
     tensor(new,&shape,out)
@@ -331,10 +332,10 @@ fn attention(q:&CudaTensor,k:&CudaTensor,v:&CudaTensor,past:usize,c:Config)->Cud
     let s=q.meta.shape().as_slice(); let total=past+s[1]; let rows=s[0]*s[1]*c.heads; let n=len(q);
     let probs=q.client.empty(rows*total*2); let out=q.client.empty(n*2);
     unsafe {
-        scores_kernel::launch_unchecked::<CudaRuntime>(&q.client,CubeCount::Static(rows as u32,1,1),CubeDim::new_1d(SCORE_THREADS),
+        scores_kernel::launch_unchecked::<Rt>(&q.client,CubeCount::Static(rows as u32,1,1),CubeDim::new_1d(SCORE_THREADS),
             ArrayArg::from_raw_parts(q.handle.clone(),n),ArrayArg::from_raw_parts(k.handle.clone(),len(k)),
             ArrayArg::from_raw_parts(probs.clone(),rows*total),s[1],c.heads,c.kv_heads,c.head_dim,total,past,c.capacity);
-        value_kernel::launch_unchecked::<CudaRuntime>(&q.client,grid(q,n),CubeDim::new_1d(64),
+        value_kernel::launch_unchecked::<Rt>(&q.client,grid(q,n),CubeDim::new_1d(64),
             ArrayArg::from_raw_parts(probs,rows*total),ArrayArg::from_raw_parts(v.handle.clone(),len(v)),
             ArrayArg::from_raw_parts(out.clone(),n),n,s[1],c.heads,c.kv_heads,c.head_dim,total,past);
     }
@@ -424,7 +425,7 @@ fn positioned_rope(x: &CudaTensor, c: Config, positions: &super::position_table:
     let n = len(x);
     let out = x.client.empty(n * 2);
     unsafe {
-        positioned_rope_kernel::launch_unchecked::<CudaRuntime>(
+        positioned_rope_kernel::launch_unchecked::<Rt>(
             &x.client, grid(x,n), CubeDim::new_1d(64),
             ArrayArg::from_raw_parts(x.handle.clone(),n),
             ArrayArg::from_raw_parts(positions.tensor().handle.clone(),3*shape[1]),
@@ -435,7 +436,7 @@ fn positioned_rope(x: &CudaTensor, c: Config, positions: &super::position_table:
     tensor(x,shape,out)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "qwen3_5-cuda"))]
 mod positioned_tests {
     use super::*;
     use cubecl::cuda::CudaDevice;
@@ -449,10 +450,10 @@ mod positioned_tests {
 
     fn fixture(tokens: usize, offset: usize) -> CudaTensor {
         let device=CudaDevice{index:0};
-        let client=CudaRuntime::client(&device);
+        let client=Rt::client(&device);
         let n=tokens*16*256;
         let out=CubeTensor::new_contiguous(client.clone(),device,[1,tokens,16,256].into(),client.empty(n*2),DType::BF16);
-        unsafe { fill_position_fixture::launch_unchecked::<CudaRuntime>(&client,grid(&out,n),CubeDim::new_1d(64),
+        unsafe { fill_position_fixture::launch_unchecked::<Rt>(&client,grid(&out,n),CubeDim::new_1d(64),
             ArrayArg::from_raw_parts(out.handle.clone(),n),n,offset); }
         out
     }

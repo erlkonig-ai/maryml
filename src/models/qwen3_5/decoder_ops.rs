@@ -5,9 +5,10 @@
 
 use burn::tensor::DType;
 use burn_cubecl::tensor::CubeTensor;
-use cubecl::{cuda::CudaRuntime, prelude::*};
+use cubecl::prelude::*;
+use super::Rt;
 use half::bf16;
-type CudaTensor = CubeTensor<CudaRuntime>;
+type CudaTensor = CubeTensor<Rt>;
 fn tensor(like:&CudaTensor,s:&[usize],h:cubecl::server::Handle)->CudaTensor { CubeTensor::new_contiguous(like.client.clone(),like.device.clone(),s.into(),h,DType::BF16) }
 fn len(t:&CudaTensor)->usize { t.meta.shape().as_slice().iter().product() }
 fn grid(t:&CudaTensor,n:usize)->CubeCount { cubecl::calculate_cube_count_elemwise(&t.client,n,CubeDim::new_1d(64)) }
@@ -38,7 +39,7 @@ pub(super) fn norm(x:&CudaTensor,w:&CudaTensor,width:usize,eps:f32)->CudaTensor 
     assert!(width<=NORM_CAPACITY, "norm row wider than {NORM_CAPACITY}");
     let n=len(x); let out=x.client.empty(n*2); let rows=(n/width) as u32;
     // SAFETY: private callers prevalidate all contiguous BF16 extents; output fresh.
-    unsafe { norm_kernel::launch_unchecked::<CudaRuntime>(&x.client,CubeCount::Static(rows,1,1),CubeDim::new_1d(NORM_THREADS),
+    unsafe { norm_kernel::launch_unchecked::<Rt>(&x.client,CubeCount::Static(rows,1,1),CubeDim::new_1d(NORM_THREADS),
         ArrayArg::from_raw_parts(x.handle.clone(),n),ArrayArg::from_raw_parts(w.handle.clone(),width),
         ArrayArg::from_raw_parts(out.clone(),n),width,eps); }
     tensor(x,x.meta.shape().as_slice(),out)
@@ -53,7 +54,7 @@ fn element_kernel(a:&Array<bf16>,b:&Array<bf16>,out:&mut Array<bf16>,n:usize,#[c
 }
 pub(super) fn elementwise(a:&CudaTensor,b:&CudaTensor,mode:u32)->CudaTensor {
     let n=len(a); let out=a.client.empty(n*2);
-    unsafe { element_kernel::launch_unchecked::<CudaRuntime>(&a.client,grid(a,n),CubeDim::new_1d(64),
+    unsafe { element_kernel::launch_unchecked::<Rt>(&a.client,grid(a,n),CubeDim::new_1d(64),
         ArrayArg::from_raw_parts(a.handle.clone(),n),ArrayArg::from_raw_parts(b.handle.clone(),n),
         ArrayArg::from_raw_parts(out.clone(),n),n,mode); }
     tensor(a,a.meta.shape().as_slice(),out)

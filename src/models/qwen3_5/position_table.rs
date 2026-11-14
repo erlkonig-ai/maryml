@@ -4,11 +4,11 @@
 
 use burn::tensor::DType;
 use burn_cubecl::tensor::CubeTensor;
-use cubecl::cuda::CudaRuntime;
+use super::Rt;
 
 use super::multimodal_layout::validate_positions;
 
-pub type CudaTensor = CubeTensor<CudaRuntime>;
+pub type CudaTensor = CubeTensor<Rt>;
 
 pub struct PositionTable {
     tensor: CudaTensor,

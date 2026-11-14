@@ -1,9 +1,9 @@
 //! Diagnostic-only observations of existing decoder operations; no model formula.
 use burn::tensor::DType;
 use burn_cubecl::tensor::CubeTensor;
-use cubecl::cuda::CudaRuntime;
+use super::Rt;
 use super::{decoder_ops::{norm,elementwise},gdn_decoder::check,gdn_mixer::project};
-pub type CudaTensor=CubeTensor<CudaRuntime>;
+pub type CudaTensor=CubeTensor<Rt>;
 pub const NAMES:[&str;8]=["input_norm","mixer_out","residual1","post_norm","mlp_gate","mlp_up","mlp_product","mlp_down"];
 pub const CONTROL_NAMES:[&str;7]=["residual1","post_norm","mlp_gate","mlp_up","mlp_product","mlp_down","output"];
 /// Ephemeral per-invocation handles, never a model/weight catalogue.

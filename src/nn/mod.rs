@@ -10,6 +10,8 @@
 #[cfg(all(any(feature = "qwen3tts", feature = "voxtral"), target_os = "macos"))]
 pub mod alias;
 pub mod backend;
+#[cfg(any(feature = "cuda-bf16-alias", feature = "qwen3_5-wgpu"))]
+pub(crate) mod bf16_extent;
 #[cfg(feature = "cuda-bf16-alias")]
 pub mod cuda_bf16_alias;
 /// Allocation at each buffer's own size, for model weights.
@@ -39,4 +41,6 @@ pub mod nvfp4_gemm;
 pub(crate) mod raw_cuda;
 #[cfg(feature = "q4")]
 pub mod q4;
+#[cfg(feature = "qwen3_5-wgpu")]
+pub mod wgpu_bf16_upload;
 pub mod weight_loader;

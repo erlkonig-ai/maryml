@@ -106,12 +106,31 @@ fn prepare_gates(
         let head = row % value_heads;
         let dt = f32::cast_from(a[row]) + f32::cast_from(dt_bias[head]);
         // The reference uses softplus's default threshold=20 in F32.
-        let softplus = if dt > 20.0f32 { dt } else { dt.exp().log1p() };
+        let softplus = if dt > 20.0f32 { dt } else { ln_1p(dt.exp()) };
         let g = -f32::cast_from(a_log[head]).exp() * softplus;
         decay[row] = g.exp();
         let b_value = f32::cast_from(b[row]);
         beta[row] = round_bf16(1.0f32 / (1.0f32 + (-b_value).exp()));
     }
+}
+
+/// `ln(1 + x)` for the softplus above. CUDA's `log1p` keeps a tiny x; the
+/// SPIR-V and MSL compilers lower `log1p` to `log(1 + x)`, which returns 0
+/// once x is below half an ulp of 1 (the Metal logarithm that "lost a tiny
+/// term before DeltaNet", 2026-10-01). The wgpu build therefore computes it
+/// with Goldberg's correction, exact when `1 + x` rounds to 1 and within a
+/// few ulps elsewhere. The CUDA build keeps its `log1p` unchanged.
+#[cfg(not(feature = "qwen3_5-wgpu"))]
+#[cube]
+fn ln_1p(x: f32) -> f32 {
+    x.log1p()
+}
+
+#[cfg(feature = "qwen3_5-wgpu")]
+#[cube]
+fn ln_1p(x: f32) -> f32 {
+    let w = 1.0f32 + x;
+    if w == 1.0f32 { x } else { w.ln() * x / (w - 1.0f32) }
 }
 
 #[cube(launch_unchecked)]

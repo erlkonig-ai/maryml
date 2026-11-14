@@ -8,11 +8,12 @@
 
 use burn::tensor::DType;
 use burn_cubecl::tensor::CubeTensor;
-use cubecl::{cuda::CudaRuntime, prelude::*};
+use cubecl::prelude::*;
+use super::Rt;
 use half::bf16;
 use triblespace::core::blob::{Blob, encodings::tensor::{Tensor as NativeTensor, elements::BF16}};
 use triblespace::prelude::{BlobStoreGet, Id, TribleSet};
-use crate::nn::cuda_bf16_alias::CudaBf16Aliases;
+use super::Binder;
 use super::{
     decoder_stack::{self, GroupSlots, Stack}, embedding_boundary,
     full_attention, gdn_decoder, gdn_mixer::GdnSlots, roles,
@@ -22,7 +23,7 @@ pub const VOCAB: usize = 248_078;
 /// Upstream tokenizer.json's `<embedding>`, not config's EOS 248044.
 pub const EMBEDDING_TOKEN: u32 = 248_077;
 pub const WEIGHT_ROLES: usize = decoder_stack::WEIGHT_ROLES + 1;
-pub type CudaTensor = CubeTensor<CudaRuntime>;
+pub type CudaTensor = CubeTensor<Rt>;
 
 pub struct PreparedDecoder {
     token_embedding: CudaTensor,
@@ -47,7 +48,7 @@ impl PreparedDecoder {
     /// A failure can retain registrations in the supplied binder/runtime.
     pub unsafe fn from_pile<R: BlobStoreGet>(
         facts: &TribleSet, snapshot: &R, root: Id,
-        aliases: &mut CudaBf16Aliases,
+        aliases: &mut Binder,
         selected: impl FnMut(&str, [u8; 32], &[u64], &[u8]) -> Result<(), String>,
     ) -> Result<Self, String> {
         // SAFETY: forwarded unchanged.
@@ -61,7 +62,7 @@ impl PreparedDecoder {
     /// As [`Self::from_pile`].
     pub unsafe fn from_pile_with<R: BlobStoreGet>(
         facts: &TribleSet, snapshot: &R, root: Id,
-        aliases: &mut CudaBf16Aliases,
+        aliases: &mut Binder,
         mut selected: impl FnMut(&str, [u8; 32], &[u64], &[u8]) -> Result<(), String>,
         precision: super::gdn_mixer::DecoderPrecision,
     ) -> Result<Self, String> {
@@ -133,7 +134,7 @@ impl PreparedDecoder {
         let dim = CubeDim::new_1d(64);
         // Every id and all fixed table/output extents were checked before the
         // dispatch. Raw table alias is never an output and is immutable.
-        unsafe { gather::launch_unchecked::<CudaRuntime>(
+        unsafe { gather::launch_unchecked::<Rt>(
             &weight.client, cubecl::calculate_cube_count_elemwise(&weight.client, count, dim), dim,
             ArrayArg::from_raw_parts(weight.handle.clone(), VOCAB * decoder_stack::HIDDEN),
             ArrayArg::from_raw_parts(ids_handle, ids.len()),
@@ -173,7 +174,7 @@ impl PreparedDecoder {
         let out = weight.client.empty(count * 2);
         let dim = CubeDim::new_1d(64);
         // Every id was validated and all extents are fixed above.
-        unsafe { gather::launch_unchecked::<CudaRuntime>(
+        unsafe { gather::launch_unchecked::<Rt>(
             &weight.client, cubecl::calculate_cube_count_elemwise(&weight.client, count, dim), dim,
             ArrayArg::from_raw_parts(weight.handle.clone(), VOCAB * decoder_stack::HIDDEN),
             ArrayArg::from_raw_parts(ids_handle, batch * tokens),

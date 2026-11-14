@@ -14,7 +14,7 @@
 
 use burn::tensor::DType;
 use triblespace::core::repo::BlobStoreGet;
-use crate::nn::cuda_bf16_alias::CudaBf16Aliases;
+use super::Binder;
 use super::{
     embedding_boundary::{self, Boundary, CudaTensor, FinalNormSlot},
     full_attention::{self, Positions},
@@ -83,7 +83,7 @@ impl Stack {
     /// second get can fetch/remap that content under another mmap owner:
     /// 425 binding calls for 425 roles, at most 425 weight registrations.
     pub unsafe fn from_pile<R: BlobStoreGet>(
-        snapshot: &R, slots: Slots, aliases: &mut CudaBf16Aliases,
+        snapshot: &R, slots: Slots, aliases: &mut Binder,
     ) -> Result<Self, String> {
         // SAFETY: forwarded unchanged.
         unsafe { Self::from_pile_with(snapshot, slots, aliases, super::gdn_mixer::DecoderPrecision::Bf16) }
@@ -96,7 +96,7 @@ impl Stack {
     /// # Safety
     /// As [`Self::from_pile`].
     pub unsafe fn from_pile_with<R: BlobStoreGet>(
-        snapshot: &R, slots: Slots, aliases: &mut CudaBf16Aliases,
+        snapshot: &R, slots: Slots, aliases: &mut Binder,
         precision: super::gdn_mixer::DecoderPrecision,
     ) -> Result<Self, String> {
         let Slots { groups, final_norm } = slots;
@@ -314,7 +314,7 @@ fn attention_config() -> full_attention::Config {
 
 unsafe fn bind_group<R: BlobStoreGet>(
     snapshot: &R, slots: GroupSlots, first_layer: usize,
-    aliases: &mut CudaBf16Aliases, precision: super::gdn_mixer::DecoderPrecision,
+    aliases: &mut Binder, precision: super::gdn_mixer::DecoderPrecision,
 ) -> Result<Group, String> {
     let [s0, s1, s2] = slots.gdn;
     // SAFETY: all calls forward from_pile's same snapshot/prefix lifetime.

@@ -118,7 +118,7 @@ fn find_bf16<const R: usize>(
         if &*observed != name { continue; }
         let blob: Blob<Tensor<BF16, R>> = snapshot.get(handle)
             .map_err(|e| format!("{name}: read native BF16 leaf {handle:?}: {e}"))?;
-        crate::nn::cuda_bf16_alias::checked_shape(&blob)
+        crate::nn::bf16_extent::checked_shape(&blob)
             .map_err(|e| format!("{name}: invalid native BF16 extent {handle:?}: {e}"))?;
         let view = crate::leaf::read_leaf(blob)
             .map_err(|e| format!("{name}: invalid native BF16 leaf {handle:?}: {e}"))?;

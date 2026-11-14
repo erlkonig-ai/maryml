@@ -11,17 +11,20 @@
 //! the vision tower through GPU scatter and explicit MRoPE positions. Raw
 //! image processing is available through the separately gated, bounded
 //! `wemm-input` codec/CUDA preparation API; video and batching remain open.
+//! The text leg alone (`text::TextWemm`: gather, decoder, boundary) also
+//! builds on CubeCL's wgpu runtime under `qwen3_5-wgpu`, BF16 only; see
+//! [`Rt`] and [`Binder`].
 
 pub mod config;
 pub mod layout;
 pub mod multimodal_layout;
-#[cfg(feature = "wemm-input")]
+#[cfg(any(feature = "wemm-input", feature = "qwen3_5-wgpu"))]
 pub mod input_codec;
 #[cfg(feature = "wemm-input")]
 pub mod image_prepare;
 #[cfg(feature = "wemm-input")]
 pub mod native;
-#[cfg(feature = "qwen3_5-cuda")]
+#[cfg(any(feature = "qwen3_5-cuda", feature = "qwen3_5-wgpu"))]
 pub mod position_table;
 #[cfg(feature = "qwen3_5-cuda")]
 pub mod multimodal;
@@ -42,31 +45,57 @@ pub mod deltanet;
 #[cfg(feature = "qwen3_5-gpu")]
 pub mod gdn_ops;
 
-#[cfg(feature = "qwen3_5-cuda")]
+#[cfg(any(feature = "qwen3_5-cuda", feature = "qwen3_5-wgpu"))]
 pub mod gdn_mixer;
 
-#[cfg(feature = "qwen3_5-cuda")]
+#[cfg(any(feature = "qwen3_5-cuda", feature = "qwen3_5-wgpu"))]
 pub mod full_attention;
 
-#[cfg(feature = "qwen3_5-cuda")]
+#[cfg(any(feature = "qwen3_5-cuda", feature = "qwen3_5-wgpu"))]
 mod decoder_ops;
 
-#[cfg(feature = "qwen3_5-cuda")]
+#[cfg(any(feature = "qwen3_5-cuda", feature = "qwen3_5-wgpu"))]
 pub mod gdn_decoder;
 
-#[cfg(feature = "qwen3_5-cuda")]
+#[cfg(any(feature = "qwen3_5-cuda", feature = "qwen3_5-wgpu"))]
 pub mod embedding_boundary;
 
-#[cfg(feature = "qwen3_5-cuda")]
+#[cfg(any(feature = "qwen3_5-cuda", feature = "qwen3_5-wgpu"))]
 pub mod decoder_stack;
 
-#[cfg(feature = "qwen3_5-cuda")]
+#[cfg(any(feature = "qwen3_5-cuda", feature = "qwen3_5-wgpu"))]
 pub mod prepared;
 
-#[cfg(feature = "qwen3_5-cuda")]
+#[cfg(any(feature = "qwen3_5-cuda", feature = "qwen3_5-wgpu"))]
 pub mod roles;
 
 #[cfg(feature = "qwen3_5-real-layer-trace")]
 pub mod outer_trace;
-#[cfg(all(feature = "qwen3_5-cuda", not(feature = "qwen3_5-real-layer-trace")))]
+#[cfg(all(any(feature = "qwen3_5-cuda", feature = "qwen3_5-wgpu"), not(feature = "qwen3_5-real-layer-trace")))]
 mod outer_trace;
+
+#[cfg(any(feature = "wemm-input", feature = "qwen3_5-wgpu"))]
+pub mod text;
+
+#[cfg(all(feature = "qwen3_5-wgpu", not(feature = "qwen3_5-cuda")))]
+mod tiled_projection;
+
+#[cfg(all(feature = "qwen3_5-cuda", feature = "qwen3_5-wgpu"))]
+compile_error!("qwen3_5-cuda and qwen3_5-wgpu select the one runtime the Qwen3.5 decoder is built for; enable one");
+
+/// The CubeCL runtime the text decoder (gather, the 32 blocks and the output
+/// boundary) is built for. CUDA unless `qwen3_5-wgpu` chooses wgpu, whose
+/// compiler is SPIR-V on Vulkan (`wemm-query-vulkan`) and MSL on Metal
+/// (`wemm-query-metal`). The same kernels compile for both.
+#[cfg(feature = "qwen3_5-cuda")]
+pub type Rt = cubecl::cuda::CudaRuntime;
+#[cfg(all(feature = "qwen3_5-wgpu", not(feature = "qwen3_5-cuda")))]
+pub type Rt = cubecl::wgpu::WgpuRuntime;
+
+/// How the decoder's BF16 leaves reach the device: CUDA aliases the pile's
+/// mapped pages (or copies them, by choice); wgpu always copies them into
+/// device buffers (`nn::wgpu_bf16_upload`).
+#[cfg(feature = "qwen3_5-cuda")]
+pub type Binder = crate::nn::cuda_bf16_alias::CudaBf16Aliases;
+#[cfg(all(feature = "qwen3_5-wgpu", not(feature = "qwen3_5-cuda")))]
+pub type Binder = crate::nn::wgpu_bf16_upload::WgpuBf16Uploads;

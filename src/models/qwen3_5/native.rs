@@ -17,107 +17,19 @@
 use std::fmt;
 
 use cubecl::cuda::CudaDevice;
-use sha2::{Digest, Sha256};
 use triblespace::{
     core::repo::BlobStoreGet,
     prelude::{Id, TribleSet},
 };
 
 use super::{
-    config::Qwen3_5Config,
     image_prepare::{Crop, DecodedRgba, GpuPreparer},
     input_codec::InputCodec,
     multimodal::{CudaTensor, PreparedMultimodal},
-    multimodal_layout,
 };
 use crate::nn::cuda_bf16_alias::{AliasStats, CudaBf16Aliases};
 
-/// Exact WeMM checkpoint configuration used by the native behavior fixtures.
-/// This is an asset checksum, not a collection or mapping identity.
-pub const CONFIG_SHA256: &str = "34abd67be4bab3d749ba7b3ad2daa5fc0a09ab12064a64f053fa244fa26c6004";
-/// The same configuration read back from facts: the SHA-256 of its
-/// [`crate::jsonfacts::canonical_string`], which is what the checkpoint's
-/// `config.json` (sha256 [`CONFIG_SHA256`]) canonicalizes to. A configuration
-/// stored as facts has no file bytes left to hash, and its canonical text is
-/// independent of map order and whitespace, so this pins the same values.
-pub const CONFIG_FACTS_SHA256: &str =
-    "719264c54581f878babd2d13317ffb1e23f5943dd424e3594a8d107fbd36d4d6";
-
-/// Validated owned assets. Bytes may be exact-fetched by the caller; this
-/// type neither opens files nor discovers asset/model records. Construct it
-/// BEFORE creating a CUDA alias session if malformed assets must initialize
-/// no GPU resources. Other template bytes are refused, not interpreted as Jinja.
-pub struct Assets {
-    config: Qwen3_5Config,
-    codec: InputCodec,
-}
-
-impl Assets {
-    /// From the checkpoint's own files, as the behavior fixtures use them.
-    pub fn from_bytes(config: &[u8], tokenizer: &[u8], template: &[u8]) -> Result<Self, String> {
-        if format!("{:x}", Sha256::digest(config)) != CONFIG_SHA256 {
-            return Err("unsupported WeMM configuration asset bytes".into());
-        }
-        let parsed_config =
-            Qwen3_5Config::from_json(std::str::from_utf8(config).map_err(|e| e.to_string())?)?;
-        multimodal_layout::validate_model(&parsed_config)?;
-        let codec = InputCodec::from_assets(tokenizer, template)?;
-        Ok(Self {
-            config: parsed_config,
-            codec,
-        })
-    }
-
-    /// From the model root itself: the tokenizer, configuration and chat
-    /// template that are part of `root`'s identity
-    /// ([`crate::ingest::RootParts`]), read from the same frozen facts and
-    /// reader the weights come from. No file is opened and nothing is
-    /// discovered; a root without all three parts is refused.
-    ///
-    /// The tokenizer is rebuilt from facts ([`crate::tokenizer::build_tokenizer`])
-    /// and so has no file bytes to pin. It is the root's own: selecting the
-    /// root selected it, and the root id is derived from its content, so it
-    /// cannot be paired with another model's weights the way a side-file
-    /// could. The configuration is pinned by [`CONFIG_FACTS_SHA256`] and the
-    /// template by its exact bytes, as before.
-    pub fn from_model_root<R: BlobStoreGet>(
-        facts: &TribleSet,
-        reader: &R,
-        root: Id,
-    ) -> Result<Self, String> {
-        let parts = crate::selection::model_root_parts(facts, root).map_err(|e| e.to_string())?;
-        let missing = |what: &str| format!("WeMM model root {root:X} has no {what} in its core");
-        let tokenizer = parts.tokenizer.ok_or_else(|| missing("tokenizer"))?;
-        let config = parts.config.ok_or_else(|| missing("config"))?;
-        let template = parts
-            .chat_template
-            .ok_or_else(|| missing("chat template"))?;
-        let config = crate::jsonfacts::load_json(facts, reader, config)
-            .map_err(|e| format!("read the WeMM configuration facts: {e}"))?;
-        let config = crate::jsonfacts::canonical_string(&config);
-        if format!("{:x}", Sha256::digest(config.as_bytes())) != CONFIG_FACTS_SHA256 {
-            return Err("unsupported WeMM configuration facts".into());
-        }
-        let parsed_config = Qwen3_5Config::from_json(&config)?;
-        multimodal_layout::validate_model(&parsed_config)?;
-        let tokenizer = crate::tokenizer::build_tokenizer(facts, reader, tokenizer)
-            .map_err(|e| format!("rebuild the WeMM tokenizer from facts: {e}"))?;
-        let template: anybytes::View<str> = reader
-            .get(template)
-            .map_err(|e| format!("read the WeMM chat template: {e}"))?;
-        let codec = InputCodec::from_tokenizer(tokenizer, template.as_bytes())?;
-        Ok(Self {
-            config: parsed_config,
-            codec,
-        })
-    }
-
-    /// The codec these assets frame input with, for a caller that also cuts
-    /// text into windows with it.
-    pub fn codec(&self) -> &InputCodec {
-        &self.codec
-    }
-}
+pub use super::text::{Assets, CONFIG_FACTS_SHA256, CONFIG_SHA256};
 
 /// A failed load does NOT unregister aliases. Keep/reuse the same caller's
 /// binder; creating a fresh binder for each retry defeats its registration
@@ -397,6 +309,7 @@ pub fn device_identity(device: &CudaDevice) -> Result<(String, i32, i32), String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
 
     #[test]
     fn unsupported_assets_fail_before_a_device_or_reader_is_needed() {

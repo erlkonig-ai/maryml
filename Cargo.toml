@@ -164,6 +164,17 @@ cuda-bf16-alias = ["dep:cubecl", "cubecl?/cuda", "dep:burn-cubecl", "burn/cuda",
 wemm-prepared-gate = ["qwen3_5-cuda", "dep:sha2"]
 wemm-input = ["qwen3_5-cuda", "tokenizer", "dep:image", "dep:tokenizers", "dep:sha2", "dep:cudarc"]
 wemm-layer1-reset = ["qwen3_5-real-layer-trace", "dep:sha2"]
+# WeMM's text query path (token table, 32 decoder blocks, output boundary;
+# no vision tower) on CubeCL's wgpu runtime instead of CUDA: the same kernels,
+# BF16 weights copied into device buffers (`nn::wgpu_bf16_upload`), and the
+# BF16 projections on a portable shared-memory tile kernel in place of the
+# CUDA-only MMA blueprint. No cudarc, no NVFP4. Excludes `qwen3_5-cuda`
+# (`models::qwen3_5::Rt` is one runtime). BF16 needs a compiler that emits
+# it, so pick the one for the platform: `wemm-query-vulkan` (SPIR-V; the
+# device must offer VK_KHR_shader_bfloat16) or `wemm-query-metal` (MSL).
+qwen3_5-wgpu = ["qwen3_5-gpu", "cubecl?/wgpu", "tokenizer", "dep:tokenizers", "dep:sha2"]
+wemm-query-vulkan = ["qwen3_5-wgpu", "cubecl?/vulkan"]
+wemm-query-metal = ["qwen3_5-wgpu", "cubecl?/metal"]
 # THE RESIDENT MIND, whole: `models::inkling::engine` (a Session, the
 # checkpoint's tokenizer, the incremental detokenizer and the host-side rank
 # link) plus `models::inkling::resident` (the turn vocabulary and the
@@ -1347,6 +1358,13 @@ required-features = ["wemm-input", "nvfp4-encode-cuda"]
 [[bin]]
 name = "wemm_suite"
 required-features = ["wemm-input"]
+
+# Embed query texts with WeMM's text leg (models::qwen3_5::text) on whichever
+# runtime the build selects: wgpu (`wemm-query-vulkan`/`wemm-query-metal`) or
+# CUDA (`wemm-input`), and write the [n,4096] f32 vectors.
+[[bin]]
+name = "wemm_query"
+required-features = ["qwen3_5-gpu", "tokenizer"]
 
 [[bin]]
 name = "flint_tokenizer_gate"

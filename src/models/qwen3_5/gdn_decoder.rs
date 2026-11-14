@@ -8,18 +8,18 @@
 
 use burn::tensor::DType;
 use burn_cubecl::tensor::CubeTensor;
-use cubecl::cuda::CudaRuntime;
+use super::Rt;
 use serde::{Deserialize, Serialize};
 use triblespace::core::{
     blob::{Blob, encodings::tensor::{Tensor as NativeTensor, elements::BF16}},
     inline::{Inline, encodings::hash::Handle},
     repo::BlobStoreGet,
 };
-use crate::nn::cuda_bf16_alias::CudaBf16Aliases;
+use super::Binder;
 use super::{decoder_ops::{norm, elementwise},
     gdn_mixer::{DecoderPrecision, GdnConfig, GdnMixer, GdnSlots, GdnState, Linear, bind_linear, project_linear}};
 
-pub type CudaTensor = CubeTensor<CudaRuntime>;
+pub type CudaTensor = CubeTensor<Rt>;
 pub type Slot<const R: usize> = Inline<Handle<NativeTensor<BF16, R>>>;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -56,7 +56,7 @@ impl Block {
     /// truncation/rewrite through CUDA runtime teardown; forwarded unchanged
     /// to the native binder and GdnMixer. Late errors may retain registrations.
     pub unsafe fn from_pile<R: BlobStoreGet>(
-        snapshot: &R, slots: Slots, config: Config, aliases: &mut CudaBf16Aliases,
+        snapshot: &R, slots: Slots, config: Config, aliases: &mut Binder,
     ) -> Result<Self, String> {
         // SAFETY: forwarded unchanged.
         unsafe { Self::from_pile_with(snapshot, slots, config, aliases, DecoderPrecision::Bf16) }
@@ -68,7 +68,7 @@ impl Block {
     /// # Safety
     /// As [`Self::from_pile`].
     pub unsafe fn from_pile_with<R: BlobStoreGet>(
-        snapshot: &R, slots: Slots, config: Config, aliases: &mut CudaBf16Aliases,
+        snapshot: &R, slots: Slots, config: Config, aliases: &mut Binder,
         precision: DecoderPrecision,
     ) -> Result<Self, String> {
         config.validate()?;

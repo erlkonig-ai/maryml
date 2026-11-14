@@ -21,7 +21,8 @@
 
 use burn::tensor::DType;
 use burn_cubecl::tensor::CubeTensor;
-use cubecl::{cuda::CudaRuntime, prelude::*};
+use cubecl::prelude::*;
+use super::Rt;
 use half::bf16;
 use serde::{Deserialize, Serialize};
 use triblespace::core::{
@@ -30,10 +31,11 @@ use triblespace::core::{
     repo::BlobStoreGet,
 };
 use super::{deltanet::{self, DeltaNetInputs}, gdn_ops, roles::LinearSlot};
-use crate::nn::cuda_bf16_alias::CudaBf16Aliases;
+use super::Binder;
+#[cfg(feature = "qwen3_5-cuda")]
 use crate::nn::nvfp4_gemv::Nvfp4;
 
-pub type CudaTensor = CubeTensor<CudaRuntime>;
+pub type CudaTensor = CubeTensor<Rt>;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 pub struct GdnConfig {
@@ -131,7 +133,7 @@ impl GdnMixer {
         snapshot: &R,
         slots: GdnSlots,
         config: GdnConfig,
-        aliases: &mut CudaBf16Aliases,
+        aliases: &mut Binder,
     ) -> Result<Self, String> {
         // SAFETY: forwarded unchanged.
         unsafe { Self::from_pile_with(snapshot, slots, config, aliases, DecoderPrecision::Bf16) }
@@ -147,7 +149,7 @@ impl GdnMixer {
         snapshot: &R,
         slots: GdnSlots,
         config: GdnConfig,
-        aliases: &mut CudaBf16Aliases,
+        aliases: &mut Binder,
         precision: DecoderPrecision,
     ) -> Result<Self, String> {
         config.validate()?;
@@ -364,6 +366,8 @@ pub enum BoundProjection {
 /// One decoder linear weight `[O, I]` and the arithmetic it runs on.
 pub(crate) enum Linear {
     Bf16(CudaTensor),
+    /// NVFP4 planes need the block-scaled CUDA MMA; a wgpu build has none.
+    #[cfg(feature = "qwen3_5-cuda")]
     Nvfp4 { weight: Nvfp4, precision: DecoderPrecision, stored: bool },
 }
 
@@ -372,12 +376,14 @@ impl Linear {
     pub(crate) fn bf16(&self) -> Result<&CudaTensor, String> {
         match self {
             Self::Bf16(t) => Ok(t),
+            #[cfg(feature = "qwen3_5-cuda")]
             Self::Nvfp4 { .. } => Err("projection is NVFP4, not BF16".into()),
         }
     }
 
     /// An NVFP4 weight already on the device: the root's stored leaf
     /// (`stored`), or quantized here from its BF16 leaf.
+    #[cfg(feature = "qwen3_5-cuda")]
     pub(crate) fn nvfp4(weight: Nvfp4, precision: DecoderPrecision, stored: bool) -> Result<Self, String> {
         if precision == DecoderPrecision::Bf16 {
             return Err("an NVFP4 weight needs an NVFP4 precision".into());
@@ -389,6 +395,7 @@ impl Linear {
     pub(crate) fn bound(&self) -> BoundProjection {
         match self {
             Self::Bf16(_) => BoundProjection::Bf16,
+            #[cfg(feature = "qwen3_5-cuda")]
             Self::Nvfp4 { precision, stored, .. } => BoundProjection::Nvfp4 { precision: *precision, stored: *stored },
         }
     }
@@ -397,6 +404,7 @@ impl Linear {
     pub(crate) fn bytes(&self) -> (u64, u64) {
         match self {
             Self::Bf16(t) => (t.meta.shape().as_slice().iter().product::<usize>() as u64 * 2, 0),
+            #[cfg(feature = "qwen3_5-cuda")]
             Self::Nvfp4 { weight, .. } => (0, weight.bytes()),
         }
     }
@@ -412,6 +420,7 @@ impl Linear {
                 }
                 Ok(())
             }
+            #[cfg(feature = "qwen3_5-cuda")]
             Self::Nvfp4 { weight, .. } => {
                 if [weight.n(), weight.k()] != shape || weight.device() != &like.device {
                     return Err(format!("{name}: NVFP4 weight is [{}, {}], wants {shape:?} on the same device", weight.n(), weight.k()));
@@ -429,8 +438,13 @@ impl Linear {
         if precision == DecoderPrecision::Bf16 {
             return Ok(None);
         }
-        let weight = Nvfp4::quantize(self.bf16()?).map_err(|e| format!("NVFP4 quantize: {e}"))?;
-        Self::nvfp4(weight, precision, false).map(Some)
+        #[cfg(feature = "qwen3_5-cuda")]
+        {
+            let weight = Nvfp4::quantize(self.bf16()?).map_err(|e| format!("NVFP4 quantize: {e}"))?;
+            Self::nvfp4(weight, precision, false).map(Some)
+        }
+        #[cfg(not(feature = "qwen3_5-cuda"))]
+        Err(format!("{} projections need the CUDA build", precision.label()))
     }
 }
 
@@ -446,11 +460,14 @@ impl Linear {
 pub(crate) unsafe fn bind_linear<R: BlobStoreGet>(
     snapshot: &R,
     slot: LinearSlot,
-    aliases: &mut CudaBf16Aliases,
+    aliases: &mut Binder,
     precision: DecoderPrecision,
 ) -> Result<Linear, String> {
     let slot = match slot {
         LinearSlot::Bf16(slot) => slot,
+        #[cfg(not(feature = "qwen3_5-cuda"))]
+        LinearSlot::Nvfp4(_) => return Err("this projection is stored as NVFP4, which needs the CUDA build".into()),
+        #[cfg(feature = "qwen3_5-cuda")]
         LinearSlot::Nvfp4(slot) => {
             // A stored NVFP4 projection: its code and scale planes are copied
             // into device memory once; nothing is converted or quantized.
@@ -463,7 +480,7 @@ pub(crate) unsafe fn bind_linear<R: BlobStoreGet>(
             let dims: [u64; 2] = view.dims().try_into().map_err(|_| "NVFP4 projection is not rank 2")?;
             let weight = Nvfp4::upload(view.payload(), dims, DType::BF16, aliases.device())
                 .map_err(|e| format!("NVFP4 upload: {e}"))?;
-            let client = CudaRuntime::client(aliases.device());
+            let client = Rt::client(aliases.device());
             for _ in 0..2 {
                 client.flush().map_err(|e| format!("flush after an NVFP4 upload: {e:?}"))?;
             }
@@ -475,21 +492,29 @@ pub(crate) unsafe fn bind_linear<R: BlobStoreGet>(
         // SAFETY: forwarded genuine immutable-prefix contract.
         return Ok(Linear::Bf16(unsafe { aliases.bind_pile_leaf(blob)? }));
     }
-    let shape = crate::nn::cuda_bf16_alias::checked_shape(&blob)?;
-    let view = crate::leaf::read_leaf(blob).map_err(|e| e.to_string())?;
-    let device = aliases.device().clone();
-    let client = CudaRuntime::client(&device);
-    let staged = client.create_from_slice(view.payload().as_ref());
-    let source = CubeTensor::new_contiguous(client.clone(), device, shape.as_slice().into(), staged, DType::BF16);
-    // Quantize reads the tensor amax back, which orders the upload before it.
-    let weight = Nvfp4::quantize(&source).map_err(|e| format!("NVFP4 quantize at load: {e}"))?;
-    drop(source);
-    // Free the upload's host staging and the transient device copy now (see
-    // CudaBf16Aliases' DeviceCopy note: two flushes release the host copy).
-    for _ in 0..2 {
-        client.flush().map_err(|e| format!("flush after an NVFP4 load: {e:?}"))?;
+    #[cfg(not(feature = "qwen3_5-cuda"))]
+    {
+        drop(blob);
+        Err(format!("{} projections need the CUDA build", precision.label()))
     }
-    Linear::nvfp4(weight, precision, false)
+    #[cfg(feature = "qwen3_5-cuda")]
+    {
+        let shape = crate::nn::bf16_extent::checked_shape(&blob)?;
+        let view = crate::leaf::read_leaf(blob).map_err(|e| e.to_string())?;
+        let device = aliases.device().clone();
+        let client = Rt::client(&device);
+        let staged = client.create_from_slice(view.payload().as_ref());
+        let source = CubeTensor::new_contiguous(client.clone(), device, shape.as_slice().into(), staged, DType::BF16);
+        // Quantize reads the tensor amax back, which orders the upload before it.
+        let weight = Nvfp4::quantize(&source).map_err(|e| format!("NVFP4 quantize at load: {e}"))?;
+        drop(source);
+        // Free the upload's host staging and the transient device copy now (see
+        // CudaBf16Aliases' DeviceCopy note: two flushes release the host copy).
+        for _ in 0..2 {
+            client.flush().map_err(|e| format!("flush after an NVFP4 load: {e:?}"))?;
+        }
+        Linear::nvfp4(weight, precision, false)
+    }
 }
 
 /// Pack one BF16 decoder projection `[n, k]` (its native leaf payload) for
@@ -498,6 +523,7 @@ pub(crate) unsafe fn bind_linear<R: BlobStoreGet>(
 /// [`bind_linear`] runs at load, code byte for code byte, scale byte for
 /// scale byte and global scale bit for bit. A stored root therefore runs
 /// exactly the weights a load-time quantization of the BF16 root runs.
+#[cfg(feature = "qwen3_5-cuda")]
 pub fn pack_projection_for_storage(
     name: &str,
     payload: &[u8],
@@ -508,7 +534,7 @@ pub fn pack_projection_for_storage(
     if payload.len() != n * k * 2 {
         return Err(format!("{name}: {} payload bytes for BF16 [{n}, {k}]", payload.len()));
     }
-    let client = CudaRuntime::client(device);
+    let client = Rt::client(device);
     let source = CubeTensor::new_contiguous(client.clone(), device.clone(), [n, k].as_slice().into(),
         client.create_from_slice(payload), DType::BF16);
     let weight = Nvfp4::quantize(&source).map_err(|e| format!("{name}: device quantize: {e}"))?;
@@ -552,10 +578,15 @@ pub fn is_vision_nvfp4_linear(name: &str) -> bool {
 /// An NVFP4 weight takes the B*T rows as one activation matrix; every row is
 /// computed independently of the others, as in the BF16 blueprint.
 pub(crate) fn project_linear(input: &CudaTensor, weight: &Linear) -> Result<CudaTensor, String> {
-    let (weight, precision) = match weight {
-        Linear::Bf16(t) => return project(input, t),
-        Linear::Nvfp4 { weight, precision, .. } => (weight, *precision),
-    };
+    match weight {
+        Linear::Bf16(t) => project(input, t),
+        #[cfg(feature = "qwen3_5-cuda")]
+        Linear::Nvfp4 { weight, precision, .. } => project_nvfp4(input, weight, *precision),
+    }
+}
+
+#[cfg(feature = "qwen3_5-cuda")]
+fn project_nvfp4(input: &CudaTensor, weight: &Nvfp4, precision: DecoderPrecision) -> Result<CudaTensor, String> {
     let s = input.meta.shape().as_slice().to_vec();
     if s.len() != 3 || s[2] != weight.k() {
         return Err("NVFP4 projection requires [B,T,I] with I the weight's input width".into());
@@ -582,15 +613,20 @@ fn project_impl(input: &CudaTensor, weight: &CudaTensor, serial: bool) -> Result
     let nw = check(weight, input, "projection weight", w, DType::BF16)?;
     let shape = [s[0], s[1], w[0]];
     let no = count(&shape)?;
+    #[cfg(feature = "qwen3_5-cuda")]
     if !serial && fixed_mma_shape(s[2], w[0]) {
         return project_mma(input, weight, shape, no);
+    }
+    #[cfg(not(feature = "qwen3_5-cuda"))]
+    if !serial {
+        return Ok(super::tiled_projection::project(input, weight, shape, no));
     }
     let output = input.client.empty(no * 2);
     let cube = CubeDim::new_1d(64);
     // SAFETY: checked contiguous BF16 inputs, u32-indexed extents and disjoint
     // fresh output; each thread owns one output and reads only bounded inputs.
     unsafe {
-        projection_kernel::launch_unchecked::<CudaRuntime>(
+        projection_kernel::launch_unchecked::<Rt>(
             &input.client, cubecl::calculate_cube_count_elemwise(&input.client, no, cube), cube,
             ArrayArg::from_raw_parts(input.handle.clone(), ni),
             ArrayArg::from_raw_parts(weight.handle.clone(), nw),
@@ -600,10 +636,12 @@ fn project_impl(input: &CudaTensor, weight: &CudaTensor, serial: bool) -> Result
     Ok(CubeTensor::new_contiguous(input.client.clone(), input.device.clone(), shape.into(), output, DType::BF16))
 }
 
+#[cfg(feature = "qwen3_5-cuda")]
 fn fixed_mma_shape(k: usize, n: usize) -> bool {
     k > 0 && n > 0 && k.is_multiple_of(16) && n.is_multiple_of(8)
 }
 
+#[cfg(feature = "qwen3_5-cuda")]
 fn projection_elems() -> cubek::matmul::definition::MatmulGlobalElems {
     use cubecl::ir::{ElemType, FloatKind, StorageType};
     let bf16 = StorageType::Scalar(ElemType::Float(FloatKind::BF16));
@@ -623,6 +661,7 @@ fn projection_elems() -> cubek::matmul::definition::MatmulGlobalElems {
 /// K stages within each partition, with no atomic or split-K output reduction.
 /// Bounds checks are always enabled, even for complete tiles, so crossing an
 /// M tile boundary does not switch to a different arithmetic configuration.
+#[cfg(feature = "qwen3_5-cuda")]
 fn projection_blueprint(m: usize, n: usize, k: usize) -> Result<cubek::matmul::definition::TilingBlueprint, String> {
     use cubek::matmul::{
         components::{stage::PartitionBuffering, tile::TileMatmulKind},
@@ -661,6 +700,7 @@ fn projection_blueprint(m: usize, n: usize, k: usize) -> Result<cubek::matmul::d
     Ok(blueprint)
 }
 
+#[cfg(feature = "qwen3_5-cuda")]
 #[cube(launch_unchecked)]
 fn projection_round(input: &Array<f32>, output: &mut Array<bf16>, n: usize) {
     let i = ABSOLUTE_POS as usize;
@@ -670,10 +710,11 @@ fn projection_round(input: &Array<f32>, output: &mut Array<bf16>, n: usize) {
 // Called only after the public descriptor/device/extent checks. Weight storage
 // remains the original aliased BF16 [N,K] handle: [K,N] strides [1,K] is a view,
 // not a transpose/cast/copy. F32 is accumulator/output scratch, never weights.
+#[cfg(feature = "qwen3_5-cuda")]
 fn project_mma(input: &CudaTensor, weight: &CudaTensor, shape: [usize; 3], no: usize) -> Result<CudaTensor, String> {
     use cubek::matmul::{definition::MatmulElems, launch::Strategy, routines::BlueprintStrategy};
     use cubek::std::InputBinding;
-    fn binding(handle: &cubecl::server::Handle, shape: [usize; 2], strides: [usize; 2]) -> TensorBinding<CudaRuntime> {
+    fn binding(handle: &cubecl::server::Handle, shape: [usize; 2], strides: [usize; 2]) -> TensorBinding<Rt> {
         TensorBinding {
             handle: handle.clone().binding(), shape: shape.into(), strides: strides.into(),
             runtime: core::marker::PhantomData,
@@ -696,7 +737,7 @@ fn project_mma(input: &CudaTensor, weight: &CudaTensor, shape: [usize; 3], no: u
     let cube = CubeDim::new_1d(128);
     // SAFETY: both handles own `no` elements, input F32/output BF16, one writer.
     unsafe {
-        projection_round::launch_unchecked::<CudaRuntime>(
+        projection_round::launch_unchecked::<Rt>(
             &input.client, cubecl::calculate_cube_count_elemwise(&input.client, no, cube), cube,
             ArrayArg::from_raw_parts(scratch, no), ArrayArg::from_raw_parts(output.clone(), no), no,
         );
@@ -722,7 +763,7 @@ fn channels(input: &CudaTensor, start: usize, width: usize) -> Result<CudaTensor
     let cube = CubeDim::new_1d(64);
     // SAFETY: checked contiguous source, bounded channel range and fresh output.
     unsafe {
-        channel_kernel::launch_unchecked::<CudaRuntime>(
+        channel_kernel::launch_unchecked::<Rt>(
             &input.client, cubecl::calculate_cube_count_elemwise(&input.client, n, cube), cube,
             ArrayArg::from_raw_parts(input.handle.clone(), ni),
             ArrayArg::from_raw_parts(output.clone(), n), n, s[2], start, width,
@@ -731,7 +772,7 @@ fn channels(input: &CudaTensor, start: usize, width: usize) -> Result<CudaTensor
     Ok(CubeTensor::new_contiguous(input.client.clone(), input.device.clone(), shape.into(), output, DType::BF16))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "qwen3_5-cuda"))]
 mod projection_tests {
     use super::*;
     use cubecl::cuda::CudaDevice;
@@ -784,7 +825,7 @@ mod projection_tests {
 
     fn fixture(shape: &[usize], rows: &[u32]) -> CudaTensor {
         let device = CudaDevice { index: 0 };
-        let client = CudaRuntime::client(&device);
+        let client = Rt::client(&device);
         let n = count(shape).unwrap();
         let width = *shape.last().unwrap();
         assert_eq!(rows.len() * width, n);
@@ -794,7 +835,7 @@ mod projection_tests {
         let cube = CubeDim::new_1d(128);
         // SAFETY: integer row table has one entry per output row, exact sizes.
         unsafe {
-            fixture_values::launch_unchecked::<CudaRuntime>(
+            fixture_values::launch_unchecked::<Rt>(
                 &client, cubecl::calculate_cube_count_elemwise(&client, n, cube), cube,
                 ArrayArg::from_raw_parts(handle.clone(), n),
                 ArrayArg::from_raw_parts(row_handle, rows.len()), n, width,

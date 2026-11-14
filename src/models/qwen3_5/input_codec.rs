@@ -395,6 +395,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "wemm-input")]
     #[ignore = "requires exact local checkpoint assets, metadata only; no GPU"]
     fn pinned_tokens_match_the_frozen_behavior_fixture() {
         let root = std::path::PathBuf::from(
