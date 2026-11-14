@@ -56,6 +56,8 @@
 #   gb10-lock.sh check <host>          -> prints the holder, rc 0 free, rc 3 held,
 #                                        rc 4 UNREACHABLE (state unknown -- never
 #                                        treat this as free OR as held)
+#   gb10-lock.sh refresh <host> <tag> -> rc 0 renewed, rc 3 no longer owned,
+#                                      rc 5 heartbeat metadata/write failure
 #
 # BUILDS TAKE THE LOCK TOO. A cargo build is not a measurement, but it is 20
 # cores of CPU contention on a unified-memory part, so it perturbs a neighbour's
@@ -217,7 +219,7 @@ ACTION=${1:-}; HOST=${2:-}; TAG=${3:-}
 usage() { sed -n '2,40p' "$0"; exit 2; }
 [ -z "$ACTION" ] && usage
 [ -z "$HOST" ] && usage
-case "$ACTION" in take|release) [ -z "$TAG" ] && usage ;; esac
+case "$ACTION" in take|refresh|release) [ -z "$TAG" ] && usage ;; esac
 
 # The payload is a QUOTED heredoc: nothing in it expands locally. Everything it
 # needs arrives as a positional argument. An unquoted heredoc would run $$,
@@ -262,12 +264,37 @@ write_info() {
   printf 'host=%s\ntag=%s\nstart=%s\nbeat=%s\n' "$ME" "$TAG" "$NOW" "$NOW" > "$1/info"
 }
 
-# A suffix makes in-place sed portable to both GNU and macOS sed. Never
-# announce a refreshed reservation if its heartbeat could not be written.
-refresh_info() {
-  sed -i.bak "s/^beat=.*/beat=$NOW/" "$1/info" || return 1
-  rm -f "$1/info.bak"
-}
+# Bind all writes to the directory whose ownership we verify. A release or
+# stale take may replace its pathname while we work; relative paths must never
+# follow us into that replacement holder. The final identity check distinguishes
+# updating a detached old directory from renewing the current reservation.
+# This does not serialize take/release or prevent a later release after success.
+refresh_info() (
+  case "$1" in /*) current=$1 ;; *) current="$PWD/$1" ;; esac
+  cd -- "$current" || { echo "REFUSING: reservation disappeared for $TAG"; exit 3; }
+  [ "$(tag_of .)" = "$TAG" ] || { echo "REFUSING: reservation changed for $TAG"; exit 3; }
+  tmp=$(mktemp .gb10-beat.XXXXXXXX) || { echo "ERROR: cannot stage heartbeat for $TAG"; exit 5; }
+  trap 'rm -f -- "$tmp"' EXIT
+  cp -p info "$tmp" || { echo "ERROR: cannot stage heartbeat metadata for $TAG"; exit 5; }
+  # A successful substitution alone does not prove that a heartbeat existed.
+  # Refuse absent, duplicate or malformed fields, leaving info unchanged.
+  if ! awk -v now="$NOW" '
+    /^beat=/ {
+      if ($0 !~ /^beat=[0-9]+$/) exit 1
+      beats++
+      print "beat=" now
+      next
+    }
+    { print }
+    END { if (beats != 1) exit 1 }
+  ' info > "$tmp"; then
+    echo "ERROR: cannot read/write a valid heartbeat for $TAG"; exit 5
+  fi
+  if ! mv -f -- "$tmp" ./info; then
+    echo "ERROR: cannot replace heartbeat for $TAG"; exit 5
+  fi
+  [ . -ef "$current" ] || { echo "REFUSING: reservation replaced during refresh for $TAG"; exit 3; }
+)
 
 case "$ACTION" in
   take)
@@ -278,7 +305,7 @@ case "$ACTION" in
     # same tag, and a third party taking it on your behalf. It can never put
     # two tags on one slot. Beat while we are here: a re-take is proof of life.
     if d=$(find_tag_dir); then
-      refresh_info "$d" || exit 4
+      refresh_info "$d" || exit $?
       echo "TAKEN $TAG (already held by you; beat refreshed)"; exit 0
     fi
     notes=""
@@ -324,7 +351,7 @@ case "$ACTION" in
     # enough that a crash costs one slot instead of the night.
     [ -n "$(held_dirs)" ] || { echo "NOT HELD"; exit 3; }
     d=$(find_tag_dir) || { echo "REFUSING: held by $(for x in $(held_dirs); do tag_of "$x"; done | paste -sd' '), not $TAG"; exit 3; }
-    refresh_info "$d" || exit 4
+    refresh_info "$d" || exit $?
     echo "BEAT $TAG"; exit 0
     ;;
   release)
@@ -342,8 +369,9 @@ esac
 REMOTE
 rc=$?
 # UNREACHABLE IS NOT FREE, AND IT IS NOT HELD. The remote payload exits only
-# 0 (free / action succeeded), 2 (usage) or 3 (held), so any other code came
-# from ssh or timeout, i.e. we never learned the lock's state at all. Before
+# 0 (free / action succeeded), 2 (usage), 3 (held/ownership lost), or 5
+# (heartbeat metadata/write failure). Other codes came from ssh or timeout,
+# i.e. we never learned the lock's state at all. Before
 # 2026-08-30 that surfaced as an ssh error on stderr and a non-matching stdout,
 # which every "wait until it says FREE" loop reads as "still held" -- so a
 # waiter sat on a box that DHCP had moved for 332 minutes, silently, because a
@@ -351,7 +379,7 @@ rc=$?
 # the loop. Give it its own word and its own exit code so a waiter can say
 # which one it is.
 case "$rc" in
-  0|2|3) exit "$rc" ;;
+  0|2|3|5) exit "$rc" ;;
   124) echo "UNREACHABLE $HOST: ssh timed out (60s)." ;;
   255) echo "UNREACHABLE $HOST: ssh could not connect or authenticate." ;;
   *)   echo "UNREACHABLE $HOST: ssh exited $rc." ;;
