@@ -321,6 +321,19 @@ impl Qwen3TtsWeights {
             self.folded_f16.len(),
         )
     }
+
+    /// The base root's ECAPA speaker encoder alone: the x-vector the talker is
+    /// conditioned on, trained to say whose voice a clip is. Hearing uses it to
+    /// compare the timbre of two clips without loading the rest of the voice.
+    pub fn speaker_encoder<B: Backend>(&self, device: &B::Device) -> SpeakerEncoder<B> {
+        let leaves = self
+            .exact
+            .iter()
+            .filter(|(name, _)| name.starts_with("speaker_encoder."))
+            .map(|(name, leaf)| (name.clone(), leaf.clone()))
+            .collect();
+        SpeakerEncoder::load(&WeightLoader::Typed(leaves), device)
+    }
 }
 
 impl Qwen3TtsWeights {
