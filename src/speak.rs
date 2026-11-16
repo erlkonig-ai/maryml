@@ -678,7 +678,8 @@ mod breeze_transport_tests {
             let config = BreezeVoiceConfig {
                 quantization: crate::persist::QUANTIZATION_NVFP4.to_owned(),
                 lane: crate::models::breeze::PROMPT_LANE,
-                reference_wav: reference_wav.clone(),
+                reference_wav: crate::models::breeze::reference::read_wav_bytes(&reference_wav)?
+                    .into(),
                 reference_text: std::fs::read_to_string(&transcript)?,
                 reference_cache: None,
                 direction: None,

@@ -6,7 +6,8 @@ use crate::models::qwen3tts::{config::SAMPLES_PER_FRAME, encoder::CodecEncoder};
 
 pub const SAMPLE_RATE: u32 = 24_000;
 pub const MAX_REFERENCE_SAMPLES: usize = SAMPLE_RATE as usize * 30;
-const MAX_WAV_BYTES: u64 = 16 * 1024 * 1024;
+/// The largest reference clip accepted, as stored bytes.
+pub const MAX_WAV_BYTES: usize = 16 * 1024 * 1024;
 
 /// Read a bounded 24 kHz PCM16/FLOAT32 WAV, mean-downmixing channels once.
 /// Other sample rates are explicit errors: we do not substitute a resampler.
@@ -19,11 +20,9 @@ pub fn read_wav(path: &Path) -> Result<Vec<f32>> {
 pub fn read_wav_bytes(path: &Path) -> Result<Vec<u8>> {
     let file = File::open(path).with_context(|| format!("open reference {}", path.display()))?;
     let mut bytes = Vec::new();
-    file.take(MAX_WAV_BYTES + 1).read_to_end(&mut bytes)?;
-    ensure!(
-        bytes.len() as u64 <= MAX_WAV_BYTES,
-        "reference WAV exceeds 16 MiB"
-    );
+    file.take(MAX_WAV_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    ensure!(bytes.len() <= MAX_WAV_BYTES, "reference WAV exceeds 16 MiB");
     Ok(bytes)
 }
 

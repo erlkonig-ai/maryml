@@ -5,6 +5,7 @@
 //! generated; each hop decodes its left context and new frames from fresh
 //! codec state, and no decoder state is carried between hops. No request
 //! can inject precomputed reference codes, a checkpoint path or a CPU LLM.
+use anybytes::Bytes;
 use anyhow::{Result, ensure};
 use cubecl::{
     Runtime,
@@ -24,7 +25,7 @@ use super::{
     nvfp4::PromptLane,
     pipeline::{self, Streamed},
     prompt::BreezeTokenizer,
-    reference::{decode_wav, encode_reference, read_wav_bytes},
+    reference::{MAX_WAV_BYTES, decode_wav, encode_reference},
     reference_cache::{ReferenceKey, encode_reference_cached},
 };
 use crate::{
@@ -44,7 +45,11 @@ pub struct BreezeVoiceConfig {
     /// How projections stored as NVFP4 multiply prompt-height activations
     /// (`breeze::PROMPT_LANE` unless a comparison asks otherwise).
     pub lane: PromptLane,
-    pub reference_wav: PathBuf,
+    /// The reference clip as stored (a 24 kHz WAV of at most
+    /// [`MAX_WAV_BYTES`]), however the caller came by it: a file or a pile
+    /// blob. It is decoded once at load, and the reference cache key is
+    /// derived from these bytes.
+    pub reference_wav: Bytes,
     /// Known transcript, not an ASR request. Outer whitespace is stripped once.
     pub reference_text: String,
     /// Where the clip's encoded codes are kept between loads
@@ -63,8 +68,12 @@ impl BreezeVoiceConfig {
     /// shared prompt/generator APIs for each target, never silently truncated.
     pub fn validate(&self) -> Result<()> {
         ensure!(
-            !self.quantization.is_empty() && !self.reference_wav.as_os_str().is_empty(),
-            "Breeze requires an explicit weight-format label and reference WAV path"
+            !self.quantization.is_empty() && !self.reference_wav.is_empty(),
+            "Breeze requires an explicit weight-format label and reference WAV"
+        );
+        ensure!(
+            self.reference_wav.len() <= MAX_WAV_BYTES,
+            "reference WAV exceeds 16 MiB"
         );
         ensure!(
             !self.reference_text.trim().is_empty() && self.reference_text.len() <= 65536,
@@ -175,7 +184,7 @@ impl BreezeResident {
         )?);
         let source_seconds = total.elapsed().as_secs_f64();
 
-        let wav_bytes = read_wav_bytes(&config.reference_wav)?;
+        let wav_bytes = config.reference_wav;
         let samples = decode_wav(&wav_bytes)?;
         let reference_samples = samples.len();
         let key = ReferenceKey::new(
@@ -368,7 +377,7 @@ pub(crate) fn test_config() -> BreezeVoiceConfig {
     BreezeVoiceConfig {
         quantization: crate::persist::QUANTIZATION_NVFP4.to_owned(),
         lane: super::PROMPT_LANE,
-        reference_wav: PathBuf::from("request-reference.wav"),
+        reference_wav: Bytes::from(b"RIFF".to_vec()),
         reference_text: "Known reference words.".to_owned(),
         reference_cache: None,
         direction: None,
@@ -395,6 +404,12 @@ mod tests {
         assert!(bad.validate().is_err());
         bad = original.clone();
         bad.options.temperature = f32::NAN;
+        assert!(bad.validate().is_err());
+        bad = original.clone();
+        bad.reference_wav = Bytes::from(Vec::<u8>::new());
+        assert!(bad.validate().is_err());
+        bad = original.clone();
+        bad.reference_wav = Bytes::from(vec![0_u8; MAX_WAV_BYTES + 1]);
         assert!(bad.validate().is_err());
         bad = original;
         bad.quantization.clear();
