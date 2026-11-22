@@ -69,8 +69,10 @@ pub enum Precision {
         block: usize,
     },
     /// E4M3 values with a UE8M0 power-of-two scale per `block` along the
-    /// input axis. The group declares `block_rows` x `block`; the stored
-    /// scale tensor still has one entry per row (see [`describe`]).
+    /// input axis. The group declares `block_rows` x `block`, but the stored
+    /// scales are per row: in the b85c3cfa release (experts 0 and 127 of
+    /// layers 20 and 23, read 2026-11-22) no group of 32 rows shares its
+    /// scale bytes. So a kernel needs 1 x `block` scales (see [`describe`]).
     Mxfp8 {
         block_rows: usize,
         block: usize,
