@@ -30,6 +30,10 @@ pub mod checkpoint;
 pub mod config;
 pub mod experts;
 pub mod layout;
+pub mod pile;
+pub mod release;
+#[cfg(feature = "inkling2-import")]
+pub mod import;
 pub mod schedule;
 
 pub use config::{Family, Inkling2LoopConfig, family_of, family_of_str};
