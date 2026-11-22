@@ -16,10 +16,14 @@
 //!   per-tensor precision from `hf_quant_config.json`;
 //! * [`checkpoint`]: a header-only inspection of a checkpoint directory
 //!   against that layout, and the explicit list of what Mary cannot run yet;
-//! * [`experts`]: the NVFP4 (amax / denominator) and MXFP8 weight decodes.
+//! * [`experts`]: the NVFP4 (amax / denominator) and MXFP8 weight decodes;
+//! * `sliding` (with `inkling-cuda`): one visit of a sliding layer outside
+//!   the looped core, on the device, with its K/V and conv state. Held to
+//!   transformers' own layer 0 by the `inkling2_layer0` binary.
 //!
-//! There is no forward here. Anything that would run the model is refused by
-//! [`checkpoint::require_native_forward`] with the operators still missing.
+//! There is no whole forward here. Anything that would run the model is
+//! refused by [`checkpoint::require_native_forward`] with the operators still
+//! missing.
 //!
 //! Pinned sources: the published release `thinkingmachines/Inkling-2-Mini` at
 //! b85c3cfa615fc413cc9af3379f491b963f3b586a (`fixtures/`), and transformers
@@ -31,5 +35,7 @@ pub mod config;
 pub mod experts;
 pub mod layout;
 pub mod schedule;
+#[cfg(feature = "inkling-cuda")]
+pub mod sliding;
 
 pub use config::{Family, Inkling2LoopConfig, family_of, family_of_str};
