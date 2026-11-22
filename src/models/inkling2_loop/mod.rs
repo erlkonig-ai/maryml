@@ -15,7 +15,8 @@
 //! * [`layout`]: checkpoint names to slots, with shapes from the config and
 //!   per-tensor precision from `hf_quant_config.json`;
 //! * [`checkpoint`]: a header-only inspection of a checkpoint directory
-//!   against that layout, and the explicit list of what Mary cannot run yet;
+//!   against that layout, and the explicit list of what Mary does not run
+//!   natively (vision, drafter, the declared activation quantisation);
 //! * [`experts`]: the NVFP4 (amax / denominator) and MXFP8 weight decodes;
 //! * `sliding` (with `inkling-cuda`): one visit of a sliding layer outside
 //!   the looped core, on the device, with its K/V and conv state. Held to
@@ -40,9 +41,11 @@
 //!   token sequences over it ([`session::MiniSession`]): token IDs in,
 //!   softcapped logits out, every layer visit's state carried.
 //!
-//! Outside `session` there is no whole forward. Anything that would run the model is
-//! refused by [`checkpoint::require_native_forward`] with the operators still
-//! missing.
+//! What the release declares beyond the text forward (the vision tower, the
+//! drafter, the declared expert activation quantisation) is not native:
+//! [`checkpoint::native_gaps`] names it, and the original Inkling's loader
+//! refuses a Mini config with that list and a pointer to the session
+//! ([`checkpoint::refusal_for_config`]).
 //!
 //! Pinned sources: the published release `thinkingmachines/Inkling-2-Mini` at
 //! b85c3cfa615fc413cc9af3379f491b963f3b586a (`fixtures/`), and transformers

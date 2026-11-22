@@ -7,10 +7,11 @@
 //! (`inkling2_loop`) it reads `hf_quant_config.json` and every
 //! `*.safetensors` header, checks every tensor against the layout (name,
 //! dtype, shape), prints the layer schedule with its per-visit state
-//! identities, and lists what Mary cannot run yet. It exits 0 only if the
-//! checkpoint is an exact bijection with the layout. Running the model is a
-//! separate question, which this tool answers in its last lines: Mary has no
-//! native Mini forward, and says which operators are missing.
+//! identities, and lists what Mary does not run natively. It exits 0 only if
+//! the checkpoint is an exact bijection with the layout. Running the model is
+//! a separate question, which this tool answers in its last lines: the text
+//! forward is native (`models::inkling2_loop::session`), and it names what the
+//! release declares beyond that.
 //!
 //! For the original Inkling (`inkling_mm_model`) it names the family and
 //! points at `inkling_layout_gate`, which checks that layout.
@@ -18,7 +19,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use mary::models::inkling2_loop::checkpoint::{inspect_dir, refuse};
+use mary::models::inkling2_loop::checkpoint::{NATIVE_TEXT, inspect_dir};
 use mary::models::inkling2_loop::layout::Precision;
 use mary::models::inkling2_loop::schedule::Segment;
 use mary::models::inkling2_loop::{Family, family_of_str};
@@ -138,8 +139,9 @@ fn main() -> ExitCode {
             format!("{} findings", ins.findings.len())
         }
     );
-    if let Err(e) = refuse(&ins.gaps) {
-        println!("forward   : {e}");
+    println!("text      : {NATIVE_TEXT}");
+    for g in &ins.gaps {
+        println!("not native: {}: {}", g.what, g.detail);
     }
     if bijection {
         ExitCode::SUCCESS
