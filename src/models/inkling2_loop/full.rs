@@ -259,6 +259,7 @@ impl FullLayer {
         state.pos += t;
         let out = residual + mlp_conv.clone();
         let rest = Taps {
+            gates: None,
             attn,
             attn_conv,
             mlp_input,
