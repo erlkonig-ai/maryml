@@ -53,7 +53,7 @@ use crate::models::inkling2_loop::layout::{
     AttnPart, ConvPart, Dtype, ExpertMat, ExpertPart, LayerPart, Slot,
 };
 
-type Dev = burn::backend::cuda::CudaDevice;
+pub(super) type Dev = burn::backend::cuda::CudaDevice;
 
 /// A stored tensor, as whoever holds the weights hands it over.
 pub struct Stored<'a> {
@@ -70,7 +70,7 @@ pub trait Weights {
     fn tensor(&self, name: &str) -> Result<Stored<'_>, String>;
 }
 
-fn want<'a>(w: &'a dyn Weights, slot: Slot, dtype: Dtype, shape: &[usize]) -> Result<Stored<'a>, String> {
+pub(super) fn want<'a>(w: &'a dyn Weights, slot: Slot, dtype: Dtype, shape: &[usize]) -> Result<Stored<'a>, String> {
     let name = slot.tensor_name();
     let t = w.tensor(&name)?;
     if t.dtype != dtype || t.shape != shape {
@@ -82,14 +82,14 @@ fn want<'a>(w: &'a dyn Weights, slot: Slot, dtype: Dtype, shape: &[usize]) -> Re
     Ok(t)
 }
 
-fn bf16_to_f32(bytes: &[u8]) -> Vec<f32> {
+pub(super) fn bf16_to_f32(bytes: &[u8]) -> Vec<f32> {
     bytes
         .chunks_exact(2)
         .map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32())
         .collect()
 }
 
-fn f32_le(bytes: &[u8]) -> Vec<f32> {
+pub(super) fn f32_le(bytes: &[u8]) -> Vec<f32> {
     bytes
         .chunks_exact(4)
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
@@ -107,10 +107,10 @@ pub enum ExpertAct {
     Bf16,
 }
 
-struct Expert {
-    gate: PackedW,
-    up: PackedW,
-    down: PackedW,
+pub(super) struct Expert {
+    pub(super) gate: PackedW,
+    pub(super) up: PackedW,
+    pub(super) down: PackedW,
 }
 
 /// The fixed sizes of a sliding layer.
@@ -161,16 +161,16 @@ impl Dims {
         }
     }
 
-    fn q_dim(&self) -> usize {
+    pub(super) fn q_dim(&self) -> usize {
         self.heads * self.head_dim
     }
 
-    fn kv_dim(&self) -> usize {
+    pub(super) fn kv_dim(&self) -> usize {
         self.kv_heads * self.head_dim
     }
 
     /// `1 / sqrt(k + 1)`, Mini's output scale on every static short conv.
-    fn conv_scale(&self) -> f32 {
+    pub(super) fn conv_scale(&self) -> f32 {
         1.0 / ((self.kernel + 1) as f32).sqrt()
     }
 }
@@ -483,7 +483,7 @@ impl SlidingLayer {
 
 /// Run one short convolution over `x`'s rows after the carried inputs in
 /// `hist`, and carry the last `k - 1` inputs forward.
-fn conv_step(hist: &mut Tensor<Bk, 2>, x: Tensor<Bk, 2>, w: &Tensor<Bk, 2>, scale: f32) -> Tensor<Bk, 2> {
+pub(super) fn conv_step(hist: &mut Tensor<Bk, 2>, x: Tensor<Bk, 2>, w: &Tensor<Bk, 2>, scale: f32) -> Tensor<Bk, 2> {
     let [t, c] = x.dims();
     let [keep, _] = hist.dims();
     let all = Tensor::cat(vec![hist.clone(), x], 0);
@@ -492,14 +492,14 @@ fn conv_step(hist: &mut Tensor<Bk, 2>, x: Tensor<Bk, 2>, w: &Tensor<Bk, 2>, scal
 }
 
 /// Scale each `[.., d]` vector down to `thr` when its L2 norm exceeds it.
-fn l2_clip(x: Tensor<Bk, 3>, thr: f32) -> Tensor<Bk, 3> {
+pub(super) fn l2_clip(x: Tensor<Bk, 3>, thr: f32) -> Tensor<Bk, 3> {
     let norm = x.clone().powf_scalar(2.0).sum_dim(2).sqrt();
     let f = norm.clone().ones_like().mul_scalar(thr).div(norm.add_scalar(1e-6)).clamp_max(1.0);
     x * f
 }
 
 /// RMS-normalise each `[.., d]` vector, with no gain.
-fn unit_rms(x: Tensor<Bk, 3>, eps: f64) -> Tensor<Bk, 3> {
+pub(super) fn unit_rms(x: Tensor<Bk, 3>, eps: f64) -> Tensor<Bk, 3> {
     let denom = x.clone().powf_scalar(2.0).mean_dim(2).add_scalar(eps).sqrt();
     x / denom
 }
@@ -508,7 +508,7 @@ fn unit_rms(x: Tensor<Bk, 3>, eps: f64) -> Tensor<Bk, 3> {
 /// learned query over the normed `[blocks.., partial]`, whose values are the
 /// same normed states. Upstream builds this norm with its default eps, 1e-6,
 /// not the config's.
-fn block_attention(query: Tensor<Bk, 1>, blocks: &[Tensor<Bk, 2>], partial: Tensor<Bk, 2>) -> Tensor<Bk, 2> {
+pub(super) fn block_attention(query: Tensor<Bk, 1>, blocks: &[Tensor<Bk, 2>], partial: Tensor<Bk, 2>) -> Tensor<Bk, 2> {
     let [t, h] = partial.dims();
     let mut all: Vec<Tensor<Bk, 3>> = blocks.iter().map(|b| b.clone().reshape([t, 1, h])).collect();
     all.push(partial.reshape([t, 1, h]));
@@ -520,7 +520,7 @@ fn block_attention(query: Tensor<Bk, 1>, blocks: &[Tensor<Bk, 2>], partial: Tens
     (normed * p).sum_dim(1).reshape([t, h])
 }
 
-fn bind_experts(
+pub(super) fn bind_experts(
     w: &dyn Weights,
     d: &Dims,
     layer: usize,

@@ -483,6 +483,12 @@ name = "inkling2_inspect"
 name = "inkling2_layer0"
 required-features = ["inkling-cuda"]
 
+# Inkling 2 Mini layer 5 (the first full-attention layer) on the device against
+# transformers' own capture (golden/capture_inkling2_global5.py).
+[[bin]]
+name = "inkling2_global5"
+required-features = ["inkling-cuda"]
+
 # Parity gate for the NVFP4 expert decode against compressed_tensors, which is
 # the library that defines this packing. Reads a small raw-binary oracle bundle.
 [[bin]]
