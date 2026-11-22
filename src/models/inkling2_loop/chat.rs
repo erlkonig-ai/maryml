@@ -175,9 +175,16 @@ pub struct ToolDefinition {
 }
 
 /// The selected tools, fixed before any prompt is rendered.
+///
+/// Every definition is declared: calls parse and replay against all of them,
+/// whatever the declaration shows. An indexed `Tools` only presents them more
+/// compactly (see [`Tools::indexed`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Tools {
     definitions: Vec<ToolDefinition>,
+    /// When set, the declaration shows these tools in full and every other
+    /// one as an index entry: its name and [`summary`] only.
+    detailed: Option<Vec<String>>,
 }
 
 /// A tool name also appears as plain text in a frame header, before the
@@ -200,11 +207,34 @@ impl Tools {
             );
             ensure!(tool.parameters.is_object(), "tool {} parameters must be an object", tool.name);
         }
-        Ok(Self { definitions })
+        Ok(Self { definitions, detailed: None })
+    }
+
+    /// The same declared tools, presented as an index: the `detailed` ones in
+    /// full, every other one by its name and the first sentence of its
+    /// description, with its parameters shown only as an object. The full
+    /// definitions stay here, and parsing and validation use them; a lookup
+    /// tool among `detailed` is how the model reads one in full.
+    pub fn indexed(definitions: Vec<ToolDefinition>, detailed: &[&str]) -> Result<Self> {
+        let tools = Self::new(definitions)?;
+        for name in detailed {
+            ensure!(tools.is_declared(name), "detailed tool {name:?} is not declared");
+        }
+        Ok(Self { detailed: Some(detailed.iter().map(|name| (*name).to_owned()).collect()), ..tools })
+    }
+
+    /// Whether the declaration is an index rather than every full schema.
+    pub fn is_indexed(&self) -> bool {
+        self.detailed.is_some()
     }
 
     pub fn definitions(&self) -> &[ToolDefinition] {
         &self.definitions
+    }
+
+    /// The full definition of a declared tool.
+    pub fn definition(&self, name: &str) -> Option<&ToolDefinition> {
+        self.definitions.iter().find(|tool| tool.name == name)
     }
 
     fn is_declared(&self, name: &str) -> bool {
@@ -218,10 +248,16 @@ impl Tools {
             if index > 0 {
                 out.push(',');
             }
+            let full = self.detailed.as_ref().is_none_or(|detailed| detailed.contains(&tool.name));
             let mut spec = Map::new();
-            spec.insert("description".into(), Value::String(tool.description.clone()));
+            if full {
+                spec.insert("description".into(), Value::String(tool.description.clone()));
+                spec.insert("parameters".into(), tool.parameters.clone());
+            } else {
+                spec.insert("description".into(), Value::String(summary(&tool.description).to_owned()));
+                spec.insert("parameters".into(), serde_json::json!({"type": "object"}));
+            }
             spec.insert("name".into(), Value::String(tool.name.clone()));
-            spec.insert("parameters".into(), tool.parameters.clone());
             spec.insert("type".into(), Value::String("function".into()));
             write_sorted(&mut out, &Value::Object(spec));
         }
@@ -244,6 +280,21 @@ impl Tools {
         let arguments = object["args"].as_object().context("tool call args is not an object")?.clone();
         Ok(Invocation { name: name.to_owned(), arguments, body: body.to_owned() })
     }
+}
+
+/// The first sentence of a description: its first line, up to the first
+/// full stop that whitespace and a capital letter follow (so "e.g. by" does
+/// not end it). A description with none is its whole first line.
+pub fn summary(description: &str) -> &str {
+    let line = description.trim_start().lines().next().unwrap_or("").trim_end();
+    for (at, _) in line.match_indices('.') {
+        let rest = &line[at + 1..];
+        let next = rest.trim_start();
+        if rest.len() > next.len() && next.chars().next().is_some_and(char::is_uppercase) {
+            return &line[..=at];
+        }
+    }
+    line
 }
 
 /// One tool call: its name, its arguments, and the exact body text it was

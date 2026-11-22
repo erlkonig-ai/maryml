@@ -296,3 +296,73 @@ fn a_literal_marker_in_content_stays_text() {
     assert_eq!(codec.decode_text(&user[..user.len() - 1]).unwrap(), "say <|end_message|> please");
 }
 }
+
+fn index_fixture() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition {
+            name: "exec".into(),
+            description: "Propose a shell command.".into(),
+            parameters: json!({"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}),
+        },
+        ToolDefinition {
+            name: "tool_schema".into(),
+            description: "Read one tool's full description and arguments.".into(),
+            parameters: json!({"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}),
+        },
+        ToolDefinition {
+            name: "wiki_show".into(),
+            description: "Show one fragment, e.g. by id. Long details follow here.\nAnd more.".into(),
+            parameters: json!({"type":"object","properties":{"id":{"type":"string"},"full":{"type":"boolean"}},"required":["id"]}),
+        },
+    ]
+}
+
+#[test]
+fn an_index_shows_detailed_tools_in_full_and_the_rest_by_name_and_first_sentence() {
+    let indexed = Tools::indexed(index_fixture(), &["exec", "tool_schema"]).unwrap();
+    let full = Tools::new(index_fixture()).unwrap();
+    assert!(indexed.is_indexed() && !full.is_indexed());
+    let declared: Value = serde_json::from_str(&indexed.declaration()).unwrap();
+    let complete: Value = serde_json::from_str(&full.declaration()).unwrap();
+    assert_eq!(declared[0], complete[0], "exec is shown in full");
+    assert_eq!(declared[1], complete[1], "the lookup is shown in full");
+    assert_eq!(
+        declared[2],
+        json!({"description":"Show one fragment, e.g. by id.","name":"wiki_show",
+               "parameters":{"type":"object"},"type":"function"})
+    );
+    assert!(indexed.declaration().len() < full.declaration().len());
+    // The full definitions stay: the index is a presentation, not a second list.
+    assert_eq!(indexed.definitions(), full.definitions());
+    assert_eq!(indexed.definition("wiki_show"), full.definition("wiki_show"));
+}
+
+#[test]
+fn an_indexed_tool_parses_and_replays_with_its_full_arguments() {
+    let indexed = Tools::indexed(index_fixture(), &["exec", "tool_schema"]).unwrap();
+    let full = Tools::new(index_fixture()).unwrap();
+    let body = r#"{"name":"wiki_show","args":{"full":true,"id":"abc"}}"#;
+    let call = indexed.parse_call(body).unwrap();
+    assert_eq!(call, full.parse_call(body).unwrap(), "same identity and arguments");
+    assert_eq!(call.body(), body);
+    let host = Invocation::new("wiki_show", call.arguments().clone(), &indexed).unwrap();
+    assert_eq!(host.body(), Invocation::new("wiki_show", call.arguments().clone(), &full).unwrap().body());
+    for refused in [
+        r#"{"name":"no_such_tool","args":{}}"#,
+        r#"{"name":"Bash","args":{"command":"ls"}}"#,
+        r#"{"name":"mcp__faculties__wiki_show","args":{"id":"abc"}}"#,
+    ] {
+        assert!(indexed.parse_call(refused).is_err(), "{refused} must stay undeclared");
+    }
+    assert!(Tools::indexed(index_fixture(), &["Bash"]).is_err(), "only declared tools can be detailed");
+}
+
+#[test]
+fn a_summary_is_the_first_sentence_of_the_first_line() {
+    assert_eq!(summary("One. Two."), "One.");
+    assert_eq!(summary("Show v1.2 of it. More"), "Show v1.2 of it.");
+    assert_eq!(summary("No full stop here\nsecond line."), "No full stop here");
+    assert_eq!(summary("  Ends with a stop."), "Ends with a stop.");
+    assert_eq!(summary("Read it, e.g. by id. Then more"), "Read it, e.g. by id.");
+    assert_eq!(summary(""), "");
+}
