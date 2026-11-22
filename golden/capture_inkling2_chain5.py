@@ -25,12 +25,16 @@ Recorded, float32 (indices int32), <run> in bf16 / f32, <phase> in prefill / ste
 phase `prefill` (the prompt), `step` (one more token through the cache), `whole` (both as one prefill, no cache,
 no states recorded).
 
-usage: python3 -I capture_inkling2_chain5.py <transformers/src> <release dir> <prepared dir> <out.safetensors> [deps]
+The CPU BF16 GEMM backend is pinned, not left to the image: `onednn` is `on` or `off` and sets
+torch.backends.mkldnn.enabled for both runs; it is recorded in the metadata with what torch reports.
+
+usage: python3 -I capture_inkling2_chain5.py <transformers/src> <release dir> <prepared dir> <out.safetensors> <onednn on|off> [deps]
 """
 import json, os, sys
 
-tf_src, model_dir, prepared, out_path = sys.argv[1:5]
-sys.path[:0] = [tf_src] + sys.argv[5:6]
+tf_src, model_dir, prepared, out_path, onednn = sys.argv[1:6]
+assert onednn in ("on", "off"), onednn
+sys.path[:0] = [tf_src] + sys.argv[6:7]
 
 import torch
 import transformers
@@ -47,6 +51,10 @@ STEP = 151083
 LAYERS = 6
 FULL = 5
 torch.manual_seed(0)
+torch.backends.mkldnn.enabled = onednn == "on"
+BACKEND = (f"mkldnn available={torch.backends.mkldnn.is_available()} enabled={torch.backends.mkldnn.enabled}"
+           f" threads={torch.get_num_threads()}")
+print(f"backend: {BACKEND}", file=sys.stderr)
 
 cfg = json.load(open(os.path.join(prepared, "config.json")))["text_config"]
 assert cfg["num_hidden_layers"] == LAYERS and cfg["local_layer_ids"] == list(range(FULL)), cfg
@@ -158,7 +166,7 @@ for run_ in ("f32", "bf16"):
 record["prompt"] = torch.tensor(PROMPT, dtype=torch.int32)
 record["step_token"] = torch.tensor([STEP], dtype=torch.int32)
 meta = {"transformers": "046bdb8cc2cee29d233964bb77fe6fd37cfe4aa3", "torch": torch.__version__,
-        "device": "cpu", "attn_implementation": "eager", "layers": "0..5",
+        "device": "cpu", "attn_implementation": "eager", "layers": "0..5", "cpu_backend": BACKEND,
         "inputs": "tokens only; nothing fed, both runs chain from the embedding",
         "conv_states": "0=k_proj.sconv 1=v_proj.sconv 2=post_attention_convolution 3=post_mlp_convolution"}
 save_file(record, out_path, metadata=meta)
