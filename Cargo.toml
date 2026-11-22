@@ -157,6 +157,8 @@ step-audio2 = ["tokenizer"]
 inkling2-import = ["import", "tokenizer", "dep:sha2", "dep:clap"]
 # The output head against upstream on the release weights in a pile (hashes the tensors).
 inkling2-head-check = ["dep:sha2"]
+# The whole Inkling 2 Mini text forward as a session over a pile root (models::inkling2_loop::session).
+inkling2-session = ["inkling-cuda", "tokenizer"]
 # Token-only Qwen2 CUDA decoder; reuses BF16 projections, not Qwen3.5 blocks.
 step-audio2-cuda = ["step-audio2", "qwen3_5-cuda"]
 step-audio2-cli = ["step-audio2-cuda", "dep:clap"]
@@ -521,6 +523,13 @@ required-features = ["inkling2-head-check"]
 [[bin]]
 name = "inkling2_tail_check"
 required-features = ["inkling-cuda", "inkling2-head-check"]
+
+# The whole Mini text forward as a session (models::inkling2_loop::session), on
+# the release's weights in a pile: cached decode against full replay, two
+# interleaved sessions, reset and replay, and optionally upstream's logits.
+[[bin]]
+name = "inkling2_session_check"
+required-features = ["inkling2-session"]
 
 # Inkling 2 Mini from the embedding through layer 5, chained, from a pile root,
 # against transformers' own run of the same layers (golden/capture_inkling2_chain5.py).
