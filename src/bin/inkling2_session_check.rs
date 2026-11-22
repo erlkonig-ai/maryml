@@ -16,10 +16,15 @@
 //! 3. **Refusals.** An out-of-table ID, an empty call and an oversized row
 //!    request are refused without moving the position.
 //! 4. **Upstream** (with `--upstream`): the replay's rows against
-//!    upstream's own f32 and bf16 logits for the same token IDs. A row passes
-//!    when its relative L2 to upstream f32 is within 1.5x upstream's own
-//!    bf16-vs-f32 distance on that row, as the layer checks; argmax and top-5
-//!    are reported for every row. Every row's error is printed, none dropped.
+//!    upstream's f32 and bf16 logits for the same token IDs, from
+//!    `golden/capture_inkling2_tail.py chained`. That reference is composed of
+//!    three upstream captures (layers 0..5, the core, the tail), and its f32
+//!    and bf16 runs share one seam (the core starts both from chain5's f32
+//!    layer-5 output, rounded to bf16), so its bf16-vs-f32 distance understates
+//!    a whole bf16 run's. It is not an independent end-to-end upstream run. A
+//!    row passes when its relative L2 to upstream f32 is within 1.5x that
+//!    distance, as the layer checks; argmax and top-5 are reported for every
+//!    row. Every row's error is printed, none dropped.
 //!
 //! usage: inkling2_session_check <pile> <collection> <root> <ids,comma,separated> <prompt_len>
 //!        [--upstream <reference.safetensors>] [--receipt <out.json>]
@@ -120,11 +125,20 @@ impl Report {
 /// one token per call. Returns one logits row per call after the prompt's
 /// last, starting with the prompt's.
 fn incremental(s: &mut MiniSession, ids: &[u32], prompt: usize) -> Vec<Vec<f32>> {
+    timed(s, ids, prompt).0
+}
+
+/// [`incremental`], with each call's wall time in seconds.
+fn timed(s: &mut MiniSession, ids: &[u32], prompt: usize) -> (Vec<Vec<f32>>, Vec<f64>) {
+    let t = Instant::now();
     let mut rows = vec![s.prefill(&ids[..prompt]).expect("prefill").last().to_vec()];
+    let mut secs = vec![t.elapsed().as_secs_f64()];
     for &id in &ids[prompt..] {
+        let t = Instant::now();
         rows.push(s.decode(id).expect("decode").last().to_vec());
+        secs.push(t.elapsed().as_secs_f64());
     }
-    rows
+    (rows, secs)
 }
 
 fn replay(model: &Arc<MiniModel>, ids: &[u32]) -> Logits {
@@ -167,10 +181,15 @@ fn main() {
     rep.say(format!("full replay of {n} tokens, {} rows, in {replay_s:.1} s; device {gpu2:?} MiB", full.rows));
     let mut b = MiniSession::new(Arc::clone(&model));
     let t2 = Instant::now();
-    let inc = incremental(&mut b, &ids, prompt);
+    let (inc, call_s) = timed(&mut b, &ids, prompt);
     let inc_s = t2.elapsed().as_secs_f64();
     rep.check("position after the incremental run", b.position() == n, format!("{} of {n}", b.position()));
-    rep.say(format!("incremental: prompt {prompt} then {} single tokens, {inc_s:.1} s", n - prompt));
+    let calls: Vec<String> = call_s.iter().map(|s| format!("{s:.2}")).collect();
+    rep.say(format!(
+        "incremental: prompt {prompt} then {} single tokens, {inc_s:.1} s (per call, prefill first: {} s)",
+        n - prompt,
+        calls.join(" ")
+    ));
     let mut cached = Vec::new();
     let mut worst = 0f64;
     let mut argmax_same = 0;
@@ -277,7 +296,7 @@ fn main() {
             let (r32, r16) = (&u32_[p * v..(p + 1) * v], &u16_[p * v..(p + 1) * v]);
             let mine = full.row(p);
             let spread = rel_l2(r16, r32);
-            let mut row = rep.row(&format!("replay row {p} vs upstream f32"), mine, r32);
+            let mut row = rep.row(&format!("replay row {p} vs composed upstream f32"), mine, r32);
             let ratio = row["rel_l2"].as_f64().unwrap() / spread.max(f64::MIN_POSITIVE);
             let a = top(mine, 1)[0];
             let ok = ratio <= TOL;
@@ -291,7 +310,7 @@ fn main() {
             upstream.push(row);
         }
         rep.check(
-            "replay rows within 1.5x upstream's own spread",
+            "replay rows within 1.5x the composed (shared-seam) upstream reference's own spread",
             within == n,
             format!("{within}/{n}; argmax = upstream f32 {am32}/{n}, = upstream bf16 {am16}/{n}"),
         );
@@ -310,7 +329,9 @@ fn main() {
             "pile": pile, "collection": args[2], "root": format!("{:X}", model.model_root()),
             "tokenizer_root": format!("{:X}", model.tokenizer_root()),
             "ids": ids, "prompt": prompt,
-            "bind_s": bind_s, "replay_s": replay_s, "incremental_s": inc_s,
+            "bind_s": bind_s, "replay_s": replay_s, "incremental_s": inc_s, "incremental_call_s": call_s,
+            "profile": if cfg!(debug_assertions) { "dev" } else { "release" },
+            "upstream_reference": flag("--upstream"),
             "device_mib": {"before": gpu0, "bound": gpu1, "after_replay": gpu2, "end": gpu3},
             "mem_available_mib": {"before": avail0, "bound": avail1},
             "cached_vs_replay": cached,

@@ -310,7 +310,8 @@ impl InklingConfig {
     /// Refuses a config of any other lineage before reading a field. Inkling 2
     /// Mini shares this model's tensor names and half its config keys, so a
     /// field-level parse is not a family check: a Mini config fails here only
-    /// because it says it is Mini, with the operators Mary lacks for it.
+    /// because it says it is Mini, with a pointer to its own session
+    /// (`models::inkling2_loop::session`) and what Mary does not run of it.
     pub fn from_json(s: &str) -> serde_json::Result<Self> {
         use crate::models::inkling2_loop::{Family, checkpoint, family_of};
         use serde::de::Error;

@@ -1,5 +1,5 @@
 //! What an Inkling 2 Mini checkpoint holds, read from its safetensors
-//! headers alone, and what Mary still cannot run of it.
+//! headers alone, and what of it Mary does not run natively.
 //!
 //! [`inspect_dir`] reads `config.json`, `hf_quant_config.json` and the
 //! *header* of every `*.safetensors` in a directory: the 8-byte length and
@@ -8,11 +8,12 @@
 //! (files, tensors, slots) next to what it found, so a clean report cannot
 //! come from looking at nothing.
 //!
-//! [`native_gaps`] is the list of operators and storage formats the release
-//! needs that Mary has no native implementation of yet. Any caller that would
-//! *run* the model goes through [`require_native_forward`] and gets that list
-//! as an error. Nothing is skipped and nothing falls back to the original
-//! Inkling's code.
+//! The text forward is native ([`NATIVE_TEXT`], `super::session`).
+//! [`native_gaps`] lists what the release declares beyond it: the vision
+//! tower, the drafter and the declared expert activation quantisation. Nothing
+//! is skipped silently and nothing falls back to the original Inkling's code;
+//! the original Inkling's loader refuses a Mini config and names the session
+//! ([`refusal_for_config`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
@@ -278,22 +279,29 @@ pub fn inspect_dir(dir: &Path) -> Result<(Inkling2LoopConfig, Inspection), Strin
     Ok((cfg, inspection))
 }
 
-/// Something the release needs that Mary does not have natively.
+/// Something the release declares that Mary does not run natively.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Gap {
     pub what: &'static str,
     pub detail: String,
 }
 
-/// The operators and formats between this checkpoint and a native forward.
+/// Where the native text forward is.
+pub const NATIVE_TEXT: &str = "the text forward (all 24 layers, the three-pass core, the head) runs natively \
+     as models::inkling2_loop::session::MiniModel / MiniSession (feature inkling2-session), with BF16 \
+     activations against the stored NVFP4 and MXFP8 weights, as transformers 046bdb8c computes";
+
+/// What the release declares beyond Mary's native text forward
+/// ([`NATIVE_TEXT`]).
 ///
-/// Mary's NVFP4 *weight decode* applies once the per-expert factor is
-/// formed (`experts::nvfp4_scale2`), and MXFP8 has a host decode
-/// (`experts::decode_mxfp8_row`); neither has a device GEMM on this path yet,
-/// so both stay listed.
+/// The looped core, the cross-pass messages, the block attention residual,
+/// the attention variant, the dynamic K/V convolutions and the softcaps are
+/// native (`sliding`, `full`, `loop_core`, `head`, `session`), so they are not
+/// listed. What remains is the vision tower, the drafter, and the activation
+/// quantisation `hf_quant_config.json` declares for the experts: the session
+/// multiplies BF16 activations, as upstream does, and never runs the declared
+/// NVFP4 `fouroversix_mae` or MXFP8 `e4m3` activation formats.
 pub fn native_gaps(cfg: &Inkling2LoopConfig, experts: &BTreeMap<usize, Precision>) -> Vec<Gap> {
-    let t = &cfg.text_config;
-    let l = &t.loop_config;
     let layers = |p: fn(&Precision) -> bool| -> Vec<usize> {
         experts
             .iter()
@@ -303,70 +311,23 @@ pub fn native_gaps(cfg: &Inkling2LoopConfig, experts: &BTreeMap<usize, Precision
     };
     let nvfp4 = layers(|p| matches!(p, Precision::Nvfp4 { .. }));
     let mxfp8 = layers(|p| matches!(p, Precision::Mxfp8 { .. }));
-    let mut gaps = vec![
-        Gap {
-            what: "looped core",
-            detail: format!(
-                "layers {}..{} run {} passes with separate KV and conv state per pass; \
-                 passes after the first restart from the pre-loop state",
-                l.core_start, l.core_end, l.num_passes
-            ),
-        },
-        Gap {
-            what: "cross-pass messages",
-            detail: format!(
-                "attention over the previous pass's block states with 4 learned queries \
-                 per core layer, then 4 rank-{} message gates (Q, K, V, MLP)",
-                l.gate_rank
-            ),
-        },
-        Gap {
-            what: "block attention residual",
-            detail: format!(
-                "attention-residual inputs before every attention (3 queries on global \
-                 layers), MLP and the final norm, blocks of {} layers",
-                t.n_layers_per_attn_res_block
-            ),
-        },
-        Gap {
-            what: "attention variant",
-            detail: format!(
-                "per-head scaled L2 clip of Q/K ({}) and of the relative state ({}) in place \
-                 of QK-norm, a learned sink per head, a sigmoid output gate, log scaling past {}",
-                t.qk_l2_clip_threshold, t.rel_l2_clip_threshold, t.log_scaling_n_floor
-            ),
-        },
-        Gap {
-            what: "dynamic K/V convolution",
-            detail: "global layers predict their K and V short-conv kernels from the input \
-                     (weight_proj + static_w)"
-                .to_string(),
-        },
-        Gap {
-            what: "softcapped experts and logits",
-            detail: format!(
-                "expert gate softcap {}, up softcap {}, final logit softcap {}",
-                t.mlp_gate_softcap, t.mlp_up_softcap, t.final_logit_softcapping
-            ),
-        },
-    ];
+    let mut gaps = Vec::new();
     if !nvfp4.is_empty() {
         gaps.push(Gap {
-            what: "NVFP4 expert lane",
+            what: "declared NVFP4 activation quantisation",
             detail: format!(
-                "layers {nvfp4:?}: weights decode through Mary's NVFP4 codec with \
-                 scale2 = amax / outer_scale_denominator, but activations use the \
-                 'fouroversix_mae' per-token scale rule, which Mary's quantiser does not \
-                 implement"
+                "layers {nvfp4:?}: the weights run natively (scale2 = amax / outer_scale_denominator); \
+                 the declared 'fouroversix_mae' per-token activation scale is not implemented, so \
+                 activations stay BF16"
             ),
         });
     }
     if !mxfp8.is_empty() {
         gaps.push(Gap {
-            what: "MXFP8 expert lane",
+            what: "declared MXFP8 activation quantisation",
             detail: format!(
-                "layers {mxfp8:?}: E4M3 values with UE8M0 scales per 32; host decode only, \
-                 no device GEMM (sm_121 kind::mxf8f6f4 is untested in Mary)"
+                "layers {mxfp8:?}: the weights decode exactly to BF16 on the host and multiply as \
+                 BF16; the declared 'mxfp8_e4m3' activation format and an MXFP8 device GEMM are not run"
             ),
         });
     }
@@ -389,15 +350,17 @@ pub fn native_gaps(cfg: &Inkling2LoopConfig, experts: &BTreeMap<usize, Precision
     gaps
 }
 
-/// Refuse to run a model whose forward Mary does not have.
+/// What a caller that wants more than text gets: an error naming what is
+/// native and what is not. Text inference itself is not refused; it is
+/// [`NATIVE_TEXT`].
 pub fn require_native_forward(cfg: &Inkling2LoopConfig) -> Result<(), String> {
     // Without hf_quant_config the expert precisions are unknown, so name the
     // gaps that do not depend on them.
-    let gaps = native_gaps(cfg, &BTreeMap::new());
-    refuse(&gaps)
+    refuse(&native_gaps(cfg, &BTreeMap::new()))
 }
 
-/// The refusal text for a list of gaps.
+/// The text naming what is native and what is not, as an error when
+/// anything is not.
 pub fn refuse(gaps: &[Gap]) -> Result<(), String> {
     if gaps.is_empty() {
         return Ok(());
@@ -407,19 +370,24 @@ pub fn refuse(gaps: &[Gap]) -> Result<(), String> {
         .map(|g| format!("{}: {}", g.what, g.detail))
         .collect();
     Err(format!(
-        "Inkling 2 Mini (inkling2_loop) is recognised, but Mary has no native forward \
-         for it yet; it is not loaded as the original Inkling. Missing: {}",
+        "Inkling 2 Mini (inkling2_loop): {NATIVE_TEXT}. Not native: {}",
         list.join("; ")
     ))
 }
 
 /// The explanation a loader of the original Inkling gives when handed a
-/// Mini config: parse it as what it is, then refuse with the gaps.
+/// Mini config: it is never loaded as the original Inkling, whatever Mary
+/// runs of it; it opens as a Mini session.
 pub fn refusal_for_config(text: &str) -> String {
     match Inkling2LoopConfig::from_json(text) {
-        Ok(cfg) => require_native_forward(&cfg)
-            .err()
-            .unwrap_or_else(|| "Inkling 2 Mini has no native forward in this crate".to_string()),
+        Ok(cfg) => {
+            let rest = require_native_forward(&cfg).err().map(|e| format!(" ({e})")).unwrap_or_default();
+            format!(
+                "Inkling 2 Mini (inkling2_loop) is recognised, but it is not loaded as the original \
+                 Inkling: open it with models::inkling2_loop::session::MiniModel (feature \
+                 inkling2-session){rest}"
+            )
+        }
         Err(e) => e,
     }
 }
@@ -556,14 +524,22 @@ mod tests {
     }
 
     #[test]
-    fn running_it_is_refused_with_the_gaps() {
+    fn the_original_loader_is_pointed_at_the_session_with_the_gaps() {
         let e = refusal_for_config(CONFIG);
-        assert!(e.contains("recognised") && e.contains("looped core"), "{e}");
+        assert!(e.contains("recognised") && e.contains("session::MiniModel"), "{e}");
         assert!(e.contains("not loaded as the original Inkling"), "{e}");
+        assert!(e.contains("vision tower") && e.contains("drafter"), "{e}");
         let (cfg, p) = setup();
         let ins = inspect(&cfg, &p, &pinned()).unwrap();
-        assert!(ins.gaps.iter().any(|g| g.what == "MXFP8 expert lane"));
-        assert!(refuse(&ins.gaps).is_err());
+        let what: Vec<&str> = ins.gaps.iter().map(|g| g.what).collect();
+        assert!(what.contains(&"declared MXFP8 activation quantisation"), "{what:?}");
+        assert!(what.contains(&"declared NVFP4 activation quantisation"), "{what:?}");
+        // the text operators are native now and must not be listed as missing
+        for native in ["looped core", "cross-pass messages", "block attention residual", "attention variant"] {
+            assert!(!what.contains(&native), "{native} listed as missing: {what:?}");
+        }
+        let text = refuse(&ins.gaps).unwrap_err();
+        assert!(text.contains("runs natively"), "{text}");
     }
 }
 
@@ -584,7 +560,7 @@ mod original_inkling_loader {
             e.contains("Inkling 2 Mini (inkling2_loop) is recognised"),
             "{e}"
         );
-        assert!(e.contains("cross-pass messages"), "{e}");
+        assert!(e.contains("session::MiniModel"), "{e}");
         let other = InklingConfig::from_json(r#"{"model_type":"inkling2"}"#).unwrap_err();
         assert!(other.to_string().contains("Inkling 2 Small"), "{other}");
     }
