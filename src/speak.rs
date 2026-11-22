@@ -226,6 +226,8 @@ impl Qwen3TtsWeights {
                             Elem::F16 => "f16",
                             Elem::Bf16 => "bf16",
                             Elem::Nvfp4 => "nvfp4",
+                            Elem::U8 => "u8",
+                            Elem::E4m3 => "e4m3",
                         },
                         if f16 { "f16" } else { "f32" }
                     );

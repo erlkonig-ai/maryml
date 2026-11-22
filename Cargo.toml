@@ -153,6 +153,8 @@ breeze-cuda = ["breeze", "qwen3_5-cuda", "qwen3tts"]
 breeze-cli = ["breeze-cuda", "dep:clap"]
 # Step-Audio2 Mini's pile assets and text/speech token codec. No model runtime.
 step-audio2 = ["tokenizer"]
+# Inkling 2 Mini source-exact import into a model collection.
+inkling2-import = ["import", "tokenizer", "dep:sha2", "dep:clap"]
 # Token-only Qwen2 CUDA decoder; reuses BF16 projections, not Qwen3.5 blocks.
 step-audio2-cuda = ["step-audio2", "qwen3_5-cuda"]
 step-audio2-cli = ["step-audio2-cuda", "dep:clap"]
@@ -474,6 +476,10 @@ required-features = ["inkling-cuda"]
 # Inkling 2 Mini's counterpart, and the family check for any Inkling directory:
 # config.json, hf_quant_config.json and safetensors HEADERS only, against
 # `models::inkling2_loop::layout`. No backend, so no feature.
+[[bin]]
+name = "inkling2_import"
+required-features = ["inkling2-import"]
+
 [[bin]]
 name = "inkling2_inspect"
 

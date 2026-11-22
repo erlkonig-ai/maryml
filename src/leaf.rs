@@ -39,7 +39,7 @@
 
 use anyhow::{Context, Result};
 use triblespace::core::attribute::Attribute;
-use triblespace::core::blob::encodings::tensor::elements::{BF16, F16, F32, NVFP4};
+use triblespace::core::blob::encodings::tensor::elements::{BF16, E4M3, F16, F32, NVFP4, U8};
 use triblespace::core::blob::encodings::tensor::{Tensor, TensorElement, TensorView, tensor_blob};
 use triblespace::core::blob::{Blob, TryFromBlob};
 use triblespace::core::id_hex;
@@ -75,6 +75,14 @@ pub enum Elem {
     /// Packed NVFP4: E2M1 codes with E4M3 block scales and one global scale in
     /// the payload (`crate::nvfp4`). Reading it as f32 decodes on the host.
     Nvfp4,
+    /// Raw bytes, stored as the source stored them: packed codes or
+    /// power-of-two scales a checkpoint keeps in a `U8` tensor. What they
+    /// mean is the reader's layout, not this element; [`Leaf::to_f32`] gives
+    /// the byte values.
+    U8,
+    /// OCP FP8 E4M3 (bias 7, no infinities), e.g. a checkpoint's NVFP4 block
+    /// scales or MXFP8 values, stored unscaled as the source stored them.
+    E4m3,
 }
 
 impl Elem {
@@ -85,6 +93,8 @@ impl Elem {
             Elem::F16 => <F16 as TensorElement>::payload_len(elems),
             Elem::Bf16 => <BF16 as TensorElement>::payload_len(elems),
             Elem::Nvfp4 => <NVFP4 as TensorElement>::payload_len(elems),
+            Elem::U8 => <U8 as TensorElement>::payload_len(elems),
+            Elem::E4m3 => <E4M3 as TensorElement>::payload_len(elems),
         }
     }
 }
@@ -135,7 +145,7 @@ impl Leaf {
     pub fn view_f32(&self) -> Option<anybytes::View<[f32]>> {
         match self.elem {
             Elem::F32 => self.payload.clone().view::<[f32]>().ok(),
-            Elem::F16 | Elem::Bf16 | Elem::Nvfp4 => None,
+            Elem::F16 | Elem::Bf16 | Elem::Nvfp4 | Elem::U8 | Elem::E4m3 => None,
         }
     }
 
@@ -144,7 +154,7 @@ impl Leaf {
     pub fn view_f16(&self) -> Option<anybytes::View<[half::f16]>> {
         match self.elem {
             Elem::F16 => self.payload.clone().view::<[half::f16]>().ok(),
-            Elem::F32 | Elem::Bf16 | Elem::Nvfp4 => None,
+            Elem::F32 | Elem::Bf16 | Elem::Nvfp4 | Elem::U8 | Elem::E4m3 => None,
         }
     }
 
@@ -153,7 +163,7 @@ impl Leaf {
     pub fn view_bf16(&self) -> Option<anybytes::View<[half::bf16]>> {
         match self.elem {
             Elem::Bf16 => self.payload.clone().view::<[half::bf16]>().ok(),
-            Elem::F32 | Elem::F16 | Elem::Nvfp4 => None,
+            Elem::F32 | Elem::F16 | Elem::Nvfp4 | Elem::U8 | Elem::E4m3 => None,
         }
     }
 
@@ -183,6 +193,12 @@ impl Leaf {
                 .collect(),
             Elem::Nvfp4 => crate::nvfp4::decode_payload(&self.payload, self.elems())
                 .expect("an NVFP4 leaf payload is sized by its encoding"),
+            Elem::U8 => self.payload.iter().map(|&b| b as f32).collect(),
+            Elem::E4m3 => self
+                .payload
+                .iter()
+                .map(|&b| crate::nvfp4::e4m3_to_f32(b))
+                .collect(),
         }
     }
 
@@ -327,6 +343,12 @@ macro_rules! leaf_by_rank {
             (Elem::Nvfp4, 1) => leaf_entity!($blobs, $head, NVFP4, 1, dims, $payload, $what),
             (Elem::Nvfp4, 2) => leaf_entity!($blobs, $head, NVFP4, 2, dims, $payload, $what),
             (Elem::Nvfp4, 3) => leaf_entity!($blobs, $head, NVFP4, 3, dims, $payload, $what),
+            (Elem::U8, 1) => leaf_entity!($blobs, $head, U8, 1, dims, $payload, $what),
+            (Elem::U8, 2) => leaf_entity!($blobs, $head, U8, 2, dims, $payload, $what),
+            (Elem::U8, 3) => leaf_entity!($blobs, $head, U8, 3, dims, $payload, $what),
+            (Elem::E4m3, 1) => leaf_entity!($blobs, $head, E4M3, 1, dims, $payload, $what),
+            (Elem::E4m3, 2) => leaf_entity!($blobs, $head, E4M3, 2, dims, $payload, $what),
+            (Elem::E4m3, 3) => leaf_entity!($blobs, $head, E4M3, 3, dims, $payload, $what),
             (_, r) => anyhow::bail!(
                 "{}: rank {r} exceeds the ranks this format dispatches (0..=6); \
                  add an arm rather than flattening",
@@ -421,6 +443,12 @@ pub fn resolve(tribles: &TribleSet, blobs: &impl BlobStoreGet, weight: Id) -> Re
     typed!(NVFP4, 1, Elem::Nvfp4);
     typed!(NVFP4, 2, Elem::Nvfp4);
     typed!(NVFP4, 3, Elem::Nvfp4);
+    typed!(U8, 1, Elem::U8);
+    typed!(U8, 2, Elem::U8);
+    typed!(U8, 3, Elem::U8);
+    typed!(E4M3, 1, Elem::E4m3);
+    typed!(E4M3, 2, Elem::E4m3);
+    typed!(E4M3, 3, Elem::E4m3);
 
     if hits > 0 {
         anyhow::ensure!(
@@ -598,6 +626,12 @@ pub fn index_typed_all(
     sweep_all!(NVFP4, 1, Elem::Nvfp4);
     sweep_all!(NVFP4, 2, Elem::Nvfp4);
     sweep_all!(NVFP4, 3, Elem::Nvfp4);
+    sweep_all!(U8, 1, Elem::U8);
+    sweep_all!(U8, 2, Elem::U8);
+    sweep_all!(U8, 3, Elem::U8);
+    sweep_all!(E4M3, 1, Elem::E4m3);
+    sweep_all!(E4M3, 2, Elem::E4m3);
+    sweep_all!(E4M3, 3, Elem::E4m3);
 
     map
 }
@@ -641,6 +675,12 @@ pub fn typed_leaf_attrs() -> Vec<(String, Id)> {
     name_all!(BF16, 4, "bf16");
     name_all!(BF16, 5, "bf16");
     name_all!(BF16, 6, "bf16");
+    name_all!(U8, 1, "u8");
+    name_all!(U8, 2, "u8");
+    name_all!(U8, 3, "u8");
+    name_all!(E4M3, 1, "e4m3");
+    name_all!(E4M3, 2, "e4m3");
+    name_all!(E4M3, 3, "e4m3");
 
     out
 }
@@ -706,7 +746,7 @@ pub(crate) fn fixture_leaf(
                     .map(|&v| half::bf16::from_f32(v))
                     .collect::<Vec<half::bf16>>(),
             ),
-            Elem::Nvfp4 => panic!("fixture leaves are dense"),
+            Elem::Nvfp4 | Elem::U8 | Elem::E4m3 => panic!("fixture leaves are dense floats"),
         }
     };
 
@@ -755,7 +795,9 @@ pub(crate) fn fixture_leaf(
                     );
                     triblespace::macros::entity! { _ @ attrs::data_f16: data, attrs::shape: shape }
                 }
-                Elem::Bf16 | Elem::Nvfp4 => panic!("the two-blob form has no bf16 or packed leaves"),
+                Elem::Bf16 | Elem::Nvfp4 | Elem::U8 | Elem::E4m3 => {
+                    panic!("the two-blob form has no bf16, packed or byte leaves")
+                }
             }
         }
     };
@@ -868,6 +910,38 @@ mod tests {
             leaf.view_f32().is_some(),
             "an f32 leaf views without a copy"
         );
+    }
+
+    /// Raw-byte and E4M3 leaves, as a checkpoint stores packed codes and
+    /// scales, come back with their element, shape and exact bytes, and are
+    /// different attributes from each other at the same rank.
+    #[test]
+    fn u8_and_e4m3_leaves_resolve_to_their_source_bytes() {
+        assert_ne!(leaf::<U8, 3>().id(), leaf::<E4M3, 3>().id());
+        let mut blobs = MemoryBlobStore::new();
+        let raw: Vec<u8> = (0..24u8).map(|b| b.wrapping_mul(37)).collect();
+        let mut stored = Vec::new();
+        for elem in [Elem::U8, Elem::E4m3] {
+            let fragment = put_leaf(&mut blobs, elem, &[2, 3, 4], bytes_of(&raw), "w").expect("stored");
+            stored.push((elem, fragment.root().expect("leaf root"), fragment.into_facts()));
+        }
+        let reader = SnapshotSource::snapshot(&mut blobs).expect("reader");
+        for (elem, id, facts) in stored {
+            let leaf = resolve(&facts, &reader, id).expect("resolves").expect("present");
+            assert_eq!(leaf.elem(), elem);
+            assert_eq!(leaf.shape(), vec![2, 3, 4]);
+            assert_eq!(&leaf.payload()[..], &raw[..]);
+        }
+        // 0x38 is 1.0 in E4M3; a U8 leaf reads its byte values.
+        let one = put_leaf(&mut blobs, Elem::E4m3, &[1], bytes_of(&[0x38]), "s").unwrap();
+        let reader = SnapshotSource::snapshot(&mut blobs).expect("reader");
+        let id = one.root().unwrap();
+        let leaf = resolve(&one.into_facts(), &reader, id).unwrap().unwrap();
+        assert_eq!(leaf.to_f32(), vec![1.0]);
+    }
+
+    fn bytes_of(b: &[u8]) -> anybytes::Bytes {
+        anybytes::Bytes::from_source(b.to_vec())
     }
 
     /// "A leaf carries one payload" is a fact about the graph, not about any

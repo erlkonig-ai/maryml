@@ -34,6 +34,10 @@ pub mod checkpoint;
 pub mod config;
 pub mod experts;
 pub mod layout;
+pub mod pile;
+pub mod release;
+#[cfg(feature = "inkling2-import")]
+pub mod import;
 pub mod schedule;
 #[cfg(feature = "inkling-cuda")]
 pub mod sliding;
