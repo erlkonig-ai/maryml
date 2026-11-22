@@ -13,12 +13,12 @@ def call(i, name, args):
     return {"id": f"call_{i}", "type": "function", "function": {"name": name, "arguments": args}}
 CASES = [
     {"name": "plain", "tools": None, "messages": [
-        {"role": "system", "content": "You are Liora."},
+        {"role": "system", "content": "You are Robin."},
         {"role": "user", "content": "Hello there."}]},
     {"name": "system_only", "tools": TOOLS, "messages": [
-        {"role": "system", "content": "You are Liora.\nWake gently."}]},
+        {"role": "system", "content": "You are Robin.\nWake gently."}]},
     {"name": "tools_turns", "tools": TOOLS, "messages": [
-        {"role": "system", "content": "You are Liora."},
+        {"role": "system", "content": "You are Robin."},
         {"role": "user", "content": "{\"source\":\"discord\",\"text\":\"Grüße — what's new?\"}"},
         {"role": "assistant", "reasoning_content": "Let me look.\nFirst the inbox.", "content": "Checking.",
          "tool_calls": [call(0, "exec", {"command": "orient show | head -n 20"})]},
@@ -26,7 +26,7 @@ CASES = [
         {"role": "assistant", "content": "Nothing new since this morning. 🙂"},
         {"role": "user", "content": "  leading spaces and\r\nCRLF\ttabs  "}]},
     {"name": "two_calls", "tools": TOOLS, "messages": [
-        {"role": "system", "content": "You are Liora."},
+        {"role": "system", "content": "You are Robin."},
         {"role": "user", "content": "Search twice."},
         {"role": "assistant", "reasoning_content": "Two searches.",
          "tool_calls": [call(0, "memory_search", {"query": "Rilke \"Die Laute\"", "limit": 3}),
@@ -41,7 +41,7 @@ CASES = [
         {"role": "system", "content": "isolated scheduling fixture"},
         {"role": "assistant", "content": "", "tool_calls": [call(0, "exec", {"command": "memory show 1"})]},
         {"role": "tool", "name": "exec", "content": "recalled\n[exit 0]"},
-        {"role": "user", "content": "{\"content_type\":\"text/plain\",\"source\":\"discord\",\"text\":\"hi Liora\"}"},
+        {"role": "user", "content": "{\"content_type\":\"text/plain\",\"source\":\"discord\",\"text\":\"hi Robin\"}"},
         {"role": "assistant", "reasoning_content": "Answer, then look.", "content": "Hello!",
          "tool_calls": [call(1, "exec", {"command": "orient show"})]},
         {"role": "tool", "name": "exec", "content": "quiet\n[exit 0]"}]},
