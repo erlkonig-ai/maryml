@@ -48,10 +48,13 @@
 //! convolutions. Upstream's cache keeps `k` columns of conv input; only its
 //! last `k - 1` are ever read, and those are what is kept here.
 //!
+//! Experts bind in their stored format ([`bind_experts`]): NVFP4 (layers
+//! 0..19) as packed codes, MXFP8 (layers 20..23) decoded on the host to BF16
+//! and multiplied by [`linear_bf16`] with BF16 activations.
+//!
 //! Scope, stated: no eviction beyond the window (positions further back than
 //! `sliding_window_size` are masked, not dropped); no log scaling (sliding
-//! layers have none upstream); NVFP4 experts only, so layers 20..23 (MXFP8)
-//! cannot bind; full-attention layers are not here. The caller keys a
+//! layers have none upstream); full-attention layers are not here. The caller keys a
 //! [`State`] per visit ([`super::schedule::CacheId`]): a core layer's passes
 //! share weights and never share state.
 
@@ -128,10 +131,45 @@ pub enum ExpertAct {
     Bf16,
 }
 
+/// One matrix of a routed expert, in the format it binds as.
+pub(super) enum ExpertW {
+    /// NVFP4 codes and scales, multiplied by [`linear_fp4`] or [`linear_w4a16`].
+    Nvfp4(PackedW),
+    /// MXFP8 weights decoded to BF16 on the host (exact: an E4M3 value times
+    /// a power of two is a BF16), multiplied by [`linear_bf16`].
+    Bf16(Bf16W),
+}
+
+impl ExpertW {
+    fn linear(&self, x: Tensor<Bk, 2>, act: ExpertAct) -> Tensor<Bk, 2> {
+        match (self, act) {
+            (ExpertW::Nvfp4(p), ExpertAct::Nvfp4) => linear_fp4(x, p),
+            (ExpertW::Nvfp4(p), ExpertAct::Bf16) => linear_w4a16(x, p),
+            // `ExpertAct` chooses only for NVFP4. MXFP8 experts always see
+            // BF16 activations: transformers 046bdb8c dequantises the weights
+            // and quantises no activation; the declared `mxfp8_e4m3`
+            // activation quantisation is not implemented here.
+            (ExpertW::Bf16(w), _) => linear_bf16(x, w),
+        }
+    }
+}
+
 pub(super) struct Expert {
-    pub(super) gate: PackedW,
-    pub(super) up: PackedW,
-    pub(super) down: PackedW,
+    pub(super) gate: ExpertW,
+    pub(super) up: ExpertW,
+    pub(super) down: ExpertW,
+}
+
+impl Expert {
+    /// Upstream's `Inkling2LoopSoftcappedSwiGLU` expert: the sigmoid sees the
+    /// raw gate, the softcaps bound the linear gate factor and `up`.
+    pub(super) fn forward(&self, d: &Dims, x: Tensor<Bk, 2>, act: ExpertAct) -> Tensor<Bk, 2> {
+        let g = self.gate.linear(x.clone(), act);
+        let u = self.up.linear(x, act);
+        let capped = |v: Tensor<Bk, 2>, c: f32| v.div_scalar(c).tanh().mul_scalar(c);
+        let a = capped(g.clone(), d.gate_softcap) * sigmoid(g) * capped(u, d.up_softcap);
+        self.down.linear(a, act)
+    }
 }
 
 /// The fixed sizes of a sliding layer.
@@ -500,17 +538,7 @@ impl SlidingLayer {
     }
 
     fn expert(&self, e: usize, x: Tensor<Bk, 2>, act: ExpertAct) -> Tensor<Bk, 2> {
-        let d = self.dims;
-        let w = &self.experts[e];
-        let lin = |x: Tensor<Bk, 2>, p: &PackedW| match act {
-            ExpertAct::Nvfp4 => linear_fp4(x, p),
-            ExpertAct::Bf16 => linear_w4a16(x, p),
-        };
-        let g = lin(x.clone(), &w.gate);
-        let u = lin(x, &w.up);
-        let capped = |v: Tensor<Bk, 2>, c: f32| v.div_scalar(c).tanh().mul_scalar(c);
-        let a = capped(g.clone(), d.gate_softcap) * sigmoid(g) * capped(u, d.up_softcap);
-        lin(a, &w.down)
+        self.experts[e].forward(&self.dims, x, act)
     }
 
     /// Attention over the three normed inputs: `qn` drives the queries, the
@@ -629,7 +657,80 @@ pub(super) fn block_attention(query: Tensor<Bk, 1>, blocks: &[Tensor<Bk, 2>], pa
     (normed * p).sum_dim(1).reshape([t, h])
 }
 
+/// Bind a layer's routed experts in the format they are stored in: U8 codes
+/// are NVFP4 (layers 0..19 of the release), F8_E4M3 values are MXFP8 (layers
+/// 20..23).
 pub(super) fn bind_experts(
+    w: &dyn Weights,
+    d: &Dims,
+    layer: usize,
+    client: &cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>,
+) -> Result<Vec<Expert>, String> {
+    let w13 = Slot::Layer(layer, LayerPart::Expert(ExpertMat::W13, ExpertPart::Weight));
+    match w.tensor(&w13.tensor_name())?.dtype {
+        Dtype::F8E4M3 => bind_mxfp8_experts(w, d, layer, client),
+        _ => bind_nvfp4_experts(w, d, layer, client),
+    }
+}
+
+/// MXFP8 experts: E4M3 values `[e, rows, cols]` and one UE8M0 scale per 32
+/// values of a row `[e, rows, cols / 32]`, decoded on the host one expert at
+/// a time (upstream's `Inkling2LoopDequantizeExperts`, then `.to(bfloat16)`,
+/// which is exact here) and uploaded as BF16. w13's rows are interleaved gate
+/// then up per intermediate unit, its scales with them (upstream's
+/// `Interleave(dim=1)` on both). About 2 GB per layer at the release's shape.
+fn bind_mxfp8_experts(
+    w: &dyn Weights,
+    d: &Dims,
+    layer: usize,
+    client: &cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>,
+) -> Result<Vec<Expert>, String> {
+    use crate::models::inkling2_loop::experts::{MXFP8_BLOCK, decode_mxfp8_row};
+    let (e, h, i) = (d.experts, d.hidden, d.inter);
+    let part = |m: ExpertMat, p: ExpertPart| Slot::Layer(layer, LayerPart::Expert(m, p));
+    let w13 = want(w, part(ExpertMat::W13, ExpertPart::Weight), Dtype::F8E4M3, &[e, 2 * i, h])?;
+    let s13 = want(w, part(ExpertMat::W13, ExpertPart::Scale), Dtype::U8, &[e, 2 * i, h / MXFP8_BLOCK])?;
+    let w2 = want(w, part(ExpertMat::W2, ExpertPart::Weight), Dtype::F8E4M3, &[e, h, i])?;
+    let s2 = want(w, part(ExpertMat::W2, ExpertPart::Scale), Dtype::U8, &[e, h, i / MXFP8_BLOCK])?;
+    for (n, k) in [(i, h), (h, i)] {
+        if !Bf16W::tileable(n, k) || k % MXFP8_BLOCK != 0 {
+            return Err(format!("layer {layer}: MXFP8 expert {n}x{k} does not tile"));
+        }
+    }
+    // rows `first, first + step, ..` (count of them) of a `[rows, cols]` matrix, as BF16 bytes
+    let decode = |vals: &[u8], scales: &[u8], cols: usize, first: usize, step: usize, count: usize| -> Result<Vec<u8>, String> {
+        let per = cols / MXFP8_BLOCK;
+        let mut row = vec![0f32; cols];
+        let mut out = Vec::with_capacity(count * cols * 2);
+        for r in (0..count).map(|j| first + j * step) {
+            decode_mxfp8_row(&vals[r * cols..(r + 1) * cols], &scales[r * per..(r + 1) * per], MXFP8_BLOCK, &mut row);
+            for &v in &row {
+                let b = half::bf16::from_f32(v);
+                if b.to_f32().to_bits() != v.to_bits() && !v.is_nan() {
+                    return Err(format!("layer {layer}: MXFP8 value {v} is not a BF16"));
+                }
+                out.extend_from_slice(&b.to_le_bytes());
+            }
+        }
+        Ok(out)
+    };
+    let upload = |bytes: Vec<u8>, n: usize, k: usize| ExpertW::Bf16(Bf16W { h: client.create_from_slice(&bytes), n, k, align: 16 });
+    let (m13, p13) = (2 * i * h, 2 * i * (h / MXFP8_BLOCK));
+    let (m2, p2) = (h * i, h * (i / MXFP8_BLOCK));
+    (0..e)
+        .map(|x| {
+            let (v13, c13) = (&w13.bytes[x * m13..(x + 1) * m13], &s13.bytes[x * p13..(x + 1) * p13]);
+            let (v2, c2) = (&w2.bytes[x * m2..(x + 1) * m2], &s2.bytes[x * p2..(x + 1) * p2]);
+            Ok(Expert {
+                gate: upload(decode(v13, c13, h, 0, 2, i)?, i, h),
+                up: upload(decode(v13, c13, h, 1, 2, i)?, i, h),
+                down: upload(decode(v2, c2, i, 0, 1, h)?, h, i),
+            })
+        })
+        .collect()
+}
+
+fn bind_nvfp4_experts(
     w: &dyn Weights,
     d: &Dims,
     layer: usize,
@@ -659,13 +760,15 @@ pub(super) fn bind_experts(
         }
         out
     };
-    let packed = |codes: &[u8], scales: &[u8], n: usize, k: usize, scale2: f32| PackedW {
-        codes: client.create_from_slice(codes),
-        scales: client.create_from_slice(scales),
-        n,
-        k,
-        scale2,
-        swizzled: false,
+    let packed = |codes: &[u8], scales: &[u8], n: usize, k: usize, scale2: f32| {
+        ExpertW::Nvfp4(PackedW {
+            codes: client.create_from_slice(codes),
+            scales: client.create_from_slice(scales),
+            n,
+            k,
+            scale2,
+            swizzled: false,
+        })
     };
     Ok((0..e)
         .map(|x| Expert {

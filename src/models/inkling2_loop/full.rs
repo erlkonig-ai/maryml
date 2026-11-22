@@ -30,8 +30,8 @@
 //! `k - 1` inputs of the four convolutions; for K and V those are the
 //! projected states, before the dynamic conv, as upstream caches them.
 //!
-//! Scope, stated: NVFP4 experts only (layer 23's MXFP8 experts cannot bind);
-//! the core's full layers (11, 17) and their messages are not here.
+//! Scope, stated: the core's full layers (11, 17) and their messages are not
+//! here. Experts bind in their stored format, so layer 23's MXFP8 experts do.
 
 use std::collections::BTreeMap;
 
@@ -41,7 +41,7 @@ use burn::tensor::{Bool, Int, TensorData};
 
 use crate::models::inkling::bf16gemm::Bf16W;
 use crate::models::inkling::block::route_from_logits;
-use crate::models::inkling::burn::{linear_bf16, linear_fp4, linear_w4a16, rms_norm};
+use crate::models::inkling::burn::{linear_bf16, rms_norm};
 use crate::models::inkling::seam::{Bk, client_of};
 use crate::models::inkling2_loop::config::{AttnKind, Inkling2LoopTextConfig};
 use crate::models::inkling2_loop::layout::{AttnPart, ConvPart, Dtype, LayerPart, Slot};
@@ -385,16 +385,8 @@ fn dyn_conv_step(
     (acc.reshape([t, c]) + x).div_scalar(((2 * k + 1) as f32).sqrt())
 }
 
-/// One routed expert: softcapped SwiGLU over NVFP4 weights, as the sliding
-/// layer's.
+/// One routed expert, in whichever format it bound as (the sliding layer's
+/// [`Expert::forward`]).
 fn expert(w: &Expert, d: &Dims, x: Tensor<Bk, 2>, act: ExpertAct) -> Tensor<Bk, 2> {
-    let lin = |x: Tensor<Bk, 2>, p: &crate::models::inkling::burn::PackedW| match act {
-        ExpertAct::Nvfp4 => linear_fp4(x, p),
-        ExpertAct::Bf16 => linear_w4a16(x, p),
-    };
-    let g = lin(x.clone(), &w.gate);
-    let u = lin(x, &w.up);
-    let capped = |v: Tensor<Bk, 2>, c: f32| v.div_scalar(c).tanh().mul_scalar(c);
-    let a = capped(g.clone(), d.gate_softcap) * sigmoid(g) * capped(u, d.up_softcap);
-    lin(a, &w.down)
+    w.forward(d, x, act)
 }
