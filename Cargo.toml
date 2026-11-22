@@ -509,6 +509,12 @@ required-features = ["inkling-cuda"]
 name = "inkling2_head_check"
 required-features = ["inkling2-head-check"]
 
+# The post-loop tail (layers 18..23, MXFP8 experts from 20, and the head) on the
+# release's weights in a pile, against golden/capture_inkling2_tail.py.
+[[bin]]
+name = "inkling2_tail_check"
+required-features = ["inkling-cuda", "inkling2-head-check"]
+
 # Parity gate for the NVFP4 expert decode against compressed_tensors, which is
 # the library that defines this packing. Reads a small raw-binary oracle bundle.
 [[bin]]

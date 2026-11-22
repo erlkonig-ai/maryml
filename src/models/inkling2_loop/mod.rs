@@ -27,6 +27,10 @@
 //!   convolutions, log scaling. Held to transformers' own layer 5 by the
 //!   `inkling2_global5` binary.
 //!
+//! * `tail_check` (with `inkling-cuda`): the post-loop tail, layers 18..23
+//!   (MXFP8 experts from 20) and the head, against transformers' own run on
+//!   fixed inputs; the `inkling2_tail_check` binary on the release's weights.
+//!
 //! There is no whole forward here. Anything that would run the model is
 //! refused by [`checkpoint::require_native_forward`] with the operators still
 //! missing.
@@ -51,5 +55,7 @@ pub mod schedule;
 pub mod full;
 #[cfg(feature = "inkling-cuda")]
 pub mod sliding;
+#[cfg(feature = "inkling-cuda")]
+pub mod tail_check;
 
 pub use config::{Family, Inkling2LoopConfig, family_of, family_of_str};
