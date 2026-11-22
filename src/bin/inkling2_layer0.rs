@@ -1,17 +1,19 @@
 //! Inkling 2 Mini layer 0, natively, against transformers 046bdb8c's own run.
 //!
-//! Reads the release directory only as a test input (its `config.json` and
-//! the tensors layer 0 binds), computes the normed embedding and one visit of
-//! layer 0 on the device for the prompt and then for one more token through
-//! the carried state, and compares every tap with the capture that
-//! `golden/capture_inkling2_layer0.py` made from upstream's code.
+//! Reads the model from a pile alone: the pile, the exact model collection
+//! and the model root, opened as a [`MiniRoot`] (config from the root's
+//! facts, layer 0's tensors as views over the pile mapping). Computes the
+//! normed embedding and one visit of layer 0 on the device for the prompt and
+//! then for one more token through the carried state, and compares every tap
+//! with the capture that `golden/capture_inkling2_layer0.py` made from
+//! upstream's code.
 //!
 //! The tolerance is calibrated, not chosen: upstream ran twice, at bf16 (the
 //! shipped precision) and at f32 on the same weights. Their distance is how
 //! far rounding alone moves each tensor. A Mary tensor passes when its
 //! distance to upstream's f32 run is within `TOL` times that spread.
 //!
-//! usage: inkling2_layer0 <release dir> <reference.safetensors> [receipt.json]
+//! usage: inkling2_layer0 <pile> <collection> <root> <reference.safetensors> [receipt.json]
 
 use std::collections::BTreeSet;
 
@@ -21,11 +23,14 @@ use memmap2::Mmap;
 use safetensors::SafeTensors;
 use safetensors::tensor::Metadata;
 
+use mary::model_collection::parse_collection_handle;
 use mary::models::inkling::burn::rms_norm;
 use mary::models::inkling::seam::Bk;
 use mary::models::inkling2_loop::Inkling2LoopConfig;
-use mary::models::inkling2_loop::layout::{Dtype, Slot};
-use mary::models::inkling2_loop::sliding::{ExpertAct, SlidingLayer, State, Stored, Taps, Weights};
+use mary::models::inkling2_loop::layout::Slot;
+use mary::models::inkling2_loop::pile::MiniRoot;
+use mary::models::inkling2_loop::sliding::{ExpertAct, SlidingLayer, State, Taps, Weights};
+use triblespace::prelude::Id;
 
 /// A pass is within this many times upstream's own bf16-vs-f32 spread.
 const TOL: f64 = 1.5;
@@ -60,20 +65,6 @@ impl File {
         let (info, b) = self.raw(name).unwrap_or_else(|| panic!("reference has no {name}"));
         assert_eq!(info.dtype, safetensors::Dtype::I32, "{name}");
         b.chunks_exact(4).map(|c| i32::from_le_bytes(c.try_into().unwrap())).collect()
-    }
-}
-
-impl Weights for File {
-    fn tensor(&self, name: &str) -> Result<Stored<'_>, String> {
-        let (info, bytes) = self.raw(name).ok_or_else(|| format!("release has no {name}"))?;
-        let dtype = match info.dtype {
-            safetensors::Dtype::BF16 => Dtype::Bf16,
-            safetensors::Dtype::F32 => Dtype::F32,
-            safetensors::Dtype::U8 => Dtype::U8,
-            safetensors::Dtype::F8_E4M3 => Dtype::F8E4M3,
-            other => return Err(format!("{name}: {other:?}")),
-        };
-        Ok(Stored { dtype, shape: info.shape.clone(), bytes })
     }
 }
 
@@ -155,11 +146,19 @@ impl Report {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let (dir, reference) = (&args[1], &args[2]);
-    let cfg = Inkling2LoopConfig::from_json(&std::fs::read_to_string(format!("{dir}/config.json")).unwrap())
-        .expect("config");
+    let (pile, collection, root, reference) = (&args[1], &args[2], &args[3], &args[4]);
+    let collection = parse_collection_handle(collection).expect("collection");
+    let root = Id::from_hex(root).expect("root must be a 32-hex id");
+    let t0 = std::time::Instant::now();
+    let model = MiniRoot::open(std::path::Path::new(pile), collection, root).expect("open the model root");
+    let (nm, nd) = model.counts();
+    println!(
+        "opened model root {:X} in {pile} ({nm} + {nd} tensors) in {:.1} s",
+        model.root(),
+        t0.elapsed().as_secs_f64()
+    );
+    let cfg = Inkling2LoopConfig::from_json(&model.config().expect("config facts").to_string()).expect("config");
     let t = &cfg.text_config;
-    let release = File::open(&format!("{dir}/model-00001-of-00001.safetensors"));
     let r = File::open(reference);
     let dev = burn::backend::cuda::CudaDevice::default();
 
@@ -168,8 +167,8 @@ fn main() {
     let h = t.hidden_size;
 
     // the normed embedding: a gather of stored BF16 rows, then RMSNorm
-    let embed = release.tensor(&Slot::Embed.tensor_name()).unwrap();
-    let gain = release.tensor(&Slot::EmbedNorm.tensor_name()).unwrap();
+    let embed = Weights::tensor(&model, &Slot::Embed.tensor_name()).unwrap();
+    let gain = Weights::tensor(&model, &Slot::EmbedNorm.tensor_name()).unwrap();
     let bf = |b: &[u8]| -> Vec<f32> {
         b.chunks_exact(2).map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32()).collect()
     };
@@ -184,7 +183,7 @@ fn main() {
     };
 
     let t0 = std::time::Instant::now();
-    let layer = SlidingLayer::bind(&release, t, 0, &dev).expect("bind layer 0");
+    let layer = SlidingLayer::bind(&model, t, 0, &dev).expect("bind layer 0");
     println!("bound layer 0 in {:.1} s", t0.elapsed().as_secs_f64());
 
     let mut rep = Report { lines: vec![], json: vec![], worst: 0.0, fails: 0 };
@@ -287,7 +286,7 @@ fn main() {
         "gated tensors: worst ratio {:.2} of TOL {TOL}; {} outside",
         rep.worst, rep.fails
     );
-    if let Some(p) = args.get(3) {
+    if let Some(p) = args.get(5) {
         std::fs::write(p, format!("[\n{}\n]\n", rep.json.join(",\n"))).expect("receipt");
     }
     std::process::exit(if rep.fails == 0 { 0 } else { 1 });

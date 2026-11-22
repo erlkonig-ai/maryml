@@ -284,3 +284,13 @@ impl MiniRoot {
         Ok(8 + header.len() as u64 + at)
     }
 }
+
+/// A sliding layer binds straight from the root: the stored leaves are the
+/// release's own bytes, so this is the same view [`MiniRoot::tensor`] gives.
+#[cfg(feature = "inkling-cuda")]
+impl super::sliding::Weights for MiniRoot {
+    fn tensor(&self, name: &str) -> Result<super::sliding::Stored<'_>, String> {
+        let (dtype, shape, bytes) = MiniRoot::tensor(self, name)?;
+        Ok(super::sliding::Stored { dtype, shape, bytes })
+    }
+}

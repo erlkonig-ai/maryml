@@ -484,7 +484,8 @@ required-features = ["inkling2-import"]
 name = "inkling2_inspect"
 
 # Inkling 2 Mini layer 0 on the device against transformers' own capture
-# (golden/capture_inkling2_layer0.py). Reads the release only as a test input.
+# (golden/capture_inkling2_layer0.py), reading the model from a pile alone:
+# pile, model collection and model root, through inkling2_loop::pile::MiniRoot.
 [[bin]]
 name = "inkling2_layer0"
 required-features = ["inkling-cuda"]
