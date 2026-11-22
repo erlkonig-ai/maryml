@@ -20,6 +20,7 @@ Recorded, float32 (indices int32), <run> in bf16 / f32, <phase> in prefill / ste
   <run>.<phase>.q_in / k_in / v_in                       layer 5's attention_input outputs    [t, H]
   <run>.<phase>.attn / attn_conv / mlp_input / experts / mlp_conv                              [t, H]
   <run>.<phase>.router_logits / router_weights / router_indices    layer 5                   [t, 128] / [t, 8]
+  <run>.<phase>.layer<l>.router_logits / router_indices  every layer's router                [t, 128] / [t, 8]
   <run>.<phase>.layer<l>.k / .v                          layer l's cached keys / values       [kv, n, d]
   <run>.<phase>.layer<l>.conv0..conv3                    layer l's conv states                [C, k]
 phase `prefill` (the prompt), `step` (one more token through the cache), `whole` (both as one prefill, no cache,
@@ -119,6 +120,7 @@ def run(dtype, tag):
         layer.post_mlp_convolution.register_forward_hook(hook("mlp_conv")),
     ]
     for i in range(LAYERS):
+        hs.append(lm.layers[i].mlp.gate.register_forward_hook(hook(f"layer{i}.router")))
         hs.append(lm.layers[i].register_forward_pre_hook(pre(i), with_kwargs=True))
         hs.append(lm.layers[i].register_forward_hook(hook(f"layer{i}.out")))
 
@@ -127,6 +129,9 @@ def run(dtype, tag):
         for i in range(LAYERS):
             for n in ("input", "out"):
                 record[f"{p}.layer{i}.{n}"] = taps[f"layer{i}.{n}"][0].float().clone().contiguous()
+            logits, _w, idx = taps[f"layer{i}.router"]
+            record[f"{p}.layer{i}.router_logits"] = logits.float().clone().contiguous()
+            record[f"{p}.layer{i}.router_indices"] = idx.to(torch.int32).clone().contiguous()
         record[f"{p}.blocks"] = taps["blocks"][0].float().clone().contiguous()
         for name in L5_KEYS:
             record[f"{p}.{name}"] = taps[name][0].float().clone().contiguous()

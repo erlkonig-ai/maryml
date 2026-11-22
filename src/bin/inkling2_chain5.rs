@@ -30,7 +30,7 @@ use mary::models::inkling::burn::rms_norm;
 use mary::models::inkling::seam::Bk;
 use mary::models::inkling2_loop::Inkling2LoopConfig;
 use mary::models::inkling2_loop::full::{FullLayer, FullTaps};
-use mary::models::inkling2_loop::layout::Slot;
+use mary::models::inkling2_loop::layout::{LayerPart, Slot};
 use mary::models::inkling2_loop::pile::MiniRoot;
 use mary::models::inkling2_loop::sliding::{ExpertAct, SlidingLayer, State, Taps, Weights};
 use triblespace::prelude::Id;
@@ -118,6 +118,24 @@ fn conv_to_rows(shape: &[usize], v: &[f32]) -> Vec<f32> {
     out
 }
 
+/// `rel_l2` of each `[h]` row, with the row's norm in the reference.
+fn per_row(mary: &[f32], r32: &[f32], h: usize) -> Vec<(usize, f64, f64)> {
+    mary.chunks(h)
+        .zip(r32.chunks(h))
+        .enumerate()
+        .map(|(i, (a, b))| (i, rel_l2(a, b), b.iter().map(|&x| (x as f64).powi(2)).sum::<f64>().sqrt()))
+        .collect()
+}
+
+/// The three rows furthest from f32, and the median row, as one line.
+fn worst_rows(mary: &[f32], r32: &[f32], h: usize) -> String {
+    let mut rows = per_row(mary, r32, h);
+    rows.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let median = rows[rows.len() / 2].1;
+    let top: Vec<String> = rows.iter().take(3).map(|(i, e, n)| format!("row {i} {e:.2e} (|ref| {n:.1})")).collect();
+    format!("worst {}; median row {median:.2e}", top.join(", "))
+}
+
 struct Report {
     lines: Vec<String>,
     json: Vec<String>,
@@ -160,10 +178,12 @@ struct Pass {
     outs: Vec<Vec<f32>>,
     /// Layer 5's block states, one `[t, H]` per completed block.
     blocks: Vec<Vec<f32>>,
-    /// Layer 5's taps, router logits and routing.
+    /// Layer 5's taps and routing.
     taps: Vec<(&'static str, Vec<f32>)>,
-    router_logits: Vec<f32>,
     routing: Vec<(Vec<usize>, Vec<f32>)>,
+    /// Every layer's router logits `[t, experts]` and chosen experts per row.
+    layer_logits: Vec<Vec<f32>>,
+    layer_experts: Vec<Vec<Vec<usize>>>,
     ms: f64,
 }
 
@@ -183,10 +203,14 @@ impl Chain {
         let t1 = std::time::Instant::now();
         let (mut inputs, mut outs) = (Vec::new(), Vec::new());
         let mut blocks = Vec::new();
+        let (mut layer_logits, mut layer_experts) = (Vec::new(), Vec::new());
         let mut x = x;
         for (l, layer) in self.sliding.iter().enumerate() {
             inputs.push(host(x.clone()));
-            x = layer.forward(x, &mut blocks, &mut states[l], act).0;
+            let (y, taps) = layer.forward(x, &mut blocks, &mut states[l], act);
+            x = y;
+            layer_logits.push(taps.router_logits);
+            layer_experts.push(taps.routing.into_iter().map(|(e, _)| e).collect());
             outs.push(host(x.clone()));
         }
         inputs.push(host(x.clone()));
@@ -196,6 +220,8 @@ impl Chain {
         outs.push(out.clone());
         let FullTaps { inputs: [qi, ki, vi], rest } = taps;
         let Taps { attn, attn_conv, mlp_input, router_logits, routing, experts, mlp_conv } = rest;
+        layer_logits.push(router_logits);
+        layer_experts.push(routing.iter().map(|(e, _)| e.clone()).collect());
         Pass {
             inputs,
             outs,
@@ -211,8 +237,9 @@ impl Chain {
                 ("mlp_conv", host(mlp_conv)),
                 ("out", out),
             ],
-            router_logits,
             routing,
+            layer_logits,
+            layer_experts,
             ms: t1.elapsed().as_secs_f64() * 1e3,
         }
     }
@@ -266,6 +293,21 @@ fn main() {
         full: FullLayer::bind(&model, t, FULL, &dev).expect("bind layer 5"),
     };
     println!("bound layers 0..{FULL} in {:.1} s", t1.elapsed().as_secs_f64());
+    // each router's score bias, for the margin at a row where the choice differs
+    let bias: Vec<Vec<f32>> = (0..=FULL)
+        .map(|l| {
+            let b = Weights::tensor(&model, &Slot::Layer(l, LayerPart::GateBias).tensor_name()).unwrap();
+            b.bytes.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()
+        })
+        .collect();
+    let ne = t.n_routed_experts;
+    let k = t.num_experts_per_tok;
+    // upstream's own f32 selection score margin between the k-th and (k+1)-th expert of a row
+    let margin = |logits: &[f32], b: &[f32]| -> f64 {
+        let mut s: Vec<f64> = logits.iter().zip(b).map(|(&x, &c)| 1.0 / (1.0 + (-(x as f64)).exp()) + c as f64).collect();
+        s.sort_by(|a, b| b.total_cmp(a));
+        s[k - 1] - s[k]
+    };
 
     let ref_t = |run: &str, key: &str| r.f32s(&format!("{run}.{key}")).1;
     let mut rep = Report { lines: vec![], json: vec![], worst: 0.0, fails: 0, earliest: None };
@@ -289,11 +331,48 @@ fn main() {
                         rep.row(tag, &format!("layer5 {name}"), v, &a, &b, gated);
                     }
                 }
-                let (a, b) = g("router_logits");
-                rep.row(tag, "layer5 router", &p.router_logits, &a, &b, gated);
+            }
+            let (a, b) = g(&format!("layer{l}.router_logits"));
+            rep.row(tag, &format!("layer{l} router"), &p.layer_logits[l], &a, &b, gated);
+            {
+                let set = |run: &str| -> Vec<BTreeSet<usize>> {
+                    r.i32s(&format!("{run}.{phase}.layer{l}.router_indices"))
+                        .chunks(k)
+                        .map(|c| c.iter().map(|&x| x as usize).collect())
+                        .collect()
+                };
+                let (r16, r32) = (set("bf16"), set("f32"));
+                let ours: Vec<BTreeSet<usize>> = p.layer_experts[l].iter().map(|e| e.iter().copied().collect()).collect();
+                let same = |a: &[BTreeSet<usize>], b: &[BTreeSet<usize>]| a.iter().zip(b).filter(|(x, y)| x == y).count();
+                let mut flips = Vec::new();
+                for (row, (o, u)) in ours.iter().zip(&r32).enumerate() {
+                    if o != u {
+                        let lo = &b[row * ne..(row + 1) * ne];
+                        let mo = &p.layer_logits[l][row * ne..(row + 1) * ne];
+                        flips.push(format!(
+                            "row {row}: Mary {:?} f32 {:?} (f32 margin {:.2e}, Mary margin {:.2e})",
+                            o.difference(u).collect::<Vec<_>>(),
+                            u.difference(o).collect::<Vec<_>>(),
+                            margin(lo, &bias[l]),
+                            margin(mo, &bias[l]),
+                        ));
+                    }
+                }
+                rep.lines.push(format!(
+                    "{tag:14} layer{l} routing  rows with f32's experts {}/{n}, with bf16's {}/{n} (upstream bf16 vs f32 {}/{n}){}{}",
+                    same(&ours, &r32),
+                    same(&ours, &r16),
+                    same(&r16, &r32),
+                    if flips.is_empty() { "" } else { "; " },
+                    flips.join("; "),
+                    n = ours.len(),
+                ));
             }
             let (a, b) = g(&format!("layer{l}.out"));
             rep.row(tag, &format!("layer{l} out"), &p.outs[l], &a, &b, gated);
+            if phase != "step" {
+                rep.lines.push(format!("{tag:14} layer{l} out rows  {}", worst_rows(&p.outs[l], &b, h)));
+            }
         }
     };
     let routing = |rep: &mut Report, tag: &str, phase: &str, p: &Pass| {
@@ -375,6 +454,40 @@ fn main() {
                     ));
                 }
             }
+        }
+    }
+
+    // each layer alone, on upstream's own f32 input of that layer (block
+    // states: the f32 normed embedding, or layer 5's recorded blocks), so the
+    // error a layer adds is apart from the error it inherits. Reported only:
+    // upstream has no bf16 run of a lone layer here to calibrate against.
+    for phase in ["prefill", "whole"] {
+        let tens = |key: &str| -> Tensor<Bk, 2> {
+            let (s, v) = r.f32s(&format!("f32.{phase}.{key}"));
+            let n = s[0];
+            Tensor::<Bk, 2>::from_data(TensorData::new(v, [n, h]), &dev)
+        };
+        for l in 0..=FULL {
+            let x = tens(&format!("layer{l}.input"));
+            let mut blocks = if l == 0 {
+                Vec::new()
+            } else if l == FULL {
+                vec![tens("blocks")]
+            } else {
+                vec![tens("layer0.input")]
+            };
+            let out = if l == FULL {
+                let mut st = State::new(&chain.full.dims, &dev);
+                host(chain.full.forward(x, &mut blocks, &mut st, ExpertAct::Bf16).0)
+            } else {
+                let mut st = State::new(&chain.sliding[l].dims, &dev);
+                host(chain.sliding[l].forward(x, &mut blocks, &mut st, ExpertAct::Bf16).0)
+            };
+            let b = ref_t("f32", &format!("{phase}.layer{l}.out"));
+            let a = ref_t("bf16", &format!("{phase}.layer{l}.out"));
+            let tag = format!("alone:{phase}");
+            rep.row(&tag, &format!("layer{l} out"), &out, &a, &b, false);
+            rep.lines.push(format!("{tag:14} layer{l} out rows  {}", worst_rows(&out, &b, h)));
         }
     }
 
