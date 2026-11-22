@@ -44,7 +44,7 @@
 //! residual and the softcaps.
 //!
 //! State is per visit and real: the post-clip K and post-norm V of every
-//! position seen, and the last `k - 1` INPUTS of each of the four short
+//! position still visible, and the last `k - 1` INPUTS of each of the four short
 //! convolutions. Upstream's cache keeps `k` columns of conv input; only its
 //! last `k - 1` are ever read, and those are what is kept here.
 //!
@@ -52,17 +52,21 @@
 //! 0..19) as packed codes, MXFP8 (layers 20..23) decoded on the host to BF16
 //! and multiplied by [`linear_bf16`] with BF16 activations.
 //!
-//! Scope, stated: no eviction beyond the window (positions further back than
-//! `sliding_window_size` are masked, not dropped); no log scaling (sliding
-//! layers have none upstream); full-attention layers are not here. The caller keys a
-//! [`State`] per visit ([`super::schedule::CacheId`]): a core layer's passes
-//! share weights and never share state.
+//! Attention itself is [`super::attend`]: keys and values in fixed segments,
+//! scored a tile at a time. A sliding visit drops a segment once no later query
+//! can see any key in it, so its cache holds at most `sliding_window_size - 1`
+//! visible rows plus less than two segments of dead or unfilled ones.
+//!
+//! Scope, stated: no log scaling (sliding layers have none upstream);
+//! full-attention layers are not here. The caller keys a [`State`] per visit
+//! ([`super::schedule::CacheId`]): a core layer's passes share weights and
+//! never share state.
 
 use std::collections::BTreeMap;
 
 use burn::prelude::*;
 use burn::tensor::activation::{sigmoid, softmax};
-use burn::tensor::{Bool, Int, TensorData};
+use burn::tensor::{Int, TensorData};
 
 use crate::models::inkling::bf16gemm::Bf16W;
 use crate::models::inkling::block::route_from_logits;
@@ -70,6 +74,7 @@ use crate::models::inkling::burn::{
     PackedW, linear_bf16, linear_fp4, linear_w4a16, rms_norm, short_conv_window,
 };
 use crate::models::inkling::seam::{Bk, client_of};
+use crate::models::inkling2_loop::attend::{AttnShape, KEY_TILE, Kv, QUERY_TILE, attend};
 use crate::models::inkling2_loop::config::Inkling2LoopTextConfig;
 use crate::models::inkling2_loop::experts::nvfp4_scale2;
 use crate::models::inkling2_loop::layout::{
@@ -270,10 +275,9 @@ pub(super) const STREAMS: [Stream; 4] = [Stream::Query, Stream::Key, Stream::Val
 pub struct State {
     /// Positions already seen.
     pub pos: usize,
-    /// `[pos, kv_dim]`, after the L2 clip.
-    pub k: Option<Tensor<Bk, 2>>,
-    /// `[pos, kv_dim]`, after the unweighted RMS norm.
-    pub v: Option<Tensor<Bk, 2>>,
+    /// Keys after the L2 clip and values after the unweighted RMS norm, `[.., kv_dim]`
+    /// each, from [`Kv::base`] to `pos`.
+    pub kv: Kv,
     /// The last `k - 1` inputs of the K, V, attention-output and MLP-output
     /// convolutions, zero before the first token, as upstream pads.
     pub conv: [Tensor<Bk, 2>; 4],
@@ -284,8 +288,7 @@ impl State {
         let z = |w: usize| Tensor::zeros([d.kernel - 1, w], dev);
         State {
             pos: 0,
-            k: None,
-            v: None,
+            kv: Kv::new(KEY_TILE),
             conv: [z(d.kv_dim()), z(d.kv_dim()), z(d.hidden), z(d.hidden)],
         }
     }
@@ -525,7 +528,6 @@ impl SlidingLayer {
     fn attention(&self, [hn, kn, vn]: [Tensor<Bk, 2>; 3], state: &mut State) -> Tensor<Bk, 2> {
         let d = self.dims;
         let [t, _] = hn.dims();
-        let dev = hn.device();
         let (heads, kvh, hd) = (d.heads, d.kv_heads, d.head_dim);
 
         let q = linear_bf16(hn.clone(), &self.wq).reshape([t, heads, hd]) * self.q_scale.clone();
@@ -537,60 +539,17 @@ impl SlidingLayer {
         let vp = linear_bf16(vn, &self.wv);
         let v = conv_step(&mut state.conv[1], vp, &self.v_sconv, d.conv_scale());
         let v = unit_rms(v.reshape([t, kvh, hd]), d.eps).reshape([t, kvh * hd]);
-        let cat = |old: Option<Tensor<Bk, 2>>, new: Tensor<Bk, 2>| match old {
-            Some(o) => Tensor::cat(vec![o, new], 0),
-            None => new,
-        };
-        let k_all = cat(state.k.take(), k);
-        let v_all = cat(state.v.take(), v);
-        state.k = Some(k_all.clone());
-        state.v = Some(v_all.clone());
-        let n = state.pos + t;
+        state.kv.append(k, v);
 
         // relative bias: per-token, per-head mix of the trained profiles in `proj`
         let rel = linear_bf16(hn.clone(), &self.wr).reshape([t, heads, d.d_rel]) * self.rel_scale.clone();
         let rel = l2_clip(rel, d.rel_clip).reshape([t * heads, d.d_rel]);
-        let rel_logits = rel
-            .matmul(self.rel_proj.clone())
-            .reshape([t, heads, d.rel_extent])
-            .swap_dims(0, 1);
-        let mut gather = Vec::with_capacity(heads * t * n);
-        let mut masked = Vec::with_capacity(heads * t * n);
-        let mut no_bias = Vec::with_capacity(heads * t * n);
-        for _ in 0..heads {
-            for i in 0..t {
-                for j in 0..n {
-                    let dist = (state.pos + i) as i64 - j as i64;
-                    gather.push(dist.clamp(0, d.rel_extent as i64 - 1));
-                    masked.push(dist < 0 || dist >= d.window as i64);
-                    no_bias.push(dist < 0 || dist >= d.rel_extent as i64);
-                }
-            }
-        }
-        let gather = Tensor::<Bk, 3, Int>::from_data(TensorData::new(gather, [heads, t, n]), &dev);
-        let masked = Tensor::<Bk, 3, Bool>::from_data(TensorData::new(masked, [heads, t, n]), &dev);
-        let no_bias = Tensor::<Bk, 3, Bool>::from_data(TensorData::new(no_bias, [heads, t, n]), &dev);
-        let bias = rel_logits.gather(2, gather).mask_fill(no_bias, 0.0);
-
-        // GQA: heads g * rep .. (g + 1) * rep read kv head g
-        let rep = heads / kvh;
-        let q = q.swap_dims(0, 1).reshape([kvh, rep * t, hd]);
-        let kt = k_all.reshape([n, kvh, hd]).swap_dims(0, 1).swap_dims(1, 2);
-        let scores = q.matmul(kt).mul_scalar((hd as f32).powf(-0.5)).reshape([heads, t, n]) + bias;
-        let scores = scores.mask_fill(masked, f32::NEG_INFINITY);
         // the sink: one more logit per query whose value is zero
-        // reshape while contiguous, then swap: on this backend `[1, heads]`
-        // swapped to `[heads, 1]` and then reshaped read zeros for every head
-        // but the first (measured at t = 1, 2026-11-22)
-        let sinks = linear_bf16(hn.clone(), &self.sink).reshape([t, heads, 1]).swap_dims(0, 1);
-        let probs = softmax(Tensor::cat(vec![scores, sinks], 2), 2).slice([0..heads, 0..t, 0..n]);
-        let vv = v_all.reshape([n, kvh, hd]).swap_dims(0, 1);
-        let o = probs
-            .reshape([kvh, rep * t, n])
-            .matmul(vv)
-            .reshape([heads, t, hd])
-            .swap_dims(0, 1)
-            .reshape([t, heads * hd]);
+        let sinks = linear_bf16(hn.clone(), &self.sink);
+        let shape = AttnShape { heads, kv_heads: kvh, head_dim: hd, rel_extent: d.rel_extent, window: Some(d.window) };
+        let o = attend(&shape, q, rel, &self.rel_proj, sinks, &state.kv, state.pos, QUERY_TILE);
+        // the next call's first query is `pos + t`; it sees keys from `pos + t + 1 - window`
+        state.kv.evict_before((state.pos + t + 1).saturating_sub(d.window));
         let gate = sigmoid(linear_bf16(hn, &self.gate_attn));
         linear_bf16(o * gate, &self.wo)
     }

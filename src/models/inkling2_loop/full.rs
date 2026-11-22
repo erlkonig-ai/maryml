@@ -26,7 +26,9 @@
 //! convolution and the log scale.
 //!
 //! State is [`State`], as for a sliding layer: post-clip K and post-norm V of
-//! every position (no eviction: a full layer has no window), and the last
+//! every position (no eviction: a full layer has no window), in the fixed
+//! segments of [`super::attend::Kv`], scored a tile at a time by
+//! [`super::attend::attend`]; and the last
 //! `k - 1` inputs of the four convolutions; for K and V those are the
 //! projected states, before the dynamic conv, as upstream caches them.
 //!
@@ -51,13 +53,14 @@
 use std::collections::BTreeMap;
 
 use burn::prelude::*;
-use burn::tensor::activation::{sigmoid, softmax};
-use burn::tensor::{Bool, Int, TensorData};
+use burn::tensor::activation::sigmoid;
+use burn::tensor::{Int, TensorData};
 
 use crate::models::inkling::bf16gemm::Bf16W;
 use crate::models::inkling::block::route_from_logits;
 use crate::models::inkling::burn::{linear_bf16, rms_norm};
 use crate::models::inkling::seam::{Bk, client_of};
+use crate::models::inkling2_loop::attend::{AttnShape, QUERY_TILE, attend};
 use crate::models::inkling2_loop::config::{AttnKind, Inkling2LoopTextConfig};
 use crate::models::inkling2_loop::layout::{AttnPart, ConvPart, Dtype, LayerPart, Slot};
 use crate::models::inkling2_loop::sliding::{
@@ -366,55 +369,13 @@ impl FullLayer {
         let v = linear_bf16(vn.clone(), &self.wv);
         let v = dyn_conv_step(&mut state.conv[1], v, linear_bf16(vn, &self.v_proj), &self.v_static, kvh, d.kernel);
         let v = unit_rms(v.reshape([t, kvh, hd]), d.eps).reshape([t, kvh * hd]);
-        let cat = |old: Option<Tensor<Bk, 2>>, new: Tensor<Bk, 2>| match old {
-            Some(o) => Tensor::cat(vec![o, new], 0),
-            None => new,
-        };
-        let k_all = cat(state.k.take(), k);
-        let v_all = cat(state.v.take(), v);
-        state.k = Some(k_all.clone());
-        state.v = Some(v_all.clone());
-        let n = state.pos + t;
+        state.kv.append(k, v);
 
         let rel = linear_bf16(qn.clone(), &self.wr).reshape([t, heads, d.d_rel]) * self.rel_scale.clone();
         let rel = (l2_clip(rel, d.rel_clip) * tau).reshape([t * heads, d.d_rel]);
-        let rel_logits = rel
-            .matmul(self.rel_proj.clone())
-            .reshape([t, heads, d.rel_extent])
-            .swap_dims(0, 1);
-        let mut gather = Vec::with_capacity(heads * t * n);
-        let mut masked = Vec::with_capacity(heads * t * n);
-        let mut no_bias = Vec::with_capacity(heads * t * n);
-        for _ in 0..heads {
-            for i in 0..t {
-                for j in 0..n {
-                    let dist = (state.pos + i) as i64 - j as i64;
-                    gather.push(dist.clamp(0, d.rel_extent as i64 - 1));
-                    masked.push(dist < 0);
-                    no_bias.push(dist < 0 || dist >= d.rel_extent as i64);
-                }
-            }
-        }
-        let gather = Tensor::<Bk, 3, Int>::from_data(TensorData::new(gather, [heads, t, n]), &dev);
-        let masked = Tensor::<Bk, 3, Bool>::from_data(TensorData::new(masked, [heads, t, n]), &dev);
-        let no_bias = Tensor::<Bk, 3, Bool>::from_data(TensorData::new(no_bias, [heads, t, n]), &dev);
-        let bias = rel_logits.gather(2, gather).mask_fill(no_bias, 0.0);
-
-        let rep = heads / kvh;
-        let q = q.swap_dims(0, 1).reshape([kvh, rep * t, hd]);
-        let kt = k_all.reshape([n, kvh, hd]).swap_dims(0, 1).swap_dims(1, 2);
-        let scores = q.matmul(kt).mul_scalar((hd as f32).powf(-0.5)).reshape([heads, t, n]) + bias;
-        let scores = scores.mask_fill(masked, f32::NEG_INFINITY);
-        // reshape while contiguous, then swap (see the sliding layer's sink)
-        let sinks = linear_bf16(qn.clone(), &self.sink).reshape([t, heads, 1]).swap_dims(0, 1);
-        let probs = softmax(Tensor::cat(vec![scores, sinks], 2), 2).slice([0..heads, 0..t, 0..n]);
-        let vv = v_all.reshape([n, kvh, hd]).swap_dims(0, 1);
-        let o = probs
-            .reshape([kvh, rep * t, n])
-            .matmul(vv)
-            .reshape([heads, t, hd])
-            .swap_dims(0, 1)
-            .reshape([t, heads * hd]);
+        let sinks = linear_bf16(qn.clone(), &self.sink);
+        let shape = AttnShape { heads, kv_heads: kvh, head_dim: hd, rel_extent: d.rel_extent, window: None };
+        let o = attend(&shape, q, rel, &self.rel_proj, sinks, &state.kv, state.pos, QUERY_TILE);
         let gate = sigmoid(linear_bf16(qn, &self.gate_attn));
         linear_bf16(o * gate, &self.wo)
     }

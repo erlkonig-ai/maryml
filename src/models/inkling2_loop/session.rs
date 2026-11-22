@@ -34,9 +34,15 @@
 //! call until [`MiniSession::reset`]. The caller replays the sequence from its
 //! archive. There is no per-token snapshot.
 //!
-//! Scope, stated. Sliding layers keep every key and value and mask beyond the
-//! window instead of dropping them, so a session's memory grows with its
-//! length. No checkpoint, rewind or cache export. The head runs on the host.
+//! Memory. A sliding visit drops keys and values no later query can see; a
+//! full visit keeps all of them ([`super::attend::Kv`]). So a session's state
+//! grows with its length only in the eight full-attention visits (layers 5 and
+//! 23 once, 11 and 17 on each of three passes): `2 * kv_dim * 4` bytes, 8 KiB,
+//! per token per full visit. Attention's scratch is bounded by its tiles
+//! ([`super::attend::QUERY_TILE`] by [`super::attend::KEY_TILE`]), not by the
+//! sequence.
+//!
+//! Scope, stated. No checkpoint, rewind or cache export. The head runs on the host.
 //! Logits are the release's: `unpadded_vocab_size` softcapped f32 values per
 //! row. Nothing here samples.
 

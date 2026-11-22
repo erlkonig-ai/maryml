@@ -65,6 +65,8 @@ pub mod release;
 pub mod import;
 pub mod schedule;
 #[cfg(feature = "inkling-cuda")]
+pub mod attend;
+#[cfg(feature = "inkling-cuda")]
 pub mod loop_core;
 #[cfg(feature = "inkling-cuda")]
 pub mod full;

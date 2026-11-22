@@ -407,9 +407,9 @@ fn main() {
                 (f("bf16"), f("f32"))
             };
             let (a, b) = st("k", false);
-            rep.row(tag, &format!("layer{l} cache k"), &host(s.k.clone().unwrap()), &a, &b, gated);
+            rep.row(tag, &format!("layer{l} cache k"), &host(s.kv.keys().unwrap()), &a, &b, gated);
             let (a, b) = st("v", false);
-            rep.row(tag, &format!("layer{l} cache v"), &host(s.v.clone().unwrap()), &a, &b, gated);
+            rep.row(tag, &format!("layer{l} cache v"), &host(s.kv.values().unwrap()), &a, &b, gated);
             for i in 0..4 {
                 let (a, b) = st(&format!("conv{i}"), true);
                 rep.row(tag, &format!("layer{l} conv{i}"), &host(s.conv[i].clone()), &a, &b, gated);

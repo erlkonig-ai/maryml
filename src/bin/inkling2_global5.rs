@@ -263,9 +263,9 @@ fn main() {
                     (f("bf16"), f("f32"))
                 };
                 let (a, b) = st("k", false);
-                rep.row(&tag, "state k", &host(state.k.clone().unwrap()), &a, &b, gated);
+                rep.row(&tag, "state k", &host(state.kv.keys().unwrap()), &a, &b, gated);
                 let (a, b) = st("v", false);
-                rep.row(&tag, "state v", &host(state.v.clone().unwrap()), &a, &b, gated);
+                rep.row(&tag, "state v", &host(state.kv.values().unwrap()), &a, &b, gated);
                 for i in 0..4 {
                     let (a, b) = st(&format!("conv{i}"), true);
                     rep.row(&tag, &format!("state conv{i}"), &host(state.conv[i].clone()), &a, &b, gated);

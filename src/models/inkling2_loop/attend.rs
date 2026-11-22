@@ -1,0 +1,585 @@
+//! Inkling 2 Mini's attention, sliding and full, in memory that does not grow
+//! with the prompt: keys and values held in fixed segments, scores computed one
+//! (query tile, key segment) pair at a time with an online softmax.
+//!
+//! What it computes is what the layers computed before, a materialised softmax
+//! over `[heads, t, n]` (transformers 046bdb8c `Inkling2LoopSlidingAttention`
+//! and `Inkling2LoopFullAttention`). For head `h` and the query at absolute
+//! position `p`, over the visible keys `j`:
+//!
+//! ```text
+//! s_j = q . k_j / sqrt(head_dim) + bias_h(p - j)
+//! out = sum_j exp(s_j) v_j / (sum_j exp(s_j) + exp(sink_h))
+//! ```
+//!
+//! A key is visible when `0 <= p - j` and, on a sliding layer, `p - j <
+//! window`. `bias_h(d)` is the query's relative logit at distance `d` when `d <
+//! rel_extent` and zero beyond. GQA: heads `g * rep .. (g + 1) * rep` read KV
+//! head `g`. The log scale of a full layer is already in `q` and in the
+//! relative states the caller passes.
+//!
+//! The online softmax starts each query row at `m = sink`, `l = 1` (the sink's
+//! own term) and `o = 0`, and folds each key segment in: `m' = max(m,
+//! max_j s_j)`, `l = l exp(m - m') + sum_j exp(s_j - m')`, `o = o exp(m - m') +
+//! sum_j exp(s_j - m') v_j`. So the sink stays in the denominator, and a row
+//! that sees no key in a segment (every `s_j` is `-inf`) leaves `m`, `l` and
+//! `o` exactly as they were. The answer is the materialised softmax's up to the
+//! order of the sums.
+//!
+//! Distances, the causal and window mask and the bias indices are built on the
+//! device from two `arange`s, and only for a segment that needs them: a segment
+//! wholly in the past and inside the window gets no mask, one wholly beyond
+//! `rel_extent` no bias, one wholly in the future or wholly outside the window
+//! is skipped.
+//!
+//! Memory. [`Kv`] holds a visit's keys and values in segments of
+//! [`KEY_TILE`] rows, each allocated whole and filled in place, so a decode
+//! step writes one row and allocates nothing. A sliding visit drops a segment
+//! once no later query can see any of its keys ([`Kv::evict_before`]); a full
+//! visit keeps every segment. The largest transient is a handful of `[heads,
+//! QUERY_TILE, KEY_TILE]` tensors (scores, distances, bias indices, masks,
+//! probabilities), never one as wide as the prompt.
+
+use burn::prelude::*;
+use burn::tensor::Int;
+
+use crate::models::inkling::seam::Bk;
+
+/// Rows of one key/value segment, and so of one key tile.
+pub const KEY_TILE: usize = 1024;
+
+/// Queries scored together against one key segment.
+pub const QUERY_TILE: usize = 1024;
+
+/// One visit's keys and values: post-clip K and post-norm V `[rows, kv_dim]`,
+/// in segments of `tile` rows, oldest first, from absolute position `base`.
+pub struct Kv {
+    tile: usize,
+    base: usize,
+    /// Every segment but the last is full.
+    segs: Vec<[Tensor<Bk, 2>; 2]>,
+    /// Rows filled in the last segment.
+    last: usize,
+}
+
+impl Kv {
+    pub fn new(tile: usize) -> Kv {
+        assert!(tile > 0, "a segment holds at least one row");
+        Kv { tile, base: 0, segs: Vec::new(), last: 0 }
+    }
+
+    /// Absolute position of the first row held.
+    pub fn base(&self) -> usize {
+        self.base
+    }
+
+    /// Rows held, dropped segments not counted.
+    pub fn rows(&self) -> usize {
+        match self.segs.len() {
+            0 => 0,
+            s => (s - 1) * self.tile + self.last,
+        }
+    }
+
+    /// One past the absolute position of the last row held.
+    pub fn end(&self) -> usize {
+        self.base + self.rows()
+    }
+
+    /// Segments held, and the rows they are allocated for (full segments,
+    /// whatever is filled).
+    pub fn allocated_rows(&self) -> usize {
+        self.segs.len() * self.tile
+    }
+
+    /// Append `k` and `v` (`[t, kv_dim]`) at positions `end() ..`.
+    pub fn append(&mut self, k: Tensor<Bk, 2>, v: Tensor<Bk, 2>) {
+        let [t, c] = k.dims();
+        assert_eq!(v.dims(), [t, c], "keys and values are the same shape");
+        let mut i = 0;
+        while i < t {
+            if self.segs.is_empty() || self.last == self.tile {
+                let dev = k.device();
+                self.segs.push([Tensor::zeros([self.tile, c], &dev), Tensor::zeros([self.tile, c], &dev)]);
+                self.last = 0;
+            }
+            let take = (self.tile - self.last).min(t - i);
+            let rows = self.last..self.last + take;
+            let [sk, sv] = self.segs.pop().expect("a segment to fill");
+            let sk = sk.slice_assign([rows.clone(), 0..c], k.clone().slice([i..i + take, 0..c]));
+            let sv = sv.slice_assign([rows, 0..c], v.clone().slice([i..i + take, 0..c]));
+            self.segs.push([sk, sv]);
+            self.last += take;
+            i += take;
+        }
+    }
+
+    /// Drop every whole segment whose rows all sit before absolute position
+    /// `first`. The segment holding `first`, and the one being filled, stay.
+    pub fn evict_before(&mut self, first: usize) {
+        while self.segs.len() > 1 && self.base + self.tile <= first {
+            self.segs.remove(0);
+            self.base += self.tile;
+        }
+    }
+
+    /// `(absolute position of row 0, keys, values)` of each segment, cut to
+    /// its filled rows.
+    pub fn segments(&self) -> impl Iterator<Item = (usize, Tensor<Bk, 2>, Tensor<Bk, 2>)> + '_ {
+        let n = self.segs.len();
+        self.segs.iter().enumerate().map(move |(s, [k, v])| {
+            let rows = if s + 1 == n { self.last } else { self.tile };
+            let [_, c] = k.dims();
+            (self.base + s * self.tile, k.clone().slice([0..rows, 0..c]), v.clone().slice([0..rows, 0..c]))
+        })
+    }
+
+    fn joined(&self, which: usize) -> Option<Tensor<Bk, 2>> {
+        let parts: Vec<Tensor<Bk, 2>> = self.segments().map(|(_, k, v)| if which == 0 { k } else { v }).collect();
+        (!parts.is_empty()).then(|| Tensor::cat(parts, 0))
+    }
+
+    /// Every key held, `[rows, kv_dim]`, as one tensor: for the comparison
+    /// binaries, which line a short cache up with upstream's.
+    pub fn keys(&self) -> Option<Tensor<Bk, 2>> {
+        self.joined(0)
+    }
+
+    /// Every value held, as [`Self::keys`].
+    pub fn values(&self) -> Option<Tensor<Bk, 2>> {
+        self.joined(1)
+    }
+}
+
+/// The fixed shape of one attention.
+#[derive(Debug, Clone, Copy)]
+pub struct AttnShape {
+    pub heads: usize,
+    pub kv_heads: usize,
+    pub head_dim: usize,
+    pub rel_extent: usize,
+    /// `Some(w)` on a sliding layer: a key `w` or more positions back is not
+    /// visible.
+    pub window: Option<usize>,
+}
+
+/// Attention of `t` queries at absolute positions `first ..` over every key in
+/// `kv`, which already holds the call's own rows.
+///
+/// `q` is `[t, heads, head_dim]`, `rel` `[t * heads, d_rel]` (both clipped and,
+/// on a full layer, log-scaled), `rel_proj` `[d_rel, rel_extent]`, `sinks`
+/// `[t, heads]`. Returns `[t, heads * head_dim]`.
+#[allow(clippy::too_many_arguments)]
+pub fn attend(
+    a: &AttnShape,
+    q: Tensor<Bk, 3>,
+    rel: Tensor<Bk, 2>,
+    rel_proj: &Tensor<Bk, 2>,
+    sinks: Tensor<Bk, 2>,
+    kv: &Kv,
+    first: usize,
+    query_tile: usize,
+) -> Tensor<Bk, 2> {
+    let [t, heads, hd] = q.dims();
+    let [_, d_rel] = rel.dims();
+    assert_eq!(heads, a.heads, "q carries the shape's heads");
+    assert_eq!(kv.end(), first + t, "the cache holds exactly the keys up to the call's last query");
+    let (kvh, e) = (a.kv_heads, a.rel_extent);
+    let rep = heads / kvh;
+    let dev = q.device();
+    let scale = (hd as f32).powf(-0.5);
+    let mut outs = Vec::with_capacity(t.div_ceil(query_tile));
+    let mut i0 = 0;
+    while i0 < t {
+        let tq = query_tile.min(t - i0);
+        let p0 = first + i0;
+        // the layouts and the swap-then-reshape chains are the materialised
+        // attention's, applied to a slice of rows
+        let qt = q.clone().slice([i0..i0 + tq, 0..heads, 0..hd]).swap_dims(0, 1).reshape([kvh, rep * tq, hd]);
+        let relt = rel
+            .clone()
+            .slice([i0 * heads..(i0 + tq) * heads, 0..d_rel])
+            .matmul(rel_proj.clone())
+            .reshape([tq, heads, e])
+            .swap_dims(0, 1);
+        // `[heads, tq, 1]`, never reshaped: on this backend a reshape after a
+        // swap with a unit dimension has read zeros (the sliding layer's note)
+        let mut m = sinks.clone().slice([i0..i0 + tq, 0..heads]).reshape([tq, heads, 1]).swap_dims(0, 1);
+        let mut l = m.ones_like();
+        let mut o: Tensor<Bk, 3> = Tensor::zeros([heads, tq, hd], &dev);
+        for (k0, k, v) in kv.segments() {
+            let [tk, _] = k.dims();
+            // the nearest and the farthest distance any (query, key) pair here has
+            let near = p0 as i64 - (k0 + tk - 1) as i64;
+            let far = (p0 + tq - 1) as i64 - k0 as i64;
+            if far < 0 {
+                break;
+            }
+            if a.window.is_some_and(|w| near >= w as i64) {
+                continue;
+            }
+            let kt = k.reshape([tk, kvh, hd]).swap_dims(0, 1).swap_dims(1, 2);
+            let mut s = qt.clone().matmul(kt).mul_scalar(scale).reshape([heads, tq, tk]);
+            let need_mask = near < 0 || a.window.is_some_and(|w| far >= w as i64);
+            let need_bias = near < e as i64;
+            if need_mask || need_bias {
+                let qp = Tensor::<Bk, 1, Int>::arange(p0 as i64..(p0 + tq) as i64, &dev).reshape([tq, 1]);
+                let kp = Tensor::<Bk, 1, Int>::arange(k0 as i64..(k0 + tk) as i64, &dev).reshape([1, tk]);
+                let dist = (qp - kp).unsqueeze_dim::<3>(0).repeat_dim(0, heads);
+                if need_bias {
+                    let idx = dist.clone().clamp(0, e as i64 - 1);
+                    let beyond = dist.clone().greater_equal_elem(e as i64);
+                    s = s + relt.clone().gather(2, idx).mask_fill(beyond, 0.0);
+                }
+                if need_mask {
+                    let mut hidden = dist.clone().lower_elem(0);
+                    if let Some(w) = a.window {
+                        hidden = hidden.bool_or(dist.greater_equal_elem(w as i64));
+                    }
+                    s = s.mask_fill(hidden, f32::NEG_INFINITY);
+                }
+            }
+            let m_new = m.clone().max_pair(s.clone().max_dim(2));
+            let alpha = (m - m_new.clone()).exp();
+            let p = (s - m_new.clone()).exp();
+            l = l * alpha.clone() + p.clone().sum_dim(2);
+            let vv = v.reshape([tk, kvh, hd]).swap_dims(0, 1);
+            let pv = p.reshape([kvh, rep * tq, tk]).matmul(vv).reshape([heads, tq, hd]);
+            o = o * alpha + pv;
+            m = m_new;
+        }
+        outs.push((o / l).swap_dims(0, 1).reshape([tq, heads * hd]));
+        i0 += tq;
+    }
+    if outs.len() == 1 { outs.pop().expect("one tile") } else { Tensor::cat(outs, 0) }
+}
+
+#[cfg(test)]
+mod tests {
+    //! [`attend`] against the materialised softmax the layers ran before (the
+    //! code of mary d17aa9d `SlidingLayer::attention` / `FullLayer::attention`
+    //! from the projections on), on the device, with random inputs.
+
+    use super::*;
+    use burn::tensor::activation::softmax;
+    use burn::tensor::{Bool, TensorData};
+
+    type Dev = burn::backend::cuda::CudaDevice;
+
+    struct Lcg(u64);
+    impl Lcg {
+        /// Roughly standard normal: a sum of four uniforms, centred and scaled.
+        fn normal(&mut self) -> f32 {
+            let mut s = 0.0;
+            for _ in 0..4 {
+                self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                s += (self.0 >> 40) as f32 / (1u64 << 24) as f32;
+            }
+            (s - 2.0) * 3f32.sqrt()
+        }
+        fn vec(&mut self, n: usize, scale: f32) -> Vec<f32> {
+            (0..n).map(|_| self.normal() * scale).collect()
+        }
+    }
+
+    fn up<const D: usize>(v: Vec<f32>, shape: [usize; D], dev: &Dev) -> Tensor<Bk, D> {
+        Tensor::from_data(TensorData::new(v, shape), dev)
+    }
+
+    fn host<const D: usize>(t: Tensor<Bk, D>) -> Vec<f32> {
+        t.into_data().convert::<f32>().to_vec().expect("f32")
+    }
+
+    /// The materialised attention of d17aa9d, generalised only in taking the
+    /// window as an option: queries at `first ..`, keys at `0 .. n`.
+    #[allow(clippy::too_many_arguments)]
+    fn materialised(
+        a: &AttnShape,
+        q: Tensor<Bk, 3>,
+        rel: Tensor<Bk, 2>,
+        rel_proj: &Tensor<Bk, 2>,
+        sinks: Tensor<Bk, 2>,
+        k_all: Tensor<Bk, 2>,
+        v_all: Tensor<Bk, 2>,
+        first: usize,
+    ) -> Tensor<Bk, 2> {
+        let [t, heads, hd] = q.dims();
+        let [n, _] = k_all.dims();
+        let dev = q.device();
+        let (kvh, e) = (a.kv_heads, a.rel_extent);
+        let rel_logits = rel.matmul(rel_proj.clone()).reshape([t, heads, e]).swap_dims(0, 1);
+        let mut gather = Vec::with_capacity(heads * t * n);
+        let mut masked = Vec::with_capacity(heads * t * n);
+        let mut no_bias = Vec::with_capacity(heads * t * n);
+        for _ in 0..heads {
+            for i in 0..t {
+                for j in 0..n {
+                    let dist = (first + i) as i64 - j as i64;
+                    gather.push(dist.clamp(0, e as i64 - 1));
+                    masked.push(dist < 0 || a.window.is_some_and(|w| dist >= w as i64));
+                    no_bias.push(dist < 0 || dist >= e as i64);
+                }
+            }
+        }
+        let gather = Tensor::<Bk, 3, Int>::from_data(TensorData::new(gather, [heads, t, n]), &dev);
+        let masked = Tensor::<Bk, 3, Bool>::from_data(TensorData::new(masked, [heads, t, n]), &dev);
+        let no_bias = Tensor::<Bk, 3, Bool>::from_data(TensorData::new(no_bias, [heads, t, n]), &dev);
+        let bias = rel_logits.gather(2, gather).mask_fill(no_bias, 0.0);
+        let rep = heads / kvh;
+        let q = q.swap_dims(0, 1).reshape([kvh, rep * t, hd]);
+        let kt = k_all.reshape([n, kvh, hd]).swap_dims(0, 1).swap_dims(1, 2);
+        let scores = q.matmul(kt).mul_scalar((hd as f32).powf(-0.5)).reshape([heads, t, n]) + bias;
+        let scores = scores.mask_fill(masked, f32::NEG_INFINITY);
+        let sinks = sinks.reshape([t, heads, 1]).swap_dims(0, 1);
+        let probs = softmax(Tensor::cat(vec![scores, sinks], 2), 2).slice([0..heads, 0..t, 0..n]);
+        let vv = v_all.reshape([n, kvh, hd]).swap_dims(0, 1);
+        probs
+            .reshape([kvh, rep * t, n])
+            .matmul(vv)
+            .reshape([heads, t, hd])
+            .swap_dims(0, 1)
+            .reshape([t, heads * hd])
+    }
+
+    /// One random sequence of `n` positions: per-position Q, rel states and
+    /// sinks, and K, V.
+    struct Case {
+        a: AttnShape,
+        d_rel: usize,
+        n: usize,
+        q: Vec<f32>,
+        rel: Vec<f32>,
+        sinks: Vec<f32>,
+        k: Vec<f32>,
+        v: Vec<f32>,
+        rel_proj: Tensor<Bk, 2>,
+        dev: Dev,
+    }
+
+    impl Case {
+        fn new(a: AttnShape, d_rel: usize, n: usize, seed: u64) -> Case {
+            let dev = Dev::default();
+            let mut r = Lcg(seed);
+            let (h, kvd) = (a.heads, a.kv_heads * a.head_dim);
+            let q = r.vec(n * h * a.head_dim, 2.0);
+            let rel = r.vec(n * h * d_rel, 1.0);
+            let mut sinks = r.vec(n * h, 2.0);
+            // a sink-dominated row: every head of position 7 sinks hard
+            for x in &mut sinks[7 * h..8 * h] {
+                *x = 60.0;
+            }
+            let k = r.vec(n * kvd, 1.0);
+            let v = r.vec(n * kvd, 1.0);
+            let rel_proj = up(r.vec(d_rel * a.rel_extent, 1.0), [d_rel, a.rel_extent], &dev);
+            Case { a, d_rel, n, q, rel, sinks, k, v, rel_proj, dev }
+        }
+
+        fn rows(&self, r: std::ops::Range<usize>) -> (Tensor<Bk, 3>, Tensor<Bk, 2>, Tensor<Bk, 2>, Tensor<Bk, 2>, Tensor<Bk, 2>) {
+            let (h, hd, kvd, t) = (self.a.heads, self.a.head_dim, self.a.kv_heads * self.a.head_dim, r.len());
+            (
+                up(self.q[r.start * h * hd..r.end * h * hd].to_vec(), [t, h, hd], &self.dev),
+                up(self.rel[r.start * h * self.d_rel..r.end * h * self.d_rel].to_vec(), [t * h, self.d_rel], &self.dev),
+                up(self.sinks[r.start * h..r.end * h].to_vec(), [t, h], &self.dev),
+                up(self.k[r.start * kvd..r.end * kvd].to_vec(), [t, kvd], &self.dev),
+                up(self.v[r.start * kvd..r.end * kvd].to_vec(), [t, kvd], &self.dev),
+            )
+        }
+
+        /// Every position's output, from the materialised attention over the
+        /// whole sequence at once.
+        fn reference(&self) -> Vec<f32> {
+            let (q, rel, sinks, k, v) = self.rows(0..self.n);
+            host(materialised(&self.a, q, rel, &self.rel_proj, sinks, k, v, 0))
+        }
+
+        /// Every position's output in f64 on the host, from the definition in
+        /// the module doc: no device arithmetic at all.
+        fn exact(&self) -> Vec<f32> {
+            let a = &self.a;
+            let (h, hd, kvh, e, dr) = (a.heads, a.head_dim, a.kv_heads, a.rel_extent, self.d_rel);
+            let rep = h / kvh;
+            let proj = host(self.rel_proj.clone());
+            let mut out = vec![0f32; self.n * h * hd];
+            let mut w = vec![0f64; self.n];
+            for p in 0..self.n {
+                for hh in 0..h {
+                    let g = hh / rep;
+                    let q = &self.q[(p * h + hh) * hd..(p * h + hh + 1) * hd];
+                    let rel = &self.rel[(p * h + hh) * dr..(p * h + hh + 1) * dr];
+                    let sink = self.sinks[p * h + hh] as f64;
+                    let lo = a.window.map_or(0, |win| (p + 1).saturating_sub(win));
+                    let mut m = sink;
+                    for j in lo..=p {
+                        let k = &self.k[(j * kvh + g) * hd..(j * kvh + g + 1) * hd];
+                        let mut s: f64 = q.iter().zip(k).map(|(x, y)| *x as f64 * *y as f64).sum::<f64>() / (hd as f64).sqrt();
+                        let d = p - j;
+                        if d < e {
+                            s += (0..dr).map(|r| rel[r] as f64 * proj[r * e + d] as f64).sum::<f64>();
+                        }
+                        w[j] = s;
+                        m = m.max(s);
+                    }
+                    let mut den = (sink - m).exp();
+                    let mut acc = vec![0f64; hd];
+                    for j in lo..=p {
+                        let pj = (w[j] - m).exp();
+                        den += pj;
+                        let v = &self.v[(j * kvh + g) * hd..(j * kvh + g + 1) * hd];
+                        for (o, x) in acc.iter_mut().zip(v) {
+                            *o += pj * *x as f64;
+                        }
+                    }
+                    for (d, o) in acc.iter().enumerate() {
+                        out[(p * h + hh) * hd + d] = (o / den) as f32;
+                    }
+                }
+            }
+            out
+        }
+
+        /// Every position's output from [`attend`], fed in calls of `plan`
+        /// lengths, with a sliding window's eviction after each call. Checks
+        /// after each call that the cache starts no later than the oldest key
+        /// the next query can see, and drops everything a segment earlier.
+        fn tiled(&self, plan: &[usize], key_tile: usize, query_tile: usize) -> Vec<f32> {
+            let mut kv = Kv::new(key_tile);
+            let mut out = Vec::new();
+            let mut at = 0;
+            for &len in plan {
+                let (q, rel, sinks, k, v) = self.rows(at..at + len);
+                kv.append(k, v);
+                out.extend(host(attend(&self.a, q, rel, &self.rel_proj, sinks, &kv, at, query_tile)));
+                at += len;
+                if let Some(w) = self.a.window {
+                    let oldest = (at + 1).saturating_sub(w);
+                    kv.evict_before(oldest);
+                    assert!(kv.base() <= oldest, "at {at}: the cache starts at {} after the oldest visible key {oldest}", kv.base());
+                    assert!(
+                        kv.base() + key_tile > oldest || kv.allocated_rows() <= key_tile,
+                        "at {at}: a whole segment before {oldest} survived (base {})",
+                        kv.base()
+                    );
+                    assert!(kv.allocated_rows() <= (w - 1).div_ceil(key_tile) * key_tile + 2 * key_tile);
+                }
+                assert_eq!(kv.end(), at);
+            }
+            assert_eq!(at, self.n, "the plan covers the sequence");
+            out
+        }
+    }
+
+    /// Worst absolute difference per row, and the worst of all.
+    fn worst(got: &[f32], want: &[f32], width: usize) -> (f32, usize) {
+        let mut w = (0f32, 0usize);
+        for (i, (g, r)) in got.chunks(width).zip(want.chunks(width)).enumerate() {
+            let d = g.iter().zip(r).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+            assert!(d.is_finite(), "row {i} is not finite");
+            if d > w.0 {
+                w = (d, i);
+            }
+        }
+        w
+    }
+
+    /// Each plan through [`attend`] against the exact host attention, beside
+    /// the materialised device attention against the same: the tiled path
+    /// must be no further from the definition than the code it replaces was
+    /// (with slack for the order of the sums), and the sink-dominated row
+    /// must be zero.
+    fn check(c: &Case, plans: &[(&[usize], usize, usize)]) {
+        let exact = c.exact();
+        let width = c.a.heads * c.a.head_dim;
+        let sunk = exact[7 * width..8 * width].iter().fold(0f32, |m, x| m.max(x.abs()));
+        assert!(sunk < 1e-12, "position 7's sink does not dominate: {sunk}");
+        let mat = c.reference();
+        let (dm, rm) = worst(&mat, &exact, width);
+        println!("materialised (d17aa9d) vs exact: worst abs {dm:.3e} at position {rm}");
+        for &(plan, kt, qt) in plans {
+            let got = c.tiled(plan, kt, qt);
+            let (d, row) = worst(&got, &exact, width);
+            let (dt, rt) = worst(&got, &mat, width);
+            println!(
+                "plan {:?}{} key tile {kt} query tile {qt}: vs exact worst abs {d:.3e} at position {row}; vs materialised {dt:.3e} at {rt}",
+                &plan[..plan.len().min(12)],
+                if plan.len() > 12 { format!(" .. ({} calls)", plan.len()) } else { String::new() }
+            );
+            assert!(d <= 1.5 * dm + 1e-5, "plan {plan:?}, tiles {kt}/{qt}: position {row} is {d} from exact, the materialised path {dm}");
+            let s = got[7 * width..8 * width].iter().fold(0f32, |m, x| m.max(x.abs()));
+            assert!(s < 1e-12, "position 7 under the sink: {s}");
+        }
+    }
+
+    // Mini's head grouping (24 over 8 is three heads a KV head), small sizes so
+    // a sequence crosses many segments, windows and the bias extent.
+    fn small(window: Option<usize>, rel_extent: usize) -> AttnShape {
+        AttnShape { heads: 6, kv_heads: 2, head_dim: 32, rel_extent, window }
+    }
+
+    #[test]
+    fn sliding_tiles_match_materialised() {
+        // window 48 = rel_extent, as on Mini's sliding layers; key tiles of 16
+        // and query tiles of 12 never line up, so query tiles straddle segments
+        // and some rows see no key of a live segment (rows 12..15 of the tile
+        // at 12 against the segment at 16, and rows beyond the window)
+        let c = Case::new(small(Some(48), 48), 4, 203, 11);
+        check(
+            &c,
+            &[
+                (&[203], 16, 12),
+                (&[203], 1024, 1024),
+                (&[30, 20, 1, 1, 1, 50, 47, 3, 1, 49], 16, 12),
+                (&[47, 1, 1, 48, 1, 105], 16, 5),
+                (&[1; 203], 16, 12),
+            ],
+        );
+    }
+
+    #[test]
+    fn full_tiles_match_materialised() {
+        // no window, rel_extent 40: many full segments behind every query,
+        // some wholly beyond the bias extent
+        let c = Case::new(small(None, 40), 4, 211, 23);
+        check(
+            &c,
+            &[
+                (&[211], 16, 12),
+                (&[211], 64, 64),
+                (&[100, 1, 1, 1, 60, 48], 16, 12),
+                (&[1; 211], 16, 7),
+            ],
+        );
+    }
+
+    #[test]
+    fn decode_appends_pack_into_segments() {
+        let dev = Dev::default();
+        let mut kv = Kv::new(16);
+        let row = || Tensor::<Bk, 2>::ones([1, 4], &dev);
+        for i in 1..=40 {
+            kv.append(row(), row());
+            assert_eq!(kv.end(), i);
+            assert_eq!(kv.segments().count(), i.div_ceil(16), "{i} rows");
+        }
+        assert_eq!(kv.allocated_rows(), 48);
+        kv.evict_before(33);
+        assert_eq!((kv.base(), kv.rows()), (32, 8));
+        let keys = host(kv.keys().unwrap());
+        assert_eq!(keys.len(), 8 * 4);
+    }
+
+    /// Mini's real attention shape and window, across the 1024 boundary with
+    /// the production tiles, in one call and in Drive-like and decode-like
+    /// calls.
+    #[test]
+    fn mini_shape_across_the_window() {
+        let sliding = AttnShape { heads: 24, kv_heads: 8, head_dim: 128, rel_extent: 1024, window: Some(1024) };
+        let c = Case::new(sliding, 16, 1300, 5);
+        check(
+            &c,
+            &[(&[1300], KEY_TILE, QUERY_TILE), (&[1000, 23, 1, 1, 1, 274], KEY_TILE, QUERY_TILE), (&[1020, 1, 1, 1, 1, 1, 1, 274], KEY_TILE, QUERY_TILE)],
+        );
+        let full = AttnShape { window: None, ..sliding };
+        let c = Case::new(full, 16, 1300, 6);
+        check(&c, &[(&[1300], KEY_TILE, QUERY_TILE), (&[1000, 23, 1, 1, 1, 274], KEY_TILE, QUERY_TILE)]);
+    }
+}
