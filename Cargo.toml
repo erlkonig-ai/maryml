@@ -496,6 +496,12 @@ required-features = ["inkling-cuda"]
 name = "inkling2_global5"
 required-features = ["inkling-cuda"]
 
+# Inkling 2 Mini from the embedding through layer 5, chained, from a pile root,
+# against transformers' own run of the same layers (golden/capture_inkling2_chain5.py).
+[[bin]]
+name = "inkling2_chain5"
+required-features = ["inkling-cuda"]
+
 # Parity gate for the NVFP4 expert decode against compressed_tensors, which is
 # the library that defines this packing. Reads a small raw-binary oracle bundle.
 [[bin]]
