@@ -264,7 +264,7 @@ pub struct SlidingLayer {
     gates: Option<[MessageGate; 4]>,
 }
 
-const STREAMS: [Stream; 4] = [Stream::Query, Stream::Key, Stream::Value, Stream::Mlp];
+pub(super) const STREAMS: [Stream; 4] = [Stream::Query, Stream::Key, Stream::Value, Stream::Mlp];
 
 /// One visit's carried state.
 pub struct State {
@@ -349,26 +349,7 @@ impl SlidingLayer {
 
         let router_bias = f32_le(want(w, l(LayerPart::GateBias), Dtype::F32, &[d.experts])?.bytes);
         let experts = bind_experts(w, &d, layer, &client)?;
-        let gates = if t.is_core(layer) {
-            let r = t.loop_config.gate_rank;
-            let gate = |s: Stream| -> Result<MessageGate, String> {
-                let part = |g: GatePart, shape: &[usize]| -> Result<Vec<f32>, String> {
-                    Ok(bf16_to_f32(want(w, l(LayerPart::Controller(s, g)), Dtype::Bf16, shape)?.bytes))
-                };
-                MessageGate::new(
-                    part(GatePart::Down, &[r, 2 * h])?,
-                    part(GatePart::Forget, &[h, r])?,
-                    part(GatePart::Gain, &[h, r])?,
-                    h,
-                    r,
-                    d.eps as f32,
-                    DownPrecision::Bf16,
-                )
-            };
-            Some([gate(STREAMS[0])?, gate(STREAMS[1])?, gate(STREAMS[2])?, gate(STREAMS[3])?])
-        } else {
-            None
-        };
+        let gates = bind_gates(w, t, layer)?;
         Ok(SlidingLayer {
             layer,
             dims: d,
@@ -448,10 +429,7 @@ impl SlidingLayer {
             assert_eq!(m.len(), t * 4 * d.hidden, "messages are [t, 4, H]");
             (g, m)
         });
-        let message = |m: &[f32], s: Stream| -> Vec<f32> {
-            let j = message_slot(s);
-            (0..t).flat_map(|i| m[(i * 4 + j) * d.hidden..(i * 4 + j + 1) * d.hidden].iter().copied()).collect()
-        };
+        let message = |m: &[f32], s: Stream| message_of(m, s, t, d.hidden);
         let upload = |v: Vec<f32>| Tensor::<Bk, 2>::from_data(TensorData::new(v, [t, d.hidden]), &dev);
         // upstream casts each normed input back to the layer dtype; here every
         // consumer of the three is a `linear_bf16`, whose entry is that cast
@@ -616,6 +594,42 @@ impl SlidingLayer {
         let gate = sigmoid(linear_bf16(hn, &self.gate_attn));
         linear_bf16(o * gate, &self.wo)
     }
+}
+
+/// A core layer's four message gates (Q, K, V, MLP, in [`message_slot`]
+/// order) with the released model's BF16 down projection; `None` outside the
+/// core. Shared by the sliding and the full-attention core layers.
+pub(super) fn bind_gates(
+    w: &dyn Weights,
+    t: &Inkling2LoopTextConfig,
+    layer: usize,
+) -> Result<Option<[MessageGate; 4]>, String> {
+    if !t.is_core(layer) {
+        return Ok(None);
+    }
+    let (h, r) = (t.hidden_size, t.loop_config.gate_rank);
+    let gate = |s: Stream| -> Result<MessageGate, String> {
+        let part = |g: GatePart, shape: &[usize]| -> Result<Vec<f32>, String> {
+            let slot = Slot::Layer(layer, LayerPart::Controller(s, g));
+            Ok(bf16_to_f32(want(w, slot, Dtype::Bf16, shape)?.bytes))
+        };
+        MessageGate::new(
+            part(GatePart::Down, &[r, 2 * h])?,
+            part(GatePart::Forget, &[h, r])?,
+            part(GatePart::Gain, &[h, r])?,
+            h,
+            r,
+            t.rms_norm_eps as f32,
+            DownPrecision::Bf16,
+        )
+    };
+    Ok(Some([gate(STREAMS[0])?, gate(STREAMS[1])?, gate(STREAMS[2])?, gate(STREAMS[3])?]))
+}
+
+/// The `[t, H]` message of stream `s` out of a visit's `[t, 4, H]` messages.
+pub(super) fn message_of(m: &[f32], s: Stream, t: usize, h: usize) -> Vec<f32> {
+    let j = message_slot(s);
+    (0..t).flat_map(|i| m[(i * 4 + j) * h..(i * 4 + j + 1) * h].iter().copied()).collect()
 }
 
 /// Run one short convolution over `x`'s rows after the carried inputs in

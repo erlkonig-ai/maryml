@@ -30,8 +30,23 @@
 //! `k - 1` inputs of the four convolutions; for K and V those are the
 //! projected states, before the dynamic conv, as upstream caches them.
 //!
-//! Scope, stated: the core's full layers (11, 17) and their messages are not
-//! here. Experts bind in their stored format, so layer 23's MXFP8 experts do.
+//! A full core layer (11, 17) on a pass after the first is upstream's
+//! `Inkling2LoopFullLoopDecoderLayer`: each of the three attention-residual
+//! outputs gets its own message gate *before* its own norm (a sliding core
+//! layer gates its one input three ways), and the MLP gate sits between
+//! `mlp_input` and `post_attention_layernorm`:
+//!
+//! ```text
+//! qh, kh, vh = attention_input(blocks, x)
+//! qh, kh, vh = gate_q(qh, m_q), gate_k(kh, m_k), gate_v(vh, m_v)
+//! a = attn(qn(qh), kn(kh), vn(vh)) ...       as above
+//! m = gate_mlp(mlp_input(blocks, h), m_mlp)
+//! ```
+//!
+//! With no messages it is exactly the ungated visit. The gates run on the host
+//! (CC's [`MessageGate`], BF16 down projection), as in a sliding core layer.
+//!
+//! Experts bind in their stored format, including the MXFP8 experts in layer 23.
 
 use std::collections::BTreeMap;
 
@@ -46,9 +61,10 @@ use crate::models::inkling::seam::{Bk, client_of};
 use crate::models::inkling2_loop::config::{AttnKind, Inkling2LoopTextConfig};
 use crate::models::inkling2_loop::layout::{AttnPart, ConvPart, Dtype, LayerPart, Slot};
 use crate::models::inkling2_loop::sliding::{
-    Dev, Dims, Expert, ExpertAct, State, Taps, Weights, bf16_to_f32, bind_experts, block_attention,
-    conv_step, f32_le, l2_clip, unit_rms, want,
+    Dev, Dims, Expert, ExpertAct, STREAMS, State, Taps, Weights, bf16_to_f32, bind_experts, bind_gates,
+    block_attention, conv_step, f32_le, l2_clip, message_of, unit_rms, want,
 };
+use crate::models::inkling2_loop::messages::MessageGate;
 
 /// A full-attention layer's weights, bound on the device.
 pub struct FullLayer {
@@ -83,11 +99,15 @@ pub struct FullLayer {
     attn_sconv: Tensor<Bk, 2>,
     mlp_sconv: Tensor<Bk, 2>,
     experts: Vec<Expert>,
+    /// Core layers only: the Q, K, V and MLP message gates, in
+    /// [`super::messages::message_slot`] order.
+    gates: Option<[MessageGate; 4]>,
 }
 
 /// What a full visit returns besides its output.
 pub struct FullTaps {
-    /// The Q, K and V streams' block-attention outputs (before their norms).
+    /// The Q, K and V streams' block-attention outputs (before their gates
+    /// and norms).
     pub inputs: [Tensor<Bk, 2>; 3],
     pub rest: Taps,
 }
@@ -97,9 +117,6 @@ impl FullLayer {
     pub fn bind(w: &dyn Weights, t: &Inkling2LoopTextConfig, layer: usize, dev: &Dev) -> Result<FullLayer, String> {
         if t.attn_kind(layer) != AttnKind::Global {
             return Err(format!("layer {layer} is a sliding layer, not a full-attention one"));
-        }
-        if t.is_core(layer) {
-            return Err(format!("layer {layer} is in the looped core; its messages are not here"));
         }
         let (heads, kv_heads, head_dim) = t.heads(AttnKind::Global);
         let d = Dims {
@@ -181,7 +198,13 @@ impl FullLayer {
             attn_sconv: conv(l(LayerPart::AttnSconv), h)?,
             mlp_sconv: conv(l(LayerPart::MlpSconv), h)?,
             experts,
+            gates: bind_gates(w, t, layer)?,
         })
+    }
+
+    /// Whether this layer has message gates (a core layer).
+    pub fn reads_messages(&self) -> bool {
+        self.gates.is_some()
     }
 
     pub fn is_block_boundary(&self) -> bool {
@@ -212,6 +235,22 @@ impl FullLayer {
         act: ExpertAct,
         origin: usize,
     ) -> (Tensor<Bk, 2>, FullTaps) {
+        self.forward_visit(x, blocks, state, act, origin, None)
+    }
+
+    /// [`Self::forward_at`], with the four messages `[t, 4, H]` (Q, K, V, MLP)
+    /// a core layer reads on a pass after the first
+    /// ([`super::messages::read_messages`]). `None` is the ungated visit.
+    /// Panics if messages reach a layer with no gates.
+    pub fn forward_visit(
+        &self,
+        x: Tensor<Bk, 2>,
+        blocks: &mut Vec<Tensor<Bk, 2>>,
+        state: &mut State,
+        act: ExpertAct,
+        origin: usize,
+        messages: Option<&[f32]>,
+    ) -> (Tensor<Bk, 2>, FullTaps) {
         let d = self.dims;
         let [t, _] = x.dims();
         let dev = x.device();
@@ -220,7 +259,27 @@ impl FullLayer {
             Some(qs) => qs.clone().map(|q| block_attention(q, blocks, x.clone())),
             None => [x.clone(), x.clone(), x.clone()],
         };
-        let normed = [0, 1, 2].map(|i| rms_norm(inputs[i].clone(), self.in_norm[i].clone(), d.eps));
+        let gated = messages.map(|m| {
+            let g = self.gates.as_ref().unwrap_or_else(|| panic!("layer {} reads no messages", self.layer));
+            assert_eq!(m.len(), t * 4 * d.hidden, "messages are [t, 4, H]");
+            (g, m)
+        });
+        let upload = |v: Vec<f32>| Tensor::<Bk, 2>::from_data(TensorData::new(v, [t, d.hidden]), &dev);
+        let mut gate_out: Option<[Vec<f32>; 4]> = None;
+        let streams = match gated {
+            None => inputs.clone(),
+            Some((g, m)) => {
+                let out = [0, 1, 2].map(|j| {
+                    let hh: Vec<f32> = inputs[j].clone().into_data().convert::<f32>().to_vec().expect("f32");
+                    g[j].apply(&hh, &message_of(m, STREAMS[j], t, d.hidden), t)
+                });
+                let up = out.clone().map(upload);
+                let [q, k, v] = out;
+                gate_out = Some([q, k, v, Vec::new()]);
+                up
+            }
+        };
+        let normed = [0, 1, 2].map(|i| rms_norm(streams[i].clone(), self.in_norm[i].clone(), d.eps));
         let attn = self.attention(normed, state, origin);
         let attn_conv = conv_step(&mut state.conv[2], attn.clone(), &self.attn_sconv, d.conv_scale());
 
@@ -231,7 +290,15 @@ impl FullLayer {
             block_residual + attn_conv.clone()
         };
         let mlp_input = block_attention(self.mlp_input.clone(), blocks, residual.clone());
-        let mn = rms_norm(mlp_input.clone(), self.mlp_norm.clone(), d.eps);
+        let mlp_in = match (gated, gate_out.as_mut()) {
+            (Some((g, m)), Some(out)) => {
+                let hh: Vec<f32> = mlp_input.clone().into_data().convert::<f32>().to_vec().expect("f32");
+                out[3] = g[3].apply(&hh, &message_of(m, STREAMS[3], t, d.hidden), t);
+                upload(out[3].clone())
+            }
+            _ => mlp_input.clone(),
+        };
+        let mn = rms_norm(mlp_in, self.mlp_norm.clone(), d.eps);
 
         let router_logits: Vec<f32> = linear_bf16(mn.clone(), &self.router)
             .into_data()
@@ -259,7 +326,7 @@ impl FullLayer {
         state.pos += t;
         let out = residual + mlp_conv.clone();
         let rest = Taps {
-            gates: None,
+            gates: gate_out,
             attn,
             attn_conv,
             mlp_input,

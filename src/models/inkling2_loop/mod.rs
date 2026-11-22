@@ -26,6 +26,10 @@
 //!   outside the core (layer 5): three block-attention inputs, dynamic K/V
 //!   convolutions, log scaling. Held to transformers' own layer 5 by the
 //!   `inkling2_global5` binary.
+//! * `loop_core` (with `inkling-cuda`): the looped core, layers 6..17 over three
+//!   passes, from the pre-loop hidden and block states to the post-loop ones,
+//!   each visit with its own carried state. Held to transformers' own
+//!   three-pass run by the `inkling2_core` binary.
 //!
 //! * `tail_check` (with `inkling-cuda`): the post-loop tail, layers 18..23
 //!   (MXFP8 experts from 20) and the head, against transformers' own run on
@@ -51,6 +55,8 @@ pub mod release;
 #[cfg(feature = "inkling2-import")]
 pub mod import;
 pub mod schedule;
+#[cfg(feature = "inkling-cuda")]
+pub mod loop_core;
 #[cfg(feature = "inkling-cuda")]
 pub mod full;
 #[cfg(feature = "inkling-cuda")]

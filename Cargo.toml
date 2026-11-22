@@ -505,6 +505,13 @@ required-features = ["inkling-cuda"]
 name = "inkling2_global5"
 required-features = ["inkling-cuda"]
 
+# Inkling 2 Mini's looped core (layers 6..17, three passes) on the device against
+# transformers' own three-pass run (golden/capture_inkling2_core.py), reading the
+# model from a pile alone through inkling2_loop::pile::MiniRoot.
+[[bin]]
+name = "inkling2_core"
+required-features = ["inkling-cuda"]
+
 [[bin]]
 name = "inkling2_head_check"
 required-features = ["inkling2-head-check"]
