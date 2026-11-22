@@ -70,7 +70,13 @@ def head(query, norm_w, unembed_padded, blocks, partial, vocab, unpadded, eps, c
     norm = Inkling2LoopRMSNorm(hidden, eps=eps).to(BF)
     softcap = Inkling2LoopSoftcap(cap)
     final_input.eval()
-    with torch.no_grad():
+    # oneDNN's CPU bf16 GEMM (MKL-DNN 3.10.2 on aarch64, in this image) is
+    # lossy: on the release's unembedding only 61% of its bf16 outputs equal
+    # the exact dot of the same bf16 operands rounded once, off by up to 0.15.
+    # With oneDNN off torch's own bf16 Linear accumulates in f32 (99.99% equal
+    # to exact), which is what a bf16 linear means and what cuBLAS does. The
+    # classes and their order are untouched; only the CPU backend is chosen.
+    with torch.no_grad(), torch.backends.mkldnn.flags(enabled=False):
         final_input.query.copy_(query)
         norm.weight.copy_(norm_w)
         lm_head.weight.copy_(cut)
@@ -150,6 +156,17 @@ elif mode == "real":
     selected, normed, raw, logits = head(query, norm_w, unembed, blocks, partial, cfg["vocab_size"],
                                          cfg["unpadded_vocab_size"], cfg["rms_norm_eps"],
                                          cfg["final_logit_softcapping"])
+    with torch.no_grad():
+        onednn_raw = torch.nn.functional.linear(normed, unembed[: cfg["unpadded_vocab_size"]])
+        exact_raw = (normed.double() @ unembed[: cfg["unpadded_vocab_size"]].double().T).to(BF)
+    backend = {
+        "reference_raw_bit_equal_exact": (raw == exact_raw).float().mean().item(),
+        "reference_raw_max_abs_from_exact": (raw.double() - exact_raw.double()).abs().max().item(),
+        "onednn_raw_bit_equal_exact": (onednn_raw == exact_raw).float().mean().item(),
+        "onednn_raw_max_abs_from_exact": (onednn_raw.double() - exact_raw.double()).abs().max().item(),
+        "torch": torch.__version__,
+    }
+    print(f"real: backend {backend}", file=sys.stderr)
     os.makedirs(out_dir, exist_ok=True)
     arrays = {"block_states": blocks[0], "partial": partial[0], "selected": selected,
               "normed": normed, "raw": raw, "logits": logits}
@@ -162,6 +179,8 @@ elif mode == "real":
         "shapes": {k: list(t.shape) for k, t in arrays.items()},
         "dtypes": {k: str(t.dtype) for k, t in arrays.items()},
         "weight_sha256": digest,
+        "cpu_backend": "torch.backends.mkldnn disabled for the head",
+        "backend_check": backend,
         "argmax": logits.argmax(-1).tolist(),
     }, open(os.path.join(out_dir, "reference.json"), "w"), indent=1)
     print(f"real: argmax {logits.argmax(-1).tolist()}", file=sys.stderr)

@@ -190,15 +190,28 @@ impl<'a> Head<'a> {
 
     /// Norm, unembedding and softcap of the residual's f32 output.
     pub fn project(&self, selected: Vec<f32>) -> HeadOut {
+        let normed = self.norm(&selected);
+        let (raw, logits) = self.unembed(&normed);
+        HeadOut { selected, normed, raw, logits }
+    }
+
+    /// The learned RMS norm in f32, then BF16: `[tokens, hidden]`.
+    pub fn norm(&self, selected: &[f32]) -> Vec<f32> {
         let h = self.hidden;
         assert!(selected.len() % h == 0, "input is not [tokens, {h}]");
-        let tokens = selected.len() / h;
-        // 1. weighted RMS norm in f32, then BF16.
-        let normed: Vec<f32> = rms_norm(&selected, &self.gain, self.eps, tokens, h)
+        rms_norm(selected, &self.gain, self.eps, selected.len() / h, h)
             .into_iter()
             .map(round_bf16)
-            .collect();
-        // 2. BF16 x BF16 with an f32 accumulator, output rounded to BF16.
+            .collect()
+    }
+
+    /// The unembedding of BF16 normed states, BF16 x BF16 with an f32
+    /// accumulator, output rounded to BF16; then the softcap in f32. Returns
+    /// (raw, softcapped), each `[tokens, vocab]`.
+    pub fn unembed(&self, normed: &[f32]) -> (Vec<f32>, Vec<f32>) {
+        let h = self.hidden;
+        assert!(normed.len() % h == 0, "input is not [tokens, {h}]");
+        let tokens = normed.len() / h;
         let mut raw = vec![0f32; tokens * self.vocab];
         let mut row = vec![0f32; h];
         for v in 0..self.vocab {
@@ -212,10 +225,9 @@ impl<'a> Head<'a> {
                 raw[t * self.vocab + v] = round_bf16(acc);
             }
         }
-        // 3. softcap in f32.
         let cap = self.cap;
         let logits = raw.iter().map(|&l| (l / cap).tanh() * cap).collect();
-        HeadOut { selected, normed, raw, logits }
+        (raw, logits)
     }
 }
 
@@ -299,22 +311,16 @@ mod tests {
         .unwrap()
     }
 
-    /// Distance in BF16 steps between two BF16 values of the same sign.
-    fn bf16_steps(a: f32, b: f32) -> u32 {
-        let (x, y) = (a.to_bits() >> 16, b.to_bits() >> 16);
-        if (x ^ y) & 0x8000 != 0 {
-            return u32::MAX;
-        }
-        x.abs_diff(y)
-    }
-
     /// The tolerances, and why. The residual is f32 end to end but sums in a
     /// different order than torch (and `sqrt().recip()` against `rsqrt`), so
     /// its output agrees to a few f32 ulps: |d| <= 1e-5 (1 + |x|). That
     /// difference, and our dot product's order, can move a value that sits
-    /// near a BF16 rounding boundary one BF16 step: so the BF16 taps within
-    /// one step and at least 90% bit-equal. The softcapped logits within the
-    /// image of one raw step (tanh' <= 1) plus f32 tanh error.
+    /// near a BF16 rounding boundary one BF16 step, and near zero, where a
+    /// step is smaller than f32 summation error, a little more: so each BF16
+    /// tap within one step of the reference value or an absolute floor (1e-5
+    /// normed, 1e-4 raw), and at least 99% of them bit-equal. The softcapped
+    /// logits within the image of one raw step (tanh' <= 1) plus f32 tanh
+    /// error. The same rule as `inkling2_head_check` on the real weights.
     fn compare(f: &Fixture, out: &HeadOut) -> Result<(usize, usize), String> {
         if out.selected.len() != f.selected.len() {
             return Err(format!("selected: {} values, reference has {}", out.selected.len(), f.selected.len()));
@@ -326,20 +332,19 @@ mod tests {
         }
         let mut equal = 0usize;
         let mut total = 0usize;
-        for (name, ours, theirs) in [("normed", &out.normed, &f.normed), ("raw", &out.raw, &f.raw)] {
+        for (name, ours, theirs, floor) in [("normed", &out.normed, &f.normed, 1e-5f32), ("raw", &out.raw, &f.raw, 1e-4)] {
             if ours.len() != theirs.len() {
                 return Err(format!("{name}: {} values, reference has {}", ours.len(), theirs.len()));
             }
             for (i, (&a, &b)) in ours.iter().zip(theirs.iter()).enumerate() {
-                let s = if a == b { 0 } else { bf16_steps(a, b) };
-                if s > 1 {
-                    return Err(format!("{name}[{i}]: ours {a}, reference {b}, {s} BF16 steps"));
+                if (a - b).abs() > b.abs() / 128.0 + floor {
+                    return Err(format!("{name}[{i}]: ours {a}, reference {b}"));
                 }
-                equal += (s == 0) as usize;
+                equal += (a == b) as usize;
                 total += 1;
             }
         }
-        if equal * 10 < total * 9 {
+        if equal * 100 < total * 99 {
             return Err(format!("only {equal} of {total} BF16 values bit-equal"));
         }
         if out.logits.len() != f.logits.len() {
