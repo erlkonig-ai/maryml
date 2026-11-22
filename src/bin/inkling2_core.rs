@@ -37,10 +37,11 @@ use safetensors::tensor::Metadata;
 use mary::model_collection::parse_collection_handle;
 use mary::models::inkling::seam::Bk;
 use mary::models::inkling2_loop::Inkling2LoopConfig;
+use mary::models::inkling2_loop::layout::{LayerPart, Slot};
 use mary::models::inkling2_loop::loop_core::{Core, CoreState, PassOut, Plant};
 use mary::models::inkling2_loop::pile::MiniRoot;
 use mary::models::inkling2_loop::schedule::CacheId;
-use mary::models::inkling2_loop::sliding::{ExpertAct, Taps};
+use mary::models::inkling2_loop::sliding::{ExpertAct, Taps, Weights};
 use triblespace::prelude::Id;
 
 /// A tensor is within this many times upstream's own bf16-vs-f32 spread.
@@ -236,6 +237,13 @@ fn main() {
     );
 
     let input = |n: &str| r.f32s(n).1;
+    let router_bias: std::collections::BTreeMap<usize, Vec<f32>> = (lc.core_start..lc.core_end)
+        .map(|l| {
+            let st = Weights::tensor(&model, &Slot::Layer(l, LayerPart::GateBias).tensor_name()).expect("gate bias");
+            (l, st.bytes.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect())
+        })
+        .collect();
+    let sig = |x: f32| 1.0 / (1.0 + (-x).exp());
     let rows = |v: Vec<f32>, n: usize| Tensor::<Bk, 2>::from_data(TensorData::new(v, [n, h]), &dev);
     let run = |state: &mut CoreState, phase: &str, plant: Option<Plant>| -> (Vec<PassOut>, Vec<Seen>) {
         let x = input(&format!("x.{phase}"));
@@ -287,6 +295,45 @@ fn main() {
             };
             let total = s.routing.len() * t.num_experts_per_tok;
             if !rep.quiet {
+                // where the error sits: rows whose routing differs from f32's, and the per-row ratio of the
+                // visit's output (Mary vs f32 over upstream's own bf16-vs-f32, row by row)
+                let differ = |a: &[BTreeSet<i32>]| -> Vec<usize> {
+                    a.iter().zip(&r32).enumerate().filter(|(_, (x, y))| x != y).map(|(i, _)| i).collect()
+                };
+                let out = &s.taps[0].1;
+                let (o16, o32) = (up("bf16", "out"), up("f32", "out"));
+                let per_row: Vec<String> = (0..s.routing.len())
+                    .map(|i| {
+                        let sl = i * h..(i + 1) * h;
+                        let sp = rel_l2(&o16[sl.clone()], &o32[sl.clone()]);
+                        format!("{:.2}", rel_l2(&out[sl.clone()], &o32[sl]) / sp.max(1e-12))
+                    })
+                    .collect();
+                // a flip is a near tie when upstream f32's own gap between its 8th and 9th selection score
+                // (sigmoid(logit) + bias) is below Mary's largest selection-score error on that row
+                let e = t.n_routed_experts;
+                let bias = &router_bias[&s.id.layer];
+                let l32 = up("f32", "router_logits");
+                let ml = &s.taps.iter().find(|(n, _)| *n == "router_logits").unwrap().1;
+                let ties: Vec<String> = differ(&s.routing)
+                    .into_iter()
+                    .map(|row| {
+                        let key = |l: &[f32]| -> Vec<f32> { (0..e).map(|x| sig(l[row * e + x]) + bias[x]).collect() };
+                        let (k32, km) = (key(&l32), key(ml));
+                        let mut sorted = k32.clone();
+                        sorted.sort_by(|a, b| b.partial_cmp(a).unwrap());
+                        let gap = sorted[t.num_experts_per_tok - 1] - sorted[t.num_experts_per_tok];
+                        let err = k32.iter().zip(&km).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+                        format!("row {row}: gap {gap:.2e} vs Mary key err {err:.2e}{}", if gap <= 2.0 * err { " (tie)" } else { " (NOT a tie)" })
+                    })
+                    .collect();
+                rep.lines.push(format!(
+                    "{tag:22} where            routing differs from f32 at rows Mary {:?}, upstream bf16 {:?}; out per-row ratio [{}]; {}",
+                    differ(&s.routing),
+                    differ(&r16),
+                    per_row.join(" "),
+                    ties.join("; ")
+                ));
                 rep.lines.push(format!(
                     "{tag:22} routing          shared experts with f32 {}/{total}, with bf16 {}/{total}  (upstream bf16 vs f32 {}/{total})",
                     overlap(&s.routing, &r32),
@@ -302,11 +349,15 @@ fn main() {
             }
         }
         // the block states at each pass's end, then the core's output
-        let nb = passes[0].blocks.len();
+        // upstream's [t, n, H]: n = the pre-loop block, the pass's first input and layer 12's input
+        let nb = r.f32s(&format!("f32.p0.{phase}.blocks")).0[1];
         for (p, po) in passes.iter().enumerate() {
             let up = |run: &str| input(&format!("{run}.p{p}.{phase}.blocks"));
             let (u16, u32) = (up("bf16"), up("f32"));
-            assert_eq!(po.blocks.len(), nb);
+            if po.blocks.len() != nb {
+                rep.check(&format!("p{p}:{phase} block count"), false, format!("{} blocks, upstream {nb}", po.blocks.len()));
+                continue;
+            }
             for (k, b) in po.blocks.iter().enumerate() {
                 rep.row(&format!("p{p}:{phase}"), &format!("end block {k}"), &host(b.clone()), &block_of(&u16, nb, k, h), &block_of(&u32, nb, k, h));
             }
@@ -315,7 +366,7 @@ fn main() {
         let up = |run: &str, n: &str| input(&format!("{run}.core.{phase}.{n}"));
         rep.row(&format!("core:{phase}"), "hidden", &host(last.hidden.clone()), &up("bf16", "hidden"), &up("f32", "hidden"));
         let (u16, u32) = (up("bf16", "blocks"), up("f32", "blocks"));
-        for (k, b) in last.blocks.iter().enumerate() {
+        for (k, b) in last.blocks.iter().enumerate().take(nb) {
             rep.row(&format!("core:{phase}"), &format!("block {k}"), &host(b.clone()), &block_of(&u16, nb, k, h), &block_of(&u32, nb, k, h));
         }
     };
