@@ -43,8 +43,14 @@
 //!
 //! * [`vision_input`]: the image front end on the CPU, a decoded RGB8 or
 //!   RGBA8 image to the processor's `pixel_values` and the vision tower's
-//!   native 20-pixel patch rows and positions. Held to the published
-//!   processor on saved images; the tower itself is not native yet.
+//!   native 20-pixel patch rows and positions, the learned position table's
+//!   bilinear taps and the rotary positions. Held to the published processor
+//!   and position helpers on saved images.
+//!
+//! * `vision` (with `inkling-cuda`): the ViT tower and its projector on the
+//!   device, image tokens to `text_hidden` features. Held to the published
+//!   tower's run on the saved images by the `inkling2_vision_check` binary.
+//!   Not yet fed into the session's text stream.
 //!
 //! What the release declares beyond the text forward (the vision tower, the
 //! drafter, the declared expert activation quantisation) is not native:
@@ -82,5 +88,7 @@ pub mod sliding;
 pub mod tail_check;
 #[cfg(feature = "inkling2-session")]
 pub mod session;
+#[cfg(feature = "inkling-cuda")]
+pub mod vision;
 
 pub use config::{Family, Inkling2LoopConfig, family_of, family_of_str};

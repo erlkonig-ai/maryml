@@ -159,6 +159,8 @@ inkling2-import = ["import", "tokenizer", "dep:sha2", "dep:clap"]
 inkling2-head-check = ["dep:sha2"]
 # The whole Inkling 2 Mini text forward as a session over a pile root (models::inkling2_loop::session).
 inkling2-session = ["inkling-cuda", "tokenizer"]
+# The Mini vision tower against the published tower on the saved fixture images (bin inkling2_vision_check).
+inkling2-vision-check = ["inkling-cuda", "dep:image", "dep:sha2"]
 # Token-only Qwen2 CUDA decoder; reuses BF16 projections, not Qwen3.5 blocks.
 step-audio2-cuda = ["step-audio2", "qwen3_5-cuda"]
 step-audio2-cli = ["step-audio2-cuda", "dep:clap"]
@@ -537,6 +539,13 @@ required-features = ["inkling2-session"]
 [[bin]]
 name = "inkling2_attention_check"
 required-features = ["inkling2-session", "inkling2-head-check"]
+
+# Inkling 2 Mini's vision tower and projector (models::inkling2_loop::vision) on the
+# release's weights in a pile, against the published tower's run on the saved
+# fixture images (fixtures/vision/make_fixture.py).
+[[bin]]
+name = "inkling2_vision_check"
+required-features = ["inkling2-vision-check"]
 
 # Inkling 2 Mini from the embedding through layer 5, chained, from a pile root,
 # against transformers' own run of the same layers (golden/capture_inkling2_chain5.py).

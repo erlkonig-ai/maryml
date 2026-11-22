@@ -323,3 +323,60 @@ fn the_grid_pads_only_what_the_tile_does_not_fill() {
         .is_err()
     );
 }
+
+/// The learned position table's taps and the rotary positions, against the
+/// published helpers' outputs on the two fixture images (indices as i64 LE,
+/// weights as f32 LE, both images concatenated as the reference batches them).
+#[test]
+fn position_taps_and_rotary_positions_match_the_published_helpers() {
+    let r: Value = serde_json::from_str(REFERENCE).unwrap();
+    let v = &r["vision_input"];
+    let side = Inkling2LoopConfig::from_json(CONFIG).unwrap().vision_config.posemb_grid_size;
+    assert_eq!(side, 32);
+    let (mut idx, mut wts, mut taps_all) = (Vec::new(), Vec::new(), Vec::new());
+    for im in r["images"].as_array().unwrap() {
+        let (_, t) = run(im["file"].as_str().unwrap());
+        let taps = posemb_taps(&t.native_positions(), t.patch_grid(), side).unwrap();
+        for tap in &taps {
+            for &(i, w) in tap {
+                idx.extend_from_slice(&(i as i64).to_le_bytes());
+                wts.push(w);
+            }
+        }
+        taps_all.extend(taps);
+        // the class token first at (0, 0), then the patches 1-indexed
+        let seq = t.sequence_positions();
+        let native = t.native_positions();
+        assert_eq!(seq.len(), 1 + native.len());
+        assert_eq!(seq[0], [0, 0]);
+        for (s, n) in seq[1..].iter().zip(&native) {
+            assert_eq!(*s, [n[0] + 1, n[1] + 1]);
+        }
+    }
+    assert_eq!(hex(&idx), v["interp_indices_sha256"].as_str().unwrap());
+    assert_eq!(f32_sha(&wts), v["interp_weights_f32_sha256"].as_str().unwrap());
+    for (k, want) in v["interp_indices_first8"].as_array().unwrap().iter().enumerate() {
+        let got: Vec<u64> = taps_all[k].iter().map(|&(i, _)| i as u64).collect();
+        assert_eq!(serde_json::json!(got), *want, "taps of row {k}");
+    }
+    for (k, want) in v["interp_weights_first8"].as_array().unwrap().iter().enumerate() {
+        for (j, w) in want.as_array().unwrap().iter().enumerate() {
+            assert_eq!(taps_all[k][j].1.to_bits(), (w.as_f64().unwrap() as f32).to_bits(), "weight {k}.{j}");
+        }
+    }
+}
+
+/// Upsampling past the table (more native patches than its side) clamps to
+/// the border, and a position outside the stated grid is refused, not read.
+#[test]
+fn position_taps_clamp_at_the_border_and_refuse_outside_the_grid() {
+    let taps = posemb_taps(&[[0, 0], [63, 63]], (64, 64), 32).unwrap();
+    // src = 0.5 * 32 / 64 - 0.5 = -0.25: both taps on row/col 0, weights 0.25 and 0.75
+    let w: f32 = taps[0].iter().map(|&(_, w)| w).sum();
+    assert_eq!(w, 1.0);
+    assert!(taps[0].iter().all(|&(i, _)| i == 0));
+    assert!(taps[1].iter().all(|&(i, _)| i == 31 * 32 + 31));
+    assert!(posemb_taps(&[[4, 0]], (4, 6), 32).is_err());
+    assert!(posemb_taps(&[[0, 0]], (0, 6), 32).is_err());
+    assert!(posemb_taps(&[[0, 0]], (4, 6), 0).is_err());
+}

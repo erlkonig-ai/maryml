@@ -245,6 +245,76 @@ impl ImageTokens {
     }
 }
 
+/// The learned position table's bilinear taps for each native patch row, in
+/// [`ImageTokens::native_patches`]'s order: four `(index, weight)` pairs into
+/// the flattened `side x side` table (`posemb_grid_size`), the taps ordered
+/// `(h0, w0), (h0, w1), (h1, w0), (h1, w1)`.
+///
+/// The reference's `get_vision_interpolation_indices_and_weights` at
+/// transformers 046bdb8 (`mode="bilinear"`, `align_corners=False`,
+/// `padding="border"`), which reproduces `F.interpolate` of the table to the
+/// image's native grid: per axis `src = (i + 0.5) * side / size - 0.5` in f32,
+/// taps `floor(src) + {0, 1}` clamped to the table, weights
+/// `max(0, 1 - |src - floor - offset|)`, and the 2-D weight the product of
+/// the two axes' in f32. The expression order is upstream's, so the weights
+/// are its bits.
+pub fn posemb_taps(
+    positions: &[[usize; 2]],
+    patch_grid: (usize, usize),
+    side: usize,
+) -> Result<Vec<[(usize, f32); 4]>, String> {
+    let (rows, cols) = patch_grid;
+    if side == 0 || rows == 0 || cols == 0 {
+        return Err(format!("position taps: side {side}, patch grid {rows}x{cols}"));
+    }
+    let axis = |i: usize, size: usize| -> [(usize, f32); 2] {
+        let src = (i as f32 + 0.5) * side as f32 / size as f32 - 0.5;
+        let floor = src.floor();
+        let base = floor as i64;
+        [0i64, 1].map(|o| {
+            let tap = (base + o).clamp(0, side as i64 - 1) as usize;
+            let distance = (src - floor - o as f32).abs();
+            (tap, (1.0 - distance).max(0.0))
+        })
+    };
+    positions
+        .iter()
+        .map(|&[r, c]| {
+            if r >= rows || c >= cols {
+                return Err(format!("position ({r}, {c}) outside the {rows}x{cols} patch grid"));
+            }
+            let (h, w) = (axis(r, rows), axis(c, cols));
+            Ok([
+                (h[0].0 * side + w[0].0, h[0].1 * w[0].1),
+                (h[0].0 * side + w[1].0, h[0].1 * w[1].1),
+                (h[1].0 * side + w[0].0, h[1].1 * w[0].1),
+                (h[1].0 * side + w[1].0, h[1].1 * w[1].1),
+            ])
+        })
+        .collect()
+}
+
+impl ImageTokens {
+    /// `(rows, cols)` of native patches: [`Self::patch_grid_thw`] without
+    /// its time axis.
+    pub fn patch_grid(&self) -> (usize, usize) {
+        let [_, h, w] = self.patch_grid_thw();
+        (h, w)
+    }
+
+    /// The rotary `(h, w)` position of every row of the tower's sequence for
+    /// this image: the class token first at `(0, 0)`, then each native patch
+    /// at its 1-indexed `(row + 1, col + 1)`, in [`Self::native_patches`]'s
+    /// order. The reference's `position_ids.index_copy(0, patch_index,
+    /// position_ids + 1)` for one image.
+    pub fn sequence_positions(&self) -> Vec<[usize; 2]> {
+        let mut out = Vec::with_capacity(1 + self.tokens() * self.geometry.merge * self.geometry.merge);
+        out.push([0, 0]);
+        out.extend(self.native_positions().into_iter().map(|[r, c]| [r + 1, c + 1]));
+        out
+    }
+}
+
 #[cfg(test)]
 #[path = "vision_input_tests.rs"]
 mod tests;

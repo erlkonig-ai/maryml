@@ -38,7 +38,8 @@
 //!   tokenizer's, not necessarily the ones sampled. Callers compare token
 //!   prefixes before reusing inference state.
 //!
-//! Images are not supported (Mary has no Mini vision tower); neither is audio,
+//! Images are not supported (the vision tower runs natively in `vision`, but
+//! the session takes no image features yet); neither is audio,
 //! which the template itself refuses.
 
 use anyhow::{Context, Result, bail, ensure};
