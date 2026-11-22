@@ -1068,6 +1068,9 @@ cubecl = { version = "0.10.0", default-features = false, features = ["std", "cud
 
 [dev-dependencies]
 ciborium = "0.2"
+# Decoding and digesting the saved images models::inkling2_loop::vision_input is held to.
+image = { version = "0.25", default-features = false, features = ["png"] }
+sha2 = "0.10"
 burn-ndarray = { version = "0.21.0", package = "maryml-burn-ndarray", path = "../burn-fork/crates/burn-ndarray" }
 
 # Selective stored-weight decoder gate; never loads or executes a full model.

@@ -41,6 +41,11 @@
 //!   token sequences over it ([`session::MiniSession`]): token IDs in,
 //!   softcapped logits out, every layer visit's state carried.
 //!
+//! * [`vision_input`]: the image front end on the CPU, a decoded RGB8 or
+//!   RGBA8 image to the processor's `pixel_values` and the vision tower's
+//!   native 20-pixel patch rows and positions. Held to the published
+//!   processor on saved images; the tower itself is not native yet.
+//!
 //! What the release declares beyond the text forward (the vision tower, the
 //! drafter, the declared expert activation quantisation) is not native:
 //! [`checkpoint::native_gaps`] names it, and the original Inkling's loader
@@ -64,6 +69,7 @@ pub mod release;
 #[cfg(feature = "inkling2-import")]
 pub mod import;
 pub mod schedule;
+pub mod vision_input;
 #[cfg(feature = "inkling-cuda")]
 pub mod attend;
 #[cfg(feature = "inkling-cuda")]
