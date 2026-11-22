@@ -1,7 +1,7 @@
 //! One visit of an Inkling 2 Mini *sliding* decoder layer, on the device.
 //!
 //! From transformers 046bdb8c `Inkling2LoopSlidingDecoderLayer.forward`, for
-//! the layers outside the looped core (no messages):
+//! the layers outside the looped core, and the core's first pass (no messages):
 //!
 //! ```text
 //! r = x
@@ -15,6 +15,24 @@
 //! y = mlp_sconv(y)
 //! out = res + y
 //! ```
+//!
+//! A sliding core layer (6..17) on a pass after the first is upstream's
+//! `Inkling2LoopSlidingLoopDecoderLayer` with `messages` `[t, 4, H]` (Q, K, V,
+//! MLP), mixed in by the layer's four message gates ([`MessageGate`], CC's
+//! operator, with the released model's BF16 down projection):
+//!
+//! ```text
+//! h  = attention_input(blocks, x)
+//! qn = input_layernorm(gate_q(h, m_q))      the Q input also drives the
+//! kn = input_layernorm(gate_k(h, m_k))      relative bias, the sink and the
+//! vn = input_layernorm(gate_v(h, m_v))      output gate
+//! a  = attn(qn, kn, vn) ...                 as above
+//! m  = gate_mlp(mlp_input(blocks, h), m_mlp)   before mlp_norm
+//! ```
+//!
+//! With no messages a core layer is exactly the visit above, so the first
+//! pass is independent of anything a later pass reads. The gates run on the
+//! host: one `[t, H]` download and up to four uploads per gated visit.
 //!
 //! What is Mary's here: the BF16 projections ([`linear_bf16`]), the NVFP4
 //! expert GEMMs ([`linear_fp4`] / [`linear_w4a16`] over [`PackedW`]), the short
@@ -33,7 +51,9 @@
 //! Scope, stated: no eviction beyond the window (positions further back than
 //! `sliding_window_size` are masked, not dropped); no log scaling (sliding
 //! layers have none upstream); NVFP4 experts only, so layers 20..23 (MXFP8)
-//! cannot bind; full-attention layers and the looped core are not here.
+//! cannot bind; full-attention layers are not here. The caller keys a
+//! [`State`] per visit ([`super::schedule::CacheId`]): a core layer's passes
+//! share weights and never share state.
 
 use std::collections::BTreeMap;
 
@@ -50,8 +70,9 @@ use crate::models::inkling::seam::{Bk, client_of};
 use crate::models::inkling2_loop::config::Inkling2LoopTextConfig;
 use crate::models::inkling2_loop::experts::nvfp4_scale2;
 use crate::models::inkling2_loop::layout::{
-    AttnPart, ConvPart, Dtype, ExpertMat, ExpertPart, LayerPart, Slot,
+    AttnPart, ConvPart, Dtype, ExpertMat, ExpertPart, GatePart, LayerPart, Slot, Stream,
 };
+use crate::models::inkling2_loop::messages::{DownPrecision, MessageGate, message_slot};
 
 type Dev = burn::backend::cuda::CudaDevice;
 
@@ -200,7 +221,12 @@ pub struct SlidingLayer {
     attn_sconv: Tensor<Bk, 2>,
     mlp_sconv: Tensor<Bk, 2>,
     experts: Vec<Expert>,
+    /// Core layers only: the Q, K, V and MLP message gates, in
+    /// [`message_slot`] order.
+    gates: Option<[MessageGate; 4]>,
 }
+
+const STREAMS: [Stream; 4] = [Stream::Query, Stream::Key, Stream::Value, Stream::Mlp];
 
 /// One visit's carried state.
 pub struct State {
@@ -236,6 +262,9 @@ pub struct Taps {
     pub routing: Vec<(Vec<usize>, Vec<f32>)>,
     pub experts: Tensor<Bk, 2>,
     pub mlp_conv: Tensor<Bk, 2>,
+    /// A gated visit's four message-gate outputs `[t, H]`, before their
+    /// norms, in [`message_slot`] order.
+    pub gates: Option<[Vec<f32>; 4]>,
 }
 
 impl SlidingLayer {
@@ -282,6 +311,26 @@ impl SlidingLayer {
 
         let router_bias = f32_le(want(w, l(LayerPart::GateBias), Dtype::F32, &[d.experts])?.bytes);
         let experts = bind_experts(w, &d, layer, &client)?;
+        let gates = if t.is_core(layer) {
+            let r = t.loop_config.gate_rank;
+            let gate = |s: Stream| -> Result<MessageGate, String> {
+                let part = |g: GatePart, shape: &[usize]| -> Result<Vec<f32>, String> {
+                    Ok(bf16_to_f32(want(w, l(LayerPart::Controller(s, g)), Dtype::Bf16, shape)?.bytes))
+                };
+                MessageGate::new(
+                    part(GatePart::Down, &[r, 2 * h])?,
+                    part(GatePart::Forget, &[h, r])?,
+                    part(GatePart::Gain, &[h, r])?,
+                    h,
+                    r,
+                    d.eps as f32,
+                    DownPrecision::Bf16,
+                )
+            };
+            Some([gate(STREAMS[0])?, gate(STREAMS[1])?, gate(STREAMS[2])?, gate(STREAMS[3])?])
+        } else {
+            None
+        };
         Ok(SlidingLayer {
             layer,
             dims: d,
@@ -310,11 +359,17 @@ impl SlidingLayer {
             attn_sconv: conv(l(LayerPart::AttnSconv), h)?,
             mlp_sconv: conv(l(LayerPart::MlpSconv), h)?,
             experts,
+            gates,
         })
     }
 
     pub fn is_block_boundary(&self) -> bool {
         self.layer % self.dims.block == 0
+    }
+
+    /// Whether this layer has message gates (a core layer).
+    pub fn reads_messages(&self) -> bool {
+        self.gates.is_some()
     }
 
     /// Run `x` (`[t, hidden]`, positions `state.pos ..`) through the layer,
@@ -327,6 +382,21 @@ impl SlidingLayer {
         state: &mut State,
         act: ExpertAct,
     ) -> (Tensor<Bk, 2>, Taps) {
+        self.forward_visit(x, blocks, state, act, None)
+    }
+
+    /// [`Self::forward`], with the four messages `[t, 4, H]` (Q, K, V, MLP)
+    /// a core layer reads on a pass after the first
+    /// ([`super::messages::read_messages`]). `None` is the ungated visit.
+    /// Panics if messages reach a layer with no gates.
+    pub fn forward_visit(
+        &self,
+        x: Tensor<Bk, 2>,
+        blocks: &mut Vec<Tensor<Bk, 2>>,
+        state: &mut State,
+        act: ExpertAct,
+        messages: Option<&[f32]>,
+    ) -> (Tensor<Bk, 2>, Taps) {
         let d = self.dims;
         let [t, _] = x.dims();
         let dev = x.device();
@@ -335,7 +405,34 @@ impl SlidingLayer {
             Some(q) => block_attention(q.clone(), blocks, x.clone()),
             None => x.clone(),
         };
-        let attn = self.attention(rms_norm(h, self.attn_norm.clone(), d.eps), state);
+        let gated = messages.map(|m| {
+            let g = self.gates.as_ref().unwrap_or_else(|| panic!("layer {} reads no messages", self.layer));
+            assert_eq!(m.len(), t * 4 * d.hidden, "messages are [t, 4, H]");
+            (g, m)
+        });
+        let message = |m: &[f32], s: Stream| -> Vec<f32> {
+            let j = message_slot(s);
+            (0..t).flat_map(|i| m[(i * 4 + j) * d.hidden..(i * 4 + j + 1) * d.hidden].iter().copied()).collect()
+        };
+        let upload = |v: Vec<f32>| Tensor::<Bk, 2>::from_data(TensorData::new(v, [t, d.hidden]), &dev);
+        // upstream casts each normed input back to the layer dtype; here every
+        // consumer of the three is a `linear_bf16`, whose entry is that cast
+        let norm = |v: Tensor<Bk, 2>| rms_norm(v, self.attn_norm.clone(), d.eps);
+        let mut gate_out: Option<[Vec<f32>; 4]> = None;
+        let qkv = match gated {
+            None => {
+                let hn = norm(h);
+                [hn.clone(), hn.clone(), hn]
+            }
+            Some((g, m)) => {
+                let hh: Vec<f32> = h.into_data().convert::<f32>().to_vec().expect("f32");
+                let [q, k, v] = [0, 1, 2].map(|j| g[j].apply(&hh, &message(m, STREAMS[j]), t));
+                let qkv = [norm(upload(q.clone())), norm(upload(k.clone())), norm(upload(v.clone()))];
+                gate_out = Some([q, k, v, Vec::new()]);
+                qkv
+            }
+        };
+        let attn = self.attention(qkv, state);
         let attn_conv = conv_step(&mut state.conv[2], attn.clone(), &self.attn_sconv, d.conv_scale());
 
         let residual = if self.is_block_boundary() {
@@ -345,7 +442,15 @@ impl SlidingLayer {
             block_residual + attn_conv.clone()
         };
         let mlp_input = block_attention(self.mlp_input.clone(), blocks, residual.clone());
-        let mn = rms_norm(mlp_input.clone(), self.mlp_norm.clone(), d.eps);
+        let mlp_in = match (gated, gate_out.as_mut()) {
+            (Some((g, m)), Some(out)) => {
+                let hh: Vec<f32> = mlp_input.clone().into_data().convert::<f32>().to_vec().expect("f32");
+                out[3] = g[3].apply(&hh, &message(m, Stream::Mlp), t);
+                upload(out[3].clone())
+            }
+            _ => mlp_input.clone(),
+        };
+        let mn = rms_norm(mlp_in, self.mlp_norm.clone(), d.eps);
 
         let router_logits: Vec<f32> = linear_bf16(mn.clone(), &self.router)
             .into_data()
@@ -389,6 +494,7 @@ impl SlidingLayer {
             routing: routes.into_iter().map(|r| (r.experts, r.weights)).collect(),
             experts: acc,
             mlp_conv,
+            gates: gate_out,
         };
         (out, taps)
     }
@@ -407,7 +513,10 @@ impl SlidingLayer {
         lin(a, &w.down)
     }
 
-    fn attention(&self, hn: Tensor<Bk, 2>, state: &mut State) -> Tensor<Bk, 2> {
+    /// Attention over the three normed inputs: `qn` drives the queries, the
+    /// relative bias, the sink and the output gate; `kn` and `vn` the keys and
+    /// values. Outside a gated visit the three are the same tensor.
+    fn attention(&self, [hn, kn, vn]: [Tensor<Bk, 2>; 3], state: &mut State) -> Tensor<Bk, 2> {
         let d = self.dims;
         let [t, _] = hn.dims();
         let dev = hn.device();
@@ -416,10 +525,10 @@ impl SlidingLayer {
         let q = linear_bf16(hn.clone(), &self.wq).reshape([t, heads, hd]) * self.q_scale.clone();
         let q = l2_clip(q, d.qk_clip);
 
-        let kp = linear_bf16(hn.clone(), &self.wk);
+        let kp = linear_bf16(kn, &self.wk);
         let k = conv_step(&mut state.conv[0], kp, &self.k_sconv, d.conv_scale());
         let k = l2_clip(k.reshape([t, kvh, hd]), d.qk_clip).reshape([t, kvh * hd]);
-        let vp = linear_bf16(hn.clone(), &self.wv);
+        let vp = linear_bf16(vn, &self.wv);
         let v = conv_step(&mut state.conv[1], vp, &self.v_sconv, d.conv_scale());
         let v = unit_rms(v.reshape([t, kvh, hd]), d.eps).reshape([t, kvh * hd]);
         let cat = |old: Option<Tensor<Bk, 2>>, new: Tensor<Bk, 2>| match old {

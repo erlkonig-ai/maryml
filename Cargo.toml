@@ -490,6 +490,13 @@ name = "inkling2_inspect"
 name = "inkling2_layer0"
 required-features = ["inkling-cuda"]
 
+# Inkling 2 Mini core layer 6 on the device, first pass and a message-reading
+# later pass, against transformers' own capture (golden/capture_inkling2_loop6.py),
+# reading the model from a pile alone through inkling2_loop::pile::MiniRoot.
+[[bin]]
+name = "inkling2_loop6"
+required-features = ["inkling-cuda"]
+
 # Parity gate for the NVFP4 expert decode against compressed_tensors, which is
 # the library that defines this packing. Reads a small raw-binary oracle bundle.
 [[bin]]

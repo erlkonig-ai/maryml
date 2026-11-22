@@ -226,7 +226,7 @@ fn main() {
             let mut blocks = Vec::new();
             let t1 = std::time::Instant::now();
             let (out, taps) = layer.forward(x, &mut blocks, &mut state, act);
-            let Taps { attn, attn_conv, mlp_input, router_logits, routing, experts, mlp_conv } = taps;
+            let Taps { attn, attn_conv, mlp_input, router_logits, routing, experts, mlp_conv, .. } = taps;
             let out = host(out);
             let ms = t1.elapsed().as_secs_f64() * 1e3;
             let g = |n: &str| (ref_in("bf16", &format!("{phase}.{n}")), ref_in("f32", &format!("{phase}.{n}")));
