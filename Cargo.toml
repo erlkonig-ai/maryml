@@ -531,6 +531,13 @@ required-features = ["inkling-cuda", "inkling2-head-check"]
 name = "inkling2_session_check"
 required-features = ["inkling2-session"]
 
+# Fixed tokens through a Mini session by a call plan, every returned row written
+# with its position; and a row-by-row comparison of two such runs (attention
+# footprint work: old vs new code, chunked vs one-shot).
+[[bin]]
+name = "inkling2_attention_check"
+required-features = ["inkling2-session", "inkling2-head-check"]
+
 # Inkling 2 Mini from the embedding through layer 5, chained, from a pile root,
 # against transformers' own run of the same layers (golden/capture_inkling2_chain5.py).
 [[bin]]
