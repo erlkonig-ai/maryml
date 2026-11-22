@@ -1,0 +1,210 @@
+//! Inkling 2 Mini's looped core, on the device: layers `core_start..core_end`
+//! (6..17 in the release), run `num_passes` (3) times over shared weights.
+//!
+//! From transformers 046bdb8c `Inkling2LoopTextModel.forward`, the lines
+//! between the pre-loop and the post-loop layers:
+//!
+//! ```text
+//! pre_h, pre_blocks = h, blocks             what layers 0..5 produced: one block, the embedding
+//! pass 0:   for l in core: h = layer_l(h, blocks)                      a boundary layer appends its input
+//! pass p>0: prev_blocks = blocks[n_pre + 1 ..]                         drops the pass's first block (= pre_h):
+//!                                                                      the release keeps one, layer 12's input
+//!           prev_h = h                                                 layer 17's output
+//!           h, blocks = pre_h, pre_blocks                              every pass restarts from the pre-loop state
+//!           for l in core: h = layer_l(h, blocks, message_input(prev_blocks, prev_h, l - core_start))
+//! return h, blocks                                                     pass 3's output; [emb, pre_h, layer-12 input]
+//! ```
+//!
+//! Each layer's four messages use that layer's own queries
+//! ([`MessageQueries::layer`]) over the same previous-pass states. The sliding
+//! core layers are [`SlidingLayer`], the full ones (11, 17) [`FullLayer`], both
+//! bound once and visited once per pass. Each visit carries its own [`State`]
+//! across token steps, keyed by [`CacheId`] `(layer, pass)`: shared weights,
+//! separate keys, values and convolution tails.
+//!
+//! The messages are read on the host ([`read_messages`], CC's f32 operator),
+//! from the previous pass's states downloaded once per pass.
+
+use std::collections::BTreeMap;
+
+use burn::prelude::*;
+
+use crate::models::inkling::seam::Bk;
+use crate::models::inkling2_loop::config::{AttnKind, Inkling2LoopTextConfig};
+use crate::models::inkling2_loop::full::FullLayer;
+use crate::models::inkling2_loop::layout::{Dtype, Slot};
+use crate::models::inkling2_loop::messages::{MessageQueries, read_messages};
+use crate::models::inkling2_loop::schedule::CacheId;
+use crate::models::inkling2_loop::sliding::{Dev, ExpertAct, SlidingLayer, State, Taps, Weights, f32_le, want};
+
+/// One core layer, bound once.
+pub enum CoreLayer {
+    Sliding(SlidingLayer),
+    Full(FullLayer),
+}
+
+impl CoreLayer {
+    pub fn layer(&self) -> usize {
+        match self {
+            CoreLayer::Sliding(l) => l.layer,
+            CoreLayer::Full(l) => l.layer,
+        }
+    }
+
+    fn new_state(&self, dev: &Dev) -> State {
+        match self {
+            CoreLayer::Sliding(l) => State::new(&l.dims, dev),
+            CoreLayer::Full(l) => State::new(&l.dims, dev),
+        }
+    }
+
+    fn visit(
+        &self,
+        x: Tensor<Bk, 2>,
+        blocks: &mut Vec<Tensor<Bk, 2>>,
+        state: &mut State,
+        act: ExpertAct,
+        origin: usize,
+        messages: Option<&[f32]>,
+    ) -> (Tensor<Bk, 2>, Taps) {
+        match self {
+            CoreLayer::Sliding(l) => l.forward_visit(x, blocks, state, act, messages),
+            CoreLayer::Full(l) => {
+                let (out, taps) = l.forward_visit(x, blocks, state, act, origin, messages);
+                (out, taps.rest)
+            }
+        }
+    }
+}
+
+/// The looped core's weights: its layers and the cross-pass message queries.
+pub struct Core {
+    pub layers: Vec<CoreLayer>,
+    pub queries: MessageQueries,
+    pub passes: usize,
+    hidden: usize,
+}
+
+/// Every core visit's carried state, keyed by `(layer, pass)`.
+pub struct CoreState {
+    pub visits: BTreeMap<CacheId, State>,
+}
+
+/// What a pass ended with, on the device.
+pub struct PassOut {
+    /// The pass's output, layer 17's.
+    pub hidden: Tensor<Bk, 2>,
+    /// The block states at the pass's end, `[pre_blocks.., pre_h, layer-12 input]`.
+    pub blocks: Vec<Tensor<Bk, 2>>,
+}
+
+/// A deliberate fault in the core's composition, for checking that a
+/// comparison notices one. Never used outside such a check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Plant {
+    /// Passes after the first continue from the previous pass's output and
+    /// blocks instead of restarting from the pre-loop state.
+    NoReset,
+    /// Every core layer reads its messages with the first core layer's queries.
+    SharedQuery,
+}
+
+/// Sees each visit as it ends: its identity, output, taps and the messages it
+/// read.
+pub type VisitHook<'a> = &'a mut dyn FnMut(CacheId, &Tensor<Bk, 2>, Taps, Option<&[f32]>);
+
+impl Core {
+    /// Bind the core layers and the message queries from `w`.
+    pub fn bind(w: &dyn Weights, t: &Inkling2LoopTextConfig, dev: &Dev) -> Result<Core, String> {
+        let l = &t.loop_config;
+        let (h, core) = (t.hidden_size, l.core_end - l.core_start);
+        let layers = (l.core_start..l.core_end)
+            .map(|layer| -> Result<CoreLayer, String> {
+                let bound = match t.attn_kind(layer) {
+                    AttnKind::Global => CoreLayer::Full(FullLayer::bind(w, t, layer, dev)?),
+                    _ => CoreLayer::Sliding(SlidingLayer::bind(w, t, layer, dev)?),
+                };
+                Ok(bound)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let f32_of = |s: Slot| -> Result<Vec<f32>, String> { Ok(f32_le(want(w, s, Dtype::F32, &[2 * core, h])?.bytes)) };
+        let queries = MessageQueries::from_checkpoint(
+            &f32_of(Slot::CrossPassQueries)?,
+            &f32_of(Slot::CrossPassKvQueries)?,
+            core,
+            h,
+        )?;
+        Ok(Core { layers, queries, passes: l.num_passes, hidden: h })
+    }
+
+    /// Fresh state for every visit, `passes x layers`.
+    pub fn new_state(&self, dev: &Dev) -> CoreState {
+        let mut visits = BTreeMap::new();
+        for pass in 0..self.passes {
+            for l in &self.layers {
+                visits.insert(CacheId { layer: l.layer(), pass }, l.new_state(dev));
+            }
+        }
+        CoreState { visits }
+    }
+
+    /// Run the core over `x` (`[t, H]`, the pre-loop hidden state) and the
+    /// pre-loop `blocks` (each `[t, H]`), positions `state`'s next ones. A
+    /// prefill and a decode step are the same call. Returns every pass's end;
+    /// the last is the core's output (`hidden`, `blocks`) for the post-loop
+    /// layers.
+    ///
+    /// `origin` is the absolute position of the first cached row (only the full
+    /// layers' log scale reads it). `hook` sees every visit's output and the
+    /// messages it read, in execution order.
+    pub fn forward(
+        &self,
+        x: Tensor<Bk, 2>,
+        blocks: &[Tensor<Bk, 2>],
+        state: &mut CoreState,
+        act: ExpertAct,
+        origin: usize,
+        plant: Option<Plant>,
+        mut hook: Option<VisitHook<'_>>,
+    ) -> Vec<PassOut> {
+        let [t, h] = x.dims();
+        assert_eq!(h, self.hidden);
+        let n_pre = blocks.len();
+        let mut passes: Vec<PassOut> = Vec::with_capacity(self.passes);
+        // the previous pass's message sources on the host: blocks [t, n, H] and output [t, H]
+        let mut prev: Option<(Vec<f32>, usize, Vec<f32>)> = None;
+        for pass in 0..self.passes {
+            let (mut hs, mut bs) = match (plant, passes.last()) {
+                (Some(Plant::NoReset), Some(p)) => (p.hidden.clone(), p.blocks.clone()),
+                _ => (x.clone(), blocks.to_vec()),
+            };
+            for (i, layer) in self.layers.iter().enumerate() {
+                let q = if plant == Some(Plant::SharedQuery) { 0 } else { i };
+                let messages = prev
+                    .as_ref()
+                    .map(|(pb, n, pp)| read_messages(self.queries.layer(q), pb, pp, t, *n, h));
+                let id = CacheId { layer: layer.layer(), pass };
+                let st = state.visits.get_mut(&id).unwrap_or_else(|| panic!("no state for {id:?}"));
+                let (out, taps) = layer.visit(hs, &mut bs, st, act, origin, messages.as_deref());
+                if let Some(f) = hook.as_mut() {
+                    f(id, &out, taps, messages.as_deref());
+                }
+                hs = out;
+            }
+            // upstream: previous_block_states = block_states[..., num_pre_loop_blocks + 1:, :]
+            let keep = &bs[(n_pre + 1).min(bs.len())..];
+            let n = keep.len();
+            let mut pb = vec![0f32; t * n * h];
+            for (k, b) in keep.iter().enumerate() {
+                let v: Vec<f32> = b.clone().into_data().convert::<f32>().to_vec().expect("f32");
+                for row in 0..t {
+                    pb[(row * n + k) * h..(row * n + k + 1) * h].copy_from_slice(&v[row * h..(row + 1) * h]);
+                }
+            }
+            let pp: Vec<f32> = hs.clone().into_data().convert::<f32>().to_vec().expect("f32");
+            prev = Some((pb, n, pp));
+            passes.push(PassOut { hidden: hs, blocks: bs });
+        }
+        passes
+    }
+}
