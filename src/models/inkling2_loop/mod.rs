@@ -16,7 +16,9 @@
 //!   per-tensor precision from `hf_quant_config.json`;
 //! * [`checkpoint`]: a header-only inspection of a checkpoint directory
 //!   against that layout, and the explicit list of what Mary cannot run yet;
-//! * [`experts`]: the NVFP4 (amax / denominator) and MXFP8 weight decodes.
+//! * [`experts`]: the NVFP4 (amax / denominator) and MXFP8 weight decodes;
+//! * [`messages`]: the cross-pass message read and the four message gates of
+//!   the core layers, on the CPU, as upstream computes them at bf16 and f32.
 //!
 //! There is no forward here. Anything that would run the model is refused by
 //! [`checkpoint::require_native_forward`] with the operators still missing.
@@ -30,6 +32,7 @@ pub mod checkpoint;
 pub mod config;
 pub mod experts;
 pub mod layout;
+pub mod messages;
 pub mod schedule;
 
 pub use config::{Family, Inkling2LoopConfig, family_of, family_of_str};
