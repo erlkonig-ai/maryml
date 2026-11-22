@@ -20,6 +20,10 @@
 //! * `sliding` (with `inkling-cuda`): one visit of a sliding layer outside
 //!   the looped core, on the device, with its K/V and conv state. Held to
 //!   transformers' own layer 0 by the `inkling2_layer0` binary.
+//! * `full` (with `inkling-cuda`): one visit of a full-attention layer
+//!   outside the core (layer 5): three block-attention inputs, dynamic K/V
+//!   convolutions, log scaling. Held to transformers' own layer 5 by the
+//!   `inkling2_global5` binary.
 //!
 //! There is no whole forward here. Anything that would run the model is
 //! refused by [`checkpoint::require_native_forward`] with the operators still
@@ -39,6 +43,8 @@ pub mod release;
 #[cfg(feature = "inkling2-import")]
 pub mod import;
 pub mod schedule;
+#[cfg(feature = "inkling-cuda")]
+pub mod full;
 #[cfg(feature = "inkling-cuda")]
 pub mod sliding;
 
