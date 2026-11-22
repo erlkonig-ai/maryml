@@ -306,7 +306,20 @@ pub struct InklingConfig {
 
 impl InklingConfig {
     /// Parse a checkpoint's `config.json`.
+    ///
+    /// Refuses a config of any other lineage before reading a field. Inkling 2
+    /// Mini shares this model's tensor names and half its config keys, so a
+    /// field-level parse is not a family check: a Mini config fails here only
+    /// because it says it is Mini, with the operators Mary lacks for it.
     pub fn from_json(s: &str) -> serde_json::Result<Self> {
-        serde_json::from_str(s)
+        use crate::models::inkling2_loop::{Family, checkpoint, family_of};
+        use serde::de::Error;
+        let v: serde_json::Value = serde_json::from_str(s)?;
+        match family_of(&v).map_err(serde_json::Error::custom)? {
+            Family::Inkling => serde_json::from_value(v),
+            Family::Inkling2Loop => Err(serde_json::Error::custom(
+                checkpoint::refusal_for_config(s),
+            )),
+        }
     }
 }

@@ -53,6 +53,12 @@ pub mod k3;
 #[cfg(feature = "inkling-cuda")]
 pub mod inkling;
 
+// Inkling 2 Mini (`inkling2_loop`), a separate lineage: config and family
+// discrimination, the looped layer schedule, the checkpoint layout and the
+// expert weight decodes. No backend, so it is not feature-gated; the original
+// Inkling's loader consults its family check.
+pub mod inkling2_loop;
+
 // Inkling's speculation algebra — tree topology, top-b, the drafting schedule,
 // the ancestor masks, the accept walk — is backend-free by construction, and
 // the whole point of building it that way is that it can be TESTED where there
@@ -72,7 +78,7 @@ pub mod inkling {
     pub mod fp4quant;
     // Unchanged helpers reused by Nemotron's BF16/packed MoE paths. The codec
     // is also referenced by fp4gemm's host helpers, not only device tests.
-    #[cfg(feature = "nemotron-cuda")]
+    // Also Inkling 2 Mini's NVFP4 weight decode, which is backend-free.
     #[path = "nvfp4.rs"]
     pub mod nvfp4;
     #[cfg(feature = "nemotron-cuda")]
@@ -86,6 +92,11 @@ pub mod inkling {
     pub mod moegroup;
     #[path = "cache_pile.rs"]
     pub mod cache_pile;
+    // The configuration is serde and nothing else; here it is what lets the
+    // family check in `from_json` (an Inkling 2 Mini config is refused, not
+    // parsed as this model) be tested without the CUDA lane.
+    #[path = "config.rs"]
+    pub mod config;
     #[path = "spectree.rs"]
     pub mod spectree;
 

@@ -471,6 +471,12 @@ required-features = ["k3"]
 name = "inkling_layout_gate"
 required-features = ["inkling-cuda"]
 
+# Inkling 2 Mini's counterpart, and the family check for any Inkling directory:
+# config.json, hf_quant_config.json and safetensors HEADERS only, against
+# `models::inkling2_loop::layout`. No backend, so no feature.
+[[bin]]
+name = "inkling2_inspect"
+
 # Parity gate for the NVFP4 expert decode against compressed_tensors, which is
 # the library that defines this packing. Reads a small raw-binary oracle bundle.
 [[bin]]
