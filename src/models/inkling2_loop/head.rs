@@ -208,21 +208,54 @@ impl<'a> Head<'a> {
     /// The unembedding of BF16 normed states, BF16 x BF16 with an f32
     /// accumulator, output rounded to BF16; then the softcap in f32. Returns
     /// (raw, softcapped), each `[tokens, vocab]`.
+    ///
+    /// The vocabulary is split across the host's threads. Each output is still
+    /// one dot product in index order, so the result does not depend on the
+    /// thread count.
     pub fn unembed(&self, normed: &[f32]) -> (Vec<f32>, Vec<f32>) {
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+        self.unembed_threads(normed, threads)
+    }
+
+    /// [`Self::unembed`] on exactly `threads` threads (at least one).
+    pub fn unembed_threads(&self, normed: &[f32], threads: usize) -> (Vec<f32>, Vec<f32>) {
         let h = self.hidden;
         assert!(normed.len() % h == 0, "input is not [tokens, {h}]");
         let tokens = normed.len() / h;
-        let mut raw = vec![0f32; tokens * self.vocab];
-        let mut row = vec![0f32; h];
-        for v in 0..self.vocab {
-            let bytes = &self.unembed[v * h * 2..(v + 1) * h * 2];
-            for (k, r) in row.iter_mut().enumerate() {
-                *r = bf16_at(bytes, k);
-            }
+        let vocab = self.vocab;
+        let chunk = vocab.div_ceil(threads.max(1)).max(1);
+        // each worker owns a vocabulary range and returns its [tokens, range] slab
+        let slabs: Vec<(usize, Vec<f32>)> = std::thread::scope(|s| {
+            let workers: Vec<_> = (0..vocab)
+                .step_by(chunk)
+                .map(|v0| {
+                    let v1 = (v0 + chunk).min(vocab);
+                    s.spawn(move || {
+                        let w = v1 - v0;
+                        let mut slab = vec![0f32; tokens * w];
+                        let mut row = vec![0f32; h];
+                        for v in v0..v1 {
+                            let bytes = &self.unembed[v * h * 2..(v + 1) * h * 2];
+                            for (k, r) in row.iter_mut().enumerate() {
+                                *r = bf16_at(bytes, k);
+                            }
+                            for t in 0..tokens {
+                                let n = &normed[t * h..(t + 1) * h];
+                                let acc: f32 = n.iter().zip(&row).map(|(a, b)| a * b).sum();
+                                slab[t * w + (v - v0)] = round_bf16(acc);
+                            }
+                        }
+                        (v0, slab)
+                    })
+                })
+                .collect();
+            workers.into_iter().map(|j| j.join().expect("unembedding worker")).collect()
+        });
+        let mut raw = vec![0f32; tokens * vocab];
+        for (v0, slab) in slabs {
+            let w = slab.len() / tokens.max(1);
             for t in 0..tokens {
-                let n = &normed[t * h..(t + 1) * h];
-                let acc: f32 = n.iter().zip(&row).map(|(a, b)| a * b).sum();
-                raw[t * self.vocab + v] = round_bf16(acc);
+                raw[t * vocab + v0..t * vocab + v0 + w].copy_from_slice(&slab[t * w..(t + 1) * w]);
             }
         }
         let cap = self.cap;
@@ -372,6 +405,20 @@ mod tests {
         let (equal, total) = compare(&f, &out).unwrap();
         let exact = out.logits.iter().zip(&f.logits).filter(|(a, b)| a == b).count();
         eprintln!("bf16 taps bit-equal {equal}/{total}, logits bit-equal {exact}/{}", f.logits.len());
+    }
+
+    #[test]
+    fn the_thread_count_does_not_change_the_logits() {
+        let f = fixture();
+        let head = bind(&f, &f.unembed);
+        let normed = head.norm(&head.forward(&f.blocks, f.n_blocks, &f.partial).selected);
+        let one = head.unembed_threads(&normed, 1);
+        for threads in [2, 3, 7, head.vocab() + 5] {
+            let many = head.unembed_threads(&normed, threads);
+            let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(&one.0), bits(&many.0), "raw, {threads} threads");
+            assert_eq!(bits(&one.1), bits(&many.1), "logits, {threads} threads");
+        }
     }
 
     #[test]

@@ -35,7 +35,12 @@
 //!   (MXFP8 experts from 20) and the head, against transformers' own run on
 //!   fixed inputs; the `inkling2_tail_check` binary on the release's weights.
 //!
-//! There is no whole forward here. Anything that would run the model is
+//! * `session` (with `inkling2-session`): the whole text forward as a model
+//!   bound once from a pile root ([`session::MiniModel`]) and independent
+//!   token sequences over it ([`session::MiniSession`]): token IDs in,
+//!   softcapped logits out, every layer visit's state carried.
+//!
+//! Outside `session` there is no whole forward. Anything that would run the model is
 //! refused by [`checkpoint::require_native_forward`] with the operators still
 //! missing.
 //!
@@ -64,5 +69,7 @@ pub mod full;
 pub mod sliding;
 #[cfg(feature = "inkling-cuda")]
 pub mod tail_check;
+#[cfg(feature = "inkling2-session")]
+pub mod session;
 
 pub use config::{Family, Inkling2LoopConfig, family_of, family_of_str};

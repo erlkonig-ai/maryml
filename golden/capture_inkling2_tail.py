@@ -52,6 +52,12 @@ Recorded, float32 (indices int32), L in 18..23, run in f32 / bf16, mode in chain
 usage (offline container, no GPU):
   python3 -I capture_inkling2_tail.py tiny <tf src> <scratch dir> <out.safetensors> [deps dir]
   python3 -I capture_inkling2_tail.py real <tf src> <model dir> <out.safetensors> [deps dir]
+  python3 -I capture_inkling2_tail.py chained <tf src> <model dir> <out.safetensors> <deps dir> <core ref> <chain5 ref>
+
+`chained` is upstream end to end on the chain5 capture's token ids, stage by stage: layers 0..5 (chain5 capture),
+the core (core capture, from chain5's f32 layer-5 output rounded to bf16 once) and this tail from each run's own
+core output. It adds `ids` [t], `f32.logits` and `bf16.logits` [t, V] for inkling2_session_check. The bf16 run
+shares the layer-5 seam with the f32 run, so its distance to f32 understates a whole bf16 run's.
 """
 import hashlib, json, os, sys, types
 
@@ -273,11 +279,13 @@ def run_head(head, blocks, x, dtype):
     return {"selected": selected[0], "normed": normed[0], "raw": raw[0], "logits": logits[0]}
 
 
-def tail(tc, get, x0, blocks0, positions, rec, layers_cache=None):
-    """Both runs. `layers_cache`, when given, keeps the built modules (tiny only, for the from_pretrained proof)."""
+def tail(tc, get, x0, blocks0, positions, rec, layers_cache=None, per_run=None):
+    """Both runs. `layers_cache`, when given, keeps the built modules (tiny only, for the from_pretrained proof).
+    `per_run`, when given, maps a run to its own (x0, blocks0) chain input (chained only)."""
     f32_inputs = {}
     for run, dtype in (("f32", F32), ("bf16", BF)):
-        x, blocks = x0.to(dtype), blocks0.to(dtype)
+        x, blocks = per_run[run] if per_run else (x0, blocks0)
+        x, blocks = x.to(dtype), blocks.to(dtype)
         for L in range(FIRST, LAST + 1):
             layer = build_layer(tc, L, get, dtype)
             full = tc.layer_types[L] != "hybrid_sliding"
@@ -515,6 +523,44 @@ def main():
         meta["inputs"] = ("blocks[:, 0] = embed_norm(embed rows 200005 151083 371 13), blocks[:, 1] / [:, 2] = "
                           "gaussians x4 / x12, x = gaussians x0.5 x2 x8 x32 (seed 18); positions 9000.. so the log "
                           "scale bends")
+        meta["text_config"] = json.dumps(cfg_text(where))
+    elif mode == "chained":
+        # upstream end to end on real token ids, stage by stage: the core capture's own pass-3 output for the
+        # whole sequence (which began from the chain5 capture's layer-5 output on the same ids) enters layer 18
+        config = Inkling2LoopConfig.from_pretrained(where)
+        tc = config.text_config
+        tc._attn_implementation = "eager"
+        f = safe_open(os.path.join(where, "model-00001-of-00001.safetensors"), "pt")
+        digest = {}
+        cache = {}
+
+        def get(n):
+            if n not in cache:
+                t = f.get_tensor(n)
+                digest[n] = hashlib.sha256(t.contiguous().view(torch.uint8).numpy().tobytes()).hexdigest()
+                cache[n] = t
+            return cache[n]
+
+        core_path, chain5_path = sys.argv[6], sys.argv[7]
+        core = safe_open(core_path, "pt")
+        c5 = safe_open(chain5_path, "pt")
+        ids = torch.cat([c5.get_tensor("prompt"), c5.get_tensor("step_token")]).to(torch.int32)
+        per_run = {run: (core.get_tensor(f"{run}.core.whole.hidden"), core.get_tensor(f"{run}.core.whole.blocks"))
+                   for run in ("f32", "bf16")}
+        x0, blocks0 = per_run["f32"]
+        assert x0.shape[0] == ids.shape[0], (x0.shape, ids.shape)
+        positions = torch.arange(ids.shape[0])
+        tail(tc, get, x0, blocks0, positions, rec, per_run=per_run)
+        rec["ids"] = ids
+        rec["f32.logits"] = rec["f32.chain.head.logits"]
+        rec["bf16.logits"] = rec["bf16.chain.head.logits"]
+        sha = lambda p: hashlib.sha256(open(p, "rb").read()).hexdigest()
+        meta["weight_sha256"] = json.dumps(digest, sort_keys=True)
+        meta["inputs"] = (f"ids = chain5 prompt + step_token; each run's layer-18 input and blocks = that run's "
+                          f"core.whole.hidden / core.whole.blocks of the core capture (sha256 {sha(core_path)}), "
+                          f"whose input was the chain5 capture's f32 layer-5 output (sha256 {sha(chain5_path)}), "
+                          f"bf16-rounded once; positions 0..")
+        meta["core_metadata_inputs"] = core.metadata().get("inputs", "")
         meta["text_config"] = json.dumps(cfg_text(where))
     else:
         sys.exit(f"unknown mode {mode}")
