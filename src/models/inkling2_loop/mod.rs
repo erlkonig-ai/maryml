@@ -20,6 +20,8 @@
 //! * `sliding` (with `inkling-cuda`): one visit of a sliding layer outside
 //!   the looped core, on the device, with its K/V and conv state. Held to
 //!   transformers' own layer 0 by the `inkling2_layer0` binary.
+//! * [`messages`]: the cross-pass message read and the four message gates of
+//!   the core layers, on the CPU, as upstream computes them at bf16 and f32.
 //!
 //! There is no whole forward here. Anything that would run the model is
 //! refused by [`checkpoint::require_native_forward`] with the operators still
@@ -34,6 +36,7 @@ pub mod checkpoint;
 pub mod config;
 pub mod experts;
 pub mod layout;
+pub mod messages;
 pub mod pile;
 pub mod release;
 #[cfg(feature = "inkling2-import")]
