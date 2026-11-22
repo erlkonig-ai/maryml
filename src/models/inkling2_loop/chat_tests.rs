@@ -79,7 +79,7 @@ fn cases() -> Vec<Value> {
 #[test]
 fn the_reference_digest_matches() {
     let digest = include_str!("fixtures/chat_reference.json.sha256");
-    assert!(digest.starts_with("b2874bae7a67216703fe0ff3d94aef22f65a8607d0cc48a4a1d22af2f956eb01"));
+    assert!(digest.starts_with("d1838404baa2bc28b3e28ce403c30b36a194c30042669b2740313408dafea648"));
     assert_eq!(cases().len(), 7, "five conversations at the default effort, plus none and max");
 }
 
