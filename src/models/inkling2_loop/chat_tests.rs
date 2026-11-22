@@ -132,9 +132,12 @@ fn tokenizes_every_reference_conversation_as_upstream_does() {
     let root = triblespace::prelude::Id::from_hex(&env("MINI_MODEL_ROOT")).unwrap();
     let mini = super::super::pile::MiniRoot::open(std::path::Path::new(&env("MINI_MODEL_PILE")), collection, root).unwrap();
     check_template(&mini.chat_template().unwrap()).unwrap();
+    // Build the two tokenizers once; every case shares them.
+    let whole = crate::tokenizer::build_tokenizer_with_added(mini.facts(), mini.store(), mini.tokenizer_root(), true).unwrap();
+    let content = crate::tokenizer::build_tokenizer_with_added(mini.facts(), mini.store(), mini.tokenizer_root(), false).unwrap();
     for case in cases() {
         let tools = tools_of(&case);
-        let codec = ChatCodec::from_graph(mini.facts(), mini.store(), mini.tokenizer_root(), tools.clone(), effort_of(&case["effort"])).unwrap();
+        let codec = ChatCodec::new(whole.clone(), content.clone(), tools.clone(), effort_of(&case["effort"])).unwrap();
         let history = history_of(&case, &tools);
         let rendered = codec.render(&history).unwrap();
         let expected: Vec<u32> = serde_json::from_value(case["ids"].clone()).unwrap();
@@ -142,7 +145,7 @@ fn tokenizes_every_reference_conversation_as_upstream_does() {
         assert_eq!(rendered.token_ids, expected, "{} at effort {}", case["name"], case["effort"]);
     }
     // Fixed strings outside any conversation.
-    let codec = ChatCodec::from_graph(mini.facts(), mini.store(), mini.tokenizer_root(), Tools::default(), Effort::default()).unwrap();
+    let codec = ChatCodec::new(whole, content, Tools::default(), Effort::default()).unwrap();
     for text in ["Hello there.", "Grüße — what's new? 🙂", "  a\r\n\tb  ", "<|end_message|>"] {
         let ids = codec.encode_content(text).unwrap();
         assert!(ids.iter().all(|id| Marker::from_id(*id).is_none()), "{text:?} encoded a control");

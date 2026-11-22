@@ -222,6 +222,11 @@ impl MiniRoot {
         self.documents.keys().map(String::as_str).collect()
     }
 
+    /// The entity the root's `config.json` facts hang from.
+    pub fn config_root(&self) -> Id {
+        self.parts.config.expect("checked at open")
+    }
+
     /// `config.json`, from the root's config facts.
     pub fn config(&self) -> Result<serde_json::Value> {
         crate::jsonfacts::load_json(&self.facts, &self.store, self.parts.config.expect("checked at open"))
