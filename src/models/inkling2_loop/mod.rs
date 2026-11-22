@@ -29,6 +29,7 @@
 pub mod checkpoint;
 pub mod config;
 pub mod experts;
+pub mod head;
 pub mod layout;
 pub mod pile;
 pub mod release;
