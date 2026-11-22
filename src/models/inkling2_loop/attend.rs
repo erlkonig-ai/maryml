@@ -567,6 +567,90 @@ mod tests {
         assert_eq!(keys.len(), 8 * 4);
     }
 
+    /// The edges, made sharp: one key dominates every query that can see it,
+    /// so a query's output is that key's value exactly when the key is
+    /// visible, and an off-by-one at the window's edge or the bias extent
+    /// moves an output by O(1), not by the device's rounding.
+    ///
+    /// Every query is the same vector `u` per head, every key orthogonal-ish
+    /// noise except key `j0`, which is `30 u / |u|^2 * sqrt(head_dim)` (a score
+    /// of 30 against every query). Sinks are 0, bias off (`rel` zero). On a
+    /// sliding layer queries `j0 ..= j0 + window - 1` must return `v[j0]`, and
+    /// query `j0 + window` must not; checked one-shot, in Drive-sized chunks
+    /// and one token at a time across the window.
+    #[test]
+    fn the_oldest_visible_key_is_exactly_the_windows_edge() {
+        let a = AttnShape { heads: 24, kv_heads: 8, head_dim: 128, rel_extent: 1024, window: Some(1024) };
+        let (j0, n) = (5usize, 1300usize);
+        let mut c = Case::new(a, 16, n, 41);
+        let (h, hd, kvh) = (a.heads, a.head_dim, a.kv_heads);
+        let mut r = Lcg(99);
+        let u: Vec<f32> = r.vec(hd, 1.0);
+        let uu: f32 = u.iter().map(|x| x * x).sum();
+        for p in 0..n {
+            for hh in 0..h {
+                c.q[(p * h + hh) * hd..(p * h + hh + 1) * hd].copy_from_slice(&u);
+            }
+        }
+        c.k.iter_mut().for_each(|x| *x *= 0.05);
+        for g in 0..kvh {
+            for (d, x) in c.k[(j0 * kvh + g) * hd..(j0 * kvh + g + 1) * hd].iter_mut().enumerate() {
+                *x = 30.0 * u[d] / uu * (hd as f32).sqrt();
+            }
+        }
+        c.rel.iter_mut().for_each(|x| *x = 0.0);
+        c.sinks.iter_mut().for_each(|x| *x = 0.0);
+        let width = h * hd;
+        let vj0: Vec<f32> = (0..h).flat_map(|hh| c.v[(j0 * kvh + hh / (h / kvh)) * hd..][..hd].to_vec()).collect();
+        let near = |row: &[f32]| row.iter().zip(&vj0).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        for plan in [&[n][..], &[1000, 23, 1, 1, 1, 274], &[1020, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 261]] {
+            let got = c.tiled(plan, KEY_TILE, QUERY_TILE);
+            for p in 0..n {
+                let d = near(&got[p * width..(p + 1) * width]);
+                let sees = p >= j0 && p < j0 + 1024;
+                if sees {
+                    assert!(d < 5e-2, "plan {plan:?}: query {p} sees key {j0} but its output is {d} from v[{j0}]");
+                } else {
+                    assert!(d > 0.1, "plan {plan:?}: query {p} cannot see key {j0} yet returns v[{j0}] ({d})");
+                }
+            }
+            println!("plan {:?}..: queries {j0}..={} return v[{j0}], {} onward do not", &plan[..plan.len().min(4)], j0 + 1023, j0 + 1024);
+        }
+    }
+
+    /// The bias extent, made sharp on a full layer: the relative profile
+    /// puts +30 at distance `rel_extent - 1` and nothing else, so every query
+    /// `p >= rel_extent - 1` returns `v[p - rel_extent + 1]`, and the key one
+    /// further back, visible but unbiased, does not take over.
+    #[test]
+    fn the_bias_ends_exactly_at_rel_extent() {
+        let a = AttnShape { heads: 24, kv_heads: 8, head_dim: 128, rel_extent: 1024, window: None };
+        let n = 1300usize;
+        let mut c = Case::new(a, 16, n, 43);
+        let (h, hd, kvh, e) = (a.heads, a.head_dim, a.kv_heads, a.rel_extent);
+        c.q.iter_mut().for_each(|x| *x *= 0.02);
+        c.sinks.iter_mut().for_each(|x| *x = 0.0);
+        // rel states all (1, 0, ..), and a profile whose row 0 is +30 at e - 1
+        for p in 0..n * h {
+            for r in 0..16 {
+                c.rel[p * 16 + r] = if r == 0 { 1.0 } else { 0.0 };
+            }
+        }
+        let mut proj = vec![0f32; 16 * e];
+        proj[e - 1] = 30.0;
+        c.rel_proj = up(proj, [16, e], &c.dev);
+        let width = h * hd;
+        for plan in [&[n][..], &[1000, 23, 1, 1, 1, 274]] {
+            let got = c.tiled(plan, KEY_TILE, QUERY_TILE);
+            for p in (e - 1)..n {
+                let j = p + 1 - e;
+                let want: Vec<f32> = (0..h).flat_map(|hh| c.v[(j * kvh + hh / (h / kvh)) * hd..][..hd].to_vec()).collect();
+                let d = got[p * width..(p + 1) * width].iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+                assert!(d < 5e-2, "plan {plan:?}: query {p} should return v[{j}] (biased at distance {}), is {d} away", e - 1);
+            }
+        }
+    }
+
     /// Mini's real attention shape and window, across the 1024 boundary with
     /// the production tiles, in one call and in Drive-like and decode-like
     /// calls.
@@ -581,5 +665,57 @@ mod tests {
         let full = AttnShape { window: None, ..sliding };
         let c = Case::new(full, 16, 1300, 6);
         check(&c, &[(&[1300], KEY_TILE, QUERY_TILE), (&[1000, 23, 1, 1, 1, 274], KEY_TILE, QUERY_TILE)]);
+    }
+}
+
+#[cfg(test)]
+mod cost {
+    //! Wall time of [`attend`] alone at Mini's full-attention shape, with the
+    //! production tiles, synchronised by downloading the output. Not a test of
+    //! anything; run with `--ignored --nocapture` to print.
+
+    use super::*;
+    use std::time::Instant;
+
+    type Dev = burn::backend::cuda::CudaDevice;
+
+    fn time(kv: &Kv, t: usize, first: usize, a: &AttnShape, proj: &Tensor<Bk, 2>, dev: &Dev, reps: usize) -> f64 {
+        let q = Tensor::<Bk, 3>::random([t, a.heads, a.head_dim], burn::tensor::Distribution::Normal(0.0, 1.0), dev);
+        let rel = Tensor::<Bk, 2>::random([t * a.heads, 16], burn::tensor::Distribution::Normal(0.0, 1.0), dev);
+        let sinks = Tensor::<Bk, 2>::zeros([t, a.heads], dev);
+        let _ = attend(a, q.clone(), rel.clone(), proj, sinks.clone(), kv, first, QUERY_TILE).into_data();
+        let t0 = Instant::now();
+        for _ in 0..reps {
+            let _ = attend(a, q.clone(), rel.clone(), proj, sinks.clone(), kv, first, QUERY_TILE).into_data();
+        }
+        t0.elapsed().as_secs_f64() / reps as f64
+    }
+
+    #[test]
+    #[ignore]
+    fn full_attention_cost_at_length() {
+        let dev = Dev::default();
+        let a = AttnShape { heads: 24, kv_heads: 8, head_dim: 128, rel_extent: 1024, window: None };
+        let proj = Tensor::<Bk, 2>::random([16, 1024], burn::tensor::Distribution::Normal(0.0, 1.0), &dev);
+        let kvd = a.kv_heads * a.head_dim;
+        let mut kv = Kv::new(KEY_TILE);
+        let mut filled = 0;
+        for n in [4096usize, 16384, 65536, 131072] {
+            while filled < n {
+                let r = Tensor::<Bk, 2>::random([4096, kvd], burn::tensor::Distribution::Normal(0.0, 1.0), &dev);
+                kv.append(r.clone(), r);
+                filled += 4096;
+            }
+            // a 4096-query chunk ending at n (Drive's prefill call), and one decode query at n - 1
+            let chunk = time(&kv, 4096, n - 4096, &a, &proj, &dev, 2);
+            let step = time(&kv, 1, n - 1, &a, &proj, &dev, 5);
+            println!(
+                "keys {n}: 4096-query chunk {chunk:.3} s ({} tile pairs, {:.2} ms a pair); one decode query {:.1} ms ({} segments)",
+                4 * n / KEY_TILE - 6,
+                chunk * 1e3 / (4 * n / KEY_TILE - 6) as f64,
+                step * 1e3,
+                n / KEY_TILE
+            );
+        }
     }
 }
