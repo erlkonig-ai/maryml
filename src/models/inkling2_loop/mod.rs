@@ -44,6 +44,7 @@
 //! 046bdb8cc2cee29d233964bb77fe6fd37cfe4aa3 (`models/inkling2_loop`,
 //! `conversion_mapping.py`, `core_model_loading.py`).
 
+pub mod chat;
 pub mod checkpoint;
 pub mod config;
 pub mod experts;
