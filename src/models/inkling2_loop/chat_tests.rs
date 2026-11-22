@@ -121,6 +121,12 @@ fn a_host_call_body_is_the_templates_canonical_body() {
     assert!(Invocation::new("undeclared", Map::new(), &tools).is_err());
 }
 
+/// The codec tests need the `tokenizer` feature, as `ChatCodec` itself does;
+/// the template tests above run without it.
+#[cfg(feature = "tokenizer")]
+mod codec {
+use super::*;
+
 /// The release's own tokenizer, rebuilt from the model root's tokenizer
 /// graph, against upstream's ids. Needs the imported release:
 /// `MINI_MODEL_PILE`, `MINI_MODEL_COLLECTION` (hex) and `MINI_MODEL_ROOT`.
@@ -130,7 +136,7 @@ fn tokenizes_every_reference_conversation_as_upstream_does() {
     let env = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} is not set"));
     let collection = crate::model_collection::parse_collection_handle(&env("MINI_MODEL_COLLECTION")).unwrap();
     let root = triblespace::prelude::Id::from_hex(&env("MINI_MODEL_ROOT")).unwrap();
-    let mini = super::super::pile::MiniRoot::open(std::path::Path::new(&env("MINI_MODEL_PILE")), collection, root).unwrap();
+    let mini = crate::models::inkling2_loop::pile::MiniRoot::open(std::path::Path::new(&env("MINI_MODEL_PILE")), collection, root).unwrap();
     check_template(&mini.chat_template().unwrap()).unwrap();
     // Build the two tokenizers once; every case shares them.
     let whole = crate::tokenizer::build_tokenizer_with_added(mini.facts(), mini.store(), mini.tokenizer_root(), true).unwrap();
@@ -288,4 +294,5 @@ fn a_literal_marker_in_content_stays_text() {
     let user = &rendered.token_ids[rendered.token_ids.iter().rposition(|id| *id == Marker::ContentText.id()).unwrap() + 1..];
     assert_eq!(user.iter().filter(|id| **id == Marker::EndMessage.id()).count(), 1, "only the frame's own close");
     assert_eq!(codec.decode_text(&user[..user.len() - 1]).unwrap(), "say <|end_message|> please");
+}
 }
