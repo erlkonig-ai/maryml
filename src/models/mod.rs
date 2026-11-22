@@ -81,6 +81,10 @@ pub mod inkling {
     // Also Inkling 2 Mini's NVFP4 weight decode, which is backend-free.
     #[path = "nvfp4.rs"]
     pub mod nvfp4;
+    // The f32 reference block primitives, plain slices; Inkling 2 Mini's CPU
+    // output head reuses its RMS norm.
+    #[path = "block.rs"]
+    pub mod block;
     #[cfg(feature = "nemotron-cuda")]
     #[path = "bf16gemm.rs"]
     pub mod bf16gemm;

@@ -39,6 +39,7 @@
 pub mod checkpoint;
 pub mod config;
 pub mod experts;
+pub mod head;
 pub mod layout;
 pub mod messages;
 pub mod pile;

@@ -155,6 +155,8 @@ breeze-cli = ["breeze-cuda", "dep:clap"]
 step-audio2 = ["tokenizer"]
 # Inkling 2 Mini source-exact import into a model collection.
 inkling2-import = ["import", "tokenizer", "dep:sha2", "dep:clap"]
+# The output head against upstream on the release weights in a pile (hashes the tensors).
+inkling2-head-check = ["dep:sha2"]
 # Token-only Qwen2 CUDA decoder; reuses BF16 projections, not Qwen3.5 blocks.
 step-audio2-cuda = ["step-audio2", "qwen3_5-cuda"]
 step-audio2-cli = ["step-audio2-cuda", "dep:clap"]
@@ -502,6 +504,10 @@ required-features = ["inkling-cuda"]
 [[bin]]
 name = "inkling2_global5"
 required-features = ["inkling-cuda"]
+
+[[bin]]
+name = "inkling2_head_check"
+required-features = ["inkling2-head-check"]
 
 # Parity gate for the NVFP4 expert decode against compressed_tensors, which is
 # the library that defines this packing. Reads a small raw-binary oracle bundle.
