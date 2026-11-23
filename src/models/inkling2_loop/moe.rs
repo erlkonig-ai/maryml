@@ -1252,6 +1252,46 @@ mod tests {
         }
     }
 
+    /// A row's output does not depend on the rows beside it: one row alone (a
+    /// decode step) against the same row inside a 37-row call (a replay), the
+    /// same input and the same routing, on both formats. Also printed, not
+    /// bounded: how far the output moves when the input moves by a relative
+    /// 4e-4, which is what a cached step and a replay differ by at a layer's
+    /// expert input. Quantised activations are discontinuous there, so this is
+    /// the part of a cached-against-replay distance the experts add.
+    #[test]
+    fn a_rows_output_is_its_own() {
+        let d = dims(2304, 1152, 128, 8);
+        let (h, w) = (d.hidden, 2 * d.top_k + 1);
+        let rms = |v: &[f32]| v.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+        for nvfp4 in [true, false] {
+            let b = bank(&d, nvfp4, 0xa10e);
+            let client = b.client();
+            let rows = 37;
+            let xs = x(rows, h, 0x10e);
+            let route = b.route(&xs);
+            let topk = f32s_of(&client, &route.topk);
+            let whole = host(b.experts_grouped(&xs, &route, &fault_cell(&dev())));
+            for r in [0, 5, rows - 1] {
+                let one = Route {
+                    logits: route.logits.clone().slice([r..r + 1, 0..d.experts]),
+                    topk: client.create_from_slice(f32::as_bytes(&topk[r * w..(r + 1) * w])),
+                    rows: 1,
+                    top_k: d.top_k,
+                };
+                let alone = host(b.experts_grouped(&xs.clone().slice([r..r + 1, 0..h]), &one, &fault_cell(&dev())));
+                let same = alone.iter().zip(&whole[r * h..(r + 1) * h]).filter(|(p, q)| p.to_bits() == q.to_bits()).count();
+                assert_eq!(same, h, "nvfp4 {nvfp4} row {r}: alone and beside 36 others");
+            }
+            let mut g = Rng(0x7e57);
+            let noise: Vec<f32> = (0..rows * h).map(|_| 1.0 + g.f(4e-4 * 3f32.sqrt())).collect();
+            let moved = xs.clone() * Tensor::from_data(TensorData::new(noise, [rows, h]), &dev());
+            let out = host(b.experts_grouped(&moved, &route, &fault_cell(&dev())));
+            let diff: Vec<f32> = out.iter().zip(&whole).map(|(p, q)| p - q).collect();
+            eprintln!("MOE nvfp4 {nvfp4}: rows alone bit-equal; input moved by rel-L2 4e-4 moves the output by {:.3e}", rms(&diff) / rms(&whole));
+        }
+    }
+
     /// Tiles no expert owns: two equal rows share their eight experts, so
     /// eight of the sixteen planned tiles are owned and eight are not. The
     /// down projection's input is poisoned before the SwiGLU writes it, and
