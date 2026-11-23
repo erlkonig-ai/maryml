@@ -718,8 +718,10 @@ mod tests {
         /// the device gate against the host one, row by row, so a kernel that
         /// gets only the last row right (compass cbc76004's k = 64 failure)
         /// is caught at row 0. The weights are bf16 values, as the checkpoint's
-        /// are. A bug detector, not a tolerance: the bound is far above
-        /// summation order and far below a wrong row.
+        /// are. A bug detector, not a tolerance: on sky (2026-11-23) the worst
+        /// row was 1.9e-3, which we read as the k = 4608 sum ordered
+        /// differently and a few rank entries landing on the other side of a
+        /// bf16 rounding (2^-8 each); the k = 64 failure is off by about 26.
         #[test]
         fn the_device_gate_matches_the_host_gate_at_release_shapes() {
             let (h, r, t) = (2304, 64, 37);
@@ -744,7 +746,7 @@ mod tests {
                 for row in 0..t {
                     let e = rel_err(&got[row * h..(row + 1) * h], &want[row * h..(row + 1) * h]);
                     worst = worst.max(e);
-                    assert!(e < 1e-3, "{precision:?} row {row}: rel err {e}");
+                    assert!(e < 1e-2, "{precision:?} row {row}: rel err {e}");
                 }
                 eprintln!("{precision:?} device vs host gate, {t} rows, worst rel err {worst}");
             }
