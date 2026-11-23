@@ -385,6 +385,48 @@ impl Caches {
     }
 }
 
+/// Diagnostic: what one layer visit carries, read back from the device and
+/// digested. Two visits carry the same bits exactly when these are equal.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VisitDigest {
+    pub id: CacheId,
+    /// Positions seen, and the absolute positions of the keys and values held.
+    pub pos: usize,
+    pub base: usize,
+    pub end: usize,
+    /// Whether every value below is finite.
+    pub finite: bool,
+    /// BLAKE3 of the stored bytes (with dtype and shape) of the keys, the
+    /// values and the four convolution tails.
+    pub parts: [String; 6],
+}
+
+impl VisitDigest {
+    fn of(id: CacheId, s: &State) -> Result<VisitDigest> {
+        let mut finite = true;
+        let mut digest = |t: Option<Tensor<Bk, 2>>| -> Result<String> {
+            let Some(t) = t else { return Ok(String::new()) };
+            let d = t.into_data();
+            let mut h = blake3::Hasher::new();
+            h.update(format!("{:?} {:?}\n", d.dtype, d.shape).as_bytes());
+            h.update(d.as_bytes());
+            let v: Vec<f32> = d.convert::<f32>().to_vec().map_err(|e| anyhow!("read a carried state: {e:?}"))?;
+            finite &= v.iter().all(|x| x.is_finite());
+            Ok(h.finalize().to_hex().to_string())
+        };
+        let parts = [
+            digest(s.kv.keys())?,
+            digest(s.kv.values())?,
+            digest(Some(s.conv[0].clone()))?,
+            digest(Some(s.conv[1].clone()))?,
+            digest(Some(s.conv[2].clone()))?,
+            digest(Some(s.conv[3].clone()))?,
+        ];
+        Ok(VisitDigest { id, pos: s.pos, base: s.kv.base(), end: s.kv.end(), finite, parts })
+    }
+}
+
 /// One token sequence over a shared [`MiniModel`]: its own state for every
 /// layer visit and its own position.
 pub struct MiniSession {
@@ -429,6 +471,17 @@ impl MiniSession {
         ids.extend(self.caches.core.visits.keys().copied());
         ids.extend(self.model.post.iter().map(|l| CacheId { layer: l.layer(), pass: 0 }));
         ids
+    }
+
+    /// Diagnostic: every visit's carried state, digested, in
+    /// [`Self::cache_ids`] order. Reads the device; changes nothing.
+    #[doc(hidden)]
+    pub fn state_digests(&self) -> Result<Vec<VisitDigest>> {
+        let c = &self.caches;
+        let states = c.pre.iter().chain(c.core.visits.values()).chain(&c.post);
+        let ids = self.cache_ids();
+        ensure!(ids.len() == states.clone().count(), "{} visits for {} identities", states.count(), ids.len());
+        ids.into_iter().zip(states).map(|(id, s)| VisitDigest::of(id, s)).collect()
     }
 
     /// Attend to `ids` after everything already seen and return the logits of
