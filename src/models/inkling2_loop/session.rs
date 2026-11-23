@@ -57,24 +57,21 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use burn::prelude::*;
 use burn::tensor::TensorData;
-use cubecl::server::Handle;
 use triblespace::core::collection::CollectionHandle;
 use triblespace::prelude::Id;
 
 use crate::models::inkling::burn::rms_norm;
-use crate::models::inkling::seam::{Bk, client_of};
+use crate::models::inkling::seam::Bk;
 use crate::models::inkling2_loop::prof;
 use crate::models::inkling2_loop::config::{AttnKind, Inkling2LoopConfig, Inkling2LoopTextConfig};
 use crate::models::inkling2_loop::full::FullLayer;
 use crate::models::inkling2_loop::head::Head;
 use crate::models::inkling2_loop::layout::{Dtype, Slot};
 use crate::models::inkling2_loop::loop_core::{Core, CoreState};
-use crate::models::inkling2_loop::moe::{fault_cell, read_fault};
+use crate::models::inkling2_loop::moe::{FaultCell, fault_cell, read_fault};
 use crate::models::inkling2_loop::pile::MiniRoot;
 use crate::models::inkling2_loop::schedule::CacheId;
 use crate::models::inkling2_loop::sliding::{Dev, ExpertAct, SlidingLayer, State, Weights, bf16_to_f32, want};
-
-type Client = cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>;
 
 /// The most logit rows one call returns, so a long prefill cannot ask for
 /// `rows x 200058` floats on the host by accident.
@@ -143,7 +140,7 @@ impl Outer {
         }
     }
 
-    fn new_state(&self, dev: &Dev, fault: &Handle) -> State {
+    fn new_state(&self, dev: &Dev, fault: &FaultCell) -> State {
         match self {
             Outer::Sliding(l) => State::sharing_fault(&l.dims, dev, fault),
             Outer::Full(l) => State::sharing_fault(&l.dims, dev, fault),
@@ -258,14 +255,12 @@ impl MiniModel {
     /// Fresh caches for one sequence: every visit's state, and the one router
     /// fault cell all of them write.
     fn fresh(&self) -> Caches {
-        let client = client_of(&self.embed_gain);
-        let fault = fault_cell(&client);
+        let fault = fault_cell(&self.dev);
         Caches {
             pre: self.pre.iter().map(|l| l.new_state(&self.dev, &fault)).collect(),
             core: self.core.new_state_sharing_fault(&self.dev, &fault),
             post: self.post.iter().map(|l| l.new_state(&self.dev, &fault)).collect(),
             fault,
-            client,
             #[cfg(test)]
             nan_input: false,
         }
@@ -339,8 +334,7 @@ struct Caches {
     /// The router fault cell every visit above writes. A sequence owns it:
     /// another session over the same model has its own, and [`MiniSession::reset`]
     /// replaces it with the caches.
-    fault: Handle,
-    client: Client,
+    fault: FaultCell,
     /// Test only: the next forward multiplies its embedded input by NaN, so
     /// the first layer's router sees non-finite logits by the ordinary path.
     #[cfg(test)]
@@ -352,7 +346,7 @@ impl Caches {
     /// after a forward: a set cell is a non-finite router logit somewhere in
     /// the call. The read is a sync; the head has already synced by then.
     fn check_router(&self) {
-        if let Some(flag) = read_fault(&self.client, &self.fault) {
+        if let Some(flag) = read_fault(&self.fault) {
             panic!("router logit is non-finite (grouped lane), logit {}", flag - 1);
         }
     }

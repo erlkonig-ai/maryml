@@ -80,6 +80,7 @@ use crate::models::inkling::w4a16gemm::{CODES_PER_WORD, GROUP, KTILE, MTILE, NTI
 use crate::models::inkling2_loop::sliding::{Expert, ExpertW};
 
 type Client = ComputeClient<cubecl::cuda::CudaRuntime>;
+type Dev = burn::backend::cuda::CudaDevice;
 
 /// The tile-table value of a tile no expert owns (`0xFFFF_FFFF` in the kernels).
 pub const NO_EXPERT: u32 = u32::MAX;
@@ -586,9 +587,10 @@ impl Bank {
         d: &super::sliding::Dims,
         x: &Tensor<Bk, 2>,
         act: super::sliding::ExpertAct,
-        fault: &Handle,
+        fault: &FaultCell,
     ) -> (Tensor<Bk, 2>, Route) {
         let dev = x.device();
+        assert!(fault.dev == dev, "moe: a fault cell on {:?} for x on {dev:?}", fault.dev);
         let route = super::prof::span("router", &dev, || self.route(x));
         let out = super::prof::span("experts", &dev, || match lane(act) {
             Lane::Grouped => self.experts_grouped(x, &route, fault),
@@ -627,7 +629,7 @@ impl Bank {
 
     /// The device plan for `route` (see the module doc). `fault` (one u32)
     /// receives `1 + logit` of a row whose router logits were not finite.
-    fn plan(&self, client: &Client, route: &Route, fault: &Handle) -> Plan {
+    fn plan(&self, client: &Client, route: &Route, fault: &FaultCell) -> Plan {
         assert_eq!(route.top_k, self.top_k, "plan: a route of top {} on a bank of top {}", route.top_k, self.top_k);
         let (rows, k, e) = (route.rows, self.top_k, self.experts);
         let max_tiles = max_tiles(rows, k, e);
@@ -684,7 +686,7 @@ impl Bank {
                 ArrayArg::from_raw_parts(row_w.clone(), m_max),
                 ArrayArg::from_raw_parts(tok_rows.clone(), rows * k),
                 ArrayArg::from_raw_parts(tok_cnt.clone(), rows),
-                ArrayArg::from_raw_parts(fault.clone(), 1),
+                ArrayArg::from_raw_parts(fault.handle.clone(), 1),
                 rows as u32,
                 e as u32,
                 k as u32,
@@ -719,7 +721,7 @@ impl Bank {
     /// `[rows, H]` f32, each row the weighted sum of its picks' outputs.
     /// `fault` as in [`Bank::forward`]. The kernels below launch unchecked,
     /// so the shapes are checked here.
-    fn experts_grouped(&self, x: &Tensor<Bk, 2>, route: &Route, fault: &Handle) -> Tensor<Bk, 2> {
+    fn experts_grouped(&self, x: &Tensor<Bk, 2>, route: &Route, fault: &FaultCell) -> Tensor<Bk, 2> {
         let [rows, h] = x.dims();
         assert_eq!(h, self.hidden, "experts: x is {h} wide, the bank's hidden size is {}", self.hidden);
         assert_eq!(route.rows, rows, "experts: a route of {} rows for {rows} rows of x", route.rows);
@@ -786,14 +788,34 @@ pub(super) fn bf16_proj(client: &Client, bytes: &[u8], experts: usize, n: usize,
     }
 }
 
-/// A fresh fault cell for [`Bank::forward`]: one u32, zero.
-pub fn fault_cell(client: &Client) -> Handle {
-    u32s(client, &[0])
+/// A router fault cell for [`Bank::forward`]: one u32 on one device, `1 +
+/// logit` once a row's router logits were not finite. Only [`fault_cell`]
+/// builds one, so its buffer is always that one u32; the handle stays in this
+/// module, and [`Bank::forward`] checks the device. A clone is the same cell.
+#[derive(Clone)]
+pub struct FaultCell {
+    handle: Handle,
+    client: Client,
+    dev: Dev,
 }
 
-/// Read a fault cell: `Some(logit + 1)` if a row's router logits were not finite.
-pub fn read_fault(client: &Client, fault: &Handle) -> Option<u32> {
-    let b = client.read_one(fault.clone()).expect("read the router fault cell");
+impl FaultCell {
+    /// The device the cell lives on.
+    pub fn device(&self) -> &Dev {
+        &self.dev
+    }
+}
+
+/// A fresh fault cell on `dev`: one u32, zero.
+pub fn fault_cell(dev: &Dev) -> FaultCell {
+    let client = client_of(&Tensor::<Bk, 1>::zeros([1], dev));
+    FaultCell { handle: u32s(&client, &[0]), client, dev: dev.clone() }
+}
+
+/// Read a fault cell: `Some(logit + 1)` if a row's router logits were not
+/// finite. The read is a sync.
+pub fn read_fault(fault: &FaultCell) -> Option<u32> {
+    let b = fault.client.read_one(fault.handle.clone()).expect("read the router fault cell");
     let v = u32::from_bytes(&b)[0];
     (v != 0).then_some(v)
 }
@@ -916,10 +938,10 @@ mod tests {
         let xs = x(rows, d.hidden, seed ^ 0x5555);
         let route = b.route(&xs);
         let picks = route.picks();
-        let cell = fault_cell(&b.client());
+        let cell = fault_cell(&dev());
         let grouped = host(b.experts_grouped(&xs, &route, &cell));
         let looped = host(experts_loop(&b, d, &xs, &picks, ExpertAct::Bf16));
-        assert_eq!(read_fault(&b.client(), &cell), None);
+        assert_eq!(read_fault(&cell), None);
         let h = d.hidden;
         let (mut worst, mut differ) = (0f32, 0);
         for row in 0..rows {
@@ -1021,27 +1043,27 @@ mod tests {
         let rows = 37;
         let xs = x(rows, d.hidden, 0x0bad);
         let route = b.route(&xs);
-        let before_cell = fault_cell(&client);
+        let before_cell = fault_cell(&dev());
         let before = host(b.experts_grouped(&xs, &route, &before_cell));
-        assert_eq!(read_fault(&client, &before_cell), None);
+        assert_eq!(read_fault(&before_cell), None);
 
         let mut topk = f32s_of(&client, &route.topk);
         let w = 2 * d.top_k + 1;
         assert!(topk.chunks(w).all(|r| r[w - 1] == 0.0), "the input route is already flagged");
         topk[5 * w + w - 1] = 42.0;
         let faulted = with_topk(&client, &route, &topk);
-        let a = fault_cell(&client);
+        let a = fault_cell(&dev());
         let _ = host(b.experts_grouped(&xs, &faulted, &a));
-        assert_eq!(read_fault(&client, &a), Some(42), "the faulted call's cell");
-        assert_eq!(read_fault(&client, &before_cell), None, "an earlier call's cell");
+        assert_eq!(read_fault(&a), Some(42), "the faulted call's cell");
+        assert_eq!(read_fault(&before_cell), None, "an earlier call's cell");
 
-        let c = fault_cell(&client);
+        let c = fault_cell(&dev());
         let after = host(b.experts_grouped(&xs, &route, &c));
-        assert_eq!(read_fault(&client, &c), None, "a later call's own cell");
-        assert_eq!(read_fault(&client, &a), Some(42), "a set cell stays set");
+        assert_eq!(read_fault(&c), None, "a later call's own cell");
+        assert_eq!(read_fault(&a), Some(42), "a set cell stays set");
         let same = before.iter().zip(&after).filter(|(p, q)| p.to_bits() == q.to_bits()).count();
         assert_eq!(same, before.len(), "the bank's output changed after another cell's fault");
-        eprintln!("MOE fault: cell A {:?}, earlier and later cells clear, later output {same} of {} equal", read_fault(&client, &a), before.len());
+        eprintln!("MOE fault: cell A {:?}, earlier and later cells clear, later output {same} of {} equal", read_fault(&a), before.len());
     }
 
     /// Non-finite router logits, through the real top-k and the plan: rows
@@ -1064,9 +1086,9 @@ mod tests {
         let rows = 37;
         let xs = x(rows, d.hidden, 0x1157);
         let good = b.route(&xs);
-        let good_cell = fault_cell(&client);
+        let good_cell = fault_cell(&dev());
         let before = host(b.experts_grouped(&xs, &good, &good_cell));
-        assert_eq!(read_fault(&client, &good_cell), None);
+        assert_eq!(read_fault(&good_cell), None);
 
         let mut logits = good.logits();
         logits[2 * e + 17] = f32::NAN;
@@ -1099,7 +1121,7 @@ mod tests {
             for _ in 0..64 {
                 drop(client.create_from_slice(u32::as_bytes(&vec![0x7fff_fff0u32; rows * k])));
             }
-            let cell = fault_cell(&client);
+            let cell = fault_cell(&dev());
             let plan = b.plan(&client, &bad, &cell);
             let m_max = plan.max_tiles * MTILE;
             let tok_rows = u32s_of(&client, &plan.tok_rows);
@@ -1112,7 +1134,7 @@ mod tests {
             assert!(row_src.iter().all(|v| *v >= -1 && (*v as i64) < rows as i64), "row_src");
             assert!(tile_slot.iter().all(|v| (*v as usize) < e || *v == NO_EXPERT), "tile_slot");
             let out = host(b.experts_grouped(&xs, &bad, &cell));
-            let flag = read_fault(&client, &cell);
+            let flag = read_fault(&cell);
             assert!(flag.is_some(), "round {round}: no fault recorded");
             let finite_rows = (0..rows).filter(|r| out[r * d.hidden..(r + 1) * d.hidden].iter().all(|v| v.is_finite())).count();
             eprintln!(
@@ -1123,9 +1145,9 @@ mod tests {
             );
         }
 
-        let after_cell = fault_cell(&client);
+        let after_cell = fault_cell(&dev());
         let after = host(b.experts_grouped(&xs, &good, &after_cell));
-        assert_eq!(read_fault(&client, &after_cell), None);
+        assert_eq!(read_fault(&after_cell), None);
         let same = before.iter().zip(&after).filter(|(p, q)| p.to_bits() == q.to_bits()).count();
         assert_eq!(same, before.len(), "a finite call after the faulted ones changed");
     }

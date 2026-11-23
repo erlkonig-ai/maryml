@@ -30,15 +30,14 @@
 use std::collections::BTreeMap;
 
 use burn::prelude::*;
-use cubecl::server::Handle;
 
-use crate::models::inkling::seam::{Bk, client_of};
+use crate::models::inkling::seam::Bk;
 use crate::models::inkling2_loop::prof;
 use crate::models::inkling2_loop::config::{AttnKind, Inkling2LoopTextConfig};
 use crate::models::inkling2_loop::full::FullLayer;
 use crate::models::inkling2_loop::layout::{Dtype, Slot};
 use crate::models::inkling2_loop::messages::{DeviceQueries, MessageQueries, MessageSources};
-use crate::models::inkling2_loop::moe::fault_cell;
+use crate::models::inkling2_loop::moe::{FaultCell, fault_cell};
 use crate::models::inkling2_loop::schedule::CacheId;
 use crate::models::inkling2_loop::sliding::{Dev, ExpertAct, SlidingLayer, State, Taps, Weights, f32_le, want};
 
@@ -56,7 +55,7 @@ impl CoreLayer {
         }
     }
 
-    fn new_state(&self, dev: &Dev, fault: &Handle) -> State {
+    fn new_state(&self, dev: &Dev, fault: &FaultCell) -> State {
         match self {
             CoreLayer::Sliding(l) => State::sharing_fault(&l.dims, dev, fault),
             CoreLayer::Full(l) => State::sharing_fault(&l.dims, dev, fault),
@@ -147,12 +146,11 @@ impl Core {
     /// Fresh state for every visit, `passes x layers`, all writing one
     /// router fault cell of their own.
     pub fn new_state(&self, dev: &Dev) -> CoreState {
-        let fault = fault_cell(&client_of(&Tensor::<Bk, 1>::zeros([1], dev)));
-        self.new_state_sharing_fault(dev, &fault)
+        self.new_state_sharing_fault(dev, &fault_cell(dev))
     }
 
     /// [`Self::new_state`], every visit writing its router faults into `fault`.
-    pub fn new_state_sharing_fault(&self, dev: &Dev, fault: &Handle) -> CoreState {
+    pub fn new_state_sharing_fault(&self, dev: &Dev, fault: &FaultCell) -> CoreState {
         let mut visits = BTreeMap::new();
         for pass in 0..self.passes {
             for l in &self.layers {
