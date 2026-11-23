@@ -109,8 +109,10 @@ pub(super) fn worst_row(got: &[f32], want: &[f32], h: usize) -> f32 {
     got.chunks(h).zip(want.chunks(h)).fold(0f32, |m, (g, w)| {
         let peak = w.iter().fold(0f32, |m, v| m.max(v.abs()));
         let diff = g.iter().zip(w).fold(0f32, |m, (p, q)| m.max((p - q).abs()));
-        // a NaN anywhere, or a row of zeros, is no agreement
-        if diff.is_finite() && peak > 0.0 && g.iter().all(|v| v.is_finite()) { m.max(diff / peak) } else { f32::INFINITY }
+        // a non-finite value on either side, or a row of zeros, is no agreement
+        // (f32::max skips NaN, so `diff` alone cannot see one)
+        let finite = g.iter().chain(w).all(|v| v.is_finite());
+        if finite && peak > 0.0 { m.max(diff / peak) } else { f32::INFINITY }
     })
 }
 
@@ -218,5 +220,20 @@ impl<'a> OneExpert<'a> {
             self.product(&self.w2, e, h, d.inter, s).slice([0..n, 0..h]) * alpha
         });
         (out, picks.into_iter().map(|(e, _)| e).collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::worst_row;
+
+    #[test]
+    fn worst_row_rejects_non_finite_on_either_side() {
+        // f32::max skips NaN, so a NaN in `want` must not read as zero error.
+        assert_eq!(worst_row(&[1.0, 2.0], &[1.0, f32::NAN], 2), f32::INFINITY);
+        assert_eq!(worst_row(&[1.0, 2.0], &[1.0, f32::INFINITY], 2), f32::INFINITY);
+        assert_eq!(worst_row(&[1.0, f32::NAN], &[1.0, 2.0], 2), f32::INFINITY);
+        assert_eq!(worst_row(&[1.0, f32::NEG_INFINITY], &[1.0, 2.0], 2), f32::INFINITY);
+        assert_eq!(worst_row(&[1.0, 2.0], &[1.0, 2.0], 2), 0.0);
     }
 }
