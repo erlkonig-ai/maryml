@@ -42,7 +42,8 @@
 //! ([`super::attend::QUERY_TILE`] by [`super::attend::KEY_TILE`]), not by the
 //! sequence.
 //!
-//! Scope, stated. No checkpoint, rewind or cache export. The head runs on the host.
+//! Scope, stated. No checkpoint, rewind or cache export. The head runs on the
+//! device ([`DeviceHead`]), the host [`Head`]'s arithmetic in its order.
 //! Logits are the release's: `unpadded_vocab_size` softcapped f32 values per
 //! row. Nothing here samples.
 
@@ -55,11 +56,15 @@ use burn::tensor::TensorData;
 use triblespace::core::collection::CollectionHandle;
 use triblespace::prelude::Id;
 
-use crate::models::inkling::burn::rms_norm;
+use crate::models::inkling::bf16gemm::Bf16W;
+use crate::models::inkling::burn::{linear_bf16, rms_norm};
+use crate::models::inkling::seam::client_of;
+use burn::tensor::FloatDType;
+use burn::tensor::activation::softmax;
 use crate::models::inkling::seam::Bk;
 use crate::models::inkling2_loop::config::{AttnKind, Inkling2LoopConfig, Inkling2LoopTextConfig};
 use crate::models::inkling2_loop::full::FullLayer;
-use crate::models::inkling2_loop::head::Head;
+use crate::models::inkling2_loop::head::{self, Head};
 use crate::models::inkling2_loop::layout::{Dtype, Slot};
 use crate::models::inkling2_loop::loop_core::{Core, CoreState};
 use crate::models::inkling2_loop::pile::MiniRoot;
@@ -162,6 +167,68 @@ pub struct MiniModel {
     pre: Vec<Outer>,
     core: Core,
     post: Vec<Outer>,
+    head: DeviceHead,
+}
+
+/// The output head on the device: [`Head`]'s four steps in its order and at
+/// its precisions (the block residual and the learned norm in f32, the normed
+/// state rounded to BF16, the BF16 unembedding with an f32 accumulator rounded
+/// to BF16, the softcap in f32). The unembedding is bound once as the stored
+/// BF16, padded rows and all (`vocab_size` is a whole number of tiles); the
+/// pad rows' outputs are sliced away.
+struct DeviceHead {
+    query: Tensor<Bk, 1>,
+    gain: Tensor<Bk, 1>,
+    unembed: Bf16W,
+    eps: f64,
+    cap: f32,
+    vocab: usize,
+}
+
+impl DeviceHead {
+    fn bind(t: &Inkling2LoopTextConfig, root: &MiniRoot, dev: &Dev) -> Result<DeviceHead> {
+        let h = t.hidden_size;
+        // the host head checks every dtype and shape this reads
+        Head::from_root(t, root).map_err(|e| anyhow!("bind the head: {e}"))?;
+        let (_, _, query) = root.tensor(head::QUERY).map_err(|e| anyhow!(e))?;
+        let (_, _, norm) = root.tensor(head::NORM).map_err(|e| anyhow!(e))?;
+        let (_, _, unembed) = root.tensor(head::UNEMBED).map_err(|e| anyhow!(e))?;
+        let query: Vec<f32> = query.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+        let query = Tensor::<Bk, 1>::from_data(TensorData::new(query, [h]), dev);
+        let gain = Tensor::<Bk, 1>::from_data(TensorData::new(bf16_to_f32(norm), [h]), dev);
+        ensure!(Bf16W::tileable(t.vocab_size, h), "the unembedding {}x{h} does not tile", t.vocab_size);
+        let client = client_of(&query);
+        let unembed = Bf16W { h: client.create_from_slice(unembed), n: t.vocab_size, k: h, align: 16 };
+        Ok(DeviceHead {
+            query,
+            gain,
+            unembed,
+            eps: t.rms_norm_eps,
+            cap: t.final_logit_softcapping as f32,
+            vocab: t.unpadded_vocab_size,
+        })
+    }
+
+    /// `blocks` and `partial` are `[rows, hidden]` each; returns the
+    /// softcapped `[rows, vocab]` logits.
+    fn forward(&self, blocks: Vec<Tensor<Bk, 2>>, partial: Tensor<Bk, 2>) -> Tensor<Bk, 2> {
+        let [rows, h] = partial.dims();
+        let mut states = blocks;
+        states.push(partial);
+        let n = states.len();
+        // the one-query block residual over the unweighted-normed states
+        let x = Tensor::stack::<3>(states, 1);
+        let ms = x.clone().powf_scalar(2.0).mean_dim(2);
+        let normed = x / ms.add_scalar(head::RESIDUAL_EPS).sqrt();
+        let scores = (normed.clone() * self.query.clone().reshape([1, 1, h])).sum_dim(2) * (h as f32).powf(-0.5);
+        let w = softmax(scores, 1);
+        let selected = (normed * w).sum_dim(1).reshape([rows, h]);
+        debug_assert!(n > 0);
+        let bf16 = |x: Tensor<Bk, 2>| x.cast(FloatDType::BF16).cast(FloatDType::F32);
+        let y = bf16(rms_norm(selected, self.gain.clone(), self.eps));
+        let raw = bf16(linear_bf16(y, &self.unembed).slice([0..rows, 0..self.vocab]));
+        (raw / self.cap).tanh() * self.cap
+    }
 }
 
 impl MiniModel {
@@ -192,9 +259,8 @@ impl MiniModel {
         let pre = outer(0..l.core_start)?;
         let core = Core::bind(&root, t, &dev).map_err(|e| anyhow!("bind the core: {e}"))?;
         let post = outer(l.core_end..t.num_hidden_layers)?;
-        // check the head binds now rather than at the first call
-        Head::from_root(t, &root).map_err(|e| anyhow!("bind the head: {e}"))?;
-        Ok(MiniModel { root, cfg, tokenizer, content_tokenizer, opts, dev, embed_gain, pre, core, post })
+        let head = DeviceHead::bind(t, &root, &dev)?;
+        Ok(MiniModel { root, cfg, tokenizer, content_tokenizer, opts, dev, embed_gain, pre, core, post, head })
     }
 
     pub fn config(&self) -> &Inkling2LoopTextConfig {
@@ -282,22 +348,11 @@ impl MiniModel {
         for (layer, st) in self.post.iter().zip(caches.post.iter_mut()) {
             x = layer.forward(x, &mut blocks, st, act);
         }
-        // the head, on the host, for the last `rows` rows only
-        let tail = |v: Tensor<Bk, 2>| -> Vec<f32> {
-            v.slice([n - rows..n, 0..h]).into_data().convert::<f32>().to_vec().expect("f32")
-        };
-        let nb = blocks.len();
-        let host_blocks: Vec<Vec<f32>> = blocks.into_iter().map(tail).collect();
-        let partial = tail(x);
-        let mut stacked = Vec::with_capacity(rows * nb * h);
-        for r in 0..rows {
-            for b in &host_blocks {
-                stacked.extend_from_slice(&b[r * h..(r + 1) * h]);
-            }
-        }
-        let head = Head::from_root(t, &self.root).expect("checked at open");
-        let out = head.forward(&stacked, nb, &partial);
-        Logits { rows, vocab: head.vocab(), values: out.logits }
+        // The head needs only the requested trailing rows.
+        let tail = |v: Tensor<Bk, 2>| v.slice([n - rows..n, 0..h]);
+        let logits = self.head.forward(blocks.into_iter().map(tail).collect(), tail(x));
+        let values = logits.into_data().convert::<f32>().to_vec().expect("f32");
+        Logits { rows, vocab: self.head.vocab, values }
     }
 }
 
