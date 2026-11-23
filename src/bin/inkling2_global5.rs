@@ -13,7 +13,10 @@
 //!
 //! The tolerance is calibrated as for layer 0: a tensor passes when its
 //! distance to upstream's f32 run is within `TOL` times upstream's own
-//! bf16-vs-f32 distance, here layer 5's rounding alone.
+//! bf16-vs-f32 distance, here layer 5's rounding alone. Gates are the tensors
+//! before the experts; the experts, `mlp_conv`, `out` and the last
+//! convolution's state are information, because upstream's runs multiply
+//! unquantised activations there and Mary's do not.
 //!
 //! usage: inkling2_global5 <release dir> <reference.safetensors> [receipt.json]
 
@@ -34,6 +37,8 @@ use mary::models::inkling2_loop::sliding::{State, Stored, Taps, Weights};
 /// A pass is within this many times upstream's own bf16-vs-f32 spread.
 const TOL: f64 = 1.5;
 const LAYER: usize = 5;
+/// Computed from the experts' output.
+const POST_EXPERT: [&str; 4] = ["experts", "mlp_conv", "out", "state conv3"];
 
 struct File {
     map: Mmap,
@@ -132,6 +137,10 @@ struct Report {
     json: Vec<String>,
     worst: f64,
     fails: usize,
+    gates: usize,
+    info: usize,
+    info_beyond: usize,
+    info_worst: f64,
 }
 
 impl Report {
@@ -142,15 +151,24 @@ impl Report {
         let ratio = e32 / spread;
         let pass = ratio <= TOL;
         if gated {
+            self.gates += 1;
             self.worst = self.worst.max(ratio);
             if !pass {
                 self.fails += 1;
             }
+        } else {
+            self.info += 1;
+            self.info_beyond += usize::from(!pass);
+            self.info_worst = self.info_worst.max(ratio);
         }
         self.lines.push(format!(
             "{tag:18} {name:14} vs f32 {e32:.3e} (max {:.2e})  vs bf16 {e16:.3e}  upstream spread {spread:.3e}  ratio {ratio:6.2}  {}",
             max_abs(mary, r32),
-            if !gated { "report" } else if pass { "ok" } else { "OUTSIDE" },
+            match (gated, pass) {
+                (true, true) => "gate ok",
+                (true, false) => "gate OUTSIDE",
+                (false, _) => "info",
+            },
         ));
         self.json.push(format!(
             "{{\"run\":\"{tag}\",\"tensor\":\"{name}\",\"rel_l2_vs_f32\":{e32:e},\"rel_l2_vs_bf16\":{e16:e},\"upstream_spread\":{spread:e},\"ratio\":{ratio:e},\"gated\":{gated}}}"
@@ -192,7 +210,7 @@ fn main() {
     };
     let ref_t = |run: &str, key: &str| r.f32s(&format!("{run}.{key}")).1;
 
-    let mut rep = Report { lines: vec![], json: vec![], worst: 0.0, fails: 0 };
+    let mut rep = Report { lines: vec![], json: vec![], worst: 0.0, fails: 0, gates: 0, info: 0, info_beyond: 0, info_worst: 0.0 };
     let tap_rows = |taps: FullTaps, out: Tensor<Bk, 2>| -> (Vec<(&'static str, Vec<f32>)>, Vec<f32>, Vec<(Vec<usize>, Vec<f32>)>) {
         let FullTaps { inputs: [qi, ki, vi], rest } = taps;
         let Taps { attn, attn_conv, mlp_input, route, experts, mlp_conv, gates } = rest;
@@ -227,7 +245,7 @@ fn main() {
             for (name, v) in rows {
                 let a = ref_t("bf16", &format!("{scen}.whole.{name}"));
                 let b = ref_t("f32", &format!("{scen}.whole.{name}"));
-                rep.row(&tag, name, &v, &a, &b, true);
+                rep.row(&tag, name, &v, &a, &b, !POST_EXPERT.contains(&name));
                 if name == "out" {
                     let last = |v: &[f32]| v[(n - 1) * h..].to_vec();
                     let s = ref_t("f32", &format!("{scen}.step.out"));
@@ -249,7 +267,7 @@ fn main() {
             let g = |n: &str| (ref_t("bf16", &format!("{scen}.{phase}.{n}")), ref_t("f32", &format!("{scen}.{phase}.{n}")));
             for (name, v) in rows {
                 let (a, b) = g(name);
-                rep.row(&tag, name, &v, &a, &b, true);
+                rep.row(&tag, name, &v, &a, &b, !POST_EXPERT.contains(&name));
             }
             let (a, b) = g("router_logits");
             rep.row(&tag, "router_logits", &router_logits, &a, &b, true);
@@ -266,7 +284,8 @@ fn main() {
             rep.row(&tag, "state v", &host(state.kv.values().unwrap()), &a, &b, true);
             for i in 0..4 {
                 let (a, b) = st(&format!("conv{i}"), true);
-                rep.row(&tag, &format!("state conv{i}"), &host(state.conv[i].clone()), &a, &b, true);
+                let name = format!("state conv{i}");
+                rep.row(&tag, &name, &host(state.conv[i].clone()), &a, &b, !POST_EXPERT.contains(&name.as_str()));
             }
             let rset = |run: &str| -> Vec<BTreeSet<i32>> {
                 r.i32s(&format!("{run}.{scen}.{phase}.router_indices"))
@@ -297,7 +316,10 @@ fn main() {
     for l in &rep.lines {
         println!("{l}");
     }
-    println!("gated tensors: worst ratio {:.2} of TOL {TOL}; {} outside", rep.worst, rep.fails);
+    println!(
+        "gates: {} compared, worst ratio {:.2} of TOL {TOL}; {} outside. information: {} rows, {} beyond {TOL}, worst ratio {:.2}",
+        rep.gates, rep.worst, rep.fails, rep.info, rep.info_beyond, rep.info_worst
+    );
     if let Some(p) = args.get(3) {
         std::fs::write(p, format!("[\n{}\n]\n", rep.json.join(",\n"))).expect("receipt");
     }

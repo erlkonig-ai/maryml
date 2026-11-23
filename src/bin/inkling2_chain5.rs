@@ -13,7 +13,19 @@
 //! and at bfloat16, nothing fed, so their distance at each layer is how far
 //! rounding alone has moved the chain there. A tensor passes when its distance
 //! to upstream's f32 run is within `TOL` times that. The report names the
-//! earliest tensor in chain order that does not.
+//! earliest gated tensor in chain order that does not.
+//!
+//! Mary's experts quantise their activations as the model was trained and
+//! upstream's runs do not, so the chain's history differs from layer 0's
+//! experts on, by intention. Gates are therefore:
+//! * in the chain, what the embedding alone determines: layer 0's input,
+//!   router logits, cached keys and values and first three convolution states,
+//!   and the one block (the embedding);
+//! * `alone`: each layer on upstream's own recorded f32 input to it, its router
+//!   logits and, for layer 5, the taps before its experts. Upstream has no
+//!   bf16 run of a lone layer here, so the tolerance is its chained spread,
+//!   looser than a same-input spread.
+//! Everything else is information.
 //!
 //! usage: inkling2_chain5 <pile> <collection> <root> <reference.safetensors> [receipt.json]
 
@@ -141,6 +153,10 @@ struct Report {
     json: Vec<String>,
     worst: f64,
     fails: usize,
+    gates: usize,
+    info: usize,
+    info_beyond: usize,
+    info_worst: f64,
     /// The first gated tensor outside, in chain order.
     earliest: Option<String>,
 }
@@ -153,16 +169,25 @@ impl Report {
         let ratio = e32 / spread;
         let pass = ratio <= TOL;
         if gated {
+            self.gates += 1;
             self.worst = self.worst.max(ratio);
             if !pass {
                 self.fails += 1;
                 self.earliest.get_or_insert_with(|| format!("{tag} {name} (ratio {ratio:.2})"));
             }
+        } else {
+            self.info += 1;
+            self.info_beyond += usize::from(!pass);
+            self.info_worst = self.info_worst.max(ratio);
         }
         self.lines.push(format!(
             "{tag:14} {name:16} vs f32 {e32:.3e} (max {:.2e})  vs bf16 {e16:.3e}  upstream spread {spread:.3e}  ratio {ratio:6.2}  {}",
             max_abs(mary, r32),
-            if !gated { "report" } else if pass { "ok" } else { "OUTSIDE" },
+            match (gated, pass) {
+                (true, true) => "gate ok",
+                (true, false) => "gate OUTSIDE",
+                (false, _) => "info",
+            },
         ));
         self.json.push(format!(
             "{{\"run\":\"{tag}\",\"tensor\":\"{name}\",\"rel_l2_vs_f32\":{e32:e},\"rel_l2_vs_bf16\":{e16:e},\"upstream_spread\":{spread:e},\"ratio\":{ratio:e},\"gated\":{gated}}}"
@@ -312,7 +337,7 @@ fn main() {
     };
 
     let ref_t = |run: &str, key: &str| r.f32s(&format!("{run}.{key}")).1;
-    let mut rep = Report { lines: vec![], json: vec![], worst: 0.0, fails: 0, earliest: None };
+    let mut rep = Report { lines: vec![], json: vec![], worst: 0.0, fails: 0, gates: 0, info: 0, info_beyond: 0, info_worst: 0.0, earliest: None };
 
     // every layer's input and output, then layer 5's block states and taps,
     // in chain order, so the first row outside is the earliest divergence
@@ -320,7 +345,7 @@ fn main() {
         let g = |n: &str| (ref_t("bf16", &format!("{phase}.{n}")), ref_t("f32", &format!("{phase}.{n}")));
         for l in 0..=FULL {
             let (a, b) = g(&format!("layer{l}.input"));
-            rep.row(tag, &format!("layer{l} input"), &p.inputs[l], &a, &b, gated);
+            rep.row(tag, &format!("layer{l} input"), &p.inputs[l], &a, &b, gated && l == 0);
             if l == FULL {
                 let (s, a) = r.f32s(&format!("bf16.{phase}.blocks"));
                 assert_eq!(s[1], p.blocks.len(), "block count");
@@ -330,12 +355,12 @@ fn main() {
                 for (name, v) in &p.taps {
                     if *name != "out" {
                         let (a, b) = g(name);
-                        rep.row(tag, &format!("layer5 {name}"), v, &a, &b, gated);
+                        rep.row(tag, &format!("layer5 {name}"), v, &a, &b, false);
                     }
                 }
             }
             let (a, b) = g(&format!("layer{l}.router_logits"));
-            rep.row(tag, &format!("layer{l} router"), &p.layer_logits[l], &a, &b, gated);
+            rep.row(tag, &format!("layer{l} router"), &p.layer_logits[l], &a, &b, gated && l == 0);
             {
                 let set = |run: &str| -> Vec<BTreeSet<usize>> {
                     r.i32s(&format!("{run}.{phase}.layer{l}.router_indices"))
@@ -371,7 +396,7 @@ fn main() {
                 ));
             }
             let (a, b) = g(&format!("layer{l}.out"));
-            rep.row(tag, &format!("layer{l} out"), &p.outs[l], &a, &b, gated);
+            rep.row(tag, &format!("layer{l} out"), &p.outs[l], &a, &b, false);
             if phase != "step" {
                 rep.lines.push(format!("{tag:14} layer{l} out rows  {}", worst_rows(&p.outs[l], &b, h)));
             }
@@ -408,12 +433,12 @@ fn main() {
                 (f("bf16"), f("f32"))
             };
             let (a, b) = st("k", false);
-            rep.row(tag, &format!("layer{l} cache k"), &host(s.kv.keys().unwrap()), &a, &b, gated);
+            rep.row(tag, &format!("layer{l} cache k"), &host(s.kv.keys().unwrap()), &a, &b, gated && l == 0);
             let (a, b) = st("v", false);
-            rep.row(tag, &format!("layer{l} cache v"), &host(s.kv.values().unwrap()), &a, &b, gated);
+            rep.row(tag, &format!("layer{l} cache v"), &host(s.kv.values().unwrap()), &a, &b, gated && l == 0);
             for i in 0..4 {
                 let (a, b) = st(&format!("conv{i}"), true);
-                rep.row(tag, &format!("layer{l} conv{i}"), &host(s.conv[i].clone()), &a, &b, gated);
+                rep.row(tag, &format!("layer{l} conv{i}"), &host(s.conv[i].clone()), &a, &b, gated && l == 0 && i < 3);
             }
         }
     };
@@ -455,8 +480,9 @@ fn main() {
 
     // each layer alone, on upstream's own f32 input of that layer (block
     // states: the f32 normed embedding, or layer 5's recorded blocks), so the
-    // error a layer adds is apart from the error it inherits. Reported only:
-    // upstream has no bf16 run of a lone layer here to calibrate against.
+    // error a layer adds is apart from the error it inherits. The router logits, and layer 5's taps before its
+    // experts, are gates at the chain's spread (see the header); `out` is
+    // information.
     for phase in ["prefill", "whole"] {
         let tens = |key: &str| -> Tensor<Bk, 2> {
             let (s, v) = r.f32s(&format!("f32.{phase}.{key}"));
@@ -472,16 +498,32 @@ fn main() {
             } else {
                 vec![tens("layer0.input")]
             };
-            let out = if l == FULL {
+            let tag = format!("alone:{phase}");
+            let pair = |n: &str| (ref_t("bf16", &format!("{phase}.{n}")), ref_t("f32", &format!("{phase}.{n}")));
+            let (out, logits) = if l == FULL {
                 let mut st = State::new(&chain.full.dims, &dev);
-                host(chain.full.forward(x, &mut blocks, &mut st).0)
+                let (out, FullTaps { inputs: [q, k, v], rest }) = chain.full.forward(x, &mut blocks, &mut st);
+                for (name, t) in [
+                    ("q_in", q),
+                    ("k_in", k),
+                    ("v_in", v),
+                    ("attn", rest.attn),
+                    ("attn_conv", rest.attn_conv),
+                    ("mlp_input", rest.mlp_input),
+                ] {
+                    let (a, b) = pair(name);
+                    rep.row(&tag, &format!("layer5 {name}"), &host(t), &a, &b, true);
+                }
+                (host(out), rest.route.logits())
             } else {
                 let mut st = State::new(&chain.sliding[l].dims, &dev);
-                host(chain.sliding[l].forward(x, &mut blocks, &mut st).0)
+                let (out, taps) = chain.sliding[l].forward(x, &mut blocks, &mut st);
+                (host(out), taps.route.logits())
             };
+            let (a, b) = pair(&format!("layer{l}.router_logits"));
+            rep.row(&tag, &format!("layer{l} router"), &logits, &a, &b, true);
             let b = ref_t("f32", &format!("{phase}.layer{l}.out"));
             let a = ref_t("bf16", &format!("{phase}.layer{l}.out"));
-            let tag = format!("alone:{phase}");
             rep.row(&tag, &format!("layer{l} out"), &out, &a, &b, false);
             rep.lines.push(format!("{tag:14} layer{l} out rows  {}", worst_rows(&out, &b, h)));
         }
@@ -491,10 +533,14 @@ fn main() {
         println!("{l}");
     }
     println!(
-        "gated tensors: worst ratio {:.2} of TOL {TOL}; {} outside; earliest divergence: {}",
+        "gates: {} compared, worst ratio {:.2} of TOL {TOL}; {} outside (earliest {}). information: {} rows, {} beyond {TOL}, worst ratio {:.2}",
+        rep.gates,
         rep.worst,
         rep.fails,
-        rep.earliest.as_deref().unwrap_or("none")
+        rep.earliest.as_deref().unwrap_or("none"),
+        rep.info,
+        rep.info_beyond,
+        rep.info_worst
     );
     if let Some(p) = args.get(5) {
         std::fs::write(p, format!("[\n{}\n]\n", rep.json.join(",\n"))).expect("receipt");

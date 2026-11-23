@@ -74,10 +74,10 @@ fn main() -> Result<()> {
         println!("{l}");
     }
     let passed = rep.fails.is_empty();
-    println!("worst ratio {:.2} (tolerance {TOL}), {} failures, {run_s:.1} s", rep.worst, rep.fails.len());
+    println!("{} ({run_s:.1} s)", rep.summary());
     let json = format!(
         "{{\"scope\":\"Inkling 2 Mini layers 18..23 and the output head, one prefill from fixed inputs, Mary's device layers (CUDA) and CPU head on the pile's weights against transformers 046bdb8c on CPU with oneDNN off\",\
-         \"pile\":{:?},\"root\":\"{:X}\",\"inputs\":{:?},\"tolerance\":\"rel L2 to upstream f32 within {TOL} x upstream's bf16-vs-f32 rel L2 on the same input; routed sets equal to upstream f32's or bf16's; argmax equal to upstream f32's or bf16's\",\
+         \"pile\":{:?},\"root\":\"{:X}\",\"inputs\":{:?},\"tolerance\":\"gates: taps before the experts and the head, each on upstream's own input, rel L2 to upstream f32 within {TOL} x upstream's bf16-vs-f32 rel L2; routed sets equal to upstream f32's or bf16's; the grouped experts against one expert at a time; block counts; finite. Everything behind an expert is information\",\
          \"mutation\":{:?},\"passed\":{passed},\"worst_ratio\":{},\"failures\":{:?},\"open_s\":{open_s},\"hash_s\":{hash_s},\"run_s\":{run_s},\"rows\":[{}]}}\n",
         pile.display().to_string(),
         root.root(),
@@ -90,9 +90,10 @@ fn main() -> Result<()> {
     std::fs::write(&receipt, json).with_context(|| format!("{}", receipt.display()))?;
     match (mutation, passed) {
         (None, true) => Ok(()),
-        (None, false) => bail!("the tail is outside tolerance: {:?}", rep.fails),
+        (None, false) => bail!("the tail's gates failed: {:?}", rep.fails),
         (Some(m), false) => {
-            println!("{m:?}: failed as it must");
+            ensure!(rep.fails.iter().all(|f| f.starts_with(m.gate())), "{m:?} failed elsewhere too: {:?}", rep.fails);
+            println!("{m:?}: failed as it must, at {:?}: {:?}", m.gate(), rep.fails);
             Ok(())
         }
         (Some(m), true) => bail!("{m:?} passed: the check cannot see it"),

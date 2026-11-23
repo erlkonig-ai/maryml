@@ -15,13 +15,18 @@
 //! state, and all 1041 rows as one prefill with no state) every tap, the
 //! routing and the carried state are compared, with the tolerance of
 //! `inkling2_layer0`: a Mary tensor passes when its distance to upstream's f32
-//! run is within `TOL` times upstream's own bf16-vs-f32 spread.
+//! run is within `TOL` times upstream's own bf16-vs-f32 spread. Gates are the
+//! tensors before the experts, whose inputs are upstream's own (messages, gate
+//! outputs, attention, MLP input, router logits, keys and values, the first
+//! three convolution states). The experts, `mlp_conv`, `out`, the change of
+//! `out` and the last convolution's state are information: Mary's experts
+//! quantise their activations as trained, upstream's runs do not.
 //!
 //! Then the two structural checks the slice is for:
 //! * the first pass is independent of the messages: its output and carried
 //!   state are bit-identical whether the second pass then reads A or B;
-//! * the gated visit follows them: B moves the second pass's output, and by
-//!   about as much as it moves upstream's.
+//! * the gated visit follows them: B moves the second pass's output (by how
+//!   much, beside upstream, is information).
 //!
 //! usage: inkling2_loop6 <pile> <collection> <root> <reference.safetensors> [receipt.json]
 
@@ -50,6 +55,8 @@ const TOL: f64 = 1.5;
 /// A tensor with no spread passes within f32 round-off of a 2304-wide sum.
 const F32_FLOOR: f64 = 1e-5;
 const LAYER: usize = 6;
+/// Computed from the experts' output.
+const POST_EXPERT: [&str; 5] = ["experts", "mlp_conv", "out", "out change", "state conv3"];
 
 struct File {
     map: Mmap,
@@ -158,6 +165,11 @@ struct Report {
     json: Vec<String>,
     worst: f64,
     fails: usize,
+    gates: usize,
+    checks: usize,
+    info: usize,
+    info_beyond: usize,
+    info_worst: f64,
 }
 
 impl Report {
@@ -167,26 +179,37 @@ impl Report {
         let spread = rel_l2(r16, r32);
         let ratio = if spread > 0.0 { e32 / spread } else { e32 / F32_FLOOR * TOL };
         let pass = ratio <= TOL;
-        self.worst = self.worst.max(ratio);
-        if !pass {
-            self.fails += 1;
+        let gated = !POST_EXPERT.contains(&name);
+        if gated {
+            self.gates += 1;
+            self.worst = self.worst.max(ratio);
+            self.fails += usize::from(!pass);
+        } else {
+            self.info += 1;
+            self.info_beyond += usize::from(!pass);
+            self.info_worst = self.info_worst.max(ratio);
         }
         self.lines.push(format!(
             "{tag:14} {name:14} vs f32 {e32:.3e} (max {:.2e})  vs bf16 {e16:.3e}  upstream spread {spread:.3e}  ratio {ratio:6.2}{}  {}",
             max_abs(mary, r32),
             if spread > 0.0 { "" } else { " (f32 floor)" },
-            if pass { "ok" } else { "OUTSIDE" },
+            match (gated, pass) {
+                (true, true) => "gate ok",
+                (true, false) => "gate OUTSIDE",
+                (false, _) => "info",
+            },
         ));
         self.json.push(format!(
-            "{{\"run\":\"{tag}\",\"tensor\":\"{name}\",\"rel_l2_vs_f32\":{e32:e},\"rel_l2_vs_bf16\":{e16:e},\"upstream_spread\":{spread:e},\"ratio\":{ratio:e}}}"
+            "{{\"run\":\"{tag}\",\"tensor\":\"{name}\",\"gated\":{gated},\"rel_l2_vs_f32\":{e32:e},\"rel_l2_vs_bf16\":{e16:e},\"upstream_spread\":{spread:e},\"ratio\":{ratio:e}}}"
         ));
     }
 
     fn check(&mut self, what: &str, ok: bool, detail: String) {
+        self.checks += 1;
         if !ok {
             self.fails += 1;
         }
-        self.lines.push(format!("check {what}: {detail}  {}", if ok { "ok" } else { "FAILED" }));
+        self.lines.push(format!("check {what}: {detail}  gate {}", if ok { "ok" } else { "FAILED" }));
         self.json.push(format!("{{\"check\":\"{what}\",\"ok\":{ok},\"detail\":\"{detail}\"}}"));
     }
 }
@@ -239,7 +262,7 @@ fn main() {
 
     let input = |n: &str| r.f32s(n).1;
     let rows = |v: Vec<f32>, n: usize| Tensor::<Bk, 2>::from_data(TensorData::new(v, [n, h]), &dev);
-    let mut rep = Report { lines: vec![], json: vec![], worst: 0.0, fails: 0 };
+    let mut rep = Report { lines: vec![], json: vec![], worst: 0.0, fails: 0, gates: 0, checks: 0, info: 0, info_beyond: 0, info_worst: 0.0 };
 
     // One visit: pass 0 reads nothing, pass 1 reads the messages of `prev`.
     // Each visit starts from the pre-loop block states, as upstream's passes do.
@@ -377,8 +400,8 @@ fn main() {
             "output, taps and carried state bit-identical under A and B".into(),
         );
     }
-    // the gated visit follows its messages as upstream's does: Mary's change
-    // from A to B, held to upstream's change by the same calibrated tolerance
+    // the gated visit follows its messages: Mary's change from A to B, beside
+    // upstream's (information: `out` is behind the experts)
     for phase in ["prefill", "step"] {
         let out = |m: &BTreeMap<String, Seen>, s: &str| -> Vec<f32> {
             m[&format!("{s}.{phase}")].taps.iter().find(|(n, _)| *n == "out").unwrap().1.clone()
@@ -405,7 +428,10 @@ fn main() {
     for l in &rep.lines {
         println!("{l}");
     }
-    println!("tensors: worst ratio {:.2} of TOL {TOL}; {} outside or failed", rep.worst, rep.fails);
+    println!(
+        "gates: {} tensors (worst ratio {:.2} of TOL {TOL}) and {} checks; {} outside or failed. information: {} rows, {} beyond {TOL}, worst ratio {:.2}",
+        rep.gates, rep.worst, rep.checks, rep.fails, rep.info, rep.info_beyond, rep.info_worst
+    );
     if let Some(p) = args.get(5) {
         std::fs::write(p, format!("[\n{}\n]\n", rep.json.join(",\n"))).expect("receipt");
     }

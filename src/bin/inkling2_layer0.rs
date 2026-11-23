@@ -13,6 +13,13 @@
 //! far rounding alone moves each tensor. A Mary tensor passes when its
 //! distance to upstream's f32 run is within `TOL` times that spread.
 //!
+//! Gates are the tensors before the experts, whose input matches upstream's:
+//! the embedding, attention and its convolution, the MLP input, the router's
+//! logits, the cached keys and values and the first three convolution states.
+//! The experts, `mlp_conv`, `out` and the last convolution's state are
+//! information: Mary's experts quantise their activations as the model was
+//! trained, upstream's runs do not, and that difference is meant.
+//!
 //! usage: inkling2_layer0 <pile> <collection> <root> <reference.safetensors> [receipt.json]
 
 use std::collections::BTreeSet;
@@ -34,6 +41,8 @@ use triblespace::prelude::Id;
 
 /// A pass is within this many times upstream's own bf16-vs-f32 spread.
 const TOL: f64 = 1.5;
+/// Computed from the experts' output.
+const POST_EXPERT: [&str; 4] = ["experts", "mlp_conv", "out", "state conv3"];
 
 struct File {
     map: Mmap,
@@ -142,6 +151,10 @@ struct Report {
     json: Vec<String>,
     worst: f64,
     fails: usize,
+    gates: usize,
+    info: usize,
+    info_beyond: usize,
+    info_worst: f64,
 }
 
 impl Report {
@@ -152,15 +165,24 @@ impl Report {
         let ratio = e32 / spread;
         let pass = ratio <= TOL;
         if gated {
+            self.gates += 1;
             self.worst = self.worst.max(ratio);
             if !pass {
                 self.fails += 1;
             }
+        } else {
+            self.info += 1;
+            self.info_beyond += usize::from(!pass);
+            self.info_worst = self.info_worst.max(ratio);
         }
         self.lines.push(format!(
             "{tag:10} {name:14} vs f32 {e32:.3e} (max {:.2e})  vs bf16 {e16:.3e}  upstream spread {spread:.3e}  ratio {ratio:6.2}  {}",
             max_abs(mary, r32),
-            if !gated { "report" } else if pass { "ok" } else { "OUTSIDE" },
+            match (gated, pass) {
+                (true, true) => "gate ok",
+                (true, false) => "gate OUTSIDE",
+                (false, _) => "info",
+            },
         ));
         self.json.push(format!(
             "{{\"run\":\"{tag}\",\"tensor\":\"{name}\",\"rel_l2_vs_f32\":{e32:e},\"rel_l2_vs_bf16\":{e16:e},\"upstream_spread\":{spread:e},\"ratio\":{ratio:e},\"gated\":{gated}}}"
@@ -210,7 +232,7 @@ fn main() {
     let layer = SlidingLayer::bind(&model, t, 0, &dev).expect("bind layer 0");
     println!("bound layer 0 in {:.1} s", t0.elapsed().as_secs_f64());
 
-    let mut rep = Report { lines: vec![], json: vec![], worst: 0.0, fails: 0 };
+    let mut rep = Report { lines: vec![], json: vec![], worst: 0.0, fails: 0, gates: 0, info: 0, info_beyond: 0, info_worst: 0.0 };
     let xp = embed_rows(&prompt);
     let xs = embed_rows(&step);
     let ref_in = |run: &str, n: &str| r.f32s(&format!("{run}.{n}")).1;
@@ -235,7 +257,7 @@ fn main() {
             ("out", host(out)),
         ] {
             let f = |run: &str| last(ref_in(run, &format!("whole.{name}")));
-            rep.row("whole", name, &last(v), &f("bf16"), &f("f32"), true);
+            rep.row("whole", name, &last(v), &f("bf16"), &f("f32"), !POST_EXPERT.contains(&name));
         }
     }
 
@@ -260,7 +282,7 @@ fn main() {
             ("out", out),
         ] {
             let (a, b) = g(name);
-            rep.row(&tag, name, &v, &a, &b, true);
+            rep.row(&tag, name, &v, &a, &b, !POST_EXPERT.contains(&name));
         }
         // carried state
         let st = |n: &str, conv: bool| {
@@ -280,7 +302,8 @@ fn main() {
         }
         for i in 0..4 {
             let (a, b) = st(&format!("conv{i}"), true);
-            rep.row(&tag, &format!("state conv{i}"), &host(state.conv[i].clone()), &a, &b, true);
+            let name = format!("state conv{i}");
+            rep.row(&tag, &name, &host(state.conv[i].clone()), &a, &b, !POST_EXPERT.contains(&name.as_str()));
         }
         // routing, as sets per token
         let rset = |run: &str| -> Vec<BTreeSet<i32>> {
@@ -306,8 +329,8 @@ fn main() {
         println!("{l}");
     }
     println!(
-        "gated tensors: worst ratio {:.2} of TOL {TOL}; {} outside",
-        rep.worst, rep.fails
+        "gates: {} compared, worst ratio {:.2} of TOL {TOL}; {} outside. information: {} rows, {} beyond {TOL}, worst ratio {:.2}",
+        rep.gates, rep.worst, rep.fails, rep.info, rep.info_beyond, rep.info_worst
     );
     if let Some(p) = args.get(5) {
         std::fs::write(p, format!("[\n{}\n]\n", rep.json.join(",\n"))).expect("receipt");
