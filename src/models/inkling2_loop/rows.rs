@@ -19,6 +19,7 @@ use std::sync::OnceLock;
 
 use burn::tensor::Tensor;
 use cubecl::prelude::*;
+use half::bf16;
 
 use crate::models::inkling::seam::{Bk, client_of, handle_of_any, tensor_of};
 
@@ -27,15 +28,18 @@ const PLANE: u32 = 32;
 /// The most block states [`block_attention`] reads besides the partial one.
 pub const MAX_BLOCKS: usize = 6;
 
-/// Which row kernels run: all (default); `MINI_ROWS=scale` only the clip and
-/// norm kernels; `MINI_ROWS=burn` none, Burn's composition everywhere. The
-/// settings exist for an A/B in one binary.
+/// Which row kernels run, cumulatively: `MINI_ROWS=burn` none (Burn's
+/// composition everywhere); `scale` the clip and norm kernels; `gates` also
+/// the message gates' input, rounding and output; anything else (the
+/// default) also the block attention and the message read. The settings
+/// exist for an A/B in one binary.
 fn setting() -> u8 {
     static ON: OnceLock<u8> = OnceLock::new();
     *ON.get_or_init(|| match std::env::var("MINI_ROWS").as_deref() {
         Ok("burn") => 0,
         Ok("scale") => 1,
-        _ => 2,
+        Ok("gates") => 2,
+        _ => 3,
     })
 }
 
@@ -43,8 +47,12 @@ fn enabled() -> bool {
     setting() >= 1
 }
 
-fn blocks_enabled() -> bool {
+fn gates_enabled() -> bool {
     setting() >= 2
+}
+
+fn blocks_enabled() -> bool {
+    setting() >= 3
 }
 
 /// `x * min(thr / (|x| + 1e-6), 1)` per row (`mode` 0); `x / sqrt(mean(x^2) + eps)`
@@ -309,4 +317,240 @@ pub fn block_attention(query: Tensor<Bk, 1>, blocks: &[Tensor<Bk, 2>], partial: 
         }
     }
     Some(tensor_of(client, dev, out, rows, d))
+}
+
+/// A message gate's input: `[rms(hidden), rms(message)]` per row, `[rows, 2H]`,
+/// rounded to bf16 (kept as f32) when `round`.
+#[cube(launch_unchecked)]
+fn gate_in(
+    hs: &Array<f32>,
+    ms: &Array<f32>,
+    out: &mut Array<f32>,
+    rows: u32,
+    eps: f32,
+    #[comptime] h: u32,
+    #[comptime] round: bool,
+) {
+    let r = CUBE_POS_X;
+    if r < rows {
+        let l = UNIT_POS_PLANE;
+        let steps = comptime!(h.div_ceil(32));
+        let mut sh = 0.0f32;
+        let mut sm = 0.0f32;
+        for t in 0..steps {
+            let j = l + t * 32u32;
+            if j < h {
+                let a = hs[(r * h + j) as usize];
+                let b = ms[(r * h + j) as usize];
+                sh += a * a;
+                sm += b * b;
+            }
+        }
+        let ih = 1.0f32 / Sqrt::sqrt(plane_sum(sh) / f32::cast_from(h) + eps);
+        let im = 1.0f32 / Sqrt::sqrt(plane_sum(sm) / f32::cast_from(h) + eps);
+        for t in 0..steps {
+            let j = l + t * 32u32;
+            if j < h {
+                let mut a = hs[(r * h + j) as usize] * ih;
+                let mut b = ms[(r * h + j) as usize] * im;
+                if comptime!(round) {
+                    a = f32::cast_from(bf16::cast_from(a));
+                    b = f32::cast_from(bf16::cast_from(b));
+                }
+                out[(r * 2u32 * h + j) as usize] = a;
+                out[(r * 2u32 * h + h + j) as usize] = b;
+            }
+        }
+    }
+}
+
+/// Every value rounded to the nearest bf16, kept as f32.
+#[cube(launch_unchecked)]
+fn round_bf16(x: &Array<f32>, out: &mut Array<f32>, total: u32) {
+    let p = ABSOLUTE_POS as u32;
+    if p < total {
+        out[p as usize] = f32::cast_from(bf16::cast_from(x[p as usize]));
+    }
+}
+
+/// `(1 - tanh(f)) * hidden + tanh(g) * message` with `fg` `[rows, 2H]`
+/// holding `f` then `g` per row.
+#[cube(launch_unchecked)]
+fn gate_out(fg: &Array<f32>, hs: &Array<f32>, ms: &Array<f32>, out: &mut Array<f32>, total: u32, #[comptime] h: u32) {
+    let p = ABSOLUTE_POS as u32;
+    if p < total {
+        let r = p / h;
+        let c = p % h;
+        let f = fg[(r * 2u32 * h + c) as usize];
+        let g = fg[(r * 2u32 * h + h + c) as usize];
+        out[p as usize] = (1.0f32 - Tanh::tanh(f)) * hs[p as usize] + Tanh::tanh(g) * ms[p as usize];
+    }
+}
+
+const ELEMS: u32 = 256;
+
+/// [`super::messages::DeviceGate::apply`]'s input: `[rms(hidden), rms(message)]`,
+/// `[t, 2H]`, bf16-rounded when `round`. One launch.
+pub fn gate_input(hidden: Tensor<Bk, 2>, message: Tensor<Bk, 2>, eps: f64, round: bool) -> Option<Tensor<Bk, 2>> {
+    if !gates_enabled() || !is_f32(&hidden) || !is_f32(&message) {
+        return None;
+    }
+    let [rows, h] = hidden.dims();
+    let client = client_of(&hidden);
+    let dev = hidden.device();
+    let (hh, mh) = (f32_handle(hidden).expect("f32"), f32_handle(message).expect("f32"));
+    let out = client.empty(rows * 2 * h * 4);
+    if rows > 0 {
+        unsafe {
+            gate_in::launch_unchecked::<cubecl::cuda::CudaRuntime>(
+                &client,
+                CubeCount::new_1d(rows as u32),
+                CubeDim::new_1d(PLANE),
+                ArrayArg::from_raw_parts(hh, rows * h),
+                ArrayArg::from_raw_parts(mh, rows * h),
+                ArrayArg::from_raw_parts(out.clone(), rows * 2 * h),
+                rows as u32,
+                eps as f32,
+                h as u32,
+                round,
+            );
+        }
+    }
+    Some(tensor_of(client, dev, out, rows, 2 * h))
+}
+
+/// Round to bf16, kept as f32, in one launch.
+pub fn round_to_bf16(x: Tensor<Bk, 2>) -> Option<Tensor<Bk, 2>> {
+    if !gates_enabled() || !is_f32(&x) {
+        return None;
+    }
+    let [rows, c] = x.dims();
+    let total = rows * c;
+    let client = client_of(&x);
+    let dev = x.device();
+    let xh = f32_handle(x).expect("f32");
+    let out = client.empty(total * 4);
+    if total > 0 {
+        unsafe {
+            round_bf16::launch_unchecked::<cubecl::cuda::CudaRuntime>(
+                &client,
+                CubeCount::new_1d((total as u32).div_ceil(ELEMS)),
+                CubeDim::new_1d(ELEMS),
+                ArrayArg::from_raw_parts(xh, total),
+                ArrayArg::from_raw_parts(out.clone(), total),
+                total as u32,
+            );
+        }
+    }
+    Some(tensor_of(client, dev, out, rows, c))
+}
+
+/// [`super::messages::DeviceGate::apply`]'s output from the stacked forget
+/// and gain pre-activations `fg` (`[t, 2H]`), in one launch.
+pub fn gate_output(fg: Tensor<Bk, 2>, hidden: Tensor<Bk, 2>, message: Tensor<Bk, 2>) -> Option<Tensor<Bk, 2>> {
+    if !gates_enabled() || !is_f32(&fg) || !is_f32(&hidden) || !is_f32(&message) {
+        return None;
+    }
+    let [rows, h] = hidden.dims();
+    assert_eq!(fg.dims(), [rows, 2 * h], "gate output: fg is [t, 2H]");
+    let total = rows * h;
+    let client = client_of(&hidden);
+    let dev = hidden.device();
+    let (fh, hh, mh) = (f32_handle(fg).expect("f32"), f32_handle(hidden).expect("f32"), f32_handle(message).expect("f32"));
+    let out = client.empty(total * 4);
+    if total > 0 {
+        unsafe {
+            gate_out::launch_unchecked::<cubecl::cuda::CudaRuntime>(
+                &client,
+                CubeCount::new_1d((total as u32).div_ceil(ELEMS)),
+                CubeDim::new_1d(ELEMS),
+                ArrayArg::from_raw_parts(fh, 2 * total),
+                ArrayArg::from_raw_parts(hh, total),
+                ArrayArg::from_raw_parts(mh, total),
+                ArrayArg::from_raw_parts(out.clone(), total),
+                total as u32,
+                h as u32,
+            );
+        }
+    }
+    Some(tensor_of(client, dev, out, rows, h))
+}
+
+/// One layer's four messages from the normed sources `[t, keys, H]` and its
+/// queries `[4, H]`: per (row, stream), a softmax over the keys of the scaled
+/// dot products, then the weighted sum of the keys. One cube per (row, stream).
+#[cube(launch_unchecked)]
+fn msg_read(normed: &Array<f32>, q: &Array<f32>, out: &mut Array<f32>, cells: u32, keys: u32, #[comptime] h: u32) {
+    let cell = CUBE_POS_X;
+    if cell < cells {
+        let l = UNIT_POS_PLANE;
+        let r = cell / 4u32;
+        let s = cell % 4u32;
+        let steps = comptime!(h.div_ceil(32));
+        let scale = comptime!(1.0f32 / (h as f32).sqrt());
+        let mut logit = Array::<f32>::new(comptime!(MAX_BLOCKS + 2));
+        let mut mx = f32::new(-3.0e38);
+        for k in 0..keys {
+            let mut dot = 0.0f32;
+            for t in 0..steps {
+                let j = l + t * 32u32;
+                if j < h {
+                    dot += normed[((r * keys + k) * h + j) as usize] * q[(s * h + j) as usize];
+                }
+            }
+            let lg = plane_sum(dot) * scale;
+            logit[k as usize] = lg;
+            if lg > mx {
+                mx = lg;
+            }
+        }
+        let mut sum = 0.0f32;
+        for k in 0..keys {
+            let e = Exp::exp(logit[k as usize] - mx);
+            logit[k as usize] = e;
+            sum += e;
+        }
+        for t in 0..steps {
+            let j = l + t * 32u32;
+            if j < h {
+                let mut acc = 0.0f32;
+                for k in 0..keys {
+                    acc += (logit[k as usize] / sum) * normed[((r * keys + k) * h + j) as usize];
+                }
+                out[(cell * h + j) as usize] = acc;
+            }
+        }
+    }
+}
+
+/// [`super::messages::MessageSources::read`] in one launch: `normed`
+/// `[t, keys, H]`, `queries` `[1, 4, H]`, the messages `[t, 4, H]`.
+pub fn read_messages(normed: &Tensor<Bk, 3>, queries: Tensor<Bk, 3>) -> Option<Tensor<Bk, 3>> {
+    let [t, keys, h] = normed.dims();
+    if !blocks_enabled() || keys > MAX_BLOCKS + 2 || !is_f32(normed) || !is_f32(&queries) {
+        return None;
+    }
+    assert_eq!(queries.dims(), [1, 4, h], "message queries are [1, 4, H]");
+    let client = client_of(normed);
+    let dev = normed.device();
+    let nh = f32_handle(normed.clone()).expect("f32");
+    let qh = f32_handle(queries).expect("f32");
+    let cells = t * 4;
+    let out = client.empty(cells * h * 4);
+    if cells > 0 {
+        unsafe {
+            msg_read::launch_unchecked::<cubecl::cuda::CudaRuntime>(
+                &client,
+                CubeCount::new_1d(cells as u32),
+                CubeDim::new_1d(PLANE),
+                ArrayArg::from_raw_parts(nh, t * keys * h),
+                ArrayArg::from_raw_parts(qh, 4 * h),
+                ArrayArg::from_raw_parts(out.clone(), cells * h),
+                cells as u32,
+                keys as u32,
+                h as u32,
+            );
+        }
+    }
+    Some(crate::models::inkling::seam::tensor_of3(client, dev, out, t, 4, h))
 }

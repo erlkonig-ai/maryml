@@ -380,6 +380,9 @@ mod device {
         /// matrix multiply: Burn's f32 matmul on this runtime is TF32, and the
         /// queries and normed states are f32 values upstream multiplies in f32.
         pub fn read(&self, queries: Tensor<Bk, 3>) -> Tensor<Bk, 3> {
+            if let Some(m) = crate::models::inkling2_loop::rows::read_messages(&self.normed, queries.clone()) {
+                return m;
+            }
             let [t, keys, h] = self.normed.dims();
             let scaling = (h as f32).powf(-0.5);
             let key = |k: usize| self.normed.clone().slice([0..t, k..k + 1, 0..h]); // [t, 1, H]
@@ -446,15 +449,24 @@ mod device {
         pub fn apply(&self, hidden_states: Tensor<Bk, 2>, message: Tensor<Bk, 2>) -> Tensor<Bk, 2> {
             let [t, h] = hidden_states.dims();
             assert_eq!(h, self.hidden);
-            let x = Tensor::cat(
-                vec![unit_rms_rows(hidden_states.clone(), self.eps), unit_rms_rows(message.clone(), self.eps)],
-                1,
-            );
+            use crate::models::inkling2_loop::rows;
             let bf = self.precision == DownPrecision::Bf16;
-            let x = if bf { round_bf16_dev(x) } else { x };
+            let x = match rows::gate_input(hidden_states.clone(), message.clone(), self.eps, bf) {
+                Some(x) => x,
+                None => {
+                    let x = Tensor::cat(
+                        vec![unit_rms_rows(hidden_states.clone(), self.eps), unit_rms_rows(message.clone(), self.eps)],
+                        1,
+                    );
+                    if bf { round_bf16_dev(x) } else { x }
+                }
+            };
             let d = x.matmul(self.down_t.clone());
-            let d = if bf { round_bf16_dev(d) } else { d };
+            let d = if bf { rows::round_to_bf16(d.clone()).unwrap_or_else(|| round_bf16_dev(d)) } else { d };
             let fg = d.matmul(self.forget_gain_t.clone());
+            if let Some(out) = rows::gate_output(fg.clone(), hidden_states.clone(), message.clone()) {
+                return out;
+            }
             let f = fg.clone().slice([0..t, 0..h]);
             let g = fg.slice([0..t, h..2 * h]);
             f.tanh().neg().add_scalar(1.0) * hidden_states + g.tanh() * message
