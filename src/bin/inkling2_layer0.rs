@@ -86,6 +86,30 @@ fn max_abs(a: &[f32], b: &[f32]) -> f64 {
     a.iter().zip(b).map(|(x, y)| (x - y).abs() as f64).fold(0.0, f64::max)
 }
 
+/// The rows Mary and upstream both still hold of a carried K or V cache: both
+/// end at the visit's last position, so the matching absolute positions are the
+/// last `min(ours, upstream)` rows of each. Mary's `attend::Kv` evicts whole tiles and
+/// upstream keeps the window, so either side may hold more.
+fn matching_suffix<'a>(ours: &'a [f32], a: &'a [f32], b: &'a [f32], width: usize) -> (&'a [f32], &'a [f32], &'a [f32], usize) {
+    assert_eq!(a.len(), b.len(), "the two upstream runs hold the same rows");
+    assert!(ours.len() % width == 0 && b.len() % width == 0, "rows of width {width}");
+    let n = ours.len().min(b.len()) / width;
+    assert!(n > 0, "no position held by both");
+    let tail = |v: &'a [f32]| &v[v.len() - n * width..];
+    (tail(ours), tail(a), tail(b), n)
+}
+
+/// A visit's held keys and values on the host, checked to end at its position.
+fn held_kv(st: &State) -> (Vec<f32>, Vec<f32>) {
+    let kv = &st.kv;
+    assert_eq!(kv.base() + kv.rows(), st.pos, "the cache ends at the visit's position");
+    let k = kv.keys().expect("a carried visit holds keys");
+    let v = kv.values().expect("a carried visit holds values");
+    assert_eq!(k.dims()[0], kv.rows());
+    assert_eq!(v.dims()[0], kv.rows());
+    (host(k), host(v))
+}
+
 /// Upstream's cache `[heads, n, d]` as Mary's rows `[n, heads * d]`.
 fn heads_to_rows(shape: &[usize], v: &[f32]) -> Vec<f32> {
     let (h, n, d) = (shape[0], shape[1], shape[2]);
@@ -250,10 +274,14 @@ fn main() {
                 };
                 (f("bf16"), f("f32"))
             };
-            let (a, b) = st("k", false);
-            rep.row(&tag, "state k", &host(state.k.clone().unwrap()), &a, &b, gated);
-            let (a, b) = st("v", false);
-            rep.row(&tag, "state v", &host(state.v.clone().unwrap()), &a, &b, gated);
+            // the positions both still hold (see matching_suffix)
+            let (hk, hv) = held_kv(&state);
+            let width = hk.len() / state.kv.rows();
+            for (name, ours) in [("k", hk), ("v", hv)] {
+                let (a, b) = st(name, false);
+                let (ours, a, b, _) = matching_suffix(&ours, &a, &b, width);
+                rep.row(&tag, &format!("state {name}"), ours, a, b, gated);
+            }
             for i in 0..4 {
                 let (a, b) = st(&format!("conv{i}"), true);
                 rep.row(&tag, &format!("state conv{i}"), &host(state.conv[i].clone()), &a, &b, gated);

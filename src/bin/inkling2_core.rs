@@ -213,13 +213,14 @@ struct Seen {
     routing: Vec<BTreeSet<i32>>,
 }
 
-fn seen(id: CacheId, out: &Tensor<Bk, 2>, taps: Taps, messages: Option<&[f32]>) -> Seen {
+fn seen(id: CacheId, out: &Tensor<Bk, 2>, taps: Taps, messages: Option<&Tensor<Bk, 3>>) -> Seen {
     let mut v = vec![("out", host(out.clone())), ("mlp_input", host(taps.mlp_input)), ("router_logits", taps.router_logits)];
     if let Some([q, k, vv, m]) = taps.gates {
-        v.extend([("gate_q", q), ("gate_k", k), ("gate_v", vv), ("gate_mlp", m)]);
+        v.extend([("gate_q", host(q)), ("gate_k", host(k)), ("gate_v", host(vv)), ("gate_mlp", host(m))]);
     }
     if let Some(m) = messages {
-        v.push(("messages", m.to_vec()));
+        let [t, j, h] = m.dims();
+        v.push(("messages", host(m.clone().reshape([t * j, h]))));
     }
     Seen {
         id,
@@ -274,7 +275,7 @@ fn main() {
         let n = x.len() / h;
         let blocks = vec![rows(input(&format!("emb.{phase}")), n)];
         let mut visits = Vec::new();
-        let mut hook = |id: CacheId, out: &Tensor<Bk, 2>, taps: Taps, m: Option<&[f32]>| visits.push(seen(id, out, taps, m));
+        let mut hook = |id: CacheId, out: &Tensor<Bk, 2>, taps: Taps, m: Option<&Tensor<Bk, 3>>| visits.push(seen(id, out, taps, m));
         let t1 = std::time::Instant::now();
         let passes = core.forward(rows(x, n), &blocks, state, ExpertAct::Bf16, 0, plant, Some(&mut hook));
         println!("{phase}{}: {n} rows through 36 visits in {:.0} ms", plant.map(|p| format!(" planted {p:?}")).unwrap_or_default(), t1.elapsed().as_secs_f64() * 1e3);

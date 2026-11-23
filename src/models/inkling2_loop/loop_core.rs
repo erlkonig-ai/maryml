@@ -22,8 +22,10 @@
 //! across token steps, keyed by [`CacheId`] `(layer, pass)`: shared weights,
 //! separate keys, values and convolution tails.
 //!
-//! The messages are read on the host ([`read_messages`], CC's f32 operator),
-//! from the previous pass's states downloaded once per pass.
+//! The messages are read on the device ([`MessageSources`], the device form of
+//! [`super::messages::read_messages`]): the previous pass's states stay where
+//! they are, are normed once per pass, and each layer reads its four messages
+//! for all of the call's tokens in two matrix multiplies.
 
 use std::collections::BTreeMap;
 
@@ -33,7 +35,7 @@ use crate::models::inkling::seam::Bk;
 use crate::models::inkling2_loop::config::{AttnKind, Inkling2LoopTextConfig};
 use crate::models::inkling2_loop::full::FullLayer;
 use crate::models::inkling2_loop::layout::{Dtype, Slot};
-use crate::models::inkling2_loop::messages::{MessageQueries, read_messages};
+use crate::models::inkling2_loop::messages::{DeviceQueries, MessageQueries, MessageSources};
 use crate::models::inkling2_loop::schedule::CacheId;
 use crate::models::inkling2_loop::sliding::{Dev, ExpertAct, SlidingLayer, State, Taps, Weights, f32_le, want};
 
@@ -65,7 +67,7 @@ impl CoreLayer {
         state: &mut State,
         act: ExpertAct,
         origin: usize,
-        messages: Option<&[f32]>,
+        messages: Option<&Tensor<Bk, 3>>,
     ) -> (Tensor<Bk, 2>, Taps) {
         match self {
             CoreLayer::Sliding(l) => l.forward_visit(x, blocks, state, act, messages),
@@ -81,6 +83,7 @@ impl CoreLayer {
 pub struct Core {
     pub layers: Vec<CoreLayer>,
     pub queries: MessageQueries,
+    device_queries: DeviceQueries,
     pub passes: usize,
     hidden: usize,
 }
@@ -110,8 +113,8 @@ pub enum Plant {
 }
 
 /// Sees each visit as it ends: its identity, output, taps and the messages it
-/// read.
-pub type VisitHook<'a> = &'a mut dyn FnMut(CacheId, &Tensor<Bk, 2>, Taps, Option<&[f32]>);
+/// read (`[t, 4, H]`, on the device).
+pub type VisitHook<'a> = &'a mut dyn FnMut(CacheId, &Tensor<Bk, 2>, Taps, Option<&Tensor<Bk, 3>>);
 
 impl Core {
     /// Bind the core layers and the message queries from `w`.
@@ -134,7 +137,8 @@ impl Core {
             core,
             h,
         )?;
-        Ok(Core { layers, queries, passes: l.num_passes, hidden: h })
+        let device_queries = DeviceQueries::new(&queries, dev);
+        Ok(Core { layers, queries, device_queries, passes: l.num_passes, hidden: h })
     }
 
     /// Fresh state for every visit, `passes x layers`.
@@ -167,12 +171,12 @@ impl Core {
         plant: Option<Plant>,
         mut hook: Option<VisitHook<'_>>,
     ) -> Vec<PassOut> {
-        let [t, h] = x.dims();
+        let [_, h] = x.dims();
         assert_eq!(h, self.hidden);
         let n_pre = blocks.len();
         let mut passes: Vec<PassOut> = Vec::with_capacity(self.passes);
-        // the previous pass's message sources on the host: blocks [t, n, H] and output [t, H]
-        let mut prev: Option<(Vec<f32>, usize, Vec<f32>)> = None;
+        // the previous pass's message sources, normed, on the device
+        let mut prev: Option<MessageSources> = None;
         for pass in 0..self.passes {
             let (mut hs, mut bs) = match (plant, passes.last()) {
                 (Some(Plant::NoReset), Some(p)) => (p.hidden.clone(), p.blocks.clone()),
@@ -180,29 +184,18 @@ impl Core {
             };
             for (i, layer) in self.layers.iter().enumerate() {
                 let q = if plant == Some(Plant::SharedQuery) { 0 } else { i };
-                let messages = prev
-                    .as_ref()
-                    .map(|(pb, n, pp)| read_messages(self.queries.layer(q), pb, pp, t, *n, h));
+                let messages = prev.as_ref().map(|src| src.read(self.device_queries.layer(q)));
                 let id = CacheId { layer: layer.layer(), pass };
                 let st = state.visits.get_mut(&id).unwrap_or_else(|| panic!("no state for {id:?}"));
-                let (out, taps) = layer.visit(hs, &mut bs, st, act, origin, messages.as_deref());
+                let (out, taps) = layer.visit(hs, &mut bs, st, act, origin, messages.as_ref());
                 if let Some(f) = hook.as_mut() {
-                    f(id, &out, taps, messages.as_deref());
+                    f(id, &out, taps, messages.as_ref());
                 }
                 hs = out;
             }
             // upstream: previous_block_states = block_states[..., num_pre_loop_blocks + 1:, :]
             let keep = &bs[(n_pre + 1).min(bs.len())..];
-            let n = keep.len();
-            let mut pb = vec![0f32; t * n * h];
-            for (k, b) in keep.iter().enumerate() {
-                let v: Vec<f32> = b.clone().into_data().convert::<f32>().to_vec().expect("f32");
-                for row in 0..t {
-                    pb[(row * n + k) * h..(row * n + k + 1) * h].copy_from_slice(&v[row * h..(row + 1) * h]);
-                }
-            }
-            let pp: Vec<f32> = hs.clone().into_data().convert::<f32>().to_vec().expect("f32");
-            prev = Some((pb, n, pp));
+            prev = Some(MessageSources::new(keep, hs.clone()));
             passes.push(PassOut { hidden: hs, blocks: bs });
         }
         passes
