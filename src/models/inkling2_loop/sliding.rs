@@ -443,6 +443,12 @@ impl SlidingLayer {
         (out, taps)
     }
 
+    /// The experts' input of an ungated visit, from its `mlp_input` tap.
+    #[cfg(test)]
+    pub(super) fn expert_input(&self, mlp_input: &Tensor<Bk, 2>) -> Tensor<Bk, 2> {
+        rms_norm(mlp_input.clone(), self.mlp_norm.clone(), self.dims.eps)
+    }
+
     /// Attention over the three normed inputs: `qn` drives the queries, the
     /// relative bias, the sink and the output gate; `kn` and `vn` the keys and
     /// values. Outside a gated visit the three are the same tensor.

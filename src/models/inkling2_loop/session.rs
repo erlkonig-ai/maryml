@@ -500,8 +500,9 @@ const _: fn() = || {
 
 #[cfg(test)]
 mod tests {
-    //! The router-fault boundary on the release's weights: a non-finite router
-    //! logit fails its own session's append and no other session's. Needs the
+    //! On the release's weights: the router-fault boundary (a non-finite router
+    //! logit fails its own session's append and no other session's), and the
+    //! experts' own determinism. Needs the
     //! imported release (`MINI_MODEL_PILE`, `MINI_MODEL_COLLECTION`,
     //! `MINI_MODEL_ROOT`) and a GPU; the fault is induced by the test-only
     //! `nan_input` flag, so the cell is written by the real experts in
@@ -561,5 +562,38 @@ mod tests {
         a.decode(next_a).expect("A decodes after reset");
         assert_eq!(a.position(), ids_a.len() + 1);
         eprintln!("SESSION fault: A reset, replayed bit for bit, decoded to position {}", a.position());
+    }
+
+    /// Release weights: a captured decode-step row at the experts' input, and
+    /// the last row of a replay, each alone and inside the replay's call under
+    /// one routing, give the same activation codes and the same expert output,
+    /// bit for bit. Layer 0 (NVFP4) on its own operands; layer 20 (MXFP8) on
+    /// the embedding, which is not what reaches it, but the claim is per operand.
+    #[test]
+    #[ignore = "needs the imported Mini release (MINI_MODEL_PILE, MINI_MODEL_COLLECTION, MINI_MODEL_ROOT) and a GPU"]
+    fn identical_expert_input_gives_identical_codes_and_output() {
+        let model = open();
+        let ids: Vec<u32> = (0..27).map(|i| 1000 + 37 * i).collect();
+        let n = ids.len();
+        for layer in [0usize, 20] {
+            let outer = if layer == 0 { &model.pre[0] } else { &model.post[layer - model.config().loop_config.core_end] };
+            let Outer::Sliding(l) = outer else { panic!("layer {layer} is not sliding") };
+            assert_eq!((l.layer, l.moe.is_nvfp4()), (layer, layer == 0));
+            let visit = |ids: &[u32], st: &mut State| {
+                let x = model.embed(ids);
+                let mut blocks = if layer == 0 { Vec::new() } else { vec![x.clone()] };
+                l.expert_input(&l.forward(x, &mut blocks, st).1.mlp_input)
+            };
+            let whole = visit(&ids, &mut State::new(&l.dims, &model.dev));
+            let mut st = State::new(&l.dims, &model.dev);
+            visit(&ids[..n - 1], &mut st);
+            let step = visit(&ids[n - 1..], &mut st);
+            let [_, h] = whole.dims();
+            let mixed = Tensor::cat(vec![whole.clone().slice([0..n - 1, 0..h]), step], 0);
+            for (what, x) in [("the replay's row", &whole), ("the cached step's row", &mixed)] {
+                let line = l.moe.row_is_its_own(x, &l.moe.route(x), n - 1).unwrap_or_else(|e| panic!("layer {layer}, {what}: {e}"));
+                eprintln!("EXPERT INPUT layer {layer}, {what}: {line}");
+            }
+        }
     }
 }

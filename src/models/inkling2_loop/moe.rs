@@ -724,6 +724,61 @@ pub fn read_fault(fault: &FaultCell) -> Option<u32> {
 }
 
 #[cfg(test)]
+impl Bank {
+    pub(super) fn is_nvfp4(&self) -> bool {
+        matches!(self.gate.stack, Stack::Nvfp4 { .. })
+    }
+
+    /// Identical input, identical bits: row `r` of `x` alone and inside `x`,
+    /// under `route`'s routing of it, gives the same activation codes, scales
+    /// and outer scale (NVFP4) or rounded values (MXFP8), and the same expert
+    /// output, bit for bit. Returns what it counted.
+    pub(super) fn row_is_its_own(&self, x: &Tensor<Bk, 2>, route: &Route, r: usize) -> Result<String, String> {
+        let [rows, h] = x.dims();
+        let client = client_of(x);
+        let read = |h: &Handle| client.read_one(h.clone()).expect("read").to_vec();
+        let one = x.clone().slice([r..r + 1, 0..h]);
+        let quant = |t: Tensor<Bk, 2>, n: usize| -> Vec<(&'static str, Vec<u8>, usize)> {
+            let (hd, dt) = handle_of_any(t.cast(burn::tensor::FloatDType::BF16));
+            assert_eq!(dt, burn::tensor::DType::BF16);
+            if self.is_nvfp4() {
+                let (c, s, a) = quantize_nvfp4_46_bf16(&client, &hd, n, h);
+                vec![("codes", read(&c), h / 2), ("scales", read(&s), h / GROUP), ("outer scale", read(&a), 4)]
+            } else {
+                vec![("MXFP8 values", read(&qdq_mxfp8_bf16(&client, &hd, n, h)), h * 2)]
+            }
+        };
+        let mut seen = Vec::new();
+        for ((name, a, per), (_, b, _)) in quant(one.clone(), 1).into_iter().zip(quant(x.clone(), rows)) {
+            if a[..per] != b[r * per..(r + 1) * per] {
+                return Err(format!("row {r}: its {name} alone are not its {name} among {rows} rows"));
+            }
+            if a[..per].iter().all(|v| *v == 0) {
+                return Err(format!("row {r}: its {name} are all zero, which shows nothing"));
+            }
+            seen.push(format!("{per} bytes of {name}"));
+        }
+        let w = 2 * self.top_k + 1;
+        let topk = f32::from_bytes(&read(&route.topk)).to_vec();
+        let given = Route {
+            logits: route.logits.clone().slice([r..r + 1, 0..self.experts]),
+            topk: client.create_from_slice(f32::as_bytes(&topk[r * w..(r + 1) * w])),
+            rows: 1,
+            top_k: self.top_k,
+        };
+        let host = |t: Tensor<Bk, 2>| t.into_data().convert::<f32>().to_vec::<f32>().expect("f32");
+        let dev = x.device();
+        let alone = host(self.experts_grouped(&one, &given, &fault_cell(&dev)));
+        let among = host(self.experts_grouped(x, route, &fault_cell(&dev)));
+        let same = alone.iter().zip(&among[r * h..(r + 1) * h]).filter(|(p, q)| p.to_bits() == q.to_bits()).count();
+        if same != h || !alone.iter().all(|v| v.is_finite()) || alone.iter().all(|v| *v == 0.0) {
+            return Err(format!("row {r}: {same} of {h} expert outputs are the bits of the {rows}-row call's"));
+        }
+        Ok(format!("row {r} of {rows}, alone and beside the others: {} and {h} outputs bit-equal", seen.join(", ")))
+    }
+}
+
+#[cfg(test)]
 mod tests {
     //! The grouped experts against the same bank's experts one at a time, on the
     //! same device routing, and the device routing against
@@ -731,9 +786,9 @@ mod tests {
     //! math: a wrong tile, row, expert offset or scale is an order-one error.
     use super::*;
     use crate::models::inkling::block::route_from_logits;
-    use crate::models::inkling::seam::tensor_of_dt;
+    use crate::models::inkling2_loop::one_expert::{MXFP8_BOUND, NVFP4_BOUND, combine, qdq46, qdq_mx, swiglu, worst_row};
     use crate::models::inkling2_loop::sliding::Dims;
-    use burn::tensor::{Int, TensorData};
+    use burn::tensor::TensorData;
 
     fn dev() -> burn::backend::cuda::CudaDevice {
         burn::backend::cuda::CudaDevice::default()
@@ -796,11 +851,6 @@ mod tests {
 
     fn host(t: Tensor<Bk, 2>) -> Vec<f32> {
         t.into_data().convert::<f32>().to_vec().unwrap()
-    }
-
-    fn rel_err(got: &[f32], want: &[f32]) -> f32 {
-        let peak = want.iter().fold(0f32, |m, v| m.max(v.abs()));
-        got.iter().zip(want).fold(0f32, |m, (g, w)| m.max((g - w).abs())) / peak
     }
 
     /// The device top-k against `route_from_logits` on the same logits:
@@ -1080,6 +1130,55 @@ mod tests {
         client.create_from_slice(&b)
     }
 
+    /// Known answers of the shared Four Over Six quantizer, computed by hand
+    /// from its rule and from nothing else here (no host twin): outer scale
+    /// `amax / 1536` per row, block scale E4M3, E2M1 magnitudes
+    /// 0 .5 1 1.5 2 3 4 6 as codes 0..7 with the sign in bit 3, the low nibble
+    /// first, the target (block max onto 6 or onto 4) with the lower summed
+    /// error, 6 on a tie.
+    #[test]
+    fn four_over_six_quantizer_known_answers() {
+        let client = client_of(&Tensor::<Bk, 1>::zeros([1], &dev()));
+        let mut v = vec![0f32; 3 * 64];
+        // row 0: its largest magnitude is 1536, so alpha = 1.
+        // Block 0: every magnitude times 256. Onto 6: scale 256 (E4M3 0x78), no error.
+        v[..16].copy_from_slice(&[0., 128., 256., 384., 512., 768., 1024., 1536., 0., -128., -256., -384., -512., -768., -1024., -1536.]);
+        // Block 1: magnitudes up to 4, times 64. Onto 4: scale 64 (0x68), no error.
+        // Onto 6: 256 / 6 rounds to 44, so 64 reads 66: 4 wins.
+        v[16..32].copy_from_slice(&[0., 32., 64., 96., 128., 192., 256., 256., 0., -32., -64., -96., -128., -192., -256., -256.]);
+        // Block 2: onto 6 the scale is 1 (0x38) and the first seven values are
+        // midpoints, which go to the even code: 0, 2, 2, 4, 4, 6, 6. Its error is
+        // .25 * 4 + .5 * 2 + 1 = 3. Onto 4 (scale 1.5) it is 5: 6 wins.
+        v[32..48].copy_from_slice(&[0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5., 6., 4., 4., 4., 4., 2., 2., 1., 1.]);
+        // Block 3: one value, 96: exact onto 6 (scale 16, 0x58, code 7) and onto
+        // 4 (scale 24, code 6). A tie keeps 6.
+        v[48 + 5] = 96.;
+        // row 1: its largest magnitude is 3 (a negative value), alpha = 3 / 1536 = 2^-9.
+        // Block 0: onto 6, scale 256. Block 1: 6 * 2^-9, scale 1. A tie each: 6.
+        v[64] = -3.;
+        v[64 + 16] = 6. / 512.;
+        // row 2 is zero: alpha, scales and codes are zero.
+        let (c, s, a) = quantize_nvfp4_46_bf16(&client, &bf16_handle(&client, &v), 3, 64);
+        let mut codes = vec![0u8; 3 * 32];
+        codes[..8].copy_from_slice(&[0x10, 0x32, 0x54, 0x76, 0x90, 0xBA, 0xDC, 0xFE]);
+        codes[8..16].copy_from_slice(&[0x10, 0x32, 0x54, 0x66, 0x90, 0xBA, 0xDC, 0xEE]);
+        codes[16..24].copy_from_slice(&[0x20, 0x42, 0x64, 0x76, 0x66, 0x66, 0x44, 0x22]);
+        codes[24 + 2] = 0x70;
+        codes[32] = 0x0F;
+        codes[40] = 0x07;
+        let mut scales = vec![0u8; 3 * 4];
+        scales[..4].copy_from_slice(&[0x78, 0x68, 0x38, 0x58]);
+        scales[4..6].copy_from_slice(&[0x78, 0x38]);
+        assert_eq!(f32s_of(&client, &a)[..3], [1.0, 1.0 / 512.0, 0.0], "outer scales");
+        let got = client.read_one(s).unwrap()[..12].to_vec();
+        assert_eq!(got, scales, "block scales {got:02x?}, by hand {scales:02x?}");
+        let got = client.read_one(c).unwrap()[..96].to_vec();
+        for b in 0..12 {
+            assert_eq!(got[b * 8..b * 8 + 8], codes[b * 8..b * 8 + 8], "row {} block {}: codes {:02x?}", b / 4, b % 4, &got[b * 8..b * 8 + 8]);
+        }
+        eprintln!("QUANT46 known answers: 3 outer scales, 12 block scales, 192 codes as computed by hand");
+    }
+
     #[test]
     fn four_over_six_quantizer_matches_its_host_twin() {
         let client = client_of(&Tensor::<Bk, 1>::zeros([1], &dev()));
@@ -1137,30 +1236,6 @@ mod tests {
         assert_eq!(bad, 0);
     }
 
-    /// `x` through the trained activation quantiser and back: BF16, then 4/6
-    /// NVFP4 per row, dequantized with its outer scale (f32).
-    fn qdq46(x: Tensor<Bk, 2>) -> Tensor<Bk, 2> {
-        use crate::models::inkling::fp4quant::dequantize_nvfp4;
-        let [n, k] = x.dims();
-        let client = client_of(&x);
-        let dev = x.device();
-        let (h, dt) = handle_of_any(x.cast(burn::tensor::FloatDType::BF16));
-        assert_eq!(dt, burn::tensor::DType::BF16);
-        let (c, s, a) = quantize_nvfp4_46_bf16(&client, &h, n, k);
-        let deq = tensor_of(client.clone(), dev.clone(), dequantize_nvfp4(&client, &c, &s, n, k), n, k);
-        deq * tensor_of(client, dev, a, n, 1)
-    }
-
-    /// `x` through the MXFP8 activation rounding, as f32.
-    fn qdq_mx(x: Tensor<Bk, 2>) -> Tensor<Bk, 2> {
-        let [n, k] = x.dims();
-        let client = client_of(&x);
-        let dev = x.device();
-        let (h, _) = handle_of_any(x.cast(burn::tensor::FloatDType::BF16));
-        let h = qdq_mxfp8_bf16(&client, &h, n, k);
-        tensor_of_dt(client, dev, h, n, k, burn::tensor::DType::BF16).cast(burn::tensor::FloatDType::F32)
-    }
-
     /// Expert `e` of `p` against `x`, alone: the dense GEMM on the expert's
     /// slice of the stacked weights.
     fn linear(b: &Bank, p: &Proj, e: usize, x: Tensor<Bk, 2>) -> Tensor<Bk, 2> {
@@ -1187,50 +1262,29 @@ mod tests {
     }
 
     /// The grouped experts against one expert at a time, each fed the same
-    /// quantized activations (dequantized): the same operands up to the BF16
-    /// rounding of an NVFP4 value, in another GEMM. Detects a wrong offset,
-    /// outer scale, tile or row. Returns the worst row error.
+    /// quantized activations (dequantized), in another GEMM. Synthetic weights. The
+    /// picks are the grouped path's own and so are the quantizers, so this
+    /// proves dispatch and combine under a supplied route (offset, outer
+    /// scale, tile, row), not the router or the quantizers. Returns the worst
+    /// row error.
     fn compare(d: &Dims, nvfp4: bool, rows: usize, seed: u64, bound: f32) -> f32 {
         let b = bank(d, nvfp4, seed);
         let xs = x(rows, d.hidden, seed ^ 0x2222);
         let route = b.route(&xs);
-        let picks = route.picks();
         let cell = fault_cell(&dev());
         let grouped = host(b.experts_grouped(&xs, &route, &cell));
         let qdq = |t: Tensor<Bk, 2>| if nvfp4 { qdq46(t) } else { qdq_mx(t) };
-        let mut by_expert: std::collections::BTreeMap<usize, Vec<(usize, f32)>> = Default::default();
-        for (row, (es, ws)) in picks.iter().enumerate() {
-            for (&ex, &g) in es.iter().zip(ws) {
-                by_expert.entry(ex).or_default().push((row, g));
-            }
-        }
-        let mut looped = vec![0f32; rows * d.hidden];
-        for (&ex, rws) in &by_expert {
-            let idx: Vec<i64> = rws.iter().map(|&(r, _)| r as i64).collect();
-            let n = idx.len();
-            let xsel = xs.clone().select(0, Tensor::<Bk, 1, Int>::from_data(TensorData::new(idx, [n]), &dev()));
-            let xq = qdq(xsel);
-            let g = linear(&b, &b.gate, ex, xq.clone());
-            let u = linear(&b, &b.up, ex, xq);
-            let capped = |v: Tensor<Bk, 2>, c: f32| v.div_scalar(c).tanh().mul_scalar(c);
-            let a = capped(g.clone(), d.gate_softcap) * burn::tensor::activation::sigmoid(g) * capped(u, d.up_softcap);
-            let y = host(linear(&b, &b.down, ex, qdq(a)));
-            for (j, &(r, w)) in rws.iter().enumerate() {
-                for c in 0..d.hidden {
-                    looped[r * d.hidden + c] += w * y[j * d.hidden + c];
-                }
-            }
-        }
+        let looped = combine(&xs, &route.picks(), |ex, sel| {
+            let [n, _] = sel.dims();
+            let (a, alpha) = qdq(sel);
+            let lin = |p: &Proj, x: Tensor<Bk, 2>, alpha: Tensor<Bk, 2>| linear(&b, p, ex, x).slice([0..n, 0..p.n]) * alpha;
+            let (g, u) = (lin(&b.gate, a.clone(), alpha.clone()), lin(&b.up, a, alpha));
+            let (s, alpha) = qdq(swiglu(g, u, d.gate_softcap, d.up_softcap));
+            lin(&b.down, s, alpha)
+        });
         assert_eq!(read_fault(&cell), None);
-        let (mut worst, h) = (0f32, d.hidden);
-        for row in 0..rows {
-            let rr = row * h..(row + 1) * h;
-            assert!(looped[rr.clone()].iter().any(|v| *v != 0.0), "row {row}: the loop produced zeros");
-            assert!(grouped[rr.clone()].iter().all(|v| v.is_finite()), "row {row}: non-finite");
-            let err = rel_err(&grouped[rr.clone()], &looped[rr]);
-            assert!(err < bound, "row {row} of {rows}: grouped vs one expert at a time rel err {err}");
-            worst = worst.max(err);
-        }
+        let worst = worst_row(&grouped, &looped, d.hidden);
+        assert!(worst < bound, "{rows} rows: grouped vs one expert at a time, worst row rel err {worst}");
         worst
     }
 
@@ -1239,7 +1293,7 @@ mod tests {
         // 128 experts at 37 rows: mostly one- or two-row experts, a tile each;
         // 16 experts: about 18 rows each, two tiles; one row: a decode step
         for (e, rows) in [(128, 37), (16, 37), (128, 1)] {
-            let worst = compare(&dims(2304, 1152, e, 8), true, rows, 0x4646 + e as u64, 5e-2);
+            let worst = compare(&dims(2304, 1152, e, 8), true, rows, 0x4646 + e as u64, NVFP4_BOUND);
             eprintln!("MOE trained nvfp4 E {e} rows {rows}: grouped vs one at a time worst row rel err {worst:.3e}");
         }
     }
@@ -1247,14 +1301,15 @@ mod tests {
     #[test]
     fn grouped_mxfp8_experts_match_one_at_a_time() {
         for (e, rows) in [(128, 37), (16, 37), (128, 1)] {
-            let worst = compare(&dims(2304, 1152, e, 8), false, rows, 0x7f4a + e as u64, 1e-2);
+            let worst = compare(&dims(2304, 1152, e, 8), false, rows, 0x7f4a + e as u64, MXFP8_BOUND);
             eprintln!("MOE trained mxfp8 E {e} rows {rows}: grouped vs one at a time worst row rel err {worst:.3e}");
         }
     }
 
-    /// A row's output does not depend on the rows beside it: one row alone (a
-    /// decode step) against the same row inside a 37-row call (a replay), the
-    /// same input and the same routing, on both formats. Also printed, not
+    /// A row's quantizer codes and output do not depend on the rows beside it
+    /// ([`Bank::row_is_its_own`]): one row alone (a decode step) against the
+    /// same row inside a 37-row call (a replay), the same input and the same
+    /// routing, on both formats. Also printed, not
     /// bounded: how far the output moves when the input moves by a relative
     /// 4e-4, which is what a cached step and a replay differ by at a layer's
     /// expert input. Quantised activations are discontinuous there, so this is
@@ -1262,33 +1317,24 @@ mod tests {
     #[test]
     fn a_rows_output_is_its_own() {
         let d = dims(2304, 1152, 128, 8);
-        let (h, w) = (d.hidden, 2 * d.top_k + 1);
+        let h = d.hidden;
         let rms = |v: &[f32]| v.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
         for nvfp4 in [true, false] {
             let b = bank(&d, nvfp4, 0xa10e);
-            let client = b.client();
             let rows = 37;
             let xs = x(rows, h, 0x10e);
             let route = b.route(&xs);
-            let topk = f32s_of(&client, &route.topk);
             let whole = host(b.experts_grouped(&xs, &route, &fault_cell(&dev())));
             for r in [0, 5, rows - 1] {
-                let one = Route {
-                    logits: route.logits.clone().slice([r..r + 1, 0..d.experts]),
-                    topk: client.create_from_slice(f32::as_bytes(&topk[r * w..(r + 1) * w])),
-                    rows: 1,
-                    top_k: d.top_k,
-                };
-                let alone = host(b.experts_grouped(&xs.clone().slice([r..r + 1, 0..h]), &one, &fault_cell(&dev())));
-                let same = alone.iter().zip(&whole[r * h..(r + 1) * h]).filter(|(p, q)| p.to_bits() == q.to_bits()).count();
-                assert_eq!(same, h, "nvfp4 {nvfp4} row {r}: alone and beside 36 others");
+                let line = b.row_is_its_own(&xs, &route, r).unwrap_or_else(|e| panic!("nvfp4 {nvfp4}: {e}"));
+                eprintln!("MOE nvfp4 {nvfp4}: {line}");
             }
             let mut g = Rng(0x7e57);
             let noise: Vec<f32> = (0..rows * h).map(|_| 1.0 + g.f(4e-4 * 3f32.sqrt())).collect();
             let moved = xs.clone() * Tensor::from_data(TensorData::new(noise, [rows, h]), &dev());
             let out = host(b.experts_grouped(&moved, &route, &fault_cell(&dev())));
             let diff: Vec<f32> = out.iter().zip(&whole).map(|(p, q)| p - q).collect();
-            eprintln!("MOE nvfp4 {nvfp4}: rows alone bit-equal; input moved by rel-L2 4e-4 moves the output by {:.3e}", rms(&diff) / rms(&whole));
+            eprintln!("MOE nvfp4 {nvfp4}: input moved by rel-L2 4e-4 moves the output by {:.3e}", rms(&diff) / rms(&whole));
         }
     }
 
