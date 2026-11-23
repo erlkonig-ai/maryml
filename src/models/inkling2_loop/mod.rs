@@ -71,6 +71,8 @@ pub mod loop_core;
 #[cfg(feature = "inkling-cuda")]
 pub mod full;
 #[cfg(feature = "inkling-cuda")]
+pub mod moe;
+#[cfg(feature = "inkling-cuda")]
 pub mod sliding;
 #[cfg(feature = "inkling-cuda")]
 pub mod tail_check;
