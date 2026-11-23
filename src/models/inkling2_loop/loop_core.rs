@@ -39,7 +39,7 @@ use crate::models::inkling2_loop::layout::{Dtype, Slot};
 use crate::models::inkling2_loop::messages::{DeviceQueries, MessageQueries, MessageSources};
 use crate::models::inkling2_loop::moe::{FaultCell, fault_cell};
 use crate::models::inkling2_loop::schedule::CacheId;
-use crate::models::inkling2_loop::sliding::{Dev, ExpertAct, SlidingLayer, State, Taps, Weights, f32_le, want};
+use crate::models::inkling2_loop::sliding::{Dev, SlidingLayer, State, Taps, Weights, f32_le, want};
 
 /// One core layer, bound once.
 pub enum CoreLayer {
@@ -67,14 +67,13 @@ impl CoreLayer {
         x: Tensor<Bk, 2>,
         blocks: &mut Vec<Tensor<Bk, 2>>,
         state: &mut State,
-        act: ExpertAct,
         origin: usize,
         messages: Option<&Tensor<Bk, 3>>,
     ) -> (Tensor<Bk, 2>, Taps) {
         match self {
-            CoreLayer::Sliding(l) => l.forward_visit(x, blocks, state, act, messages),
+            CoreLayer::Sliding(l) => l.forward_visit(x, blocks, state, messages),
             CoreLayer::Full(l) => {
-                let (out, taps) = l.forward_visit(x, blocks, state, act, origin, messages);
+                let (out, taps) = l.forward_visit(x, blocks, state, origin, messages);
                 (out, taps.rest)
             }
         }
@@ -174,7 +173,6 @@ impl Core {
         x: Tensor<Bk, 2>,
         blocks: &[Tensor<Bk, 2>],
         state: &mut CoreState,
-        act: ExpertAct,
         origin: usize,
         plant: Option<Plant>,
         mut hook: Option<VisitHook<'_>>,
@@ -197,7 +195,7 @@ impl Core {
                 let dev = hs.device();
                 let messages = prof::span("msg_read", &dev, || prev.as_ref().map(|src| src.read(self.device_queries.layer(q))));
                 let st = state.visits.get_mut(&id).unwrap_or_else(|| panic!("no state for {id:?}"));
-                let (out, taps) = layer.visit(hs, &mut bs, st, act, origin, messages.as_ref());
+                let (out, taps) = layer.visit(hs, &mut bs, st, origin, messages.as_ref());
                 if let Some(f) = hook.as_mut() {
                     f(id, &out, taps, messages.as_ref());
                 }

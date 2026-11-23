@@ -40,7 +40,7 @@ use mary::models::inkling2_loop::layout::Slot;
 use mary::models::inkling2_loop::messages::{MessageQueries, read_messages};
 use mary::models::inkling2_loop::pile::MiniRoot;
 use mary::models::inkling2_loop::schedule::CacheId;
-use mary::models::inkling2_loop::sliding::{ExpertAct, SlidingLayer, State, Weights};
+use mary::models::inkling2_loop::sliding::{SlidingLayer, State, Weights};
 use triblespace::prelude::Id;
 
 /// A pass is within this many times upstream's own bf16-vs-f32 spread.
@@ -261,7 +261,7 @@ fn main() {
             Tensor::<Bk, 3>::from_data(TensorData::new(m, [n, 4, h]), &dev)
         });
         let state = states.entry(CacheId { layer: LAYER, pass }).or_insert_with(|| State::new(&layer.dims, &dev));
-        let (out, taps) = layer.forward_visit(rows(x, n), &mut blocks, state, ExpertAct::Bf16, messages.as_ref());
+        let (out, taps) = layer.forward_visit(rows(x, n), &mut blocks, state, messages.as_ref());
         assert_eq!(blocks.len(), 2, "layer 6 is a block boundary: its input joins the blocks once");
         let mut seen = vec![
             ("attn", host(taps.attn)),

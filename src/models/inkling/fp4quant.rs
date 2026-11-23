@@ -352,7 +352,7 @@ fn quantize_nvfp4_into<E: Scalar + Cast, R: Runtime>(
 /// Largest E4M3 value Four Over Six lets the per-token outer scale target:
 /// `256 * 6 / 4 = 384` is still an E4M3, so a block holding its row's largest
 /// value can still take the scale-to-4 candidate (arXiv 2512.02010, §3.1).
-pub const FOUR_OVER_SIX_E4M3_MAX: f32 = 256.0;
+pub(crate) const FOUR_OVER_SIX_E4M3_MAX: f32 = 256.0;
 
 /// Threads per cube of [`quantize_nvfp4_46_kernel`]: one per 16-element block
 /// of a row, so a row of up to `16 * 256` elements is one cube.
@@ -408,7 +408,6 @@ fn quantize_nvfp4_46_kernel<E: Scalar + Cast>(
     scales: &mut Array<e4m3>,
     alpha_out: &mut Array<f32>,
     #[comptime] bpr: usize,
-    #[comptime] four_over_six: bool,
 ) {
     let row = CUBE_POS_X as usize;
     let b = UNIT_POS_X as usize;
@@ -436,10 +435,7 @@ fn quantize_nvfp4_46_kernel<E: Scalar + Cast>(
         sync_cube();
         stride /= 2u32;
     }
-    let mut alpha = red[0] / (6.0f32 * FOUR_OVER_SIX_E4M3_MAX);
-    if comptime!(!four_over_six) {
-        alpha = red[0] / (6.0f32 * E4M3_MAX);
-    }
+    let alpha = red[0] / (6.0f32 * FOUR_OVER_SIX_E4M3_MAX);
 
     if b < bpr {
         if b == 0 {
@@ -466,7 +462,7 @@ fn quantize_nvfp4_46_kernel<E: Scalar + Cast>(
             se = s6;
             w0 = w06;
             w1 = w16;
-            if comptime!(four_over_six) && e4 < e6 {
+            if e4 < e6 {
                 se = s4;
                 w0 = w04;
                 w1 = w14;
@@ -479,60 +475,60 @@ fn quantize_nvfp4_46_kernel<E: Scalar + Cast>(
 }
 
 /// [`quantize_nvfp4_46_kernel`] over `rows` rows of `k` BF16 values: `(codes
-/// [rows, k/8] u32, scales [rows, k/16] e4m3, alpha [rows] f32)`.
-pub fn quantize_nvfp4_46_bf16<R: Runtime>(
+/// [rows, k/8] u32, scales [rows, k/16] e4m3, alpha [rows] f32)`. Every row is
+/// read, so every row of `x` must have been written.
+pub(crate) fn quantize_nvfp4_46_bf16<R: Runtime>(
     client: &ComputeClient<R>,
     x: &Handle,
     rows: usize,
     k: usize,
-) -> (Handle, Handle, Handle) {
-    quantize_nvfp4_rowscaled_bf16(client, x, rows, k, true)
-}
-
-/// The same kernel with the block rule chosen: `four_over_six` false is
-/// plain NVFP4 with a per-row outer scale, `alpha = amax / (6 * 448)` and every
-/// block's largest magnitude onto 6.
-pub fn quantize_nvfp4_rowscaled_bf16<R: Runtime>(
-    client: &ComputeClient<R>,
-    x: &Handle,
-    rows: usize,
-    k: usize,
-    four_over_six: bool,
 ) -> (Handle, Handle, Handle) {
     let bpr = k / GROUP;
     assert!(k > 0 && k % 64 == 0 && rows > 0, "4/6 NVFP4 needs rows > 0 and k a positive multiple of 64");
     assert!(bpr <= ROW_CUBE as usize, "a row of {k} is more blocks than one cube of {ROW_CUBE}");
-    let n = rows * k;
+    let n = bf16_extent(x, rows, k);
+    let cubes = u32::try_from(rows).expect("4/6 NVFP4: more rows than a u32 counts");
     let codes = client.empty(n / CODES_PER_WORD * core::mem::size_of::<u32>());
     let scales = client.empty(n / GROUP);
     let alpha = client.empty(rows * core::mem::size_of::<f32>());
     unsafe {
         quantize_nvfp4_46_kernel::launch_unchecked::<half::bf16, R>(
             client,
-            CubeCount::new_1d(rows as u32),
+            CubeCount::new_1d(cubes),
             CubeDim::new_1d(ROW_CUBE),
             ArrayArg::from_raw_parts(x.clone(), n / LINE),
             ArrayArg::from_raw_parts(codes.clone(), n / CODES_PER_WORD),
             ArrayArg::from_raw_parts(scales.clone(), n / GROUP),
             ArrayArg::from_raw_parts(alpha.clone(), rows),
             bpr,
-            four_over_six,
         );
     }
     (codes, scales, alpha)
 }
 
+/// `rows * k`, checked to fit a u32 and to lie inside `x` as BF16 values: the
+/// launches below are unchecked.
+fn bf16_extent(x: &Handle, rows: usize, k: usize) -> usize {
+    let n = rows.checked_mul(k).filter(|n| u32::try_from(*n).is_ok());
+    let n = n.unwrap_or_else(|| panic!("{rows} rows of {k} are more elements than a u32 counts"));
+    let bytes = n as u64 * core::mem::size_of::<half::bf16>() as u64;
+    assert!(x.size_in_used() >= bytes, "a buffer of {} bytes is shorter than {rows} rows of {k} BF16 values", x.size_in_used());
+    n
+}
+
 /// Elements per MXFP8 block scale.
-pub const MX_BLOCK: usize = 32;
+pub(crate) const MX_BLOCK: usize = 32;
 
 /// MXFP8 (E4M3 elements, one UE8M0 scale per 32) quantised and dequantised in
 /// one pass, BF16 in and BF16 out: one unit per 32-element block.
 ///
 /// The scale is the OCP MX v1.0 rule, `2^(floor(log2 amax) - 8)` (8 is E4M3's
 /// largest exponent), and the scaled elements round to nearest E4M3 after a
-/// clamp to ±448. Every result is an E4M3 value times a power of two, which a
-/// BF16 holds exactly, so a BF16 GEMM over the output against exactly decoded
-/// MXFP8 weights multiplies the same numbers an MXFP8 MMA would.
+/// clamp to ±448. A result is an E4M3 value times a power of two, which a BF16
+/// holds exactly down to its smallest subnormal, 2^-133; below that it rounds.
+/// So a BF16 GEMM over the output sees MXFP8-rounded operands. That is all it
+/// claims: its accumulator and its order of summation are the BF16 MMA's, and
+/// nothing here shows a product equal to an FP8 MMA's.
 #[cube(launch_unchecked)]
 fn qdq_mxfp8_bf16_kernel(x: &Array<half::bf16>, out: &mut Array<half::bf16>, blocks: usize) {
     let blk = ABSOLUTE_POS;
@@ -558,12 +554,14 @@ fn qdq_mxfp8_bf16_kernel(x: &Array<half::bf16>, out: &mut Array<half::bf16>, blo
     }
 }
 
-/// [`qdq_mxfp8_bf16_kernel`] over `n` BF16 values (`n % 32 == 0`, blocks along
-/// the contiguous axis), into a fresh buffer.
-pub fn qdq_mxfp8_bf16<R: Runtime>(client: &ComputeClient<R>, x: &Handle, n: usize) -> Handle {
-    assert!(n % MX_BLOCK == 0, "{n} values are not whole MX blocks of {MX_BLOCK}");
+/// [`qdq_mxfp8_bf16_kernel`] over `rows` rows of `k` BF16 values (`k % 32 ==
+/// 0`, blocks along the row), into a fresh buffer. Every row is read, so every
+/// row of `x` must have been written.
+pub(crate) fn qdq_mxfp8_bf16<R: Runtime>(client: &ComputeClient<R>, x: &Handle, rows: usize, k: usize) -> Handle {
+    assert!(k > 0 && k % MX_BLOCK == 0 && rows > 0, "{rows} rows of {k} are not whole MX blocks of {MX_BLOCK}");
+    let n = bf16_extent(x, rows, k);
     let blocks = n / MX_BLOCK;
-    let out = client.empty(n * 2);
+    let out = client.empty(n * core::mem::size_of::<half::bf16>());
     unsafe {
         qdq_mxfp8_bf16_kernel::launch_unchecked::<R>(
             client,

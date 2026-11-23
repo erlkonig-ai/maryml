@@ -32,9 +32,8 @@
 //! (a device error surfaces as a panic in the backend) may leave some visits
 //! updated and others not; the session is then *poisoned* and refuses every
 //! call until [`MiniSession::reset`]. A non-finite router logit is such a
-//! failure on either expert lane: the loop lane panics as it reads the
-//! routing, and the grouped lane writes the session's own fault cell, which
-//! `append` reads after the forward and turns into the same panic. The cell
+//! failure: the experts write the session's own fault cell, which
+//! `append` reads after the forward and turns into a panic. The cell
 //! is the session's, so a fault never reaches another session over the same
 //! model. The caller replays the sequence from its
 //! archive. There is no per-token snapshot.
@@ -76,33 +75,11 @@ use crate::models::inkling2_loop::loop_core::{Core, CoreState};
 use crate::models::inkling2_loop::moe::{FaultCell, fault_cell, read_fault};
 use crate::models::inkling2_loop::pile::MiniRoot;
 use crate::models::inkling2_loop::schedule::CacheId;
-use crate::models::inkling2_loop::sliding::{Dev, ExpertAct, SlidingLayer, State, Weights, bf16_to_f32, want};
+use crate::models::inkling2_loop::sliding::{Dev, SlidingLayer, State, Weights, bf16_to_f32, want};
 
 /// The most logit rows one call returns, so a long prefill cannot ask for
 /// `rows x 200058` floats on the host by accident.
 pub const MAX_LOGIT_ROWS: usize = 64;
-
-/// How a model binds.
-#[derive(Debug, Clone, Copy)]
-pub struct MiniOptions {
-    /// What the experts multiply. [`ExpertAct::Trained`] (the default) is the
-    /// precision they were trained in; [`ExpertAct::Bf16`] is what
-    /// transformers 046bdb8c computes and what the comparisons checked.
-    pub experts: ExpertAct,
-}
-
-impl Default for MiniOptions {
-    /// The trained expert precision ([`ExpertAct::Trained`]), unless
-    /// `MINI_EXPERTS=w4a16` asks for BF16 activations (the comparison arm).
-    fn default() -> Self {
-        let experts = match std::env::var("MINI_EXPERTS").as_deref() {
-            Ok("trained") | Err(_) => ExpertAct::Trained,
-            Ok("w4a16") => ExpertAct::Bf16,
-            Ok(other) => panic!("MINI_EXPERTS={other}: the arms are trained and w4a16"),
-        };
-        MiniOptions { experts }
-    }
-}
 
 /// Which rows of a call's logits to compute and return.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,11 +137,11 @@ impl Outer {
         }
     }
 
-    fn forward(&self, x: Tensor<Bk, 2>, blocks: &mut Vec<Tensor<Bk, 2>>, state: &mut State, act: ExpertAct) -> Tensor<Bk, 2> {
+    fn forward(&self, x: Tensor<Bk, 2>, blocks: &mut Vec<Tensor<Bk, 2>>, state: &mut State) -> Tensor<Bk, 2> {
         match self {
-            Outer::Sliding(l) => l.forward(x, blocks, state, act).0,
+            Outer::Sliding(l) => l.forward(x, blocks, state).0,
             // a session starts at position 0: the first cached row is absolute position 0
-            Outer::Full(l) => l.forward_at(x, blocks, state, act, 0).0,
+            Outer::Full(l) => l.forward_at(x, blocks, state, 0).0,
         }
     }
 }
@@ -176,7 +153,6 @@ pub struct MiniModel {
     cfg: Inkling2LoopConfig,
     tokenizer: tokenizers::Tokenizer,
     content_tokenizer: tokenizers::Tokenizer,
-    opts: MiniOptions,
     dev: Dev,
     embed_gain: Tensor<Bk, 1>,
     pre: Vec<Outer>,
@@ -250,7 +226,7 @@ impl MiniModel {
     /// Open `root` in `collection` of the pile at `path` and bind every layer
     /// on the default CUDA device. The weights are views over the pile
     /// mapping until bound; binding uploads them.
-    pub fn open(path: &Path, collection: CollectionHandle, root: Id, opts: MiniOptions) -> Result<MiniModel> {
+    pub fn open(path: &Path, collection: CollectionHandle, root: Id) -> Result<MiniModel> {
         let root = MiniRoot::open(path, collection, root).context("open the Mini model root")?;
         let cfg = Inkling2LoopConfig::from_json(&root.config().context("config facts")?.to_string())
             .map_err(|e| anyhow!("config: {e}"))?;
@@ -275,7 +251,7 @@ impl MiniModel {
         let core = Core::bind(&root, t, &dev).map_err(|e| anyhow!("bind the core: {e}"))?;
         let post = outer(l.core_end..t.num_hidden_layers)?;
         let head = DeviceHead::bind(t, &root, &dev)?;
-        Ok(MiniModel { root, cfg, tokenizer, content_tokenizer, opts, dev, embed_gain, pre, core, post, head })
+        Ok(MiniModel { root, cfg, tokenizer, content_tokenizer, dev, embed_gain, pre, core, post, head })
     }
 
     pub fn config(&self) -> &Inkling2LoopTextConfig {
@@ -357,7 +333,6 @@ impl MiniModel {
     fn forward(&self, ids: &[u32], caches: &mut Caches, rows: usize) -> Logits {
         let t = self.config();
         let (n, h) = (ids.len(), t.hidden_size);
-        let act = self.opts.experts;
         prof::at(usize::MAX, 0);
         let mut x = prof::span("embed", &self.dev, || self.embed(ids));
         #[cfg(test)]
@@ -367,14 +342,14 @@ impl MiniModel {
         let mut blocks: Vec<Tensor<Bk, 2>> = Vec::new();
         for (layer, st) in self.pre.iter().zip(caches.pre.iter_mut()) {
             prof::at(layer.layer(), 0);
-            x = layer.forward(x, &mut blocks, st, act);
+            x = layer.forward(x, &mut blocks, st);
         }
-        let mut passes = self.core.forward(x, &blocks, &mut caches.core, act, 0, None, None);
+        let mut passes = self.core.forward(x, &blocks, &mut caches.core, 0, None, None);
         let last = passes.pop().expect("the core runs at least one pass");
         let (mut x, mut blocks) = (last.hidden, last.blocks);
         for (layer, st) in self.post.iter().zip(caches.post.iter_mut()) {
             prof::at(layer.layer(), 0);
-            x = layer.forward(x, &mut blocks, st, act);
+            x = layer.forward(x, &mut blocks, st);
         }
         prof::at(usize::MAX, 0);
         // The head needs only the requested trailing rows.
@@ -401,12 +376,11 @@ struct Caches {
 }
 
 impl Caches {
-    /// The grouped lane's form of the loop lane's panic in `Route::picks`,
-    /// after a forward: a set cell is a non-finite router logit somewhere in
+    /// The panic of `Route::picks`, after a forward: a set cell is a non-finite router logit somewhere in
     /// the call. The read is a sync; the head has already synced by then.
     fn check_router(&self) {
         if let Some(flag) = read_fault(&self.fault) {
-            panic!("router logit is non-finite (grouped lane), logit {}", flag - 1);
+            panic!("router logit is non-finite, logit {}", flag - 1);
         }
     }
 }
@@ -530,7 +504,7 @@ mod tests {
     //! logit fails its own session's append and no other session's. Needs the
     //! imported release (`MINI_MODEL_PILE`, `MINI_MODEL_COLLECTION`,
     //! `MINI_MODEL_ROOT`) and a GPU; the fault is induced by the test-only
-    //! `nan_input` flag, so the cell is written by the real grouped lane in
+    //! `nan_input` flag, so the cell is written by the real experts in
     //! layer 0 and read by the real `append`.
     use super::*;
 
@@ -538,7 +512,7 @@ mod tests {
         let env = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} is not set"));
         let collection = crate::model_collection::parse_collection_handle(&env("MINI_MODEL_COLLECTION")).unwrap();
         let root = Id::from_hex(&env("MINI_MODEL_ROOT")).expect("MINI_MODEL_ROOT is a 32-hex id");
-        Arc::new(MiniModel::open(Path::new(&env("MINI_MODEL_PILE")), collection, root, MiniOptions::default()).unwrap())
+        Arc::new(MiniModel::open(Path::new(&env("MINI_MODEL_PILE")), collection, root).unwrap())
     }
 
     fn bits(l: &Logits) -> Vec<u32> {
@@ -548,7 +522,6 @@ mod tests {
     #[test]
     #[ignore = "needs the imported Mini release (MINI_MODEL_PILE, MINI_MODEL_COLLECTION, MINI_MODEL_ROOT) and a GPU"]
     fn a_router_fault_poisons_only_its_own_session() {
-        assert_eq!(super::super::moe::lane(ExpertAct::Bf16), super::super::moe::Lane::Grouped, "run with the grouped lane");
         let model = open();
         let ids_a: Vec<u32> = (0..24).map(|i| 1000 + 37 * i).collect();
         let ids_b: Vec<u32> = (0..17).map(|i| 2000 + 53 * i).collect();

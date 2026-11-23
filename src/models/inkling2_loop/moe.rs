@@ -58,27 +58,41 @@
 //!
 //! A layer's experts are bound as one buffer per projection, experts stacked
 //! `[E, n, k]`, so expert `e`'s weight row `r` is global row `e * n + r` and
-//! needs no offset table. The per-expert [`super::sliding::Expert`] values the
-//! loop multiplies are views into the same buffers: one copy on the device.
+//! needs no offset table. One copy on the device.
+//!
+//! # Precision
+//!
+//! The experts run at the precision they were trained in, and there is no
+//! other arm. Stated by the release's `hf_quant_config.json` (layers 0..19):
+//! NVFP4 weights, and NVFP4 activations into both products (E2M1, an E4M3
+//! scale per 16, round to nearest, an outer scale per token, Four Over Six
+//! with the MAE rule). Stated (layers 20..23): MXFP8 weights and activations
+//! (E4M3, a UE8M0 scale per 32, round to nearest). Stated by the Four Over Six
+//! paper or its reference code: the outer scale `amax / (6 * 256)`, errors
+//! summed in f32, a tie keeping 6, E2M1 ties to even.
+//!
+//! Inferred, with no source that states it for this model: the MXFP8 activation
+//! scale (the OCP MX v1.0 rule), BF16 for the values that enter a quantizer,
+//! f32 for the MMA accumulator, the SwiGLU and the weighted scatter.
+//!
+//! Not reproduced: an FP8 MMA (layers 20..23 multiply MXFP8-rounded operands
+//! in a BF16 GEMM, whose accumulator and summation order are not shown to
+//! match one), and the compressed transport the training run's combine used.
 
 use burn::tensor::Tensor;
-use cubecl::e4m3;
-use cubecl::ir::MatrixIdent;
 use cubecl::prelude::*;
 use cubecl::server::Handle;
 use half::bf16;
 
 use crate::models::inkling::bf16gemm::{Bf16W, linear_bf16 as linear_bf16_handle, linear_bf16_narrow};
-use crate::models::inkling::burn::PackedW;
-use crate::models::inkling::fp4quant::{qdq_mxfp8_bf16, quantize_nvfp4_46_bf16, quantize_nvfp4_rowscaled_bf16};
+use crate::models::inkling::fp4quant::{qdq_mxfp8_bf16, quantize_nvfp4_46_bf16};
 use crate::models::inkling::moegroup::{
     BlockPlanDev, bf16_linear_grouped_launch, fp4_linear_grouped_planes_launch_as, gather_grouped_bf16,
     gather_grouped_bf16_from_bf16, scatter_weighted,
 };
 use crate::models::inkling::routetopk::router_topk_launch;
 use crate::models::inkling::seam::{Bk, client_of, handle_of_any, tensor_of};
-use crate::models::inkling::w4a16gemm::{CODES_PER_WORD, GROUP, KTILE, MTILE, NTILE, e2m1_value};
-use crate::models::inkling2_loop::sliding::{Expert, ExpertW};
+use crate::models::inkling::w4a16gemm::{GROUP, MTILE};
 
 type Client = ComputeClient<cubecl::cuda::CudaRuntime>;
 type Dev = burn::backend::cuda::CudaDevice;
@@ -93,7 +107,7 @@ pub(super) enum Stack {
     /// and each expert's second-level scale `[E]` f32. `off` is `[2E]` u64:
     /// expert `e`'s first code byte and first scale byte, the table
     /// [`fp4_linear_grouped_planes_launch_as`] reads.
-    Nvfp4 { codes: Handle, scales: Handle, scale2: Handle, scale2_host: Vec<f32>, off: Handle },
+    Nvfp4 { codes: Handle, scales: Handle, scale2: Handle, off: Handle },
     /// BF16 (MXFP8 decoded exactly): `[E * n, k]`, and the per-expert element
     /// offsets `[E]` u64 that [`bf16_linear_grouped_launch`] indexes.
     Bf16 { w: Handle, off: Handle },
@@ -105,34 +119,13 @@ pub(super) struct Proj {
     pub k: usize,
 }
 
-impl Proj {
-    /// Expert `e`'s `[n, k]` slice, as the per-expert loop multiplies it.
-    fn view(&self, e: usize, experts: usize) -> ExpertW {
-        let slice = |h: &Handle, per: usize| {
-            h.clone().offset_start((e * per) as u64).offset_end(((experts - 1 - e) * per) as u64)
-        };
-        match &self.stack {
-            Stack::Nvfp4 { codes, scales, scale2_host, .. } => ExpertW::Nvfp4(PackedW {
-                codes: slice(codes, self.n * self.k / 2),
-                scales: slice(scales, self.n * self.k / GROUP),
-                n: self.n,
-                k: self.k,
-                scale2: scale2_host[e],
-                swizzled: false,
-            }),
-            Stack::Bf16 { w, .. } => {
-                ExpertW::Bf16(Bf16W { h: slice(w, self.n * self.k * 2), n: self.n, k: self.k, align: 16 })
-            }
-        }
-    }
-}
-
 /// A layer's router and routed experts.
 pub struct Bank {
     router: Bf16W,
     /// `[E]` f32 on the device.
     bias: Handle,
-    pub(super) bias_host: Vec<f32>,
+    #[cfg(test)]
+    bias_host: Vec<f32>,
     gate: Proj,
     up: Proj,
     down: Proj,
@@ -143,8 +136,6 @@ pub struct Bank {
     route_scale: f32,
     gate_softcap: f32,
     up_softcap: f32,
-    /// The same experts as views, for the per-expert loop.
-    pub(super) loop_experts: Vec<Expert>,
 }
 
 /// The routing a visit used, on the device; read it only if you want it.
@@ -178,61 +169,6 @@ impl Route {
             })
             .collect()
     }
-}
-
-/// Which expert lane a visit runs. The grouped lane is the default; the loop
-/// is kept, on the same weights, as what the grouped lane is checked against
-/// and for NVFP4 activations ([`super::sliding::ExpertAct::Nvfp4`]), which the
-/// grouped lane does not implement.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Lane {
-    Grouped,
-    Loop,
-}
-
-/// The lane for `act`: NVFP4 activations take the loop; otherwise the grouped
-/// lane, unless `MINI_MOE=loop` asks for the loop (an A/B in one binary).
-pub fn lane(act: super::sliding::ExpertAct) -> Lane {
-    use std::sync::OnceLock;
-    static FORCED: OnceLock<bool> = OnceLock::new();
-    let forced = *FORCED.get_or_init(|| match std::env::var("MINI_MOE").as_deref() {
-        Ok("loop") => true,
-        Ok("grouped") | Err(_) => false,
-        Ok(other) => panic!("MINI_MOE={other}: the lanes are grouped and loop"),
-    });
-    match act {
-        super::sliding::ExpertAct::Trained => {
-            assert!(!forced, "MINI_MOE=loop: the trained expert precision runs on the grouped lane only");
-            Lane::Grouped
-        }
-        super::sliding::ExpertAct::Nvfp4 => Lane::Loop,
-        super::sliding::ExpertAct::Bf16 if forced => Lane::Loop,
-        super::sliding::ExpertAct::Bf16 => Lane::Grouped,
-    }
-}
-
-/// Measurement arms inside [`super::sliding::ExpertAct::Trained`], read once:
-/// `MINI_TRAINED=nvfp4|mxfp8` keeps the trained precision on only those layers
-/// (the others multiply BF16 activations), and `MINI_SCALE_RULE=static6` replaces
-/// Four Over Six with plain NVFP4 (`amax / (6 * 448)`, every block onto 6).
-/// Unset is the trained precision everywhere.
-fn trained_arms() -> (bool, bool, bool) {
-    use std::sync::OnceLock;
-    static ARMS: OnceLock<(bool, bool, bool)> = OnceLock::new();
-    *ARMS.get_or_init(|| {
-        let (nv, mx) = match std::env::var("MINI_TRAINED").as_deref() {
-            Ok("all") | Err(_) => (true, true),
-            Ok("nvfp4") => (true, false),
-            Ok("mxfp8") => (false, true),
-            Ok(other) => panic!("MINI_TRAINED={other}: all, nvfp4 or mxfp8"),
-        };
-        let rule = match std::env::var("MINI_SCALE_RULE").as_deref() {
-            Ok("fouroversix") | Err(_) => true,
-            Ok("static6") => false,
-            Ok(other) => panic!("MINI_SCALE_RULE={other}: fouroversix or static6"),
-        };
-        (nv, mx, rule)
-    })
 }
 
 /// The device plan of one visit. `m_max = 16 * max_tiles` stacked rows.
@@ -397,7 +333,9 @@ fn route_place(
 }
 
 /// `out = act(gate) * up` per stacked row, Mini's softcapped SwiGLU, into BF16
-/// for the down projection. Rows of tiles no expert owns are skipped. When
+/// for the down projection. Rows of tiles no expert owns are zero: no GEMM
+/// wrote their `g` and `u`, so those are not read, but the trained precision
+/// quantizes every row of `out`, so each must hold a value. When
 /// `scaled`, `g` and `u` are first multiplied by their row's `alpha` (the
 /// per-token outer scale the W4A4 GEMM leaves out).
 #[cube(launch_unchecked)]
@@ -435,149 +373,10 @@ fn softcapped_swiglu(
                 s = 1.0f32 / (1.0f32 + e);
             }
             out[p as usize] = bf16::cast_from(cg * s * cu);
+        } else {
+            out[p as usize] = bf16::cast_from(0.0f32);
         }
     }
-}
-
-/// [`crate::models::inkling::w4a16gemm::w4a16_linear`] over stacked experts:
-/// M tile `CUBE_POS_Y` belongs to expert `tile_slot[m_tile]` (or to none, and
-/// ends), whose weight rows start at `slot * size_n` of the `[E * n, k]`
-/// planes and whose second-level scale is `scale2[slot]`. Everything inside
-/// the k loop is the parent's.
-///
-/// The grid is the parent's transposed, N in x: the dense kernel puts M in x
-/// so the few m tiles sharing a weight row run together, but here M is every
-/// expert's rows stacked (about 2,200 tiles, 160 MB of A at a 4,096-token
-/// chunk), and M-fastest would stream all of A from DRAM once per N tile.
-/// N-fastest keeps one m tile's A and its expert's B (about 1.5 MB for a
-/// gate or up projection) in L2 while its N tiles run, which is the reuse the
-/// per-expert launches had by construction.
-#[cube(launch)]
-#[allow(clippy::too_many_arguments)]
-pub fn w4a16_grouped<AB: Scalar + Cast, S: Scalar, NA: Size, NC: Size>(
-    a: &Array<Vector<AB, NA>>,
-    b: &Array<u32>,
-    b_sc: &Array<S>,
-    scale2: &Array<f32>,
-    tile_slot: &Array<u32>,
-    out: &mut Array<Vector<f32, NC>>,
-    #[comptime] size_k: usize,
-    #[comptime] size_n: usize,
-) {
-    let def = cmma::MmaDefinition::<AB, AB, f32>::new(MTILE, NTILE, KTILE);
-    let lane = UNIT_POS_PLANE;
-    let pack = AB::packing_factor();
-
-    let n_tile = CUBE_POS_X as usize;
-    let m_tile = CUBE_POS_Y as usize;
-    let slot = tile_slot[m_tile];
-    if slot == 0xFFFF_FFFFu32 {
-        terminate!();
-    }
-    let n_base = n_tile * NTILE;
-    let m_base = m_tile * MTILE;
-    let row0 = slot as usize * size_n;
-    let scale = scale2[slot as usize];
-
-    let ec_a = def.elems_per_lane(MatrixIdent::A);
-    let vs_a = def.vector_size(MatrixIdent::A);
-    let vc_a = comptime!(ec_a / vs_a);
-    let ec_b = def.elems_per_lane(MatrixIdent::B);
-    let vs_b = def.vector_size(MatrixIdent::B);
-    let vc_b = comptime!(ec_b / vs_b);
-    let ec_c = def.elems_per_lane(MatrixIdent::Accumulator);
-    let vs_c = def.vector_size(MatrixIdent::Accumulator);
-    let vc_c = comptime!(ec_c / vs_c);
-
-    let mut reg_a = Array::<Vector<AB, NA>>::new(vc_a);
-    let mut reg_b = Array::<Vector<AB, NA>>::new(vc_b);
-    let mut acc = Array::<Vector<f32, NC>>::new(vc_c);
-    #[unroll]
-    for i in 0..vc_c {
-        acc[i] = Vector::<f32, NC>::cast_from(0.0f32);
-    }
-
-    let wpr = comptime!(size_k / CODES_PER_WORD);
-    let spr = comptime!(size_k / GROUP);
-    let k_tiles = comptime!(size_k / KTILE);
-
-    for t in 0..k_tiles {
-        let kbase = t * KTILE;
-        #[unroll]
-        for i in 0..vc_a {
-            let (row, col) = def.position_of_nth(lane, (i * vs_a * pack) as u32, MatrixIdent::A);
-            let gr = row as usize + m_base;
-            let gc = col as usize + kbase;
-            reg_a[i] = a[(gr * size_k + gc) / a.vector_size()];
-        }
-        #[unroll]
-        for i in 0..vc_b {
-            let (row, col) = def.position_of_nth(lane, (i * vs_b) as u32, MatrixIdent::B);
-            let gr = row0 + col as usize + n_base;
-            let gc = row as usize + kbase;
-            let word = b[gr * wpr + gc / CODES_PER_WORD];
-            let s = f32::cast_from(b_sc[gr * spr + gc / GROUP]);
-            let mut v = Vector::<AB, NA>::empty();
-            #[unroll]
-            for j in 0..vs_b {
-                let kk = gc + j;
-                let code = (word >> (4 * (kk % CODES_PER_WORD)) as u32) & 15u32;
-                v[j] = AB::cast_from(e2m1_value(code) * s);
-            }
-            reg_b[i] = v;
-        }
-        let d = def.execute(&reg_a, &reg_b, &acc);
-        #[unroll]
-        for i in 0..vc_c {
-            acc[i] = d[i];
-        }
-    }
-
-    #[unroll]
-    for i in 0..vc_c {
-        let (row, col) = def.position_of_nth(lane, (i * vs_c) as u32, MatrixIdent::Accumulator);
-        let gr = row as usize + m_base;
-        let gc = col as usize + n_base;
-        out[(gr * size_n + gc) / out.vector_size()] = acc[i] * Vector::<f32, NC>::cast_from(scale);
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn w4a16_grouped_launch(
-    client: &Client,
-    a: &Handle,
-    codes: &Handle,
-    scales: &Handle,
-    scale2: &Handle,
-    tile_slot: &Handle,
-    experts: usize,
-    max_tiles: usize,
-    k: usize,
-    n: usize,
-) -> Handle {
-    assert!(n % NTILE == 0 && k % KTILE == 0, "w4a16_grouped: {n}x{k} does not tile");
-    assert!(max_tiles <= 65535, "w4a16_grouped: {max_tiles} m-tiles exceed grid y");
-    let m = max_tiles * MTILE;
-    let out = client.empty(m * n * core::mem::size_of::<f32>());
-    let vs = 32 / bf16::cube_type().size_bits();
-    unsafe {
-        w4a16_grouped::launch::<bf16, e4m3, cubecl::cuda::CudaRuntime>(
-            client,
-            CubeCount::Static((n / NTILE) as u32, max_tiles as u32, 1),
-            CubeDim::new_1d(32),
-            vs,
-            2,
-            ArrayArg::from_raw_parts(a.clone(), m * k),
-            ArrayArg::from_raw_parts(codes.clone(), experts * n * (k / CODES_PER_WORD)),
-            ArrayArg::from_raw_parts(scales.clone(), experts * n * (k / GROUP)),
-            ArrayArg::from_raw_parts(scale2.clone(), experts),
-            ArrayArg::from_raw_parts(tile_slot.clone(), max_tiles),
-            ArrayArg::from_raw_parts(out.clone(), m * n),
-            k,
-            n,
-        )
-    };
-    out
 }
 
 fn u32s(client: &Client, v: &[u32]) -> Handle {
@@ -597,12 +396,10 @@ impl Bank {
         up_softcap: f32,
     ) -> Bank {
         let experts = bias.len();
-        let loop_experts = (0..experts)
-            .map(|e| Expert { gate: gate.view(e, experts), up: up.view(e, experts), down: down.view(e, experts) })
-            .collect();
         Bank {
             router,
             bias: client.create_from_slice(f32::as_bytes(&bias)),
+            #[cfg(test)]
             bias_host: bias,
             hidden: gate.k,
             inter: gate.n,
@@ -614,34 +411,23 @@ impl Bank {
             route_scale,
             gate_softcap,
             up_softcap,
-            loop_experts,
         }
     }
 
-    /// The router, then the experts in the lane `act` and `MINI_MOE` select:
-    /// `[rows, H]` f32, and the routing on the device.
+    /// The router, then the experts: `[rows, H]` f32, and the routing on the
+    /// device.
     ///
-    /// `fault` is the caller's cell ([`fault_cell`]): the grouped lane writes
+    /// `fault` is the caller's cell ([`fault_cell`]): the plan writes
     /// `1 + logit` into it when a row's router logits are not finite, its form
     /// of `route_from_logits`' panic, and nothing else reads or clears it. The
-    /// read is a sync, so it is the caller's to place ([`read_fault`]); the
-    /// loop lane panics in [`Route::picks`] instead. The cell belongs to
+    /// read is a sync, so it is the caller's to place ([`read_fault`]). The cell belongs to
     /// whoever owns the call's state, never to the bank, so one context's
     /// fault cannot reach another context sharing these weights.
-    pub fn forward(
-        &self,
-        d: &super::sliding::Dims,
-        x: &Tensor<Bk, 2>,
-        act: super::sliding::ExpertAct,
-        fault: &FaultCell,
-    ) -> (Tensor<Bk, 2>, Route) {
+    pub fn forward(&self, x: &Tensor<Bk, 2>, fault: &FaultCell) -> (Tensor<Bk, 2>, Route) {
         let dev = x.device();
         assert!(fault.dev == dev, "moe: a fault cell on {:?} for x on {dev:?}", fault.dev);
         let route = super::prof::span("router", &dev, || self.route(x));
-        let out = super::prof::span("experts", &dev, || match lane(act) {
-            Lane::Grouped => self.experts_grouped(x, &route, fault, act == super::sliding::ExpertAct::Trained),
-            Lane::Loop => experts_loop(self, d, x, &route.picks(), act),
-        });
+        let out = super::prof::span("experts", &dev, || self.experts_grouped(x, &route, fault));
         (out, route)
     }
 
@@ -742,34 +528,23 @@ impl Bank {
         Plan { row_src, row_w, tile_slot, tok_rows, tok_cnt, blk, max_tiles }
     }
 
-    fn project(&self, client: &Client, p: &Proj, a: &Handle, plan: &Plan) -> Handle {
-        let m = plan.max_tiles * MTILE;
-        match &p.stack {
-            Stack::Nvfp4 { codes, scales, scale2, .. } => w4a16_grouped_launch(
-                client, a, codes, scales, scale2, &plan.tile_slot, self.experts, plan.max_tiles, p.k, p.n,
-            ),
-            Stack::Bf16 { w, off } => bf16_linear_grouped_launch(
-                client,
-                a,
-                w,
-                self.experts * p.n * p.k * 2,
-                &plan.blk,
-                off,
-                self.experts,
-                m,
-                p.k,
-                p.n,
-            ),
-        }
+    /// One MXFP8 projection as the BF16 GEMM multiplies it: `[m, n]` f32 from
+    /// the MXFP8-rounded activations `a` (`[m, k]` BF16).
+    fn project_mxfp8(&self, client: &Client, p: &Proj, a: &Handle, plan: &Plan) -> Handle {
+        let Stack::Bf16 { w, off } = &p.stack else {
+            panic!("project_mxfp8: a projection decoded to BF16 only");
+        };
+        let bytes = self.experts * p.n * p.k * 2;
+        bf16_linear_grouped_launch(
+            client, a, w, bytes, &plan.blk, off, self.experts, plan.max_tiles * MTILE, p.k, p.n,
+        )
     }
 
     /// The grouped experts over `x` (`[rows, H]`) routed by `route`:
     /// `[rows, H]` f32, each row the weighted sum of its picks' outputs.
-    /// `fault` as in [`Bank::forward`]. `trained` multiplies at the trained
-    /// precision ([`super::sliding::ExpertAct::Trained`]); otherwise the
-    /// activations are BF16. The kernels below launch unchecked, so the shapes
-    /// are checked here.
-    fn experts_grouped(&self, x: &Tensor<Bk, 2>, route: &Route, fault: &FaultCell, trained: bool) -> Tensor<Bk, 2> {
+    /// `fault` as in [`Bank::forward`]. The precision is the module doc's. The
+    /// kernels below launch unchecked, so the shapes are checked here.
+    fn experts_grouped(&self, x: &Tensor<Bk, 2>, route: &Route, fault: &FaultCell) -> Tensor<Bk, 2> {
         let [rows, h] = x.dims();
         assert_eq!(h, self.hidden, "experts: x is {h} wide, the bank's hidden size is {}", self.hidden);
         assert_eq!(route.rows, rows, "experts: a route of {} rows for {rows} rows of x", route.rows);
@@ -784,14 +559,43 @@ impl Bank {
             burn::tensor::DType::BF16 => gather_grouped_bf16_from_bf16(&client, &xh, &plan.row_src, rows, m, h),
             other => panic!("experts: no lane for a {other:?} activation"),
         };
+        let s = client.empty(m * self.inter * 2);
         let nvfp4 = matches!(self.gate.stack, Stack::Nvfp4 { .. });
-        let (on_nv, on_mx, four_over_six) = trained_arms();
-        let trained = trained && if nvfp4 { on_nv } else { on_mx };
+        let (y, row_w) = if nvfp4 {
+            // W4A4: both operands NVFP4, the activations per token with Four
+            // Over Six; the per-token outer scale multiplies the GEMM's rows,
+            // so it enters the SwiGLU for gate and up and the scatter weight
+            // for down.
+            let (ac, asc, alpha) = quantize_nvfp4_46_bf16(&client, &a, m, h);
+            let g = self.project_w4a4(&client, &self.gate, &ac, &asc, &plan);
+            let u = self.project_w4a4(&client, &self.up, &ac, &asc, &plan);
+            self.swiglu(&client, g, u, Some(&alpha), &plan, &s);
+            let (sc, ssc, alpha2) = quantize_nvfp4_46_bf16(&client, &s, m, self.inter);
+            let y = self.project_w4a4(&client, &self.down, &sc, &ssc, &plan);
+            (y, scale_rows(&client, &plan.row_w, &alpha2, m))
+        } else {
+            // MXFP8: the activations rounded to MXFP8 and held as BF16, against
+            // the decoded MXFP8 weights, in the BF16 GEMM (whose accumulator
+            // and order are its own, not shown to be an FP8 MMA's).
+            let aq = qdq_mxfp8_bf16(&client, &a, m, h);
+            let g = self.project_mxfp8(&client, &self.gate, &aq, &plan);
+            let u = self.project_mxfp8(&client, &self.up, &aq, &plan);
+            self.swiglu(&client, g, u, None, &plan, &s);
+            let sq = qdq_mxfp8_bf16(&client, &s, m, self.inter);
+            (self.project_mxfp8(&client, &self.down, &sq, &plan), plan.row_w.clone())
+        };
+        let out = scatter_weighted(&client, &y, &row_w, &plan.tok_rows, &plan.tok_cnt, m, rows, h, self.top_k);
+        tensor_of(client, dev, out, rows, h)
+    }
+
+    /// [`softcapped_swiglu`] over every stacked row of `plan` into `s` (`[m,
+    /// inter]` BF16); `alpha` (`[m]` f32) scales `g` and `u` per row first.
+    fn swiglu(&self, client: &Client, g: Handle, u: Handle, alpha: Option<&Handle>, plan: &Plan, s: &Handle) {
+        let m = plan.max_tiles * MTILE;
         let total = m * self.inter;
-        let s = client.empty(total * 2);
-        let swiglu = |g: Handle, u: Handle, alpha: Option<&Handle>| unsafe {
+        unsafe {
             softcapped_swiglu::launch_unchecked::<cubecl::cuda::CudaRuntime>(
-                &client,
+                client,
                 CubeCount::new_1d(total.div_ceil(CUBE as usize) as u32),
                 CubeDim::new_1d(CUBE),
                 ArrayArg::from_raw_parts(g, total),
@@ -805,36 +609,7 @@ impl Bank {
                 self.inter as u32,
                 alpha.is_some(),
             );
-        };
-        let (y, row_w) = if trained && nvfp4 {
-            // W4A4: both operands NVFP4, the activations per token with Four
-            // Over Six; the per-token outer scale multiplies the GEMM's rows,
-            // so it enters the SwiGLU for gate and up and the scatter weight
-            // for down.
-            let (ac, asc, alpha) = quantize_nvfp4_rowscaled_bf16(&client, &a, m, h, four_over_six);
-            let g = self.project_w4a4(&client, &self.gate, &ac, &asc, &plan);
-            let u = self.project_w4a4(&client, &self.up, &ac, &asc, &plan);
-            swiglu(g, u, Some(&alpha));
-            let (sc, ssc, alpha2) = quantize_nvfp4_rowscaled_bf16(&client, &s, m, self.inter, four_over_six);
-            let y = self.project_w4a4(&client, &self.down, &sc, &ssc, &plan);
-            (y, scale_rows(&client, &plan.row_w, &alpha2, m))
-        } else if trained {
-            // MXFP8: the activations quantised to MXFP8 and dequantised
-            // exactly, against the exactly decoded MXFP8 weights.
-            let aq = qdq_mxfp8_bf16(&client, &a, m * h);
-            let g = self.project(&client, &self.gate, &aq, &plan);
-            let u = self.project(&client, &self.up, &aq, &plan);
-            swiglu(g, u, None);
-            let sq = qdq_mxfp8_bf16(&client, &s, total);
-            (self.project(&client, &self.down, &sq, &plan), plan.row_w.clone())
-        } else {
-            let g = self.project(&client, &self.gate, &a, &plan);
-            let u = self.project(&client, &self.up, &a, &plan);
-            swiglu(g, u, None);
-            (self.project(&client, &self.down, &s, &plan), plan.row_w.clone())
-        };
-        let out = scatter_weighted(&client, &y, &row_w, &plan.tok_rows, &plan.tok_cnt, m, rows, h, self.top_k);
-        tensor_of(client, dev, out, rows, h)
+        }
     }
 
     /// One NVFP4 projection with NVFP4 activations (`codes`, `scales` as
@@ -899,7 +674,6 @@ pub(super) fn nvfp4_proj(client: &Client, codes: &[u8], scales: &[u8], scale2: V
             codes: client.create_from_slice(codes),
             scales: client.create_from_slice(scales),
             scale2: client.create_from_slice(f32::as_bytes(&scale2)),
-            scale2_host: scale2,
             off: client.create_from_slice(u64::as_bytes(&off)),
         },
         n,
@@ -949,47 +723,16 @@ pub fn read_fault(fault: &FaultCell) -> Option<u32> {
     (v != 0).then_some(v)
 }
 
-/// The per-expert loop, on the bank's views (`route` read back to the host).
-pub(super) fn experts_loop(
-    bank: &Bank,
-    d: &super::sliding::Dims,
-    x: &Tensor<Bk, 2>,
-    picks: &[(Vec<usize>, Vec<f32>)],
-    act: super::sliding::ExpertAct,
-) -> Tensor<Bk, 2> {
-    use std::collections::BTreeMap;
-    use burn::tensor::{Int, TensorData};
-    let [t, _] = x.dims();
-    let dev = x.device();
-    let mut by_expert: BTreeMap<usize, Vec<(usize, f32)>> = BTreeMap::new();
-    for (row, (es, ws)) in picks.iter().enumerate() {
-        for (&e, &g) in es.iter().zip(ws) {
-            by_expert.entry(e).or_default().push((row, g));
-        }
-    }
-    let mut acc: Tensor<Bk, 2> = Tensor::zeros([t, d.hidden], &dev);
-    for (&e, rows) in &by_expert {
-        let idx: Vec<i64> = rows.iter().map(|&(r, _)| r as i64).collect();
-        let gw: Vec<f32> = rows.iter().map(|&(_, g)| g).collect();
-        let n = idx.len();
-        let idx = Tensor::<Bk, 1, Int>::from_data(TensorData::new(idx, [n]), &dev);
-        let gw = Tensor::<Bk, 2>::from_data(TensorData::new(gw, [n, 1]), &dev);
-        let xs = x.clone().select(0, idx.clone());
-        let y = bank.loop_experts[e].forward(d, xs, act) * gw;
-        acc = acc.select_assign(0, idx, y, burn::tensor::IndexingUpdateOp::Add);
-    }
-    acc
-}
-
 #[cfg(test)]
 mod tests {
-    //! The grouped lane against the per-expert loop on the same bank and the
+    //! The grouped experts against the same bank's experts one at a time, on the
     //! same device routing, and the device routing against
     //! `route_from_logits`. Bug detectors for a change that claims the same
     //! math: a wrong tile, row, expert offset or scale is an order-one error.
     use super::*;
     use crate::models::inkling::block::route_from_logits;
-    use crate::models::inkling2_loop::sliding::{Dims, ExpertAct};
+    use crate::models::inkling::seam::tensor_of_dt;
+    use crate::models::inkling2_loop::sliding::Dims;
     use burn::tensor::{Int, TensorData};
 
     fn dev() -> burn::backend::cuda::CudaDevice {
@@ -1058,49 +801,6 @@ mod tests {
     fn rel_err(got: &[f32], want: &[f32]) -> f32 {
         let peak = want.iter().fold(0f32, |m, v| m.max(v.abs()));
         got.iter().zip(want).fold(0f32, |m, (g, w)| m.max((g - w).abs())) / peak
-    }
-
-    /// Grouped against the loop, every row (row 0 included), at the release's
-    /// H and I. Returns the worst row error and how many rows differ at all.
-    fn compare(d: &Dims, nvfp4: bool, rows: usize, seed: u64) -> (f32, usize) {
-        let b = bank(d, nvfp4, seed);
-        let xs = x(rows, d.hidden, seed ^ 0x5555);
-        let route = b.route(&xs);
-        let picks = route.picks();
-        let cell = fault_cell(&dev());
-        let grouped = host(b.experts_grouped(&xs, &route, &cell, false));
-        let looped = host(experts_loop(&b, d, &xs, &picks, ExpertAct::Bf16));
-        assert_eq!(read_fault(&cell), None);
-        let h = d.hidden;
-        let (mut worst, mut differ) = (0f32, 0);
-        for row in 0..rows {
-            let rr = row * h..(row + 1) * h;
-            let e = rel_err(&grouped[rr.clone()], &looped[rr.clone()]);
-            assert!(looped[rr.clone()].iter().any(|v| *v != 0.0), "row {row}: the loop produced zeros");
-            assert!(grouped[rr].iter().all(|v| v.is_finite()), "row {row}: non-finite grouped output");
-            assert!(e < 1e-2, "{} row {row} of {rows}: grouped vs loop rel err {e}", if nvfp4 { "nvfp4" } else { "bf16" });
-            worst = worst.max(e);
-            differ += (e > 0.0) as usize;
-        }
-        (worst, differ)
-    }
-
-    #[test]
-    fn grouped_matches_the_loop_on_nvfp4_experts() {
-        // 128 experts at 37 rows: mostly one- or two-row experts, a tile each;
-        // 16 experts: about 18 rows each, two tiles; one row: a decode step
-        for (e, rows) in [(128, 37), (16, 37), (128, 1)] {
-            let (worst, differ) = compare(&dims(2304, 1152, e, 8), true, rows, 0x9e37 + e as u64);
-            eprintln!("MOE nvfp4 E {e} rows {rows}: grouped vs loop worst row rel err {worst:.3e}, {differ} of {rows} rows differ");
-        }
-    }
-
-    #[test]
-    fn grouped_matches_the_loop_on_bf16_experts() {
-        for (e, rows) in [(128, 37), (16, 37), (128, 1)] {
-            let (worst, differ) = compare(&dims(2304, 1152, e, 8), false, rows, 0x7f4a + e as u64);
-            eprintln!("MOE bf16 E {e} rows {rows}: grouped vs loop worst row rel err {worst:.3e}, {differ} of {rows} rows differ");
-        }
     }
 
     /// The device top-k against `route_from_logits` on the same logits:
@@ -1173,7 +873,7 @@ mod tests {
         let xs = x(rows, d.hidden, 0x0bad);
         let route = b.route(&xs);
         let before_cell = fault_cell(&dev());
-        let before = host(b.experts_grouped(&xs, &route, &before_cell, false));
+        let before = host(b.experts_grouped(&xs, &route, &before_cell));
         assert_eq!(read_fault(&before_cell), None);
 
         let mut topk = f32s_of(&client, &route.topk);
@@ -1182,12 +882,12 @@ mod tests {
         topk[5 * w + w - 1] = 42.0;
         let faulted = with_topk(&client, &route, &topk);
         let a = fault_cell(&dev());
-        let _ = host(b.experts_grouped(&xs, &faulted, &a, false));
+        let _ = host(b.experts_grouped(&xs, &faulted, &a));
         assert_eq!(read_fault(&a), Some(42), "the faulted call's cell");
         assert_eq!(read_fault(&before_cell), None, "an earlier call's cell");
 
         let c = fault_cell(&dev());
-        let after = host(b.experts_grouped(&xs, &route, &c, false));
+        let after = host(b.experts_grouped(&xs, &route, &c));
         assert_eq!(read_fault(&c), None, "a later call's own cell");
         assert_eq!(read_fault(&a), Some(42), "a set cell stays set");
         let same = before.iter().zip(&after).filter(|(p, q)| p.to_bits() == q.to_bits()).count();
@@ -1216,7 +916,7 @@ mod tests {
         let xs = x(rows, d.hidden, 0x1157);
         let good = b.route(&xs);
         let good_cell = fault_cell(&dev());
-        let before = host(b.experts_grouped(&xs, &good, &good_cell, false));
+        let before = host(b.experts_grouped(&xs, &good, &good_cell));
         assert_eq!(read_fault(&good_cell), None);
 
         let mut logits = good.logits();
@@ -1262,7 +962,7 @@ mod tests {
             assert!(tok_cnt.iter().all(|c| *c as usize == k), "tok_cnt");
             assert!(row_src.iter().all(|v| *v >= -1 && (*v as i64) < rows as i64), "row_src");
             assert!(tile_slot.iter().all(|v| (*v as usize) < e || *v == NO_EXPERT), "tile_slot");
-            let out = host(b.experts_grouped(&xs, &bad, &cell, false));
+            let out = host(b.experts_grouped(&xs, &bad, &cell));
             let flag = read_fault(&cell);
             assert!(flag.is_some(), "round {round}: no fault recorded");
             let finite_rows = (0..rows).filter(|r| out[r * d.hidden..(r + 1) * d.hidden].iter().all(|v| v.is_finite())).count();
@@ -1275,7 +975,7 @@ mod tests {
         }
 
         let after_cell = fault_cell(&dev());
-        let after = host(b.experts_grouped(&xs, &good, &after_cell, false));
+        let after = host(b.experts_grouped(&xs, &good, &after_cell));
         assert_eq!(read_fault(&after_cell), None);
         let same = before.iter().zip(&after).filter(|(p, q)| p.to_bits() == q.to_bits()).count();
         assert_eq!(same, before.len(), "a finite call after the faulted ones changed");
@@ -1418,7 +1118,7 @@ mod tests {
         use crate::models::inkling::nvfp4::e4m3_to_f32;
         let client = client_of(&Tensor::<Bk, 1>::zeros([1], &dev()));
         let x = spread_rows(9, 1152, 0x88);
-        let got = client.read_one(qdq_mxfp8_bf16(&client, &bf16_handle(&client, &x), x.len())).unwrap();
+        let got = client.read_one(qdq_mxfp8_bf16(&client, &bf16_handle(&client, &x), 9, 1152)).unwrap();
         let got: Vec<f32> = got.chunks_exact(2).map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32()).collect();
         let mut bad = 0;
         for (bi, blk) in x.chunks_exact(32).enumerate() {
@@ -1451,54 +1151,156 @@ mod tests {
         deq * tensor_of(client, dev, a, n, 1)
     }
 
-    /// The trained NVFP4 lane against the per-expert loop fed the same
-    /// quantized activations (dequantized), W4A16: the same products up to
-    /// the BF16 rounding of `E2M1 * D * alpha`. Detects a wrong offset,
-    /// outer scale or row.
+    /// `x` through the MXFP8 activation rounding, as f32.
+    fn qdq_mx(x: Tensor<Bk, 2>) -> Tensor<Bk, 2> {
+        let [n, k] = x.dims();
+        let client = client_of(&x);
+        let dev = x.device();
+        let (h, _) = handle_of_any(x.cast(burn::tensor::FloatDType::BF16));
+        let h = qdq_mxfp8_bf16(&client, &h, n, k);
+        tensor_of_dt(client, dev, h, n, k, burn::tensor::DType::BF16).cast(burn::tensor::FloatDType::F32)
+    }
+
+    /// Expert `e` of `p` against `x`, alone: the dense GEMM on the expert's
+    /// slice of the stacked weights.
+    fn linear(b: &Bank, p: &Proj, e: usize, x: Tensor<Bk, 2>) -> Tensor<Bk, 2> {
+        use crate::models::inkling::burn::{PackedW, linear_bf16, linear_w4a16};
+        let slice = |h: &Handle, per: usize| {
+            h.clone().offset_start((e * per) as u64).offset_end(((b.experts - 1 - e) * per) as u64)
+        };
+        match &p.stack {
+            Stack::Nvfp4 { codes, scales, scale2, .. } => {
+                let w = PackedW {
+                    codes: slice(codes, p.n * p.k / 2),
+                    scales: slice(scales, p.n * p.k / GROUP),
+                    n: p.n,
+                    k: p.k,
+                    scale2: f32s_of(&b.client(), scale2)[e],
+                    swizzled: false,
+                };
+                linear_w4a16(x, &w)
+            }
+            Stack::Bf16 { w, .. } => {
+                linear_bf16(x, &Bf16W { h: slice(w, p.n * p.k * 2), n: p.n, k: p.k, align: 16 })
+            }
+        }
+    }
+
+    /// The grouped experts against one expert at a time, each fed the same
+    /// quantized activations (dequantized): the same operands up to the BF16
+    /// rounding of an NVFP4 value, in another GEMM. Detects a wrong offset,
+    /// outer scale, tile or row. Returns the worst row error.
+    fn compare(d: &Dims, nvfp4: bool, rows: usize, seed: u64, bound: f32) -> f32 {
+        let b = bank(d, nvfp4, seed);
+        let xs = x(rows, d.hidden, seed ^ 0x2222);
+        let route = b.route(&xs);
+        let picks = route.picks();
+        let cell = fault_cell(&dev());
+        let grouped = host(b.experts_grouped(&xs, &route, &cell));
+        let qdq = |t: Tensor<Bk, 2>| if nvfp4 { qdq46(t) } else { qdq_mx(t) };
+        let mut by_expert: std::collections::BTreeMap<usize, Vec<(usize, f32)>> = Default::default();
+        for (row, (es, ws)) in picks.iter().enumerate() {
+            for (&ex, &g) in es.iter().zip(ws) {
+                by_expert.entry(ex).or_default().push((row, g));
+            }
+        }
+        let mut looped = vec![0f32; rows * d.hidden];
+        for (&ex, rws) in &by_expert {
+            let idx: Vec<i64> = rws.iter().map(|&(r, _)| r as i64).collect();
+            let n = idx.len();
+            let xsel = xs.clone().select(0, Tensor::<Bk, 1, Int>::from_data(TensorData::new(idx, [n]), &dev()));
+            let xq = qdq(xsel);
+            let g = linear(&b, &b.gate, ex, xq.clone());
+            let u = linear(&b, &b.up, ex, xq);
+            let capped = |v: Tensor<Bk, 2>, c: f32| v.div_scalar(c).tanh().mul_scalar(c);
+            let a = capped(g.clone(), d.gate_softcap) * burn::tensor::activation::sigmoid(g) * capped(u, d.up_softcap);
+            let y = host(linear(&b, &b.down, ex, qdq(a)));
+            for (j, &(r, w)) in rws.iter().enumerate() {
+                for c in 0..d.hidden {
+                    looped[r * d.hidden + c] += w * y[j * d.hidden + c];
+                }
+            }
+        }
+        assert_eq!(read_fault(&cell), None);
+        let (mut worst, h) = (0f32, d.hidden);
+        for row in 0..rows {
+            let rr = row * h..(row + 1) * h;
+            assert!(looped[rr.clone()].iter().any(|v| *v != 0.0), "row {row}: the loop produced zeros");
+            assert!(grouped[rr.clone()].iter().all(|v| v.is_finite()), "row {row}: non-finite");
+            let err = rel_err(&grouped[rr.clone()], &looped[rr]);
+            assert!(err < bound, "row {row} of {rows}: grouped vs one expert at a time rel err {err}");
+            worst = worst.max(err);
+        }
+        worst
+    }
+
     #[test]
-    fn trained_grouped_matches_the_loop_on_quantized_activations() {
+    fn grouped_nvfp4_experts_match_one_at_a_time() {
+        // 128 experts at 37 rows: mostly one- or two-row experts, a tile each;
+        // 16 experts: about 18 rows each, two tiles; one row: a decode step
         for (e, rows) in [(128, 37), (16, 37), (128, 1)] {
-            let d = dims(2304, 1152, e, 8);
-            let b = bank(&d, true, 0x4646 + e as u64);
-            let xs = x(rows, d.hidden, 0x6464 + e as u64);
-            let route = b.route(&xs);
-            let picks = route.picks();
-            let cell = fault_cell(&dev());
-            let grouped = host(b.experts_grouped(&xs, &route, &cell, true));
-            let mut by_expert: std::collections::BTreeMap<usize, Vec<(usize, f32)>> = Default::default();
-            for (row, (es, ws)) in picks.iter().enumerate() {
-                for (&ex, &g) in es.iter().zip(ws) {
-                    by_expert.entry(ex).or_default().push((row, g));
+            let worst = compare(&dims(2304, 1152, e, 8), true, rows, 0x4646 + e as u64, 5e-2);
+            eprintln!("MOE trained nvfp4 E {e} rows {rows}: grouped vs one at a time worst row rel err {worst:.3e}");
+        }
+    }
+
+    #[test]
+    fn grouped_mxfp8_experts_match_one_at_a_time() {
+        for (e, rows) in [(128, 37), (16, 37), (128, 1)] {
+            let worst = compare(&dims(2304, 1152, e, 8), false, rows, 0x7f4a + e as u64, 1e-2);
+            eprintln!("MOE trained mxfp8 E {e} rows {rows}: grouped vs one at a time worst row rel err {worst:.3e}");
+        }
+    }
+
+    /// Tiles no expert owns: two equal rows share their eight experts, so
+    /// eight of the sixteen planned tiles are owned and eight are not. The
+    /// down projection's input is poisoned before the SwiGLU writes it, and
+    /// `g` and `u` are poisoned on the unowned rows, which no GEMM writes.
+    /// Both down quantizers read every row, so every row must be defined: zero
+    /// on the unowned tiles, hence a zero outer scale, zero codes and scales
+    /// and zero MXFP8 values. The owned tiles must not be.
+    #[test]
+    fn tiles_no_expert_owns_reach_the_down_quantizers_as_zeros() {
+        let d = dims(2304, 1152, 128, 8);
+        let (i, rows) = (d.inter, 2);
+        let b = bank(&d, true, 0x0f0f);
+        let client = b.client();
+        let one = x(1, d.hidden, 0x77);
+        let xs = Tensor::cat(vec![one.clone(), one], 0);
+        let route = b.route(&xs);
+        let plan = b.plan(&client, &route, &fault_cell(&dev()));
+        let m = plan.max_tiles * MTILE;
+        let slots = u32s_of(&client, &plan.tile_slot);
+        let unowned = |row: usize| slots[row / MTILE] == NO_EXPERT;
+        let owned_tiles = slots.iter().filter(|s| **s != NO_EXPERT).count();
+        assert_eq!((plan.max_tiles, owned_tiles), (16, 8), "the plan this test is about");
+
+        let mut r = Rng(0x5a5a);
+        let poison = |row: usize, v: f32| if unowned(row) { 1e30 } else { v };
+        let gu: Vec<f32> = (0..m * i).map(|p| poison(p / i, r.f(2.0))).collect();
+        let ones = client.create_from_slice(f32::as_bytes(&vec![1f32; m]));
+        for scaled in [true, false] {
+            let g = client.create_from_slice(f32::as_bytes(&gu));
+            let s = bf16_handle(&client, &vec![3.0e5f32; m * i]);
+            b.swiglu(&client, g.clone(), g, scaled.then_some(&ones), &plan, &s);
+            let bytes = client.read_one(s.clone()).unwrap();
+            let sv: Vec<f32> = bytes.chunks_exact(2).map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32()).collect();
+            let (codes, scales, alpha) = quantize_nvfp4_46_bf16(&client, &s, m, i);
+            let (codes, scales, alpha) = (client.read_one(codes).unwrap(), client.read_one(scales).unwrap(), f32s_of(&client, &alpha));
+            let mx = client.read_one(qdq_mxfp8_bf16(&client, &s, m, i)).unwrap();
+            let row = |v: &[u8], at: usize, per: usize| v[at * per..(at + 1) * per].iter().any(|b| *b != 0);
+            let mut undefined = 0;
+            for at in 0..m {
+                let live = sv[at * i..(at + 1) * i].iter().any(|v| *v != 0.0);
+                let quantized = alpha[at] != 0.0 || row(&codes, at, i / 2) || row(&scales, at, i / GROUP) || row(&mx, at, i * 2);
+                if unowned(at) {
+                    undefined += (live || quantized) as usize;
+                } else {
+                    assert!(live && quantized && alpha[at] > 0.0, "owned row {at} is zero");
                 }
             }
-            let mut looped = vec![0f32; rows * d.hidden];
-            for (&ex, rws) in &by_expert {
-                let idx: Vec<i64> = rws.iter().map(|&(r, _)| r as i64).collect();
-                let n = idx.len();
-                let xsel = xs.clone().select(0, Tensor::<Bk, 1, Int>::from_data(TensorData::new(idx, [n]), &dev()));
-                let ew = &b.loop_experts[ex];
-                let xq = qdq46(xsel);
-                let g = ew.gate.linear(xq.clone(), ExpertAct::Bf16);
-                let u = ew.up.linear(xq, ExpertAct::Bf16);
-                let capped = |v: Tensor<Bk, 2>, c: f32| v.div_scalar(c).tanh().mul_scalar(c);
-                let a = capped(g.clone(), d.gate_softcap) * burn::tensor::activation::sigmoid(g) * capped(u, d.up_softcap);
-                let y = host(ew.down.linear(qdq46(a), ExpertAct::Bf16));
-                for (j, &(r, w)) in rws.iter().enumerate() {
-                    for c in 0..d.hidden {
-                        looped[r * d.hidden + c] += w * y[j * d.hidden + c];
-                    }
-                }
-            }
-            assert_eq!(read_fault(&cell), None);
-            let (mut worst, h) = (0f32, d.hidden);
-            for row in 0..rows {
-                let rr = row * h..(row + 1) * h;
-                assert!(grouped[rr.clone()].iter().all(|v| v.is_finite()), "row {row}: non-finite");
-                let err = rel_err(&grouped[rr.clone()], &looped[rr]);
-                assert!(err < 5e-2, "E {e} row {row} of {rows}: trained grouped vs quantized loop rel err {err}");
-                worst = worst.max(err);
-            }
-            eprintln!("MOE trained E {e} rows {rows}: grouped vs quantized loop worst row rel err {worst:.3e}");
+            eprintln!("MOE unowned tiles, scaled {scaled}: {undefined} of {} unowned rows undefined", m - owned_tiles * MTILE);
+            assert_eq!(undefined, 0, "unowned rows reached the down quantizers undefined");
         }
     }
 

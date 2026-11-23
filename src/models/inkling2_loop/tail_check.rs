@@ -38,7 +38,7 @@ use crate::models::inkling2_loop::config::{AttnKind, Inkling2LoopTextConfig};
 use crate::models::inkling2_loop::full::FullLayer;
 use crate::models::inkling2_loop::head::{self, Head, HeadOut};
 use crate::models::inkling2_loop::layout::Dtype;
-use crate::models::inkling2_loop::sliding::{ExpertAct, SlidingLayer, State, Stored, Taps, Weights};
+use crate::models::inkling2_loop::sliding::{SlidingLayer, State, Stored, Taps, Weights};
 
 /// A pass is within this many times upstream's own bf16-vs-f32 spread.
 pub const TOL: f64 = 1.5;
@@ -257,14 +257,14 @@ impl Bound {
         match self {
             Bound::Sliding(l) => {
                 let mut st = State::new(&l.dims, &dev);
-                let (out, taps) = l.forward(x, blocks, &mut st, ExpertAct::Bf16);
+                let (out, taps) = l.forward(x, blocks, &mut st);
                 assert!(taps.gates.is_none(), "a post-loop layer reads no messages");
                 let (rows, sets) = tap_rows(taps, host(out.clone()));
                 (out, rows, sets)
             }
             Bound::Full(l) => {
                 let mut st = State::new(&l.dims, &dev);
-                let (out, taps) = l.forward_at(x, blocks, &mut st, ExpertAct::Bf16, origin);
+                let (out, taps) = l.forward_at(x, blocks, &mut st, origin);
                 let [q, k, v] = taps.inputs;
                 let (mut rows, sets) = tap_rows(taps.rest, host(out.clone()));
                 rows.extend([("q_in", host(q)), ("k_in", host(k)), ("v_in", host(v))]);

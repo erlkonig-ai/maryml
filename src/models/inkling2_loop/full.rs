@@ -61,7 +61,7 @@ use crate::models::inkling2_loop::attend::{AttnShape, QUERY_TILE, attend};
 use crate::models::inkling2_loop::config::{AttnKind, Inkling2LoopTextConfig};
 use crate::models::inkling2_loop::layout::{AttnPart, ConvPart, Dtype, LayerPart, Slot};
 use crate::models::inkling2_loop::sliding::{
-    Dev, Dims, ExpertAct, STREAMS, State, Taps, Weights, bf16_to_f32, bind_bank, bind_gates,
+    Dev, Dims, STREAMS, State, Taps, Weights, bf16_to_f32, bind_bank, bind_gates,
     block_attention, conv_step, f32_le, l2_clip, rms_norm, unit_rms, want,
 };
 use crate::models::inkling2_loop::messages::{DeviceGate, message_tensor};
@@ -215,9 +215,8 @@ impl FullLayer {
         x: Tensor<Bk, 2>,
         blocks: &mut Vec<Tensor<Bk, 2>>,
         state: &mut State,
-        act: ExpertAct,
     ) -> (Tensor<Bk, 2>, FullTaps) {
-        self.forward_at(x, blocks, state, act, 0)
+        self.forward_at(x, blocks, state, 0)
     }
 
     /// [`Self::forward`] for a sequence whose first cached row sits at absolute
@@ -229,10 +228,9 @@ impl FullLayer {
         x: Tensor<Bk, 2>,
         blocks: &mut Vec<Tensor<Bk, 2>>,
         state: &mut State,
-        act: ExpertAct,
         origin: usize,
     ) -> (Tensor<Bk, 2>, FullTaps) {
-        self.forward_visit(x, blocks, state, act, origin, None)
+        self.forward_visit(x, blocks, state, origin, None)
     }
 
     /// [`Self::forward_at`], with the four messages `[t, 4, H]` (Q, K, V, MLP)
@@ -244,7 +242,6 @@ impl FullLayer {
         x: Tensor<Bk, 2>,
         blocks: &mut Vec<Tensor<Bk, 2>>,
         state: &mut State,
-        act: ExpertAct,
         origin: usize,
         messages: Option<&Tensor<Bk, 3>>,
     ) -> (Tensor<Bk, 2>, FullTaps) {
@@ -290,7 +287,7 @@ impl FullLayer {
         };
         let mn = rms_norm(mlp_in, self.mlp_norm.clone(), d.eps);
 
-        let (acc, route) = self.moe.forward(&d, &mn, act, state.fault());
+        let (acc, route) = self.moe.forward(&mn, state.fault());
         let mlp_conv = conv_step(&mut state.conv[3], acc.clone(), &self.mlp_sconv, d.conv_scale());
         state.pos += t;
         let out = residual + mlp_conv.clone();

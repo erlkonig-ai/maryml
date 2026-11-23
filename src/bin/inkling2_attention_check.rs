@@ -30,7 +30,7 @@ use std::time::Instant;
 use burn::prelude::*;
 use mary::model_collection::parse_collection_handle;
 use mary::models::inkling::seam::{Bk, client_of, pool_reserved};
-use mary::models::inkling2_loop::session::{MiniModel, MiniOptions, MiniSession, Rows};
+use mary::models::inkling2_loop::session::{MiniModel, MiniSession, Rows};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use triblespace::prelude::Id;
@@ -94,7 +94,7 @@ fn run(args: &[String]) {
 
     let (gpu0, avail0) = (gpu_mib(), mem_available_mib());
     let t0 = Instant::now();
-    let model = Arc::new(MiniModel::open(pile.as_ref(), collection, root, MiniOptions::default()).expect("open the model"));
+    let model = Arc::new(MiniModel::open(pile.as_ref(), collection, root).expect("open the model"));
     let bind_s = t0.elapsed().as_secs_f64();
     let client = client_of(&Tensor::<Bk, 1>::zeros([1], &Default::default()));
     let (gpu1, avail1, pool1) = (gpu_mib(), mem_available_mib(), pool_reserved(&client));

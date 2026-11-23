@@ -29,7 +29,7 @@ use mary::models::inkling::seam::Bk;
 use mary::models::inkling2_loop::Inkling2LoopConfig;
 use mary::models::inkling2_loop::full::{FullLayer, FullTaps};
 use mary::models::inkling2_loop::layout::Dtype;
-use mary::models::inkling2_loop::sliding::{ExpertAct, State, Stored, Taps, Weights};
+use mary::models::inkling2_loop::sliding::{State, Stored, Taps, Weights};
 
 /// A pass is within this many times upstream's own bf16-vs-f32 spread.
 const TOL: f64 = 1.5;
@@ -221,9 +221,9 @@ fn main() {
             let (x, mut blocks) = input(scen, "whole");
             let n = x.dims()[0];
             let mut state = State::new(&layer.dims, &dev);
-            let (out, taps) = layer.forward_at(x, &mut blocks, &mut state, ExpertAct::Bf16, at);
+            let (out, taps) = layer.forward_at(x, &mut blocks, &mut state, at);
             let (rows, _, _) = tap_rows(taps, out);
-            let tag = format!("w4a16:{scen}:whole");
+            let tag = format!("{scen}:whole");
             for (name, v) in rows {
                 let a = ref_t("bf16", &format!("{scen}.whole.{name}"));
                 let b = ref_t("f32", &format!("{scen}.whole.{name}"));
@@ -238,58 +238,55 @@ fn main() {
                 }
             }
         }
-        for act in [ExpertAct::Bf16, ExpertAct::Nvfp4] {
-            let gated = act == ExpertAct::Bf16;
-            let mut state = State::new(&layer.dims, &dev);
-            for phase in ["prefill", "step"] {
-                let tag = format!("{}:{scen}:{phase}", if gated { "w4a16" } else { "w4a4" });
-                let (x, mut blocks) = input(scen, phase);
-                let t1 = std::time::Instant::now();
-                let (out, taps) = layer.forward_at(x, &mut blocks, &mut state, act, at);
-                let (rows, router_logits, routing) = tap_rows(taps, out);
-                let ms = t1.elapsed().as_secs_f64() * 1e3;
-                let g = |n: &str| (ref_t("bf16", &format!("{scen}.{phase}.{n}")), ref_t("f32", &format!("{scen}.{phase}.{n}")));
-                for (name, v) in rows {
-                    let (a, b) = g(name);
-                    rep.row(&tag, name, &v, &a, &b, gated);
-                }
-                let (a, b) = g("router_logits");
-                rep.row(&tag, "router_logits", &router_logits, &a, &b, gated);
-                let st = |n: &str, conv: bool| {
-                    let f = |run: &str| {
-                        let (shape, v) = r.f32s(&format!("{run}.{scen}.{phase}.{n}"));
-                        if conv { conv_to_rows(&shape, &v) } else { heads_to_rows(&shape, &v) }
-                    };
-                    (f("bf16"), f("f32"))
-                };
-                let (a, b) = st("k", false);
-                rep.row(&tag, "state k", &host(state.kv.keys().unwrap()), &a, &b, gated);
-                let (a, b) = st("v", false);
-                rep.row(&tag, "state v", &host(state.kv.values().unwrap()), &a, &b, gated);
-                for i in 0..4 {
-                    let (a, b) = st(&format!("conv{i}"), true);
-                    rep.row(&tag, &format!("state conv{i}"), &host(state.conv[i].clone()), &a, &b, gated);
-                }
-                let rset = |run: &str| -> Vec<BTreeSet<i32>> {
-                    r.i32s(&format!("{run}.{scen}.{phase}.router_indices"))
-                        .chunks(t.num_experts_per_tok)
-                        .map(|c| c.iter().copied().collect())
-                        .collect()
-                };
-                let (r16, r32) = (rset("bf16"), rset("f32"));
-                let ours: Vec<BTreeSet<i32>> =
-                    routing.iter().map(|(e, _)| e.iter().map(|&x| x as i32).collect()).collect();
-                let overlap = |a: &[BTreeSet<i32>], b: &[BTreeSet<i32>]| -> usize {
-                    a.iter().zip(b).map(|(x, y)| x.intersection(y).count()).sum()
-                };
-                let total = ours.len() * t.num_experts_per_tok;
-                rep.note(format!(
-                    "{tag:18} routing        shared experts with f32 {}/{total}, with bf16 {}/{total}  (upstream bf16 vs f32 {}/{total})  [{ms:.0} ms]",
-                    overlap(&ours, &r32),
-                    overlap(&ours, &r16),
-                    overlap(&r16, &r32),
-                ));
+        let mut state = State::new(&layer.dims, &dev);
+        for phase in ["prefill", "step"] {
+            let tag = format!("cached:{scen}:{phase}");
+            let (x, mut blocks) = input(scen, phase);
+            let t1 = std::time::Instant::now();
+            let (out, taps) = layer.forward_at(x, &mut blocks, &mut state, at);
+            let (rows, router_logits, routing) = tap_rows(taps, out);
+            let ms = t1.elapsed().as_secs_f64() * 1e3;
+            let g = |n: &str| (ref_t("bf16", &format!("{scen}.{phase}.{n}")), ref_t("f32", &format!("{scen}.{phase}.{n}")));
+            for (name, v) in rows {
+                let (a, b) = g(name);
+                rep.row(&tag, name, &v, &a, &b, true);
             }
+            let (a, b) = g("router_logits");
+            rep.row(&tag, "router_logits", &router_logits, &a, &b, true);
+            let st = |n: &str, conv: bool| {
+                let f = |run: &str| {
+                    let (shape, v) = r.f32s(&format!("{run}.{scen}.{phase}.{n}"));
+                    if conv { conv_to_rows(&shape, &v) } else { heads_to_rows(&shape, &v) }
+                };
+                (f("bf16"), f("f32"))
+            };
+            let (a, b) = st("k", false);
+            rep.row(&tag, "state k", &host(state.kv.keys().unwrap()), &a, &b, true);
+            let (a, b) = st("v", false);
+            rep.row(&tag, "state v", &host(state.kv.values().unwrap()), &a, &b, true);
+            for i in 0..4 {
+                let (a, b) = st(&format!("conv{i}"), true);
+                rep.row(&tag, &format!("state conv{i}"), &host(state.conv[i].clone()), &a, &b, true);
+            }
+            let rset = |run: &str| -> Vec<BTreeSet<i32>> {
+                r.i32s(&format!("{run}.{scen}.{phase}.router_indices"))
+                    .chunks(t.num_experts_per_tok)
+                    .map(|c| c.iter().copied().collect())
+                    .collect()
+            };
+            let (r16, r32) = (rset("bf16"), rset("f32"));
+            let ours: Vec<BTreeSet<i32>> =
+                routing.iter().map(|(e, _)| e.iter().map(|&x| x as i32).collect()).collect();
+            let overlap = |a: &[BTreeSet<i32>], b: &[BTreeSet<i32>]| -> usize {
+                a.iter().zip(b).map(|(x, y)| x.intersection(y).count()).sum()
+            };
+            let total = ours.len() * t.num_experts_per_tok;
+            rep.note(format!(
+                "{tag:18} routing        shared experts with f32 {}/{total}, with bf16 {}/{total}  (upstream bf16 vs f32 {}/{total})  [{ms:.0} ms]",
+                overlap(&ours, &r32),
+                overlap(&ours, &r16),
+                overlap(&r16, &r32),
+            ));
         }
     }
     // the log scale must matter at the far origin, or the far rows test nothing

@@ -701,9 +701,11 @@ pub fn fp4_linear_grouped_launch_as<O: Scalar + Cast + CubeElement, R: Runtime>(
 /// [`fp4_linear_grouped_launch_as`] with the codes and the block scales in two
 /// buffers, each `(handle, bytes)`: `off[2 * slot]` is a byte offset into the
 /// first and `off[2 * slot + 1]` into the second. A single registered mapping
-/// is the case where both are the same buffer.
+/// is the case where both are the same buffer. Crate-private: the lengths are
+/// the caller's, so the callers are the two that derive them from the weights
+/// they bound.
 #[allow(clippy::too_many_arguments)]
-pub fn fp4_linear_grouped_planes_launch_as<O: Scalar + Cast + CubeElement, R: Runtime>(
+pub(crate) fn fp4_linear_grouped_planes_launch_as<O: Scalar + Cast + CubeElement, R: Runtime>(
     client: &ComputeClient<R>,
     swz: bool,
     a: &Handle,
@@ -730,6 +732,13 @@ pub fn fp4_linear_grouped_planes_launch_as<O: Scalar + Cast + CubeElement, R: Ru
         0,
         "the scale row {} is not a whole number of {SCALE_VEC}-wide vectors",
         k / GROUP
+    );
+
+    assert!(
+        codes_bytes as u64 <= codes.size_in_used() && b_sc_bytes as u64 <= b_sc.size_in_used(),
+        "{codes_bytes} code bytes and {b_sc_bytes} scale bytes declared of buffers holding {} and {}",
+        codes.size_in_used(),
+        b_sc.size_in_used()
     );
 
     // How many N tiles one plane keeps in registers; see [`grouped_nrep`].

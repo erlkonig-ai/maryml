@@ -41,7 +41,7 @@ use mary::models::inkling2_loop::layout::{LayerPart, Slot};
 use mary::models::inkling2_loop::loop_core::{Core, CoreState, PassOut, Plant};
 use mary::models::inkling2_loop::pile::MiniRoot;
 use mary::models::inkling2_loop::schedule::CacheId;
-use mary::models::inkling2_loop::sliding::{ExpertAct, State, Taps, Weights};
+use mary::models::inkling2_loop::sliding::{State, Taps, Weights};
 use triblespace::prelude::Id;
 
 /// A tensor is within this many times upstream's own bf16-vs-f32 spread.
@@ -277,7 +277,7 @@ fn main() {
         let mut visits = Vec::new();
         let mut hook = |id: CacheId, out: &Tensor<Bk, 2>, taps: Taps, m: Option<&Tensor<Bk, 3>>| visits.push(seen(id, out, taps, m));
         let t1 = std::time::Instant::now();
-        let passes = core.forward(rows(x, n), &blocks, state, ExpertAct::Bf16, 0, plant, Some(&mut hook));
+        let passes = core.forward(rows(x, n), &blocks, state, 0, plant, Some(&mut hook));
         println!("{phase}{}: {n} rows through 36 visits in {:.0} ms", plant.map(|p| format!(" planted {p:?}")).unwrap_or_default(), t1.elapsed().as_secs_f64() * 1e3);
         (passes, visits)
     };

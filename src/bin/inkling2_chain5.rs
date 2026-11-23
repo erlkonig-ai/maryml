@@ -32,7 +32,7 @@ use mary::models::inkling2_loop::Inkling2LoopConfig;
 use mary::models::inkling2_loop::full::{FullLayer, FullTaps};
 use mary::models::inkling2_loop::layout::{LayerPart, Slot};
 use mary::models::inkling2_loop::pile::MiniRoot;
-use mary::models::inkling2_loop::sliding::{ExpertAct, SlidingLayer, State, Taps, Weights};
+use mary::models::inkling2_loop::sliding::{SlidingLayer, State, Taps, Weights};
 use triblespace::prelude::Id;
 
 /// A pass is within this many times upstream's own bf16-vs-f32 spread.
@@ -199,7 +199,7 @@ impl Chain {
         s
     }
 
-    fn run(&self, x: Tensor<Bk, 2>, states: &mut [State], act: ExpertAct) -> Pass {
+    fn run(&self, x: Tensor<Bk, 2>, states: &mut [State]) -> Pass {
         let t1 = std::time::Instant::now();
         let (mut inputs, mut outs) = (Vec::new(), Vec::new());
         let mut blocks = Vec::new();
@@ -207,7 +207,7 @@ impl Chain {
         let mut x = x;
         for (l, layer) in self.sliding.iter().enumerate() {
             inputs.push(host(x.clone()));
-            let (y, taps) = layer.forward(x, &mut blocks, &mut states[l], act);
+            let (y, taps) = layer.forward(x, &mut blocks, &mut states[l]);
             x = y;
             layer_logits.push(taps.route.logits());
             layer_experts.push(taps.route.picks().into_iter().map(|(e, _)| e).collect());
@@ -215,7 +215,7 @@ impl Chain {
         }
         inputs.push(host(x.clone()));
         let block_rows: Vec<Vec<f32>> = blocks.iter().map(|b| host(b.clone())).collect();
-        let (out, taps) = self.full.forward(x, &mut blocks, &mut states[FULL], act);
+        let (out, taps) = self.full.forward(x, &mut blocks, &mut states[FULL]);
         let out = host(out);
         outs.push(out.clone());
         let FullTaps { inputs: [qi, ki, vi], rest } = taps;
@@ -421,40 +421,34 @@ fn main() {
     // the prompt and the step token as one prefill, no carried state: the
     // reference the cached step is held to
     let mut states = chain.states(&dev);
-    let whole = chain.run(embed_rows(&whole_ids), &mut states, ExpertAct::Bf16);
-    compare(&mut rep, "w4a16:whole", "whole", &whole, true);
-    routing(&mut rep, "w4a16:whole", "whole", &whole);
+    let whole = chain.run(embed_rows(&whole_ids), &mut states);
+    compare(&mut rep, "whole", "whole", &whole, true);
+    routing(&mut rep, "whole", "whole", &whole);
 
-    for act in [ExpertAct::Bf16, ExpertAct::Nvfp4] {
-        // W4A16 is what upstream computes and is gated; the NVFP4 activation
-        // lane is the checkpoint's declared runtime and is reported
-        let gated = act == ExpertAct::Bf16;
-        let lane = if gated { "w4a16" } else { "w4a4" };
-        let mut states = chain.states(&dev);
-        for (phase, ids) in [("prefill", &prompt), ("step", &step)] {
-            let tag = format!("{lane}:{phase}");
-            let p = chain.run(embed_rows(ids), &mut states, act);
-            compare(&mut rep, &tag, phase, &p, gated);
-            routing(&mut rep, &tag, phase, &p);
-            caches(&mut rep, &tag, phase, &states, gated);
-            if gated && phase == "step" {
-                // the cached step against the replay, Mary against Mary and upstream against upstream
-                let n = whole_ids.len();
-                for l in [0, FULL] {
-                    let last = |v: &[f32]| v[(n - 1) * h..].to_vec();
-                    let ours = rel_l2(&p.outs[l], &last(&whole.outs[l]));
-                    let up = rel_l2(
-                        &ref_t("f32", &format!("step.layer{l}.out")),
-                        &last(&ref_t("f32", &format!("whole.layer{l}.out"))),
-                    );
-                    let up16 = rel_l2(
-                        &ref_t("bf16", &format!("step.layer{l}.out")),
-                        &last(&ref_t("bf16", &format!("whole.layer{l}.out"))),
-                    );
-                    rep.lines.push(format!(
-                        "cached step vs whole-prefill last row, layer{l} out: Mary {ours:.3e}, upstream f32 {up:.3e}, upstream bf16 {up16:.3e}"
-                    ));
-                }
+    let mut states = chain.states(&dev);
+    for (phase, ids) in [("prefill", &prompt), ("step", &step)] {
+        let tag = format!("cached:{phase}");
+        let p = chain.run(embed_rows(ids), &mut states);
+        compare(&mut rep, &tag, phase, &p, true);
+        routing(&mut rep, &tag, phase, &p);
+        caches(&mut rep, &tag, phase, &states, true);
+        if phase == "step" {
+            // the cached step against the replay, Mary against Mary and upstream against upstream
+            let n = whole_ids.len();
+            for l in [0, FULL] {
+                let last = |v: &[f32]| v[(n - 1) * h..].to_vec();
+                let ours = rel_l2(&p.outs[l], &last(&whole.outs[l]));
+                let up = rel_l2(
+                    &ref_t("f32", &format!("step.layer{l}.out")),
+                    &last(&ref_t("f32", &format!("whole.layer{l}.out"))),
+                );
+                let up16 = rel_l2(
+                    &ref_t("bf16", &format!("step.layer{l}.out")),
+                    &last(&ref_t("bf16", &format!("whole.layer{l}.out"))),
+                );
+                rep.lines.push(format!(
+                    "cached step vs whole-prefill last row, layer{l} out: Mary {ours:.3e}, upstream f32 {up:.3e}, upstream bf16 {up16:.3e}"
+                ));
             }
         }
     }
@@ -480,10 +474,10 @@ fn main() {
             };
             let out = if l == FULL {
                 let mut st = State::new(&chain.full.dims, &dev);
-                host(chain.full.forward(x, &mut blocks, &mut st, ExpertAct::Bf16).0)
+                host(chain.full.forward(x, &mut blocks, &mut st).0)
             } else {
                 let mut st = State::new(&chain.sliding[l].dims, &dev);
-                host(chain.sliding[l].forward(x, &mut blocks, &mut st, ExpertAct::Bf16).0)
+                host(chain.sliding[l].forward(x, &mut blocks, &mut st).0)
             };
             let b = ref_t("f32", &format!("{phase}.layer{l}.out"));
             let a = ref_t("bf16", &format!("{phase}.layer{l}.out"));

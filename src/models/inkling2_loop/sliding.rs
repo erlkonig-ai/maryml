@@ -35,7 +35,7 @@
 //! run on the device ([`DeviceGate`]), over all of a call's tokens at once.
 //!
 //! What is Mary's here: the BF16 projections ([`linear_bf16`]), the NVFP4
-//! expert GEMMs ([`linear_fp4`] / [`linear_w4a16`] over [`PackedW`]), the short
+//! and MXFP8 expert GEMMs ([`super::moe`]), the short
 //! convolution kernel ([`short_conv_window`], which is upstream's `x + conv(x)`
 //! before the `1 / sqrt(k + 1)` Mini adds), [`rms_norm`], and the router's
 //! selection rule ([`route_from_logits`] with no shared experts, which is
@@ -70,7 +70,7 @@ use burn::tensor::TensorData;
 
 use crate::models::inkling::bf16gemm::Bf16W;
 use crate::models::inkling::burn::{
-    PackedW, linear_bf16, linear_fp4, linear_w4a16, short_conv_window,
+    linear_bf16, short_conv_window,
 };
 use crate::models::inkling::seam::{Bk, client_of};
 use crate::models::inkling2_loop::prof;
@@ -124,65 +124,6 @@ pub(super) fn f32_le(bytes: &[u8]) -> Vec<f32> {
         .chunks_exact(4)
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .collect()
-}
-
-/// Which activation the routed experts multiply.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExpertAct {
-    /// NVFP4 activations, as `hf_quant_config.json` declares, but quantised by
-    /// Mary's `amax / 6` rule, not the declared `fouroversix_mae`.
-    Nvfp4,
-    /// BF16 activations against the same NVFP4 weights: what transformers
-    /// 046bdb8c computes (it dequantises the weights and quantises nothing).
-    Bf16,
-    /// The precision the experts were trained in, on the grouped lane: on
-    /// NVFP4 layers both operands are NVFP4, the activations quantised per
-    /// token with Four Over Six (`fp4quant::quantize_nvfp4_46_bf16`), as
-    /// `hf_quant_config.json` declares; on MXFP8 layers the activations are
-    /// MXFP8 (`fp4quant::qdq_mxfp8_bf16`) against the exactly decoded weights.
-    Trained,
-}
-
-/// One matrix of a routed expert, in the format it binds as.
-pub(super) enum ExpertW {
-    /// NVFP4 codes and scales, multiplied by [`linear_fp4`] or [`linear_w4a16`].
-    Nvfp4(PackedW),
-    /// MXFP8 weights decoded to BF16 on the host (exact: an E4M3 value times
-    /// a power of two is a BF16), multiplied by [`linear_bf16`].
-    Bf16(Bf16W),
-}
-
-impl ExpertW {
-    pub(super) fn linear(&self, x: Tensor<Bk, 2>, act: ExpertAct) -> Tensor<Bk, 2> {
-        match (self, act) {
-            (ExpertW::Nvfp4(p), ExpertAct::Nvfp4) => linear_fp4(x, p),
-            (ExpertW::Nvfp4(p), ExpertAct::Bf16) => linear_w4a16(x, p),
-            (_, ExpertAct::Trained) => panic!("the trained expert precision runs on the grouped lane only"),
-            // `ExpertAct` chooses only for NVFP4. MXFP8 experts always see
-            // BF16 activations: transformers 046bdb8c dequantises the weights
-            // and quantises no activation; the declared `mxfp8_e4m3`
-            // activation quantisation is not implemented here.
-            (ExpertW::Bf16(w), _) => linear_bf16(x, w),
-        }
-    }
-}
-
-pub(super) struct Expert {
-    pub(super) gate: ExpertW,
-    pub(super) up: ExpertW,
-    pub(super) down: ExpertW,
-}
-
-impl Expert {
-    /// Upstream's `Inkling2LoopSoftcappedSwiGLU` expert: the sigmoid sees the
-    /// raw gate, the softcaps bound the linear gate factor and `up`.
-    pub(super) fn forward(&self, d: &Dims, x: Tensor<Bk, 2>, act: ExpertAct) -> Tensor<Bk, 2> {
-        let g = self.gate.linear(x.clone(), act);
-        let u = self.up.linear(x, act);
-        let capped = |v: Tensor<Bk, 2>, c: f32| v.div_scalar(c).tanh().mul_scalar(c);
-        let a = capped(g.clone(), d.gate_softcap) * sigmoid(g) * capped(u, d.up_softcap);
-        self.down.linear(a, act)
-    }
 }
 
 /// The fixed sizes of a sliding layer.
@@ -424,9 +365,8 @@ impl SlidingLayer {
         x: Tensor<Bk, 2>,
         blocks: &mut Vec<Tensor<Bk, 2>>,
         state: &mut State,
-        act: ExpertAct,
     ) -> (Tensor<Bk, 2>, Taps) {
-        self.forward_visit(x, blocks, state, act, None)
+        self.forward_visit(x, blocks, state, None)
     }
 
     /// [`Self::forward`], with the four messages `[t, 4, H]` (Q, K, V, MLP)
@@ -438,7 +378,6 @@ impl SlidingLayer {
         x: Tensor<Bk, 2>,
         blocks: &mut Vec<Tensor<Bk, 2>>,
         state: &mut State,
-        act: ExpertAct,
         messages: Option<&Tensor<Bk, 3>>,
     ) -> (Tensor<Bk, 2>, Taps) {
         let d = self.dims;
@@ -488,7 +427,7 @@ impl SlidingLayer {
         };
         let mn = rms_norm(mlp_in, self.mlp_norm.clone(), d.eps);
 
-        let (acc, route) = self.moe.forward(&d, &mn, act, state.fault());
+        let (acc, route) = self.moe.forward(&mn, state.fault());
         let mlp_conv = conv_step(&mut state.conv[3], acc.clone(), &self.mlp_sconv, d.conv_scale());
         state.pos += t;
         let out = residual + mlp_conv.clone();
