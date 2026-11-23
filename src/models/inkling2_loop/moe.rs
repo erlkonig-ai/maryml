@@ -6,7 +6,7 @@
 //! and build a `BTreeMap` of rows per expert, then about 120 iterations of
 //! `select`, gate, up, the softcapped SwiGLU, down, a weight multiply and a
 //! `select_assign`, each a handful of launches. Profiled on sky at a
-//! 4,096-token chunk (liora-kufuz-razor, 2026-11-23): 7-8 s of the loop, 3.9 s
+//! 4,096-token chunk (a profile of 2026-11-23): 7-8 s of the loop, 3.9 s
 //! of router download and 2.0 s of host routing per chunk.
 //!
 //! Here one visit is a fixed sequence of launches, whatever the routing:
