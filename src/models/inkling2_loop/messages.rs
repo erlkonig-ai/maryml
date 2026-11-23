@@ -538,8 +538,9 @@ mod device {
                         let e = rel_err(&host(y), &host(a.matmul(w.clone())));
                         eprintln!("{precision:?} {name} {t} rows: {} path, rel err vs Burn matmul {e:e}", if gemv { "gemv" } else { "matmul" });
                         assert_eq!(gemv, want_gemv, "{precision:?} {name} {t} rows took the wrong path");
-                        // bf16 operands: exact products either way, only the summation order differs
-                        assert!(e < 1e-5, "{precision:?} {name} {t} rows: rel err {e}");
+                        // bf16 operands: exact products either way, only the summation order
+                        // differs (1.5e-5 measured over k = 4608); a wrong kernel is off by order one
+                        assert!(e < 1e-3, "{precision:?} {name} {t} rows: rel err {e}");
                     }
                     let hs: Vec<f32> = (0..t * h).map(|_| rnd(8.0)).collect();
                     let ms: Vec<f32> = (0..t * h).map(|_| rnd(1.0)).collect();

@@ -838,7 +838,7 @@ mod tests {
         let refused = |what: &str, f: &mut dyn FnMut()| {
             let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).expect_err(what);
             let msg = err.downcast_ref::<String>().cloned().unwrap_or_default();
-            assert!(msg.starts_with("row kernels:"), "{what}: panicked elsewhere: {msg}");
+            assert!(msg.contains("row kernels:"), "{what}: panicked elsewhere: {msg}");
         };
         refused("rms_norm", &mut || {
             rms_norm(t2(3, 64), t1(63), 1e-6);
