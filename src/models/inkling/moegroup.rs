@@ -693,6 +693,31 @@ pub fn fp4_linear_grouped_launch_as<O: Scalar + Cast + CubeElement, R: Runtime>(
     k: usize,
     n: usize,
 ) -> Handle {
+    fp4_linear_grouped_planes_launch_as::<O, R>(
+        client, swz, a, a_sc, (wmap, wmap_bytes), (wmap, wmap_bytes), blk, off, scale2, slots, m_total, k, n,
+    )
+}
+
+/// [`fp4_linear_grouped_launch_as`] with the codes and the block scales in two
+/// buffers, each `(handle, bytes)`: `off[2 * slot]` is a byte offset into the
+/// first and `off[2 * slot + 1]` into the second. A single registered mapping
+/// is the case where both are the same buffer.
+#[allow(clippy::too_many_arguments)]
+pub fn fp4_linear_grouped_planes_launch_as<O: Scalar + Cast + CubeElement, R: Runtime>(
+    client: &ComputeClient<R>,
+    swz: bool,
+    a: &Handle,
+    a_sc: &Handle,
+    (codes, codes_bytes): (&Handle, usize),
+    (b_sc, b_sc_bytes): (&Handle, usize),
+    blk: &BlockPlanDev,
+    off: &Handle,
+    scale2: &Handle,
+    slots: usize,
+    m_total: usize,
+    k: usize,
+    n: usize,
+) -> Handle {
     assert_eq!(
         m_total % MTILE,
         0,
@@ -717,10 +742,10 @@ pub fn fp4_linear_grouped_launch_as<O: Scalar + Cast + CubeElement, R: Runtime>(
     // The mapping is bound as a flat plane of packed bytes; the kernel indexes
     // it in `vs`-wide vectors, so the declared length has to be a whole number
     // of them.
-    let flat = wmap_bytes - wmap_bytes % vs;
+    let flat = codes_bytes - codes_bytes % vs;
     // The scale planes are read four bytes at a time, so the bound length has
     // to be a whole number of them too.
-    let flat_sc = wmap_bytes - wmap_bytes % SCALE_VEC;
+    let flat_sc = b_sc_bytes - b_sc_bytes % SCALE_VEC;
 
     unsafe {
         fp4_linear_grouped::launch::<e2m1x2, e4m3, O, R>(
@@ -733,8 +758,8 @@ pub fn fp4_linear_grouped_launch_as<O: Scalar + Cast + CubeElement, R: Runtime>(
             SCALE_VEC,
             ArrayArg::from_raw_parts(a.clone(), m_total * (k / 2)),
             ArrayArg::from_raw_parts(a_sc.clone(), m_total * spr),
-            ArrayArg::from_raw_parts(wmap.clone(), flat),
-            ArrayArg::from_raw_parts(wmap.clone(), flat_sc),
+            ArrayArg::from_raw_parts(codes.clone(), flat),
+            ArrayArg::from_raw_parts(b_sc.clone(), flat_sc),
             ArrayArg::from_raw_parts(blk.slot.clone(), blk.blocks),
             ArrayArg::from_raw_parts(blk.tile0.clone(), blk.blocks),
             ArrayArg::from_raw_parts(blk.cnt.clone(), blk.blocks),

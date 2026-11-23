@@ -349,6 +349,216 @@ fn quantize_nvfp4_into<E: Scalar + Cast, R: Runtime>(
     }
 }
 
+/// Largest E4M3 value Four Over Six lets the per-token outer scale target:
+/// `256 * 6 / 4 = 384` is still an E4M3, so a block holding its row's largest
+/// value can still take the scale-to-4 candidate (arXiv 2512.02010, §3.1).
+pub const FOUR_OVER_SIX_E4M3_MAX: f32 = 256.0;
+
+/// Threads per cube of [`quantize_nvfp4_46_kernel`]: one per 16-element block
+/// of a row, so a row of up to `16 * 256` elements is one cube.
+const ROW_CUBE: u32 = 256;
+
+/// The summed absolute error of a block's two code words, dequantized at
+/// `a` (block scale times outer scale), against the input.
+#[cube]
+fn four_over_six_error(l0: Vector<f32, Const<8>>, l1: Vector<f32, Const<8>>, w0: u32, w1: u32, a: f32) -> f32 {
+    let mut err = f32::new(0.0f32);
+    #[unroll]
+    for i in 0..8usize {
+        err += Abs::abs(e2m1_value((w0 >> (4 * i) as u32) & 15) * a - l0[i]);
+        err += Abs::abs(e2m1_value((w1 >> (4 * i) as u32) & 15) * a - l1[i]);
+    }
+    err
+}
+
+/// `1 / a`, or 0 for a zero scale (every element then encodes as ±0).
+#[cube]
+fn recip_or_zero(a: f32) -> f32 {
+    let mut r = f32::new(0.0f32);
+    if a > 0.0 {
+        r = 1.0 / a;
+    }
+    r
+}
+
+/// NVFP4 with a per-row (per-token) f32 outer scale and Four Over Six block
+/// scales, the activation quantisation Inkling 2 Mini's `hf_quant_config.json`
+/// declares for its NVFP4 experts: `{amax_type: per_token, block_size: 16,
+/// format: nvfp4_e2m1, rounding: nearest, scale_dtype: float8_e4m3fn,
+/// scale_selection_rule: fouroversix_mae}`.
+///
+/// One cube per row, one unit per 16-element block:
+///
+/// ```text
+/// alpha   = amax(row) / (6 * 256)                   f32, per row
+/// D_M     = E4M3(amax(block) / (alpha * M))         M = 6 and M = 4
+/// codes_M = E2M1_rn(x / (alpha * D_M))
+/// E_M     = sum |E2M1(codes_M) * D_M * alpha - x|   (16 times the mean absolute error)
+/// keep M = 4 if E_4 < E_6, else M = 6              a tie keeps 6 (the paper's rule)
+/// ```
+///
+/// A value is `E2M1 * D * alpha`; the GEMM applies `D` through the block-scaled
+/// MMA and the caller applies `alpha` to the output row. A zero row has
+/// `alpha = 0`, zero scales and zero codes. Codes and scales are laid out as
+/// [`quantize_nvfp4_kernel`] lays them out.
+#[cube(launch_unchecked)]
+fn quantize_nvfp4_46_kernel<E: Scalar + Cast>(
+    x: &Array<Vector<E, Const<8>>>,
+    codes: &mut Array<u32>,
+    scales: &mut Array<e4m3>,
+    alpha_out: &mut Array<f32>,
+    #[comptime] bpr: usize,
+) {
+    let row = CUBE_POS_X as usize;
+    let b = UNIT_POS_X as usize;
+    let mut red = SharedMemory::<f32>::new(comptime!(ROW_CUBE as usize));
+
+    let blk = row * bpr + b;
+    let mut l0 = Vector::<f32, Const<8>>::new(0.0f32);
+    let mut l1 = Vector::<f32, Const<8>>::new(0.0f32);
+    let mut amax = f32::new(0.0f32);
+    if b < bpr {
+        l0 = Vector::<f32, Const<8>>::cast_from(x[blk * 2]);
+        l1 = Vector::<f32, Const<8>>::cast_from(x[blk * 2 + 1]);
+        let hi = max(l0.abs(), l1.abs());
+        let a01 = max(max(hi[0], hi[1]), max(hi[2], hi[3]));
+        let a23 = max(max(hi[4], hi[5]), max(hi[6], hi[7]));
+        amax = max(a01, a23);
+    }
+    red[b] = amax;
+    sync_cube();
+    let mut stride = CUBE_DIM_X / 2u32;
+    while stride > 0u32 {
+        if (b as u32) < stride {
+            red[b] = max(red[b], red[b + stride as usize]);
+        }
+        sync_cube();
+        stride /= 2u32;
+    }
+    let alpha = red[0] / (6.0f32 * FOUR_OVER_SIX_E4M3_MAX);
+
+    if b < bpr {
+        if b == 0 {
+            alpha_out[row] = alpha;
+        }
+        let mut se = e4m3::cast_from(0.0f32);
+        let mut w0 = 0u32;
+        let mut w1 = 0u32;
+        if alpha > 0.0 && amax > 0.0 {
+            // block max onto 6, the standard NVFP4 candidate
+            let s6 = e4m3::cast_from(amax / (alpha * 6.0f32));
+            let a6 = f32::cast_from(s6) * alpha;
+            let r6 = Vector::<f32, Const<8>>::new(recip_or_zero(a6));
+            let w06 = u32::reinterpret(Vector::<e2m1x2, Const<4>>::cast_from(l0 * r6));
+            let w16 = u32::reinterpret(Vector::<e2m1x2, Const<4>>::cast_from(l1 * r6));
+            let e6 = four_over_six_error(l0, l1, w06, w16, a6);
+            // block max onto 4
+            let s4 = e4m3::cast_from(amax / (alpha * 4.0f32));
+            let a4 = f32::cast_from(s4) * alpha;
+            let r4 = Vector::<f32, Const<8>>::new(recip_or_zero(a4));
+            let w04 = u32::reinterpret(Vector::<e2m1x2, Const<4>>::cast_from(l0 * r4));
+            let w14 = u32::reinterpret(Vector::<e2m1x2, Const<4>>::cast_from(l1 * r4));
+            let e4 = four_over_six_error(l0, l1, w04, w14, a4);
+            se = s6;
+            w0 = w06;
+            w1 = w16;
+            if e4 < e6 {
+                se = s4;
+                w0 = w04;
+                w1 = w14;
+            }
+        }
+        scales[blk] = se;
+        codes[blk * 2] = w0;
+        codes[blk * 2 + 1] = w1;
+    }
+}
+
+/// [`quantize_nvfp4_46_kernel`] over `rows` rows of `k` BF16 values: `(codes
+/// [rows, k/8] u32, scales [rows, k/16] e4m3, alpha [rows] f32)`.
+pub fn quantize_nvfp4_46_bf16<R: Runtime>(
+    client: &ComputeClient<R>,
+    x: &Handle,
+    rows: usize,
+    k: usize,
+) -> (Handle, Handle, Handle) {
+    let bpr = k / GROUP;
+    assert!(k > 0 && k % 64 == 0 && rows > 0, "4/6 NVFP4 needs rows > 0 and k a positive multiple of 64");
+    assert!(bpr <= ROW_CUBE as usize, "a row of {k} is more blocks than one cube of {ROW_CUBE}");
+    let n = rows * k;
+    let codes = client.empty(n / CODES_PER_WORD * core::mem::size_of::<u32>());
+    let scales = client.empty(n / GROUP);
+    let alpha = client.empty(rows * core::mem::size_of::<f32>());
+    unsafe {
+        quantize_nvfp4_46_kernel::launch_unchecked::<half::bf16, R>(
+            client,
+            CubeCount::new_1d(rows as u32),
+            CubeDim::new_1d(ROW_CUBE),
+            ArrayArg::from_raw_parts(x.clone(), n / LINE),
+            ArrayArg::from_raw_parts(codes.clone(), n / CODES_PER_WORD),
+            ArrayArg::from_raw_parts(scales.clone(), n / GROUP),
+            ArrayArg::from_raw_parts(alpha.clone(), rows),
+            bpr,
+        );
+    }
+    (codes, scales, alpha)
+}
+
+/// Elements per MXFP8 block scale.
+pub const MX_BLOCK: usize = 32;
+
+/// MXFP8 (E4M3 elements, one UE8M0 scale per 32) quantised and dequantised in
+/// one pass, BF16 in and BF16 out: one unit per 32-element block.
+///
+/// The scale is the OCP MX v1.0 rule, `2^(floor(log2 amax) - 8)` (8 is E4M3's
+/// largest exponent), and the scaled elements round to nearest E4M3 after a
+/// clamp to ±448. Every result is an E4M3 value times a power of two, which a
+/// BF16 holds exactly, so a BF16 GEMM over the output against exactly decoded
+/// MXFP8 weights multiplies the same numbers an MXFP8 MMA would.
+#[cube(launch_unchecked)]
+fn qdq_mxfp8_bf16_kernel(x: &Array<half::bf16>, out: &mut Array<half::bf16>, blocks: usize) {
+    let blk = ABSOLUTE_POS;
+    if blk < blocks {
+        let base = blk * MX_BLOCK;
+        let mut amax = f32::new(0.0f32);
+        #[unroll]
+        for i in 0..MX_BLOCK {
+            amax = max(amax, Abs::abs(f32::cast_from(x[base + i])));
+        }
+        // floor(log2 amax) from the f32 exponent field; a zero or subnormal
+        // amax gives the smallest normal scale.
+        let ex = i32::cast_from((u32::reinterpret(amax) >> 23) & 255u32);
+        let biased = max(min(ex - 8i32, 254i32), 1i32);
+        let scale = f32::reinterpret(u32::cast_from(biased) << 23);
+        let inv = 1.0f32 / scale;
+        #[unroll]
+        for i in 0..MX_BLOCK {
+            let v = f32::cast_from(x[base + i]) * inv;
+            let q = e4m3::cast_from(max(min(v, 448.0f32), -448.0f32));
+            out[base + i] = half::bf16::cast_from(f32::cast_from(q) * scale);
+        }
+    }
+}
+
+/// [`qdq_mxfp8_bf16_kernel`] over `n` BF16 values (`n % 32 == 0`, blocks along
+/// the contiguous axis), into a fresh buffer.
+pub fn qdq_mxfp8_bf16<R: Runtime>(client: &ComputeClient<R>, x: &Handle, n: usize) -> Handle {
+    assert!(n % MX_BLOCK == 0, "{n} values are not whole MX blocks of {MX_BLOCK}");
+    let blocks = n / MX_BLOCK;
+    let out = client.empty(n * 2);
+    unsafe {
+        qdq_mxfp8_bf16_kernel::launch_unchecked::<R>(
+            client,
+            CubeCount::new_1d(blocks.div_ceil(CUBE_SIZE as usize) as u32),
+            CubeDim::new_1d(CUBE_SIZE),
+            ArrayArg::from_raw_parts(x.clone(), n),
+            ArrayArg::from_raw_parts(out.clone(), n),
+            blocks,
+        );
+    }
+    out
+}
+
 /// The eight representable E2M1 magnitudes, indexed by the code's low three
 /// bits — the exact inverse of what [`quantize_nvfp4_kernel`] encodes.
 ///

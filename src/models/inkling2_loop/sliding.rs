@@ -135,6 +135,12 @@ pub enum ExpertAct {
     /// BF16 activations against the same NVFP4 weights: what transformers
     /// 046bdb8c computes (it dequantises the weights and quantises nothing).
     Bf16,
+    /// The precision the experts were trained in, on the grouped lane: on
+    /// NVFP4 layers both operands are NVFP4, the activations quantised per
+    /// token with Four Over Six (`fp4quant::quantize_nvfp4_46_bf16`), as
+    /// `hf_quant_config.json` declares; on MXFP8 layers the activations are
+    /// MXFP8 (`fp4quant::qdq_mxfp8_bf16`) against the exactly decoded weights.
+    Trained,
 }
 
 /// One matrix of a routed expert, in the format it binds as.
@@ -147,10 +153,11 @@ pub(super) enum ExpertW {
 }
 
 impl ExpertW {
-    fn linear(&self, x: Tensor<Bk, 2>, act: ExpertAct) -> Tensor<Bk, 2> {
+    pub(super) fn linear(&self, x: Tensor<Bk, 2>, act: ExpertAct) -> Tensor<Bk, 2> {
         match (self, act) {
             (ExpertW::Nvfp4(p), ExpertAct::Nvfp4) => linear_fp4(x, p),
             (ExpertW::Nvfp4(p), ExpertAct::Bf16) => linear_w4a16(x, p),
+            (_, ExpertAct::Trained) => panic!("the trained expert precision runs on the grouped lane only"),
             // `ExpertAct` chooses only for NVFP4. MXFP8 experts always see
             // BF16 activations: transformers 046bdb8c dequantises the weights
             // and quantises no activation; the declared `mxfp8_e4m3`

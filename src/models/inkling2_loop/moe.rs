@@ -70,9 +70,10 @@ use half::bf16;
 
 use crate::models::inkling::bf16gemm::{Bf16W, linear_bf16 as linear_bf16_handle, linear_bf16_narrow};
 use crate::models::inkling::burn::PackedW;
+use crate::models::inkling::fp4quant::{qdq_mxfp8_bf16, quantize_nvfp4_46_bf16};
 use crate::models::inkling::moegroup::{
-    BlockPlanDev, bf16_linear_grouped_launch, gather_grouped_bf16, gather_grouped_bf16_from_bf16,
-    scatter_weighted,
+    BlockPlanDev, bf16_linear_grouped_launch, fp4_linear_grouped_planes_launch_as, gather_grouped_bf16,
+    gather_grouped_bf16_from_bf16, scatter_weighted,
 };
 use crate::models::inkling::routetopk::router_topk_launch;
 use crate::models::inkling::seam::{Bk, client_of, handle_of_any, tensor_of};
@@ -89,8 +90,10 @@ const CUBE: u32 = 256;
 /// One projection of every expert of a layer, stacked `[E, n, k]`.
 pub(super) enum Stack {
     /// NVFP4: codes `[E * n, k / 2]` bytes, E4M3 scales `[E * n, k / 16]`,
-    /// and each expert's second-level scale `[E]` f32.
-    Nvfp4 { codes: Handle, scales: Handle, scale2: Handle, scale2_host: Vec<f32> },
+    /// and each expert's second-level scale `[E]` f32. `off` is `[2E]` u64:
+    /// expert `e`'s first code byte and first scale byte, the table
+    /// [`fp4_linear_grouped_planes_launch_as`] reads.
+    Nvfp4 { codes: Handle, scales: Handle, scale2: Handle, scale2_host: Vec<f32>, off: Handle },
     /// BF16 (MXFP8 decoded exactly): `[E * n, k]`, and the per-expert element
     /// offsets `[E]` u64 that [`bf16_linear_grouped_launch`] indexes.
     Bf16 { w: Handle, off: Handle },
@@ -197,7 +200,15 @@ pub fn lane(act: super::sliding::ExpertAct) -> Lane {
         Ok("grouped") | Err(_) => false,
         Ok(other) => panic!("MINI_MOE={other}: the lanes are grouped and loop"),
     });
-    if forced || act == super::sliding::ExpertAct::Nvfp4 { Lane::Loop } else { Lane::Grouped }
+    match act {
+        super::sliding::ExpertAct::Trained => {
+            assert!(!forced, "MINI_MOE=loop: the trained expert precision runs on the grouped lane only");
+            Lane::Grouped
+        }
+        super::sliding::ExpertAct::Nvfp4 => Lane::Loop,
+        super::sliding::ExpertAct::Bf16 if forced => Lane::Loop,
+        super::sliding::ExpertAct::Bf16 => Lane::Grouped,
+    }
 }
 
 /// The device plan of one visit. `m_max = 16 * max_tiles` stacked rows.
@@ -362,24 +373,35 @@ fn route_place(
 }
 
 /// `out = act(gate) * up` per stacked row, Mini's softcapped SwiGLU, into BF16
-/// for the down projection. Rows of tiles no expert owns are skipped.
+/// for the down projection. Rows of tiles no expert owns are skipped. When
+/// `scaled`, `g` and `u` are first multiplied by their row's `alpha` (the
+/// per-token outer scale the W4A4 GEMM leaves out).
 #[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
 fn softcapped_swiglu(
     g: &Array<f32>,
     u: &Array<f32>,
     tile_slot: &Array<u32>,
+    alpha: &Array<f32>,
     out: &mut Array<bf16>,
     total: u32,
     gate_cap: f32,
     up_cap: f32,
     #[comptime] inter: u32,
+    #[comptime] scaled: bool,
 ) {
     let p = ABSOLUTE_POS as u32;
     if p < total {
         let tile = p / comptime!(inter * 16);
         if tile_slot[tile as usize] != 0xFFFF_FFFFu32 {
-            let gv = g[p as usize];
-            let uv = u[p as usize];
+            let mut gv = g[p as usize];
+            let mut uv = u[p as usize];
+            if comptime!(scaled) {
+                // the row's per-token outer scale of its NVFP4 activation
+                let a = alpha[(p / comptime!(inter)) as usize];
+                gv *= a;
+                uv *= a;
+            }
             let cg = Tanh::tanh(gv / gate_cap) * gate_cap;
             let cu = Tanh::tanh(uv / up_cap) * up_cap;
             // sigmoid without overflow: e = exp(-|g|), 1 / (1 + e) or e / (1 + e)
@@ -593,7 +615,7 @@ impl Bank {
         assert!(fault.dev == dev, "moe: a fault cell on {:?} for x on {dev:?}", fault.dev);
         let route = super::prof::span("router", &dev, || self.route(x));
         let out = super::prof::span("experts", &dev, || match lane(act) {
-            Lane::Grouped => self.experts_grouped(x, &route, fault),
+            Lane::Grouped => self.experts_grouped(x, &route, fault, act == super::sliding::ExpertAct::Trained),
             Lane::Loop => experts_loop(self, d, x, &route.picks(), act),
         });
         (out, route)
@@ -719,9 +741,11 @@ impl Bank {
 
     /// The grouped experts over `x` (`[rows, H]`) routed by `route`:
     /// `[rows, H]` f32, each row the weighted sum of its picks' outputs.
-    /// `fault` as in [`Bank::forward`]. The kernels below launch unchecked,
-    /// so the shapes are checked here.
-    fn experts_grouped(&self, x: &Tensor<Bk, 2>, route: &Route, fault: &FaultCell) -> Tensor<Bk, 2> {
+    /// `fault` as in [`Bank::forward`]. `trained` multiplies at the trained
+    /// precision ([`super::sliding::ExpertAct::Trained`]); otherwise the
+    /// activations are BF16. The kernels below launch unchecked, so the shapes
+    /// are checked here.
+    fn experts_grouped(&self, x: &Tensor<Bk, 2>, route: &Route, fault: &FaultCell, trained: bool) -> Tensor<Bk, 2> {
         let [rows, h] = x.dims();
         assert_eq!(h, self.hidden, "experts: x is {h} wide, the bank's hidden size is {}", self.hidden);
         assert_eq!(route.rows, rows, "experts: a route of {} rows for {rows} rows of x", route.rows);
@@ -736,11 +760,10 @@ impl Bank {
             burn::tensor::DType::BF16 => gather_grouped_bf16_from_bf16(&client, &xh, &plan.row_src, rows, m, h),
             other => panic!("experts: no lane for a {other:?} activation"),
         };
-        let g = self.project(&client, &self.gate, &a, &plan);
-        let u = self.project(&client, &self.up, &a, &plan);
+        let nvfp4 = matches!(self.gate.stack, Stack::Nvfp4 { .. });
         let total = m * self.inter;
         let s = client.empty(total * 2);
-        unsafe {
+        let swiglu = |g: Handle, u: Handle, alpha: Option<&Handle>| unsafe {
             softcapped_swiglu::launch_unchecked::<cubecl::cuda::CudaRuntime>(
                 &client,
                 CubeCount::new_1d(total.div_ceil(CUBE as usize) as u32),
@@ -748,17 +771,95 @@ impl Bank {
                 ArrayArg::from_raw_parts(g, total),
                 ArrayArg::from_raw_parts(u, total),
                 ArrayArg::from_raw_parts(plan.tile_slot.clone(), plan.max_tiles),
+                ArrayArg::from_raw_parts(alpha.unwrap_or(&plan.row_w).clone(), if alpha.is_some() { m } else { 1 }),
                 ArrayArg::from_raw_parts(s.clone(), total),
                 total as u32,
                 self.gate_softcap,
                 self.up_softcap,
                 self.inter as u32,
+                alpha.is_some(),
             );
-        }
-        let y = self.project(&client, &self.down, &s, &plan);
-        let out = scatter_weighted(&client, &y, &plan.row_w, &plan.tok_rows, &plan.tok_cnt, m, rows, h, self.top_k);
+        };
+        let (y, row_w) = if trained && nvfp4 {
+            // W4A4: both operands NVFP4, the activations per token with Four
+            // Over Six; the per-token outer scale multiplies the GEMM's rows,
+            // so it enters the SwiGLU for gate and up and the scatter weight
+            // for down.
+            let (ac, asc, alpha) = quantize_nvfp4_46_bf16(&client, &a, m, h);
+            let g = self.project_w4a4(&client, &self.gate, &ac, &asc, &plan);
+            let u = self.project_w4a4(&client, &self.up, &ac, &asc, &plan);
+            swiglu(g, u, Some(&alpha));
+            let (sc, ssc, alpha2) = quantize_nvfp4_46_bf16(&client, &s, m, self.inter);
+            let y = self.project_w4a4(&client, &self.down, &sc, &ssc, &plan);
+            (y, scale_rows(&client, &plan.row_w, &alpha2, m))
+        } else if trained {
+            // MXFP8: the activations quantised to MXFP8 and dequantised
+            // exactly, against the exactly decoded MXFP8 weights.
+            let aq = qdq_mxfp8_bf16(&client, &a, m * h);
+            let g = self.project(&client, &self.gate, &aq, &plan);
+            let u = self.project(&client, &self.up, &aq, &plan);
+            swiglu(g, u, None);
+            let sq = qdq_mxfp8_bf16(&client, &s, total);
+            (self.project(&client, &self.down, &sq, &plan), plan.row_w.clone())
+        } else {
+            let g = self.project(&client, &self.gate, &a, &plan);
+            let u = self.project(&client, &self.up, &a, &plan);
+            swiglu(g, u, None);
+            (self.project(&client, &self.down, &s, &plan), plan.row_w.clone())
+        };
+        let out = scatter_weighted(&client, &y, &row_w, &plan.tok_rows, &plan.tok_cnt, m, rows, h, self.top_k);
         tensor_of(client, dev, out, rows, h)
     }
+
+    /// One NVFP4 projection with NVFP4 activations (`codes`, `scales` as
+    /// [`quantize_nvfp4_46_bf16`] writes them): `[m, n]` f32, each row still
+    /// to be multiplied by its activation's outer scale.
+    fn project_w4a4(&self, client: &Client, p: &Proj, codes: &Handle, scales: &Handle, plan: &Plan) -> Handle {
+        let Stack::Nvfp4 { codes: wc, scales: ws, scale2, off, .. } = &p.stack else {
+            panic!("project_w4a4: an NVFP4 projection only");
+        };
+        let e = self.experts;
+        fp4_linear_grouped_planes_launch_as::<f32, cubecl::cuda::CudaRuntime>(
+            client,
+            false,
+            codes,
+            scales,
+            (wc, e * p.n * p.k / 2),
+            (ws, e * p.n * p.k / GROUP),
+            &plan.blk,
+            off,
+            scale2,
+            e,
+            plan.max_tiles * MTILE,
+            p.k,
+            p.n,
+        )
+    }
+}
+
+/// `out[r] = w[r] * alpha[r]` over `m` f32 rows.
+#[cube(launch_unchecked)]
+fn scale_rows_kernel(w: &Array<f32>, alpha: &Array<f32>, out: &mut Array<f32>, m: u32) {
+    let p = ABSOLUTE_POS as u32;
+    if p < m {
+        out[p as usize] = w[p as usize] * alpha[p as usize];
+    }
+}
+
+fn scale_rows(client: &Client, w: &Handle, alpha: &Handle, m: usize) -> Handle {
+    let out = client.empty(m * 4);
+    unsafe {
+        scale_rows_kernel::launch_unchecked::<cubecl::cuda::CudaRuntime>(
+            client,
+            CubeCount::new_1d(m.div_ceil(CUBE as usize) as u32),
+            CubeDim::new_1d(CUBE),
+            ArrayArg::from_raw_parts(w.clone(), m),
+            ArrayArg::from_raw_parts(alpha.clone(), m),
+            ArrayArg::from_raw_parts(out.clone(), m),
+            m as u32,
+        );
+    }
+    out
 }
 
 /// Bind helpers: one projection's stack from per-expert host bytes.
@@ -766,12 +867,14 @@ pub(super) fn nvfp4_proj(client: &Client, codes: &[u8], scales: &[u8], scale2: V
     let experts = scale2.len();
     assert_eq!(codes.len(), experts * n * k / 2);
     assert_eq!(scales.len(), experts * n * k / GROUP);
+    let off: Vec<u64> = (0..experts).flat_map(|e| [(e * n * k / 2) as u64, (e * n * k / GROUP) as u64]).collect();
     Proj {
         stack: Stack::Nvfp4 {
             codes: client.create_from_slice(codes),
             scales: client.create_from_slice(scales),
             scale2: client.create_from_slice(f32::as_bytes(&scale2)),
             scale2_host: scale2,
+            off: client.create_from_slice(u64::as_bytes(&off)),
         },
         n,
         k,
@@ -861,7 +964,7 @@ mod tests {
     use super::*;
     use crate::models::inkling::block::route_from_logits;
     use crate::models::inkling2_loop::sliding::{Dims, ExpertAct};
-    use burn::tensor::TensorData;
+    use burn::tensor::{Int, TensorData};
 
     fn dev() -> burn::backend::cuda::CudaDevice {
         burn::backend::cuda::CudaDevice::default()
@@ -939,7 +1042,7 @@ mod tests {
         let route = b.route(&xs);
         let picks = route.picks();
         let cell = fault_cell(&dev());
-        let grouped = host(b.experts_grouped(&xs, &route, &cell));
+        let grouped = host(b.experts_grouped(&xs, &route, &cell, false));
         let looped = host(experts_loop(&b, d, &xs, &picks, ExpertAct::Bf16));
         assert_eq!(read_fault(&cell), None);
         let h = d.hidden;
@@ -1044,7 +1147,7 @@ mod tests {
         let xs = x(rows, d.hidden, 0x0bad);
         let route = b.route(&xs);
         let before_cell = fault_cell(&dev());
-        let before = host(b.experts_grouped(&xs, &route, &before_cell));
+        let before = host(b.experts_grouped(&xs, &route, &before_cell, false));
         assert_eq!(read_fault(&before_cell), None);
 
         let mut topk = f32s_of(&client, &route.topk);
@@ -1053,12 +1156,12 @@ mod tests {
         topk[5 * w + w - 1] = 42.0;
         let faulted = with_topk(&client, &route, &topk);
         let a = fault_cell(&dev());
-        let _ = host(b.experts_grouped(&xs, &faulted, &a));
+        let _ = host(b.experts_grouped(&xs, &faulted, &a, false));
         assert_eq!(read_fault(&a), Some(42), "the faulted call's cell");
         assert_eq!(read_fault(&before_cell), None, "an earlier call's cell");
 
         let c = fault_cell(&dev());
-        let after = host(b.experts_grouped(&xs, &route, &c));
+        let after = host(b.experts_grouped(&xs, &route, &c, false));
         assert_eq!(read_fault(&c), None, "a later call's own cell");
         assert_eq!(read_fault(&a), Some(42), "a set cell stays set");
         let same = before.iter().zip(&after).filter(|(p, q)| p.to_bits() == q.to_bits()).count();
@@ -1087,7 +1190,7 @@ mod tests {
         let xs = x(rows, d.hidden, 0x1157);
         let good = b.route(&xs);
         let good_cell = fault_cell(&dev());
-        let before = host(b.experts_grouped(&xs, &good, &good_cell));
+        let before = host(b.experts_grouped(&xs, &good, &good_cell, false));
         assert_eq!(read_fault(&good_cell), None);
 
         let mut logits = good.logits();
@@ -1133,7 +1236,7 @@ mod tests {
             assert!(tok_cnt.iter().all(|c| *c as usize == k), "tok_cnt");
             assert!(row_src.iter().all(|v| *v >= -1 && (*v as i64) < rows as i64), "row_src");
             assert!(tile_slot.iter().all(|v| (*v as usize) < e || *v == NO_EXPERT), "tile_slot");
-            let out = host(b.experts_grouped(&xs, &bad, &cell));
+            let out = host(b.experts_grouped(&xs, &bad, &cell, false));
             let flag = read_fault(&cell);
             assert!(flag.is_some(), "round {round}: no fault recorded");
             let finite_rows = (0..rows).filter(|r| out[r * d.hidden..(r + 1) * d.hidden].iter().all(|v| v.is_finite())).count();
@@ -1146,10 +1249,231 @@ mod tests {
         }
 
         let after_cell = fault_cell(&dev());
-        let after = host(b.experts_grouped(&xs, &good, &after_cell));
+        let after = host(b.experts_grouped(&xs, &good, &after_cell, false));
         assert_eq!(read_fault(&after_cell), None);
         let same = before.iter().zip(&after).filter(|(p, q)| p.to_bits() == q.to_bits()).count();
         assert_eq!(same, before.len(), "a finite call after the faulted ones changed");
+    }
+
+    // ---- the trained expert precision -----------------------------------
+
+    /// E4M3 round to nearest, ties to the even byte, as `cvt.rn` does.
+    fn e4m3_rne(v: f32) -> u8 {
+        use crate::models::inkling::nvfp4::e4m3_to_f32;
+        let (mut best, mut bestd) = (0u8, f32::INFINITY);
+        for b in 0u8..=0x7E {
+            let d = (e4m3_to_f32(b) - v.abs()).abs();
+            if d < bestd || (d == bestd && b % 2 == 0) {
+                (best, bestd) = (b, d);
+            }
+        }
+        if v < 0.0 { best | 0x80 } else { best }
+    }
+
+    /// E2M1 code of `q`: nearest magnitude, ties to the even code, saturating at 6.
+    fn e2m1_rne(q: f32) -> u8 {
+        const MAG: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+        let a = q.abs().min(6.0);
+        let (mut best, mut bestd) = (0u8, f32::INFINITY);
+        for (c, m) in MAG.iter().enumerate() {
+            let d = (m - a).abs();
+            if d < bestd || (d == bestd && c % 2 == 0) {
+                (best, bestd) = (c as u8, d);
+            }
+        }
+        if q.is_sign_negative() { best | 8 } else { best }
+    }
+
+    fn e2m1_mag(c: u8) -> f32 {
+        let m = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0][(c & 7) as usize];
+        if c & 8 != 0 { -m } else { m }
+    }
+
+    /// Host twin of `quantize_nvfp4_46_bf16`: (codes bytes, scale bytes, alpha).
+    /// `fma`: the candidate errors as `fma(E2M1, a, -x)`, the contraction
+    /// the device compiler may apply; the twin is run both ways.
+    fn quant46_host(x: &[f32], rows: usize, k: usize, fma: bool) -> (Vec<u8>, Vec<u8>, Vec<f32>) {
+        use crate::models::inkling::nvfp4::e4m3_to_f32;
+        let (mut codes, mut scales, mut alphas) = (vec![0u8; rows * k / 2], vec![0u8; rows * k / 16], vec![0f32; rows]);
+        for r in 0..rows {
+            let row = &x[r * k..(r + 1) * k];
+            let alpha = row.iter().fold(0f32, |m, v| m.max(v.abs())) / (6.0 * 256.0);
+            alphas[r] = alpha;
+            for b in 0..k / 16 {
+                let blk = &row[b * 16..(b + 1) * 16];
+                let amax = blk.iter().fold(0f32, |m, v| m.max(v.abs()));
+                if !(alpha > 0.0 && amax > 0.0) {
+                    continue;
+                }
+                let cand = |target: f32| {
+                    let se = e4m3_rne(amax / (alpha * target));
+                    let a = e4m3_to_f32(se) * alpha;
+                    let inv = if a > 0.0 { 1.0 / a } else { 0.0 };
+                    let cs: Vec<u8> = blk.iter().map(|v| e2m1_rne(v * inv)).collect();
+                    let mut err = 0f32;
+                    let d = |c: u8, v: f32| if fma { e2m1_mag(c).mul_add(a, -v).abs() } else { (e2m1_mag(c) * a - v).abs() };
+                    for i in 0..8 {
+                        err += d(cs[i], blk[i]);
+                        err += d(cs[8 + i], blk[8 + i]);
+                    }
+                    (se, cs, err)
+                };
+                let (s6, c6, e6) = cand(6.0);
+                let (s4, c4, e4) = cand(4.0);
+                let (se, cs) = if e4 < e6 { (s4, c4) } else { (s6, c6) };
+                let gb = r * k / 16 + b;
+                scales[gb] = se;
+                for i in 0..8 {
+                    codes[gb * 8 + i] = cs[2 * i] | (cs[2 * i + 1] << 4);
+                }
+            }
+        }
+        (codes, scales, alphas)
+    }
+
+    /// BF16 activations whose blocks span six orders of magnitude, so both 4/6
+    /// candidates win somewhere, plus a zero row.
+    fn spread_rows(rows: usize, k: usize, seed: u64) -> Vec<f32> {
+        let mut r = Rng(seed);
+        let mut v = Vec::with_capacity(rows * k);
+        for row in 0..rows {
+            for b in 0..k / 16 {
+                let scale = 10f32.powf(r.f(3.0));
+                for _ in 0..16 {
+                    let x = if row == 3 { 0.0 } else { r.f(scale) };
+                    v.push(half::bf16::from_f32(x).to_f32());
+                }
+                let _ = b;
+            }
+        }
+        v
+    }
+
+    fn bf16_handle(client: &Client, v: &[f32]) -> Handle {
+        let b: Vec<u8> = v.iter().flat_map(|x| half::bf16::from_f32(*x).to_le_bytes()).collect();
+        client.create_from_slice(&b)
+    }
+
+    #[test]
+    fn four_over_six_quantizer_matches_its_host_twin() {
+        let client = client_of(&Tensor::<Bk, 1>::zeros([1], &dev()));
+        for (rows, k) in [(37, 2304), (5, 1152)] {
+            let x = spread_rows(rows, k, 0x46 + k as u64);
+            let (c, s, a) = quantize_nvfp4_46_bf16(&client, &bf16_handle(&client, &x), rows, k);
+            let (hc, hs, ha) = quant46_host(&x, rows, k, false);
+            let (fc, fs, _) = quant46_host(&x, rows, k, true);
+            let dc = client.read_one(c).unwrap();
+            let ds = client.read_one(s).unwrap();
+            let da = f32s_of(&client, &a);
+            // a block agrees if it is either twin's block, codes and scale
+            let blocks = rows * k / 16;
+            let same = |cs: &[u8], ss: &[u8], b: usize| ds[b] == ss[b] && dc[b * 8..b * 8 + 8] == cs[b * 8..b * 8 + 8];
+            let bad_b = (0..blocks).filter(|&b| !same(&hc, &hs, b) && !same(&fc, &fs, b)).count();
+            let fused = (0..blocks).filter(|&b| !same(&hc, &hs, b) && same(&fc, &fs, b)).count();
+            let bad_a = da.iter().zip(&ha).filter(|(p, q)| p.to_bits() != q.to_bits()).count();
+            let fours = (0..rows * k / 16)
+                .filter(|&b| hs[b] != 0 && {
+                    let amax = x[b * 16..b * 16 + 16].iter().fold(0f32, |m, v| m.max(v.abs()));
+                    let alpha = ha[b / (k / 16)];
+                    hs[b] == e4m3_rne(amax / (alpha * 4.0)) && hs[b] != e4m3_rne(amax / (alpha * 6.0))
+                })
+                .count();
+            eprintln!(
+                "QUANT46 {rows}x{k}: {bad_b} of {blocks} blocks match neither twin ({fused} match only the fused-error twin), {bad_a} of {rows} alphas differ; {fours} blocks took the 4 candidate"
+            );
+            assert!(fours > 0 && fours < blocks, "both candidates should win somewhere");
+            assert_eq!((bad_b, bad_a), (0, 0));
+            assert!(ds[3 * k / 16..4 * k / 16].iter().all(|b| *b == 0) && da[3] == 0.0, "the zero row");
+        }
+    }
+
+    #[test]
+    fn mxfp8_qdq_matches_its_host_twin() {
+        use crate::models::inkling::nvfp4::e4m3_to_f32;
+        let client = client_of(&Tensor::<Bk, 1>::zeros([1], &dev()));
+        let x = spread_rows(9, 1152, 0x88);
+        let got = client.read_one(qdq_mxfp8_bf16(&client, &bf16_handle(&client, &x), x.len())).unwrap();
+        let got: Vec<f32> = got.chunks_exact(2).map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32()).collect();
+        let mut bad = 0;
+        for (bi, blk) in x.chunks_exact(32).enumerate() {
+            let amax = blk.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let ex = ((amax.to_bits() >> 23) & 255) as i32;
+            let scale = f32::from_bits(((ex - 8).clamp(1, 254) as u32) << 23);
+            for (i, v) in blk.iter().enumerate() {
+                let want = e4m3_to_f32(e4m3_rne((v * (1.0 / scale)).clamp(-448.0, 448.0))) * scale;
+                let g = got[bi * 32 + i];
+                if g.to_bits() != want.to_bits() && !(g == 0.0 && want == 0.0) {
+                    bad += 1;
+                }
+            }
+        }
+        eprintln!("MXFP8 qdq: {bad} of {} values differ from the host twin", x.len());
+        assert_eq!(bad, 0);
+    }
+
+    /// `x` through the trained activation quantiser and back: BF16, then 4/6
+    /// NVFP4 per row, dequantized with its outer scale (f32).
+    fn qdq46(x: Tensor<Bk, 2>) -> Tensor<Bk, 2> {
+        use crate::models::inkling::fp4quant::dequantize_nvfp4;
+        let [n, k] = x.dims();
+        let client = client_of(&x);
+        let dev = x.device();
+        let (h, dt) = handle_of_any(x.cast(burn::tensor::FloatDType::BF16));
+        assert_eq!(dt, burn::tensor::DType::BF16);
+        let (c, s, a) = quantize_nvfp4_46_bf16(&client, &h, n, k);
+        let deq = tensor_of(client.clone(), dev.clone(), dequantize_nvfp4(&client, &c, &s, n, k), n, k);
+        deq * tensor_of(client, dev, a, n, 1)
+    }
+
+    /// The trained NVFP4 lane against the per-expert loop fed the same
+    /// quantized activations (dequantized), W4A16: the same products up to
+    /// the BF16 rounding of `E2M1 * D * alpha`. Detects a wrong offset,
+    /// outer scale or row.
+    #[test]
+    fn trained_grouped_matches_the_loop_on_quantized_activations() {
+        for (e, rows) in [(128, 37), (16, 37), (128, 1)] {
+            let d = dims(2304, 1152, e, 8);
+            let b = bank(&d, true, 0x4646 + e as u64);
+            let xs = x(rows, d.hidden, 0x6464 + e as u64);
+            let route = b.route(&xs);
+            let picks = route.picks();
+            let cell = fault_cell(&dev());
+            let grouped = host(b.experts_grouped(&xs, &route, &cell, true));
+            let mut by_expert: std::collections::BTreeMap<usize, Vec<(usize, f32)>> = Default::default();
+            for (row, (es, ws)) in picks.iter().enumerate() {
+                for (&ex, &g) in es.iter().zip(ws) {
+                    by_expert.entry(ex).or_default().push((row, g));
+                }
+            }
+            let mut looped = vec![0f32; rows * d.hidden];
+            for (&ex, rws) in &by_expert {
+                let idx: Vec<i64> = rws.iter().map(|&(r, _)| r as i64).collect();
+                let n = idx.len();
+                let xsel = xs.clone().select(0, Tensor::<Bk, 1, Int>::from_data(TensorData::new(idx, [n]), &dev()));
+                let ew = &b.loop_experts[ex];
+                let xq = qdq46(xsel);
+                let g = ew.gate.linear(xq.clone(), ExpertAct::Bf16);
+                let u = ew.up.linear(xq, ExpertAct::Bf16);
+                let capped = |v: Tensor<Bk, 2>, c: f32| v.div_scalar(c).tanh().mul_scalar(c);
+                let a = capped(g.clone(), d.gate_softcap) * burn::tensor::activation::sigmoid(g) * capped(u, d.up_softcap);
+                let y = host(ew.down.linear(qdq46(a), ExpertAct::Bf16));
+                for (j, &(r, w)) in rws.iter().enumerate() {
+                    for c in 0..d.hidden {
+                        looped[r * d.hidden + c] += w * y[j * d.hidden + c];
+                    }
+                }
+            }
+            assert_eq!(read_fault(&cell), None);
+            let (mut worst, h) = (0f32, d.hidden);
+            for row in 0..rows {
+                let rr = row * h..(row + 1) * h;
+                assert!(grouped[rr.clone()].iter().all(|v| v.is_finite()), "row {row}: non-finite");
+                let err = rel_err(&grouped[rr.clone()], &looped[rr]);
+                assert!(err < 5e-2, "E {e} row {row} of {rows}: trained grouped vs quantized loop rel err {err}");
+                worst = worst.max(err);
+            }
+            eprintln!("MOE trained E {e} rows {rows}: grouped vs quantized loop worst row rel err {worst:.3e}");
+        }
     }
 
     #[test]

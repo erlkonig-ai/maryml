@@ -85,14 +85,22 @@ pub const MAX_LOGIT_ROWS: usize = 64;
 /// How a model binds.
 #[derive(Debug, Clone, Copy)]
 pub struct MiniOptions {
-    /// What the NVFP4 experts multiply. [`ExpertAct::Bf16`] (the default) is
-    /// what transformers 046bdb8c computes and what the comparisons checked.
+    /// What the experts multiply. [`ExpertAct::Trained`] (the default) is the
+    /// precision they were trained in; [`ExpertAct::Bf16`] is what
+    /// transformers 046bdb8c computes and what the comparisons checked.
     pub experts: ExpertAct,
 }
 
 impl Default for MiniOptions {
+    /// The trained expert precision ([`ExpertAct::Trained`]), unless
+    /// `MINI_EXPERTS=w4a16` asks for BF16 activations (the comparison arm).
     fn default() -> Self {
-        MiniOptions { experts: ExpertAct::Bf16 }
+        let experts = match std::env::var("MINI_EXPERTS").as_deref() {
+            Ok("trained") | Err(_) => ExpertAct::Trained,
+            Ok("w4a16") => ExpertAct::Bf16,
+            Ok(other) => panic!("MINI_EXPERTS={other}: the arms are trained and w4a16"),
+        };
+        MiniOptions { experts }
     }
 }
 
