@@ -20,7 +20,7 @@
 //!
 //! What is Mary's: the BF16 projections ([`linear_bf16`]), the NVFP4 expert
 //! GEMMs over [`PackedW`] (bound by the sliding layer's binder), the static
-//! short conv ([`super::sliding::conv_step`]), [`rms_norm`], the router's
+//! short conv ([`super::sliding::conv_step`]), [`super::sliding::rms_norm`], the router's
 //! selection rule ([`route_from_logits`]) and the sliding layer's L2 clip, unit
 //! RMS and one-query block attention. New here and in Burn: the dynamic K/V
 //! convolution and the log scale.
@@ -55,14 +55,14 @@ use burn::tensor::activation::sigmoid;
 use burn::tensor::TensorData;
 
 use crate::models::inkling::bf16gemm::Bf16W;
-use crate::models::inkling::burn::{linear_bf16, rms_norm};
+use crate::models::inkling::burn::linear_bf16;
 use crate::models::inkling::seam::{Bk, client_of};
 use crate::models::inkling2_loop::attend::{AttnShape, QUERY_TILE, attend};
 use crate::models::inkling2_loop::config::{AttnKind, Inkling2LoopTextConfig};
 use crate::models::inkling2_loop::layout::{AttnPart, ConvPart, Dtype, LayerPart, Slot};
 use crate::models::inkling2_loop::sliding::{
     Dev, Dims, ExpertAct, STREAMS, State, Taps, Weights, bf16_to_f32, bind_bank, bind_gates,
-    block_attention, conv_step, f32_le, l2_clip, unit_rms, want,
+    block_attention, conv_step, f32_le, l2_clip, rms_norm, unit_rms, want,
 };
 use crate::models::inkling2_loop::messages::{DeviceGate, message_tensor};
 use crate::models::inkling2_loop::moe::Bank;

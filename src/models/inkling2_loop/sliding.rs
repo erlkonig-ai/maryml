@@ -70,7 +70,7 @@ use burn::tensor::TensorData;
 
 use crate::models::inkling::bf16gemm::Bf16W;
 use crate::models::inkling::burn::{
-    PackedW, linear_bf16, linear_fp4, linear_w4a16, rms_norm, short_conv_window,
+    PackedW, linear_bf16, linear_fp4, linear_w4a16, short_conv_window,
 };
 use crate::models::inkling::seam::{Bk, client_of};
 use crate::models::inkling2_loop::prof;
@@ -572,8 +572,20 @@ pub(super) fn conv_step(hist: &mut Tensor<Bk, 2>, x: Tensor<Bk, 2>, w: &Tensor<B
     short_conv_window(all, w.clone(), t).mul_scalar(scale)
 }
 
+/// `rms_norm` with a gain over the last axis: the row kernel when it applies,
+/// else Burn's composition.
+pub(super) fn rms_norm(x: Tensor<Bk, 2>, gain: Tensor<Bk, 1>, eps: f64) -> Tensor<Bk, 2> {
+    match super::rows::rms_norm(x.clone(), gain.clone(), eps) {
+        Some(y) => y,
+        None => crate::models::inkling::burn::rms_norm(x, gain, eps),
+    }
+}
+
 /// Scale each `[.., d]` vector down to `thr` when its L2 norm exceeds it.
 pub(super) fn l2_clip(x: Tensor<Bk, 3>, thr: f32) -> Tensor<Bk, 3> {
+    if let Some(y) = super::rows::l2_clip(x.clone(), thr) {
+        return y;
+    }
     let norm = x.clone().powf_scalar(2.0).sum_dim(2).sqrt();
     let f = norm.clone().ones_like().mul_scalar(thr).div(norm.add_scalar(1e-6)).clamp_max(1.0);
     x * f
@@ -581,6 +593,9 @@ pub(super) fn l2_clip(x: Tensor<Bk, 3>, thr: f32) -> Tensor<Bk, 3> {
 
 /// RMS-normalise each `[.., d]` vector, with no gain.
 pub(super) fn unit_rms(x: Tensor<Bk, 3>, eps: f64) -> Tensor<Bk, 3> {
+    if let Some(y) = super::rows::unit_rms(x.clone(), eps) {
+        return y;
+    }
     let denom = x.clone().powf_scalar(2.0).mean_dim(2).add_scalar(eps).sqrt();
     x / denom
 }
@@ -590,6 +605,9 @@ pub(super) fn unit_rms(x: Tensor<Bk, 3>, eps: f64) -> Tensor<Bk, 3> {
 /// same normed states. Upstream builds this norm with its default eps, 1e-6,
 /// not the config's.
 pub(super) fn block_attention(query: Tensor<Bk, 1>, blocks: &[Tensor<Bk, 2>], partial: Tensor<Bk, 2>) -> Tensor<Bk, 2> {
+    if let Some(y) = super::rows::block_attention(query.clone(), blocks, partial.clone()) {
+        return y;
+    }
     let [t, h] = partial.dims();
     let mut all: Vec<Tensor<Bk, 3>> = blocks.iter().map(|b| b.clone().reshape([t, 1, h])).collect();
     all.push(partial.reshape([t, 1, h]));
