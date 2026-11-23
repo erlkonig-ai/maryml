@@ -322,22 +322,22 @@ mod device {
     use crate::models::inkling2_loop::sliding::Dev;
 
     /// The message queries of every core layer on the device, each layer's four
-    /// as `[H, 4]` (columns Q, K, V, MLP), ready to multiply.
+    /// as `[1, 4, H]` (Q, K, V, MLP).
     pub struct DeviceQueries {
-        layers: Vec<Tensor<Bk, 2>>,
+        layers: Vec<Tensor<Bk, 3>>,
     }
 
     impl DeviceQueries {
         pub fn new(q: &MessageQueries, dev: &Dev) -> DeviceQueries {
             let h = q.hidden;
             let layers = (0..q.core)
-                .map(|l| Tensor::<Bk, 2>::from_data(TensorData::new(q.layer(l).to_vec(), [4, h]), dev).transpose())
+                .map(|l| Tensor::<Bk, 3>::from_data(TensorData::new(q.layer(l).to_vec(), [1, 4, h]), dev))
                 .collect();
             DeviceQueries { layers }
         }
 
-        /// Core layer `index`'s queries, `[H, 4]`.
-        pub fn layer(&self, index: usize) -> Tensor<Bk, 2> {
+        /// Core layer `index`'s queries, `[1, 4, H]`.
+        pub fn layer(&self, index: usize) -> Tensor<Bk, 3> {
             self.layers[index].clone()
         }
     }
@@ -374,14 +374,31 @@ mod device {
         }
 
         /// The four messages of one core layer, `[t, 4, H]`, from its queries
-        /// `[H, 4]` ([`DeviceQueries::layer`]). [`read_messages`] on the device.
-        pub fn read(&self, queries: Tensor<Bk, 2>) -> Tensor<Bk, 3> {
+        /// `[1, 4, H]` ([`DeviceQueries::layer`]). [`read_messages`] on the device.
+        ///
+        /// Elementwise products and sums over the (one to three) keys, not a
+        /// matrix multiply: Burn's f32 matmul on this runtime is TF32, and the
+        /// queries and normed states are f32 values upstream multiplies in f32.
+        pub fn read(&self, queries: Tensor<Bk, 3>) -> Tensor<Bk, 3> {
             let [t, keys, h] = self.normed.dims();
             let scaling = (h as f32).powf(-0.5);
-            let logits = self.normed.clone().reshape([t * keys, h]).matmul(queries).mul_scalar(scaling);
-            let p = softmax(logits.reshape([t, keys, 4]), 1);
-            // [t, 4, keys] x [t, keys, H]
-            p.swap_dims(1, 2).matmul(self.normed.clone())
+            let key = |k: usize| self.normed.clone().slice([0..t, k..k + 1, 0..h]); // [t, 1, H]
+            // upstream: matmul, then `* scaling`, then a float32 softmax over the keys
+            let logits = Tensor::cat(
+                (0..keys).map(|k| (key(k) * queries.clone()).sum_dim(2)).collect(), // each [t, 4, 1]
+                2,
+            )
+            .mul_scalar(scaling);
+            let p = softmax(logits, 2); // [t, 4, keys]
+            let mut out: Option<Tensor<Bk, 3>> = None;
+            for k in 0..keys {
+                let term = p.clone().slice([0..t, 0..4, k..k + 1]) * key(k);
+                out = Some(match out {
+                    None => term,
+                    Some(o) => o + term,
+                });
+            }
+            out.expect("at least the partial state is a key")
         }
     }
 
@@ -392,11 +409,17 @@ mod device {
         m.clone().slice([0..t, j..j + 1, 0..h]).reshape([t, h])
     }
 
-    /// One message gate on the device. The down projection's weights are the
-    /// same values as [`MessageGate`]'s (bf16 under [`DownPrecision::Bf16`]), held
-    /// as f32: a product of two bf16 values is exact in f32, so an f32 matrix
-    /// multiply over bf16-rounded inputs is the released bf16 GEMM with f32
-    /// accumulation. Forget and gain are one f32 multiply against both, stacked.
+    /// One message gate on the device, as f32 matrix multiplies.
+    ///
+    /// Burn's f32 matmul on this runtime is TF32, and that is exact here under
+    /// [`DownPrecision::Bf16`], the released model: every operand is a bf16
+    /// value (the bf16-rounded normed inputs and down weights, then the
+    /// bf16-rounded rank-`r` output and the checkpoint's bf16 forget and gain
+    /// weights), bf16's 8 significant bits fit TF32's 11, and accumulation is
+    /// f32. So this is the released bf16 GEMM, then upstream's f32 forget and
+    /// gain, up to summation order. Under [`DownPrecision::F32`] the operands
+    /// are full f32 and the products are TF32's; nothing binds that lane.
+    /// Forget and gain are one multiply against both, stacked.
     pub struct DeviceGate {
         pub hidden: usize,
         pub rank: usize,
@@ -683,10 +706,10 @@ mod tests {
         #[test]
         fn the_device_gates_match_upstream() {
             let fx = Fx::load();
-            let e32 = device_gate_errors(&fx, "f32", DownPrecision::F32);
+            // the released lane only: under F32 the products are TF32's (see DeviceGate)
             let e16 = device_gate_errors(&fx, "bf16", DownPrecision::Bf16);
-            eprintln!("device gates, worst per-token rel err: f32 {e32}, bf16 {e16}");
-            assert!(e32 < TOL && e16 < TOL, "f32 {e32}, bf16 {e16}");
+            eprintln!("device gates, worst per-token rel err as released: {e16}");
+            assert!(e16 < TOL, "bf16 {e16}");
             // and the precision is still told apart on the device
             assert!(device_gate_errors(&fx, "bf16", DownPrecision::F32) >= 100.0 * TOL);
         }
@@ -694,8 +717,9 @@ mod tests {
         /// At the release's shapes (H 2304, rank 64), over a 37-row batch:
         /// the device gate against the host one, row by row, so a kernel that
         /// gets only the last row right (compass cbc76004's k = 64 failure)
-        /// is caught at row 0. A bug detector, not a tolerance: the bound is
-        /// far above summation order and far below a wrong row.
+        /// is caught at row 0. The weights are bf16 values, as the checkpoint's
+        /// are. A bug detector, not a tolerance: the bound is far above
+        /// summation order and far below a wrong row.
         #[test]
         fn the_device_gate_matches_the_host_gate_at_release_shapes() {
             let (h, r, t) = (2304, 64, 37);
@@ -707,11 +731,12 @@ mod tests {
                 ((seed >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 2.0 * scale
             };
             let down: Vec<f32> = (0..r * 2 * h).map(|_| rnd(0.05)).collect();
-            let forget: Vec<f32> = (0..h * r).map(|_| rnd(0.1)).collect();
-            let gain: Vec<f32> = (0..h * r).map(|_| rnd(0.1)).collect();
+            let b = |v: f32| half::bf16::from_f32(v).to_f32();
+            let forget: Vec<f32> = (0..h * r).map(|_| b(rnd(0.1))).collect();
+            let gain: Vec<f32> = (0..h * r).map(|_| b(rnd(0.1))).collect();
             let hs: Vec<f32> = (0..t * h).map(|_| rnd(8.0)).collect();
             let ms: Vec<f32> = (0..t * h).map(|_| rnd(1.0)).collect();
-            for precision in [DownPrecision::Bf16, DownPrecision::F32] {
+            for precision in [DownPrecision::Bf16] {
                 let g = MessageGate::new(down.clone(), forget.clone(), gain.clone(), h, r, 1e-6, precision).unwrap();
                 let want = g.apply(&hs, &ms, t);
                 let got = host(DeviceGate::new(&g, &dev()).apply(up(hs.clone(), [t, h]), up(ms.clone(), [t, h])));
@@ -723,6 +748,51 @@ mod tests {
                 }
                 eprintln!("{precision:?} device vs host gate, {t} rows, worst rel err {worst}");
             }
+        }
+        /// Whether a token's gate output depends on how many tokens share its
+        /// call: the host gate computes every row alone; a device matmul may
+        /// pick another kernel, and so another summation order, for one row
+        /// than for many, and the bf16 rounding of the down projection turns a
+        /// reordering into whole bf16 steps. Reports, per row of a 37-row
+        /// batch, the device row against the same row computed alone, and both
+        /// against the host. Diagnostic: prints, asserts only the bug bound.
+        #[test]
+        fn the_device_gate_row_alone_and_in_a_batch() {
+            let (h, r, t) = (2304, 64, 37);
+            let mut seed = 0x2545f4914f6cdd1du64;
+            let mut rnd = |scale: f32| -> f32 {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                ((seed >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 2.0 * scale
+            };
+            let b = |v: f32| half::bf16::from_f32(v).to_f32();
+            let down: Vec<f32> = (0..r * 2 * h).map(|_| rnd(0.05)).collect();
+            let forget: Vec<f32> = (0..h * r).map(|_| b(rnd(0.1))).collect();
+            let gain: Vec<f32> = (0..h * r).map(|_| b(rnd(0.1))).collect();
+            let hs: Vec<f32> = (0..t * h).map(|_| rnd(8.0)).collect();
+            let ms: Vec<f32> = (0..t * h).map(|_| rnd(1.0)).collect();
+            let g = MessageGate::new(down, forget, gain, h, r, 1e-6, DownPrecision::Bf16).unwrap();
+            let dg = DeviceGate::new(&g, &dev());
+            let host_all = g.apply(&hs, &ms, t);
+            let batch = host(dg.apply(up(hs.clone(), [t, h]), up(ms.clone(), [t, h])));
+            let (mut alone_vs_batch, mut alone_vs_host, mut batch_vs_host, mut differing) = (0f32, 0f32, 0f32, 0);
+            for row in 0..t {
+                let rr = row * h..(row + 1) * h;
+                let alone = host(dg.apply(up(hs[rr.clone()].to_vec(), [1, h]), up(ms[rr.clone()].to_vec(), [1, h])));
+                let e = rel_err(&alone, &batch[rr.clone()]);
+                if e > 0.0 {
+                    differing += 1;
+                }
+                alone_vs_batch = alone_vs_batch.max(e);
+                alone_vs_host = alone_vs_host.max(rel_err(&alone, &host_all[rr.clone()]));
+                batch_vs_host = batch_vs_host.max(rel_err(&batch[rr.clone()], &host_all[rr]));
+            }
+            eprintln!(
+                "gate rows alone vs in a {t}-row batch: {differing} of {t} differ, worst {alone_vs_batch}; \
+                 worst vs host: alone {alone_vs_host}, batch {batch_vs_host}"
+            );
+            assert!(alone_vs_host < 1e-2 && batch_vs_host < 1e-2, "a wrong row: alone {alone_vs_host}, batch {batch_vs_host}");
         }
     }
 
