@@ -266,6 +266,8 @@ impl MiniModel {
             post: self.post.iter().map(|l| l.new_state(&self.dev, &fault)).collect(),
             fault,
             client,
+            #[cfg(test)]
+            nan_input: false,
         }
     }
 
@@ -289,6 +291,10 @@ impl MiniModel {
         let act = self.opts.experts;
         prof::at(usize::MAX, 0);
         let mut x = prof::span("embed", &self.dev, || self.embed(ids));
+        #[cfg(test)]
+        if std::mem::take(&mut caches.nan_input) {
+            x = x.mul_scalar(f32::NAN);
+        }
         let mut blocks: Vec<Tensor<Bk, 2>> = Vec::new();
         for (layer, st) in self.pre.iter().zip(caches.pre.iter_mut()) {
             prof::at(layer.layer(), 0);
@@ -335,6 +341,10 @@ struct Caches {
     /// replaces it with the caches.
     fault: Handle,
     client: Client,
+    /// Test only: the next forward multiplies its embedded input by NaN, so
+    /// the first layer's router sees non-finite logits by the ordinary path.
+    #[cfg(test)]
+    nan_input: bool,
 }
 
 impl Caches {
@@ -461,3 +471,69 @@ const _: fn() = || {
     send::<MiniSession>();
 };
 
+#[cfg(test)]
+mod tests {
+    //! The router-fault boundary on the release's weights: a non-finite router
+    //! logit fails its own session's append and no other session's. Needs the
+    //! imported release (`MINI_MODEL_PILE`, `MINI_MODEL_COLLECTION`,
+    //! `MINI_MODEL_ROOT`) and a GPU; the fault is induced by the test-only
+    //! `nan_input` flag, so the cell is written by the real grouped lane in
+    //! layer 0 and read by the real `append`.
+    use super::*;
+
+    fn open() -> Arc<MiniModel> {
+        let env = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} is not set"));
+        let collection = crate::model_collection::parse_collection_handle(&env("MINI_MODEL_COLLECTION")).unwrap();
+        let root = Id::from_hex(&env("MINI_MODEL_ROOT")).expect("MINI_MODEL_ROOT is a 32-hex id");
+        Arc::new(MiniModel::open(Path::new(&env("MINI_MODEL_PILE")), collection, root, MiniOptions::default()).unwrap())
+    }
+
+    fn bits(l: &Logits) -> Vec<u32> {
+        l.values.iter().map(|v| v.to_bits()).collect()
+    }
+
+    #[test]
+    #[ignore = "needs the imported Mini release (MINI_MODEL_PILE, MINI_MODEL_COLLECTION, MINI_MODEL_ROOT) and a GPU"]
+    fn a_router_fault_poisons_only_its_own_session() {
+        assert_eq!(super::super::moe::lane(ExpertAct::Bf16), super::super::moe::Lane::Grouped, "run with the grouped lane");
+        let model = open();
+        let ids_a: Vec<u32> = (0..24).map(|i| 1000 + 37 * i).collect();
+        let ids_b: Vec<u32> = (0..17).map(|i| 2000 + 53 * i).collect();
+        let (next_a, next_b) = (4321, 5678);
+
+        let mut a = MiniSession::new(Arc::clone(&model));
+        let mut b = MiniSession::new(Arc::clone(&model));
+        let a0 = a.prefill(&ids_a).expect("A prefill");
+        let b0 = b.prefill(&ids_b).expect("B prefill");
+
+        a.caches.nan_input = true;
+        let at = a.position();
+        let err = a.decode(next_a).expect_err("A's faulted decode must fail").to_string();
+        eprintln!("SESSION fault: A failed with: {err}");
+        assert!(err.contains("router logit is non-finite"), "A failed for another reason: {err}");
+        assert!(a.is_poisoned(), "A is not poisoned");
+        assert_eq!(a.position(), at, "A's position moved");
+        assert!(a.decode(next_a).is_err(), "a poisoned A accepted a call");
+
+        let b1 = b.decode(next_b).expect("B after A's fault");
+        assert!(b1.values.iter().all(|v| v.is_finite()), "B's logits are not finite");
+        let mut c = MiniSession::new(Arc::clone(&model));
+        let c0 = c.prefill(&ids_b).expect("C prefill");
+        let c1 = c.decode(next_b).expect("C decode");
+        let same = |x: &Logits, y: &Logits| bits(x).iter().zip(bits(y)).filter(|(p, q)| **p == *q).count();
+        eprintln!(
+            "SESSION fault: B vs a fresh run of B's sequence, prefill {} of {} equal, decode {} of {} equal",
+            same(&b0, &c0), b0.values.len(), same(&b1, &c1), b1.values.len()
+        );
+        assert_eq!(bits(&b0), bits(&c0), "B's prefill differs from a fresh run");
+        assert_eq!(bits(&b1), bits(&c1), "B's decode after A's fault differs from a fresh run");
+
+        a.reset();
+        assert!(!a.is_poisoned() && a.position() == 0);
+        let a0r = a.prefill(&ids_a).expect("A replay after reset");
+        assert_eq!(bits(&a0), bits(&a0r), "A's replay after reset differs from its first prefill");
+        a.decode(next_a).expect("A decodes after reset");
+        assert_eq!(a.position(), ids_a.len() + 1);
+        eprintln!("SESSION fault: A reset, replayed bit for bit, decoded to position {}", a.position());
+    }
+}

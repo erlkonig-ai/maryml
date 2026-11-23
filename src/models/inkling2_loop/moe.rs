@@ -989,6 +989,147 @@ mod tests {
         assert!(worst_w < 1e-4, "weights differ by {worst_w}");
     }
 
+    fn u32s_of(client: &Client, h: &Handle) -> Vec<u32> {
+        u32::from_bytes(&client.read_one(h.clone()).expect("read")).to_vec()
+    }
+
+    fn f32s_of(client: &Client, h: &Handle) -> Vec<f32> {
+        f32::from_bytes(&client.read_one(h.clone()).expect("read")).to_vec()
+    }
+
+    /// A [`Route`] whose top-k buffer is `topk` (host values), over `route`'s logits.
+    fn with_topk(client: &Client, route: &Route, topk: &[f32]) -> Route {
+        Route {
+            logits: route.logits.clone(),
+            topk: client.create_from_slice(f32::as_bytes(topk)),
+            rows: route.rows,
+            top_k: route.top_k,
+        }
+    }
+
+    /// The fault lands in the cell the call was given and in no other: a
+    /// second call on the same bank with its own cell, on finite input, stays
+    /// clear and gives the output it gave before the faulted call, bit for bit
+    /// (what a second session over the same weights sees). The faulted route
+    /// is a real device route with one row's flag column set, so the plan's
+    /// picks stay well formed and only the flag path is under test.
+    #[test]
+    fn a_fault_lands_only_in_the_cell_it_was_given() {
+        let d = dims(2304, 1152, 128, 8);
+        let b = bank(&d, true, 0xfa17);
+        let client = b.client();
+        let rows = 37;
+        let xs = x(rows, d.hidden, 0x0bad);
+        let route = b.route(&xs);
+        let before_cell = fault_cell(&client);
+        let before = host(b.experts_grouped(&xs, &route, &before_cell));
+        assert_eq!(read_fault(&client, &before_cell), None);
+
+        let mut topk = f32s_of(&client, &route.topk);
+        let w = 2 * d.top_k + 1;
+        assert!(topk.chunks(w).all(|r| r[w - 1] == 0.0), "the input route is already flagged");
+        topk[5 * w + w - 1] = 42.0;
+        let faulted = with_topk(&client, &route, &topk);
+        let a = fault_cell(&client);
+        let _ = host(b.experts_grouped(&xs, &faulted, &a));
+        assert_eq!(read_fault(&client, &a), Some(42), "the faulted call's cell");
+        assert_eq!(read_fault(&client, &before_cell), None, "an earlier call's cell");
+
+        let c = fault_cell(&client);
+        let after = host(b.experts_grouped(&xs, &route, &c));
+        assert_eq!(read_fault(&client, &c), None, "a later call's own cell");
+        assert_eq!(read_fault(&client, &a), Some(42), "a set cell stays set");
+        let same = before.iter().zip(&after).filter(|(p, q)| p.to_bits() == q.to_bits()).count();
+        assert_eq!(same, before.len(), "the bank's output changed after another cell's fault");
+        eprintln!("MOE fault: cell A {:?}, earlier and later cells clear, later output {same} of {} equal", read_fault(&client, &a), before.len());
+    }
+
+    /// Non-finite router logits, through the real top-k and the plan: rows
+    /// that are finite, partly non-finite (one NaN, one +inf, one -inf,
+    /// 121 NaN of 128) and fully NaN. Every index the gather, the GEMMs and
+    /// the scatter consume is read back and checked in range; the experts
+    /// complete; the cell holds a flag; and a finite call on the same bank
+    /// afterwards matches the one before, bit for bit.
+    ///
+    /// Before each faulted plan, buffers the size of `tok_rows` are filled
+    /// with an out-of-range value and dropped, so the pool is likely, not
+    /// certain, to hand one back: without the init in `route_select` the
+    /// fully-NaN row's unwritten slots then read as that value.
+    #[test]
+    fn non_finite_router_rows_keep_every_index_in_range() {
+        let d = dims(2304, 1152, 128, 8);
+        let (e, k) = (d.experts, d.top_k);
+        let b = bank(&d, true, 0x7a11);
+        let client = b.client();
+        let rows = 37;
+        let xs = x(rows, d.hidden, 0x1157);
+        let good = b.route(&xs);
+        let good_cell = fault_cell(&client);
+        let before = host(b.experts_grouped(&xs, &good, &good_cell));
+        assert_eq!(read_fault(&client, &good_cell), None);
+
+        let mut logits = good.logits();
+        logits[2 * e + 17] = f32::NAN;
+        logits[3 * e + 40] = f32::INFINITY;
+        logits[4 * e + 90] = f32::NEG_INFINITY;
+        for v in &mut logits[6 * e..6 * e + 121] {
+            *v = f32::NAN;
+        }
+        for v in &mut logits[9 * e..10 * e] {
+            *v = f32::NAN;
+        }
+        for v in &mut logits[(rows - 1) * e..rows * e] {
+            *v = f32::NAN;
+        }
+        let lh = client.create_from_slice(f32::as_bytes(&logits));
+        let topk = router_topk_launch(&client, &lh, &b.bias, rows, e, e, 0, k, b.route_scale);
+        let bad = Route { logits: good.logits.clone(), topk, rows, top_k: k };
+        let tv = f32s_of(&client, &bad.topk);
+        let w = 2 * k + 1;
+        let picks_of = |r: usize| -> Vec<u32> { tv[r * w..r * w + k].iter().map(|v| *v as u32).collect() };
+        assert!(picks_of(9).iter().all(|p| *p == 0), "a fully NaN row is meant to repeat expert 0: {:?}", picks_of(9));
+        for r in [0, 2, 3, 4] {
+            let mut p = picks_of(r);
+            p.sort();
+            p.dedup();
+            assert_eq!(p.len(), k, "row {r}: picks repeat: {:?}", picks_of(r));
+        }
+
+        for round in 0..2 {
+            for _ in 0..64 {
+                drop(client.create_from_slice(u32::as_bytes(&vec![0x7fff_fff0u32; rows * k])));
+            }
+            let cell = fault_cell(&client);
+            let plan = b.plan(&client, &bad, &cell);
+            let m_max = plan.max_tiles * MTILE;
+            let tok_rows = u32s_of(&client, &plan.tok_rows);
+            let tok_cnt = u32s_of(&client, &plan.tok_cnt);
+            let row_src = i32::from_bytes(&client.read_one(plan.row_src.clone()).expect("read")).to_vec();
+            let tile_slot = u32s_of(&client, &plan.tile_slot);
+            let bad_slots: Vec<(usize, u32)> = tok_rows.iter().copied().enumerate().filter(|(_, v)| *v as usize >= m_max).collect();
+            assert!(bad_slots.is_empty(), "round {round}: tok_rows out of range (m_max {m_max}): {:?}", &bad_slots[..bad_slots.len().min(8)]);
+            assert!(tok_cnt.iter().all(|c| *c as usize == k), "tok_cnt");
+            assert!(row_src.iter().all(|v| *v >= -1 && (*v as i64) < rows as i64), "row_src");
+            assert!(tile_slot.iter().all(|v| (*v as usize) < e || *v == NO_EXPERT), "tile_slot");
+            let out = host(b.experts_grouped(&xs, &bad, &cell));
+            let flag = read_fault(&client, &cell);
+            assert!(flag.is_some(), "round {round}: no fault recorded");
+            let finite_rows = (0..rows).filter(|r| out[r * d.hidden..(r + 1) * d.hidden].iter().all(|v| v.is_finite())).count();
+            eprintln!(
+                "MOE non-finite round {round}: m_max {m_max}, tok_rows max {}, row 6 slots {:?}, row 9 slots {:?}, flag {flag:?}, {finite_rows} of {rows} output rows finite",
+                tok_rows.iter().max().unwrap(),
+                &tok_rows[6 * k..7 * k],
+                &tok_rows[9 * k..10 * k],
+            );
+        }
+
+        let after_cell = fault_cell(&client);
+        let after = host(b.experts_grouped(&xs, &good, &after_cell));
+        assert_eq!(read_fault(&client, &after_cell), None);
+        let same = before.iter().zip(&after).filter(|(p, q)| p.to_bits() == q.to_bits()).count();
+        assert_eq!(same, before.len(), "a finite call after the faulted ones changed");
+    }
+
     #[test]
     fn the_tile_bound_holds() {
         assert_eq!(max_tiles(1, 8, 128), 8);
