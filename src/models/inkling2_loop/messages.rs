@@ -796,6 +796,59 @@ mod tests {
             );
             assert!(alone_vs_host < 1e-2 && batch_vs_host < 1e-2, "a wrong row: alone {alone_vs_host}, batch {batch_vs_host}");
         }
+
+        /// The numbers behind the release-shape test's 1e-2 bound, on its own
+        /// inputs (same seed): per row, the device BF16 gate against the host
+        /// BF16 gate (what the test bounds), and the spread between two honest
+        /// host gates of the same math, BF16 down projection against F32 (how
+        /// far rounding alone moves a row). Metric: `rel_err`, the row's max
+        /// abs difference over the reference row's max abs value. Prints only.
+        #[test]
+        #[ignore = "diagnostic: prints the per-row errors behind the release-shape bound"]
+        fn the_release_shape_bound_against_the_rounding_spread() {
+            let (h, r, t) = (2304, 64, 37);
+            let mut seed = 0x9e3779b97f4a7c15u64;
+            let mut rnd = |scale: f32| -> f32 {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                ((seed >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 2.0 * scale
+            };
+            let down: Vec<f32> = (0..r * 2 * h).map(|_| rnd(0.05)).collect();
+            let b = |v: f32| half::bf16::from_f32(v).to_f32();
+            let forget: Vec<f32> = (0..h * r).map(|_| b(rnd(0.1))).collect();
+            let gain: Vec<f32> = (0..h * r).map(|_| b(rnd(0.1))).collect();
+            let hs: Vec<f32> = (0..t * h).map(|_| rnd(8.0)).collect();
+            let ms: Vec<f32> = (0..t * h).map(|_| rnd(1.0)).collect();
+            let g16 = MessageGate::new(down.clone(), forget.clone(), gain.clone(), h, r, 1e-6, DownPrecision::Bf16).unwrap();
+            let g32 = MessageGate::new(down, forget, gain, h, r, 1e-6, DownPrecision::F32).unwrap();
+            let h16 = g16.apply(&hs, &ms, t);
+            let h32 = g32.apply(&hs, &ms, t);
+            let d16 = host(DeviceGate::new(&g16, &dev()).apply(up(hs.clone(), [t, h]), up(ms.clone(), [t, h])));
+            let mut rows = Vec::new();
+            for row in 0..t {
+                let rr = row * h..(row + 1) * h;
+                let dev_host = rel_err(&d16[rr.clone()], &h16[rr.clone()]);
+                let spread = rel_err(&h16[rr.clone()], &h32[rr.clone()]);
+                let dev_f32 = rel_err(&d16[rr.clone()], &h32[rr]);
+                eprintln!("BOUND row {row}: device_vs_host_bf16 {dev_host:.3e} host_bf16_vs_host_f32 {spread:.3e} device_vs_host_f32 {dev_f32:.3e}");
+                rows.push((dev_host, spread, dev_f32));
+            }
+            let worst = |f: fn(&(f32, f32, f32)) -> f32| {
+                rows.iter().enumerate().map(|(i, x)| (i, f(x))).fold((0, 0f32), |a, b| if b.1 > a.1 { b } else { a })
+            };
+            let median = |f: fn(&(f32, f32, f32)) -> f32| {
+                let mut v: Vec<f32> = rows.iter().map(f).collect();
+                v.sort_by(f32::total_cmp);
+                v[v.len() / 2]
+            };
+            let (a, b2, c) = (worst(|x| x.0), worst(|x| x.1), worst(|x| x.2));
+            eprintln!(
+                "BOUND summary over {t} rows: device_vs_host_bf16 worst row {} = {:.3e} (median {:.3e}); \
+                 host_bf16_vs_host_f32 worst row {} = {:.3e} (median {:.3e}); device_vs_host_f32 worst row {} = {:.3e}",
+                a.0, a.1, median(|x| x.0), b2.0, b2.1, median(|x| x.1), c.0, c.1
+            );
+        }
     }
 
     #[test]
