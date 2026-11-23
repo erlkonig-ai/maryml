@@ -115,6 +115,42 @@ fn is_f32<const D: usize>(x: &Tensor<Bk, D>) -> bool {
     x.dtype() == burn::tensor::DType::F32
 }
 
+// The entry points' operand contracts, checked on the dimensions before
+// anything reaches the device: the kernels index raw arrays, so a mismatch
+// would read or write past an operand instead of failing. A mismatch is a
+// caller's bug and panics; a dtype or size the kernels do not cover is not,
+// and returns `None` for the Burn path.
+
+fn check_gain(x: [usize; 2], gain: [usize; 1]) {
+    assert_eq!(gain[0], x[1], "row kernels: rms_norm gain is {gain:?}, x is {x:?}");
+}
+
+fn check_block_attention(query: [usize; 1], blocks: &[[usize; 2]], partial: [usize; 2]) {
+    assert_eq!(query[0], partial[1], "row kernels: block attention query is {query:?}, partial is {partial:?}");
+    for b in blocks {
+        assert_eq!(*b, partial, "row kernels: block attention block is {b:?}, partial is {partial:?}");
+    }
+}
+
+fn check_gate_input(hidden: [usize; 2], message: [usize; 2]) {
+    assert_eq!(message, hidden, "row kernels: gate message is {message:?}, hidden is {hidden:?}");
+}
+
+fn check_gate_output(fg: [usize; 2], hidden: [usize; 2], message: [usize; 2]) {
+    assert_eq!(message, hidden, "row kernels: gate message is {message:?}, hidden is {hidden:?}");
+    assert_eq!(fg, [hidden[0], 2 * hidden[1]], "row kernels: gate fg is {fg:?}, hidden is {hidden:?}");
+}
+
+fn check_read(normed: [usize; 3], queries: [usize; 3]) {
+    assert_eq!(queries, [1, 4, normed[2]], "row kernels: message queries are {queries:?}, normed is {normed:?}");
+}
+
+fn check_devices(devs: &[Dev]) {
+    assert!(devs.windows(2).all(|w| w[0] == w[1]), "row kernels: operands on different devices: {devs:?}");
+}
+
+type Dev = burn::backend::cuda::CudaDevice;
+
 /// [`super::sliding::l2_clip`] over the last axis, one launch.
 pub fn l2_clip(x: Tensor<Bk, 3>, thr: f32) -> Option<Tensor<Bk, 3>> {
     if !is_f32(&x) {
@@ -135,6 +171,8 @@ pub fn unit_rms(x: Tensor<Bk, 3>, eps: f64) -> Option<Tensor<Bk, 3>> {
 
 /// `rms_norm` with a gain, one launch.
 pub fn rms_norm(x: Tensor<Bk, 2>, gain: Tensor<Bk, 1>, eps: f64) -> Option<Tensor<Bk, 2>> {
+    check_gain(x.dims(), gain.dims());
+    check_devices(&[x.device(), gain.device()]);
     if !is_f32(&x) || !is_f32(&gain) {
         return None;
     }
@@ -280,11 +318,15 @@ fn block_attend(
 /// [`super::sliding::block_attention`] in one launch, with no concatenation:
 /// each block state is read where it is.
 pub fn block_attention(query: Tensor<Bk, 1>, blocks: &[Tensor<Bk, 2>], partial: Tensor<Bk, 2>) -> Option<Tensor<Bk, 2>> {
+    let dims: Vec<[usize; 2]> = blocks.iter().map(|b| b.dims()).collect();
+    check_block_attention(query.dims(), &dims, partial.dims());
+    let mut devs: Vec<Dev> = blocks.iter().map(|b| b.device()).collect();
+    devs.extend([query.device(), partial.device()]);
+    check_devices(&devs);
     if blocks.len() > MAX_BLOCKS || !is_f32(&partial) || !is_f32(&query) || blocks.iter().any(|b| !is_f32(b)) {
         return None;
     }
     let [rows, d] = partial.dims();
-    assert!(blocks.iter().all(|b| b.dims() == [rows, d]), "block attention: every block is [{rows}, {d}]");
     let client = client_of(&partial);
     let dev = partial.device();
     let n = blocks.len();
@@ -395,6 +437,8 @@ const ELEMS: u32 = 256;
 /// [`super::messages::DeviceGate::apply`]'s input: `[rms(hidden), rms(message)]`,
 /// `[t, 2H]`, bf16-rounded when `round`. One launch.
 pub fn gate_input(hidden: Tensor<Bk, 2>, message: Tensor<Bk, 2>, eps: f64, round: bool) -> Option<Tensor<Bk, 2>> {
+    check_gate_input(hidden.dims(), message.dims());
+    check_devices(&[hidden.device(), message.device()]);
     if !is_f32(&hidden) || !is_f32(&message) {
         return None;
     }
@@ -451,11 +495,12 @@ pub fn round_to_bf16(x: Tensor<Bk, 2>) -> Option<Tensor<Bk, 2>> {
 /// [`super::messages::DeviceGate::apply`]'s output from the stacked forget
 /// and gain pre-activations `fg` (`[t, 2H]`), in one launch.
 pub fn gate_output(fg: Tensor<Bk, 2>, hidden: Tensor<Bk, 2>, message: Tensor<Bk, 2>) -> Option<Tensor<Bk, 2>> {
+    check_gate_output(fg.dims(), hidden.dims(), message.dims());
+    check_devices(&[fg.device(), hidden.device(), message.device()]);
     if !is_f32(&fg) || !is_f32(&hidden) || !is_f32(&message) {
         return None;
     }
     let [rows, h] = hidden.dims();
-    assert_eq!(fg.dims(), [rows, 2 * h], "gate output: fg is [t, 2H]");
     let total = rows * h;
     let client = client_of(&hidden);
     let dev = hidden.device();
@@ -530,10 +575,11 @@ fn msg_read(normed: &Array<f32>, q: &Array<f32>, out: &mut Array<f32>, cells: u3
 /// `[t, keys, H]`, `queries` `[1, 4, H]`, the messages `[t, 4, H]`.
 pub fn read_messages(normed: &Tensor<Bk, 3>, queries: Tensor<Bk, 3>) -> Option<Tensor<Bk, 3>> {
     let [t, keys, h] = normed.dims();
+    check_read(normed.dims(), queries.dims());
+    check_devices(&[normed.device(), queries.device()]);
     if keys > MAX_BLOCKS + 2 || !is_f32(normed) || !is_f32(&queries) {
         return None;
     }
-    assert_eq!(queries.dims(), [1, 4, h], "message queries are [1, 4, H]");
     let client = client_of(normed);
     let dev = normed.device();
     let nh = f32_handle(normed.clone()).expect("f32");
@@ -620,6 +666,7 @@ pub fn conv_step(hist: &mut Tensor<Bk, 2>, x: Tensor<Bk, 2>, w: &Tensor<Bk, 2>, 
     let [t, c] = x.dims();
     let [keep, hc] = hist.dims();
     let [wc, kernel] = w.dims();
+    check_devices(&[x.device(), hist.device(), w.device()]);
     if !is_f32(&x) || !is_f32(hist) || !is_f32(w) || t == 0 || hc != c || wc != c || kernel != keep + 1 || keep == 0 {
         return None;
     }
@@ -689,6 +736,7 @@ pub const GEMV_MAX_ROWS: usize = 16;
 pub fn gemv(x: Tensor<Bk, 2>, w_t: &Tensor<Bk, 2>) -> Option<Tensor<Bk, 2>> {
     let [t, k] = x.dims();
     let [wk, n] = w_t.dims();
+    check_devices(&[x.device(), w_t.device()]);
     if t == 0 || t > GEMV_MAX_ROWS || wk != k || !is_f32(&x) || !is_f32(w_t) {
         return None;
     }
@@ -719,4 +767,97 @@ pub fn gemv(x: Tensor<Bk, 2>, w_t: &Tensor<Bk, 2>) -> Option<Tensor<Bk, 2>> {
         );
     }
     Some(tensor_of(client, dev, out, t, n))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The contracts alone, with no device: each mismatch panics in the check,
+    // which every entry point runs before it touches a client.
+
+    #[test]
+    #[should_panic(expected = "rms_norm gain")]
+    fn a_short_gain_is_refused() {
+        check_gain([3, 2304], [2303]);
+    }
+
+    #[test]
+    #[should_panic(expected = "block attention query")]
+    fn a_narrow_block_query_is_refused() {
+        check_block_attention([64], &[[3, 2304]], [3, 2304]);
+    }
+
+    #[test]
+    #[should_panic(expected = "block attention block")]
+    fn a_mismatched_block_is_refused() {
+        check_block_attention([2304], &[[3, 2304], [2, 2304]], [3, 2304]);
+    }
+
+    #[test]
+    #[should_panic(expected = "gate message")]
+    fn a_gate_input_message_of_other_rows_is_refused() {
+        check_gate_input([3, 2304], [1, 2304]);
+    }
+
+    #[test]
+    #[should_panic(expected = "gate message")]
+    fn a_gate_output_message_of_other_width_is_refused() {
+        check_gate_output([3, 4608], [3, 2304], [3, 2048]);
+    }
+
+    #[test]
+    #[should_panic(expected = "gate fg")]
+    fn a_gate_output_fg_of_other_width_is_refused() {
+        check_gate_output([3, 2304], [3, 2304], [3, 2304]);
+    }
+
+    #[test]
+    #[should_panic(expected = "message queries")]
+    fn message_queries_of_other_width_are_refused() {
+        check_read([3, 8, 2304], [1, 4, 2048]);
+    }
+
+    #[test]
+    fn matching_shapes_pass_every_check() {
+        check_gain([3, 2304], [2304]);
+        check_block_attention([2304], &[[3, 2304]; 6], [3, 2304]);
+        check_gate_input([3, 2304], [3, 2304]);
+        check_gate_output([3, 4608], [3, 2304], [3, 2304]);
+        check_read([3, 8, 2304], [1, 4, 2304]);
+    }
+
+    /// Through the entry points on the device: each mismatch panics with its
+    /// check's message (so before the launch code), and the client still
+    /// runs a well-formed call afterwards.
+    #[test]
+    fn the_entry_points_refuse_mismatches_before_launching() {
+        let dev = Dev::default();
+        let t2 = |r: usize, c: usize| Tensor::<Bk, 2>::ones([r, c], &dev);
+        let t1 = |c: usize| Tensor::<Bk, 1>::ones([c], &dev);
+        let refused = |what: &str, f: &mut dyn FnMut()| {
+            let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).expect_err(what);
+            let msg = err.downcast_ref::<String>().cloned().unwrap_or_default();
+            assert!(msg.starts_with("row kernels:"), "{what}: panicked elsewhere: {msg}");
+        };
+        refused("rms_norm", &mut || {
+            rms_norm(t2(3, 64), t1(63), 1e-6);
+        });
+        refused("block_attention", &mut || {
+            block_attention(t1(32), &[t2(3, 64)], t2(3, 64));
+        });
+        refused("gate_input", &mut || {
+            gate_input(t2(3, 64), t2(2, 64), 1e-6, true);
+        });
+        refused("gate_output", &mut || {
+            gate_output(t2(3, 128), t2(3, 64), t2(3, 32));
+        });
+        refused("read_messages", &mut || {
+            read_messages(&Tensor::<Bk, 3>::ones([3, 4, 64], &dev), Tensor::<Bk, 3>::ones([1, 4, 32], &dev));
+        });
+        let y = rms_norm(t2(3, 64), t1(64), 1e-6).expect("f32 takes the kernel");
+        let v = y.into_data().convert::<f32>().to_vec::<f32>().unwrap();
+        assert_eq!(v.len(), 3 * 64);
+        assert!(v.iter().all(|&x| (x - 1.0).abs() < 1e-5), "rms_norm of ones is ones: {:?}", &v[..4]);
+    }
 }

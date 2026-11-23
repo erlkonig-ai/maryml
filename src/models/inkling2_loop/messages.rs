@@ -449,6 +449,7 @@ mod device {
         pub fn apply(&self, hidden_states: Tensor<Bk, 2>, message: Tensor<Bk, 2>) -> Tensor<Bk, 2> {
             let [t, h] = hidden_states.dims();
             assert_eq!(h, self.hidden);
+            assert_eq!(message.dims(), [t, h], "a gate's message is [t, H] like its hidden states");
             use crate::models::inkling2_loop::rows;
             let bf = self.precision == DownPrecision::Bf16;
             let x = match rows::gate_input(hidden_states.clone(), message.clone(), self.eps, bf) {
