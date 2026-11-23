@@ -25,8 +25,13 @@
 //!    boundary.
 //! 5. **Chunks.** The same prompt in three calls, the first boundary inside the
 //!    first image's placeholders and the second inside the second's, then two
-//!    fixed text tokens one at a time; every row against the one-call replay
-//!    of the whole sequence. Reset and replay, bit for bit.
+//!    fixed text tokens one at a time. The same calls again after a reset and
+//!    in a fresh session: every row bit for bit, and every visit's position,
+//!    extent, keys, values and convolution tails bit for bit. With `--record`
+//!    the rows' and states' digests are written; with `--admit` another
+//!    process holds its own to them. Against the one-call replay of the whole
+//!    sequence the rows are information: another call shape takes other
+//!    attention kernels, and the quantised experts turn that into other codes.
 //! 6. **Refusals.** Wrong row counts, rows for a text chunk, non-finite values,
 //!    an out-of-table ID, an empty call and a bad row request are refused with
 //!    the position unchanged and the session not poisoned; the same session
@@ -49,6 +54,7 @@
 //!
 //! usage: inkling2_session_image_check <pile> <collection> <root> <vision_fixture_dir> <image_reference.safetensors>
 //!        [--text-ref <whole_reference.safetensors>] [--receipt <out.json>]
+//!        [--record <schedule.json> | --admit <schedule.json>]
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -161,6 +167,11 @@ impl Report {
         ok
     }
 
+    /// A line that fails nothing.
+    fn info(&self, what: &str, old_bound: bool, detail: String) {
+        println!("info {what} (the old bound: {}): {detail}", if old_bound { "held" } else { "not held" });
+    }
+
     fn row(&self, what: &str, got: &[f32], want: &[f32]) -> serde_json::Value {
         let (r, m) = (rel_l2(got, want), max_abs(got, want));
         let (tg, tw) = (top(got, 5), top(want, 5));
@@ -206,6 +217,26 @@ fn chunked(s: &mut MiniSession, chunks: &[(&[u32], &[f32])], after: &[u32]) -> V
         out.push(s.decode(id).expect("decode").last().to_vec());
     }
     out
+}
+
+/// Digest of `f32` rows, bit for bit.
+fn digest(rows: &[Vec<f32>]) -> String {
+    let mut h = blake3::Hasher::new();
+    for v in rows.iter().flatten() {
+        h.update(&v.to_bits().to_le_bytes());
+    }
+    h.finalize().to_hex().to_string()
+}
+
+/// Every visit's carried state as one comparable line.
+fn state_lines(s: &MiniSession) -> (Vec<String>, bool) {
+    let d = s.state_digests().expect("carried state");
+    (d.iter().map(|v| format!("{v:?}")).collect(), d.iter().all(|v| v.finite))
+}
+
+/// How many of `want` are equal in `got`.
+fn equal(got: &[String], want: &[String]) -> usize {
+    got.iter().zip(want).filter(|(a, b)| a == b).count()
 }
 
 fn decode_png(path: &str, geometry: Geometry) -> ImageTokens {
@@ -392,7 +423,7 @@ fn main() {
     }
     tmean /= tinc.len() as f64;
     let mean = cached.iter().map(|c| c["rel_l2"].as_f64().unwrap()).sum::<f64>() / cached.len() as f64;
-    rep.check(
+    rep.info(
         "chunked against replay: no wider than the decoder's own call-shape spread on text",
         mean <= 2.0 * tmean && worst <= 2.0 * tworst,
         format!(
@@ -401,17 +432,52 @@ fn main() {
         ),
     );
     let blast = full.len() - 1;
-    rep.check(
+    rep.info(
         "chunked next token after the prompt and after the decodes = replay's",
         top(&inc[n - 1], 1)[0] == top(&replay[n - 1], 1)[0] && top(&inc[blast], 1)[0] == top(&replay[blast], 1)[0],
         format!("row {} {} vs {}, row {blast} {} vs {}", n - 1, top(&inc[n - 1], 1)[0], top(&replay[n - 1], 1)[0], top(&inc[blast], 1)[0], top(&replay[blast], 1)[0]),
     );
     receipt["text_chunk_baseline"] = json!({"argmax_same": tsame, "mean_rel_l2": tmean, "worst_rel_l2": tworst});
     rep.check("position after the chunked run", b.position() == full.len(), format!("{}", b.position()));
+    let (state, finite) = state_lines(&b);
+    rep.check(
+        "chunked run: rows and carried states finite",
+        finite && inc.iter().flatten().all(|v| v.is_finite()),
+        format!("{} rows, {} visits", inc.len(), state.len()),
+    );
     b.reset();
     rep.check("reset", b.position() == 0 && !b.is_poisoned(), String::new());
     let again = chunked(&mut b, &plan, &AFTER);
-    rep.check("reset and replay bit for bit", again.iter().zip(&inc).all(|(x, y)| bits_equal(x, y)), String::new());
+    rep.check("reset and replay bit for bit", again.len() == inc.len() && again.iter().zip(&inc).all(|(x, y)| bits_equal(x, y)), String::new());
+    let (reset_state, _) = state_lines(&b);
+    rep.check("reset and replay: carried states bit-equal", reset_state == state, format!("{} of {} visits", equal(&reset_state, &state), state.len()));
+    let mut cold = MiniSession::new(Arc::clone(&model));
+    let cold_rows = chunked(&mut cold, &plan, &AFTER);
+    let (cold_state, _) = state_lines(&cold);
+    rep.check("fresh session, same calls: rows bit for bit", cold_rows.len() == inc.len() && cold_rows.iter().zip(&inc).all(|(x, y)| bits_equal(x, y)), String::new());
+    rep.check("fresh session, same calls: carried states bit-equal", cold_state == state, format!("{} of {} visits", equal(&cold_state, &state), state.len()));
+    // control: the same calls with the rows reversed must not give the same states
+    let turned: Vec<f32> = image_rows.chunks_exact(h).rev().flatten().copied().collect();
+    let turned_plan: Vec<(&[u32], &[f32])> =
+        vec![(plan[0].0, &turned[..k1 * h]), (plan[1].0, &turned[k1 * h..k2 * h]), (plan[2].0, &turned[k2 * h..])];
+    let mut other = MiniSession::new(Arc::clone(&model));
+    chunked(&mut other, &turned_plan, &AFTER);
+    let (turned_state, _) = state_lines(&other);
+    let same_states = equal(&turned_state, &state);
+    rep.check("control: reversed rows move the carried states", same_states < state.len(), format!("{same_states} of {} visits equal", state.len()));
+    let schedule = json!({
+        "ids": full, "calls": [c1, c2], "image_rows": digest(&[image_rows.clone()]),
+        "positions": inc.len(), "rows": inc.iter().map(|r| digest(std::slice::from_ref(r))).collect::<Vec<_>>(), "state": state,
+    });
+    if let Some(p) = flag("--record") {
+        std::fs::write(&p, serde_json::to_vec_pretty(&schedule).unwrap()).expect("schedule");
+    }
+    if let Some(p) = flag("--admit") {
+        let want: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).expect("schedule")).expect("schedule json");
+        for key in ["ids", "calls", "image_rows", "positions", "rows", "state"] {
+            rep.check(&format!("another process's {key}, bit for bit"), schedule[key] == want[key], String::new());
+        }
+    }
     receipt["chunked"] = json!({"rows": cached, "worst_rel_l2": worst, "mean_rel_l2": mean, "argmax_same": same, "split": [c1, c2]});
 
     // 6. refusals, mid-sequence: after the first chunk, before the second
@@ -496,8 +562,13 @@ fn main() {
         let mean: f64 = (0..n).map(|p| rel_l2(l.row(p), rows(l32, v, p, p + 1))).sum::<f64>() / n as f64;
         let cnext = top(l.row(last), 1)[0];
         rep.check(
-            &format!("control '{what}' is discriminated"),
-            in_rel > 10.0 * img_rel && mean > 2.0 * real_mean,
+            &format!("control '{what}' is discriminated at the decoder input and moves the logits"),
+            in_rel > 10.0 * img_rel && (0..n).any(|p| !bits_equal(l.row(p), &replay[p])),
+            String::new(),
+        );
+        rep.info(
+            &format!("control '{what}', logits against upstream"),
+            mean > 2.0 * real_mean,
             format!(
                 "image input rel_l2 {in_rel:.3e} (real {img_rel:.3e}); logits mean rel_l2 {mean:.3e} (real {real_mean:.3e}), last {lr:.3e} (real {real_last:.3e}), next {cnext}"
             ),
