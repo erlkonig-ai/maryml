@@ -508,19 +508,58 @@ mod tests {
             let dev = Dev::default();
             let mut r = Lcg(seed);
             let (h, kvd) = (a.heads, a.kv_heads * a.head_dim);
-            // BF16 values, so the rounding of Q, K and V changes nothing
-            let bf = |v: Vec<f32>| -> Vec<f32> { v.into_iter().map(|x| half::bf16::from_f32(x).to_f32()).collect() };
-            let q = bf(r.vec(n * h * a.head_dim, 2.0));
+            let q = r.vec(n * h * a.head_dim, 2.0);
             let rel = r.vec(n * h * d_rel, 1.0);
             let mut sinks = r.vec(n * h, 2.0);
             // a sink-dominated row: every head of position 7 sinks hard
             for x in &mut sinks[7 * h..8 * h] {
                 *x = 60.0;
             }
-            let k = bf(r.vec(n * kvd, 1.0));
-            let v = bf(r.vec(n * kvd, 1.0));
+            let k = r.vec(n * kvd, 1.0);
+            let v = r.vec(n * kvd, 1.0);
             let rel_proj = up(r.vec(d_rel * a.rel_extent, 1.0), [d_rel, a.rel_extent], &dev);
-            Case { a, d_rel, n, q, rel, sinks, k, v, rel_proj, dev }
+            // BF16 values, so the rounding of Q, K and V changes nothing
+            Case { a, d_rel, n, q, rel, sinks, k, v, rel_proj, dev }.rounded(true, true)
+        }
+
+        /// [`Self::new`]'s shapes with Q, K and V that BF16 does not hold
+        /// (every value of them has low f32 bits), and the bias table exact:
+        /// one-hot relative states over a BF16 profile.
+        fn unrounded(a: AttnShape, n: usize, seed: u64) -> Case {
+            let mut c = Case::new(a, 4, n, seed);
+            let mut r = Lcg(seed + 1);
+            let mut odd = |n: usize, scale: f32| -> Vec<f32> {
+                let v = r.vec(n, scale);
+                v.into_iter().map(|x| f32::from_bits(half::bf16::from_f32(x).to_f32().to_bits() | 0x6a5b)).collect()
+            };
+            c.q = odd(c.q.len(), 2.0);
+            c.k = odd(c.k.len(), 1.0);
+            c.v = odd(c.v.len(), 1.0);
+            c.exact_table(seed + 2);
+            c
+        }
+
+        fn rounded(mut self, q: bool, kv: bool) -> Case {
+            let bf = |v: &mut Vec<f32>| v.iter_mut().for_each(|x| *x = half::bf16::from_f32(*x).to_f32());
+            if q {
+                bf(&mut self.q);
+            }
+            if kv {
+                bf(&mut self.k);
+                bf(&mut self.v);
+            }
+            self
+        }
+
+        /// One-hot relative states over a BF16 profile: the bias table has no
+        /// rounding of its own.
+        fn exact_table(&mut self, seed: u64) {
+            let (dr, e) = (self.d_rel, self.a.rel_extent);
+            for (i, x) in self.rel.iter_mut().enumerate() {
+                *x = if i % dr == i / dr % dr { 1.0 } else { 0.0 };
+            }
+            let proj = Lcg(seed).vec(dr * e, 1.0).into_iter().map(|x| half::bf16::from_f32(x).to_f32()).collect();
+            self.rel_proj = up(proj, [dr, e], &self.dev);
         }
 
         fn rows(&self, r: std::ops::Range<usize>) -> (Tensor<Bk, 3>, Tensor<Bk, 2>, Tensor<Bk, 2>, Tensor<Bk, 2>, Tensor<Bk, 2>) {
@@ -617,17 +656,50 @@ mod tests {
         }
     }
 
-    /// Worst absolute difference per row, and the worst of all.
+    /// The largest absolute difference of `a` and `b`, which must be as long
+    /// as each other and finite throughout: `f32::max` drops a NaN, and a zip
+    /// drops what the longer side has left.
+    fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+        assert_eq!(a.len(), b.len(), "the sides differ in length");
+        let mut w = 0f32;
+        for (i, (x, y)) in a.iter().zip(b).enumerate() {
+            assert!(x.is_finite() && y.is_finite(), "element {i} is not finite: {x} and {y}");
+            w = w.max((x - y).abs());
+        }
+        w
+    }
+
+    /// Worst absolute difference of any row of `width`, and that row.
     fn worst(got: &[f32], want: &[f32], width: usize) -> (f32, usize) {
+        assert!(!got.is_empty() && got.len() % width == 0, "{} values are not rows of {width}", got.len());
+        assert_eq!(got.len(), want.len(), "the sides differ in length");
         let mut w = (0f32, 0usize);
         for (i, (g, r)) in got.chunks(width).zip(want.chunks(width)).enumerate() {
-            let d = g.iter().zip(r).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
-            assert!(d.is_finite(), "row {i} is not finite");
+            let d = max_abs_diff(g, r);
             if d > w.0 {
                 w = (d, i);
             }
         }
         w
+    }
+
+    #[test]
+    fn worst_rejects_missing_and_non_finite_values() {
+        let good = vec![1f32; 12];
+        assert_eq!(worst(&good, &good, 4), (0.0, 0));
+        let refused = |got: &[f32], want: &[f32]| std::panic::catch_unwind(|| worst(got, want, 4)).is_err();
+        assert!(refused(&good[..8], &good), "a missing row passes");
+        assert!(refused(&good, &good[..8]), "a missing reference row passes");
+        assert!(refused(&good[..10], &good[..10]), "a partial row passes");
+        assert!(refused(&[], &[]), "no rows at all pass");
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            for at in [0, 5, 11] {
+                let mut x = good.clone();
+                x[at] = bad;
+                assert!(refused(&x, &good), "{bad} at {at} passes");
+                assert!(refused(&good, &x), "{bad} at {at} of the reference passes");
+            }
+        }
     }
 
     /// Each plan through [`attend`] against the exact host attention, beside
@@ -638,7 +710,8 @@ mod tests {
     fn check(c: &Case, plans: &[(&[usize], usize, usize)]) {
         let exact = c.exact();
         let width = c.a.heads * c.a.head_dim;
-        let sunk = exact[7 * width..8 * width].iter().fold(0f32, |m, x| m.max(x.abs()));
+        let zeros = vec![0f32; width];
+        let sunk = max_abs_diff(&exact[7 * width..8 * width], &zeros);
         assert!(sunk < 1e-12, "position 7's sink does not dominate: {sunk}");
         let mat = c.reference();
         let (dm, rm) = worst(&mat, &exact, width);
@@ -653,7 +726,7 @@ mod tests {
                 if plan.len() > 12 { format!(" .. ({} calls)", plan.len()) } else { String::new() }
             );
             assert!(d <= 1.5 * dm + 1e-5, "plan {plan:?}, tiles {kt}/{qt}: position {row} is {d} from exact, the materialised path {dm}");
-            let s = got[7 * width..8 * width].iter().fold(0f32, |m, x| m.max(x.abs()));
+            let s = max_abs_diff(&got[7 * width..8 * width], &zeros);
             assert!(s < 1e-12, "position 7 under the sink: {s}");
         }
     }
@@ -751,7 +824,7 @@ mod tests {
         c.sinks.iter_mut().for_each(|x| *x = 0.0);
         let width = h * hd;
         let vj0: Vec<f32> = (0..h).flat_map(|hh| c.v[(j0 * kvh + hh / (h / kvh)) * hd..][..hd].to_vec()).collect();
-        let near = |row: &[f32]| row.iter().zip(&vj0).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        let near = |row: &[f32]| max_abs_diff(row, &vj0);
         for plan in [&[n][..], &[1000, 23, 1, 1, 1, 274], &[1020, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 261]] {
             let got = c.tiled(plan, KEY_TILE, QUERY_TILE);
             for p in 0..n {
@@ -794,7 +867,7 @@ mod tests {
             for p in (e - 1)..n {
                 let j = p + 1 - e;
                 let want: Vec<f32> = (0..h).flat_map(|hh| c.v[(j * kvh + hh / (h / kvh)) * hd..][..hd].to_vec()).collect();
-                let d = got[p * width..(p + 1) * width].iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+                let d = max_abs_diff(&got[p * width..(p + 1) * width], &want);
                 assert!(d < 5e-2, "plan {plan:?}: query {p} should return v[{j}] (biased at distance {}), is {d} away", e - 1);
             }
         }
@@ -810,12 +883,7 @@ mod tests {
     fn the_kernels_match_the_definition_given_an_exact_table() {
         for (window, e, n) in [(Some(48), 48, 203), (None, 40, 211)] {
             let mut c = Case::new(small(window, e), 4, n, 61);
-            for (i, x) in c.rel.iter_mut().enumerate() {
-                *x = if i % 4 == i / 4 % 4 { 1.0 } else { 0.0 };
-            }
-            let mut r = Lcg(62);
-            let proj = r.vec(4 * e, 1.0).into_iter().map(|x| half::bf16::from_f32(x).to_f32()).collect();
-            c.rel_proj = up(proj, [4, e], &c.dev);
+            c.exact_table(62);
             let exact = c.exact();
             let width = c.a.heads * c.a.head_dim;
             for (label, plan, kt, qt) in [
@@ -827,6 +895,54 @@ mod tests {
                 let (d, row) = worst(&got, &exact, width);
                 println!("window {window:?} {label}: worst abs {d:.3e} at position {row}");
                 assert!(d < 2e-5, "window {window:?} {label}: {d} from exact at position {row}");
+            }
+        }
+    }
+
+    /// The cache holds what upstream's does: each key and value rounded to
+    /// BF16 (nearest, ties to even), read back bit for bit, however the rows
+    /// arrived.
+    #[test]
+    fn the_cache_reads_back_the_bf16_rounding() {
+        let c = Case::unrounded(small(None, 40), 211, 71);
+        let want = c.k.iter().chain(&c.v).map(|x| half::bf16::from_f32(*x).to_f32().to_bits()).collect::<Vec<_>>();
+        assert!(c.k.iter().chain(&c.v).zip(&want).all(|(x, w)| x.to_bits() != *w), "an input BF16 already holds");
+        for plan in [vec![211], vec![100, 1, 1, 1, 60, 48], vec![1; 211]] {
+            let mut kv = Kv::new(16);
+            let mut at = 0;
+            for len in &plan {
+                let (_, _, _, k, v) = c.rows(at..at + len);
+                kv.append(k, v);
+                at += len;
+            }
+            let held: Vec<u32> = [kv.keys(), kv.values()].into_iter().flat_map(|t| host(t.expect("rows"))).map(f32::to_bits).collect();
+            assert!(held == want, "plan of {} calls: the cache is not the BF16 rounding", plan.len());
+        }
+    }
+
+    /// What each call length does to operands BF16 does not hold, against the
+    /// definition in f64 on the operands as the call should see them. K and V
+    /// are rounded in every call; Q is rounded in a long call and not in a
+    /// short one. The same output is far from the definition on either other
+    /// reading of the operands.
+    #[test]
+    fn operands_bf16_does_not_hold() {
+        for (window, e, n) in [(Some(48), 48, 203), (None, 40, 211)] {
+            let seen = |q, kv| Case::unrounded(small(window, e), n, 81).rounded(q, kv).exact();
+            let (both, kv_only, q_only) = (seen(true, true), seen(false, true), seen(true, false));
+            let c = Case::unrounded(small(window, e), n, 81);
+            let width = c.a.heads * c.a.head_dim;
+            for (label, plan, kt, qt, want, others) in [
+                ("one call", vec![n], 1024, 1024, &both, [&kv_only, &q_only]),
+                ("one call, small tiles", vec![n], 16, 40, &both, [&kv_only, &q_only]),
+                ("single tokens", vec![1; n], 16, 12, &kv_only, [&both, &q_only]),
+            ] {
+                let got = c.tiled(&plan, kt, qt);
+                let (d, row) = worst(&got, want, width);
+                let far = others.map(|o| worst(&got, o, width).0);
+                println!("window {window:?} {label}: worst abs {d:.3e} at {row}; on the other readings {far:?}");
+                assert!(d < 2e-5, "window {window:?} {label}: {d} from the definition at position {row}");
+                assert!(far.iter().all(|f| *f > 1e-3), "window {window:?} {label}: {far:?} does not tell the readings apart");
             }
         }
     }
