@@ -230,12 +230,12 @@ fn tap_rows(t: Taps, out: Vec<f32>) -> (Vec<(&'static str, Vec<f32>)>, Vec<Vec<u
         ("attn", host(t.attn)),
         ("attn_conv", host(t.attn_conv)),
         ("mlp_input", host(t.mlp_input)),
-        ("router_logits", t.router_logits),
+        ("router_logits", t.route.logits()),
         ("experts", host(t.experts)),
         ("mlp_conv", host(t.mlp_conv)),
         ("out", out),
     ];
-    (rows, t.routing.into_iter().map(|(e, _)| e).collect())
+    (rows, t.route.picks().into_iter().map(|(e, _)| e).collect())
 }
 
 enum Bound {

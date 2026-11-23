@@ -267,7 +267,7 @@ fn main() {
             ("attn", host(taps.attn)),
             ("attn_conv", host(taps.attn_conv)),
             ("mlp_input", host(taps.mlp_input)),
-            ("router_logits", taps.router_logits),
+            ("router_logits", taps.route.logits()),
             ("experts", host(taps.experts)),
             ("mlp_conv", host(taps.mlp_conv)),
             ("out", host(out)),
@@ -279,7 +279,7 @@ fn main() {
         let (k, v) = held_kv(state);
         Seen {
             taps: seen,
-            routing: taps.routing.iter().map(|(e, _)| e.iter().map(|&x| x as i32).collect()).collect(),
+            routing: taps.route.picks().iter().map(|(e, _)| e.iter().map(|&x| x as i32).collect()).collect(),
             k,
             v,
             conv: state.conv.iter().map(|c| host(c.clone())).collect(),

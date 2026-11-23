@@ -209,8 +209,8 @@ impl Chain {
             inputs.push(host(x.clone()));
             let (y, taps) = layer.forward(x, &mut blocks, &mut states[l], act);
             x = y;
-            layer_logits.push(taps.router_logits);
-            layer_experts.push(taps.routing.into_iter().map(|(e, _)| e).collect());
+            layer_logits.push(taps.route.logits());
+            layer_experts.push(taps.route.picks().into_iter().map(|(e, _)| e).collect());
             outs.push(host(x.clone()));
         }
         inputs.push(host(x.clone()));
@@ -219,9 +219,10 @@ impl Chain {
         let out = host(out);
         outs.push(out.clone());
         let FullTaps { inputs: [qi, ki, vi], rest } = taps;
-        let Taps { attn, attn_conv, mlp_input, router_logits, routing, experts, mlp_conv, gates } = rest;
+        let Taps { attn, attn_conv, mlp_input, route, experts, mlp_conv, gates } = rest;
         assert!(gates.is_none(), "the prefix has no cross-pass messages");
-        layer_logits.push(router_logits);
+        let routing = route.picks();
+        layer_logits.push(route.logits());
         layer_experts.push(routing.iter().map(|(e, _)| e.clone()).collect());
         Pass {
             inputs,

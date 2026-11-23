@@ -71,10 +71,14 @@ pub mod loop_core;
 #[cfg(feature = "inkling-cuda")]
 pub mod full;
 #[cfg(feature = "inkling-cuda")]
+pub mod moe;
+#[cfg(feature = "inkling-cuda")]
 pub mod sliding;
 #[cfg(feature = "inkling-cuda")]
 pub mod tail_check;
 #[cfg(feature = "inkling2-session")]
 pub mod session;
+#[cfg(feature = "inkling-cuda")]
+pub mod prof;
 
 pub use config::{Family, Inkling2LoopConfig, family_of, family_of_str};

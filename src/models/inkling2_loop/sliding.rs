@@ -48,9 +48,11 @@
 //! convolutions. Upstream's cache keeps `k` columns of conv input; only its
 //! last `k - 1` are ever read, and those are what is kept here.
 //!
-//! Experts bind in their stored format ([`bind_experts`]): NVFP4 (layers
-//! 0..19) as packed codes, MXFP8 (layers 20..23) decoded on the host to BF16
-//! and multiplied by [`linear_bf16`] with BF16 activations.
+//! Experts bind in their stored format ([`bind_bank`]): NVFP4 (layers
+//! 0..19) as packed codes, MXFP8 (layers 20..23) decoded on the host to BF16,
+//! one device buffer per projection with the experts stacked. The router and
+//! the experts run as [`super::moe::Bank`]: routed on the device, one grouped
+//! launch per projection.
 //!
 //! Attention itself is [`super::attend`]: keys and values in fixed segments,
 //! scored a tile at a time. A sliding visit drops a segment once no later query
@@ -62,18 +64,16 @@
 //! ([`super::schedule::CacheId`]): a core layer's passes share weights and
 //! never share state.
 
-use std::collections::BTreeMap;
-
 use burn::prelude::*;
 use burn::tensor::activation::{sigmoid, softmax};
-use burn::tensor::{Int, TensorData};
+use burn::tensor::TensorData;
 
 use crate::models::inkling::bf16gemm::Bf16W;
-use crate::models::inkling::block::route_from_logits;
 use crate::models::inkling::burn::{
     PackedW, linear_bf16, linear_fp4, linear_w4a16, rms_norm, short_conv_window,
 };
 use crate::models::inkling::seam::{Bk, client_of};
+use crate::models::inkling2_loop::prof;
 use crate::models::inkling2_loop::attend::{AttnShape, KEY_TILE, Kv, QUERY_TILE, attend};
 use crate::models::inkling2_loop::config::Inkling2LoopTextConfig;
 use crate::models::inkling2_loop::experts::nvfp4_scale2;
@@ -81,6 +81,7 @@ use crate::models::inkling2_loop::layout::{
     AttnPart, ConvPart, Dtype, ExpertMat, ExpertPart, GatePart, LayerPart, Slot, Stream,
 };
 use crate::models::inkling2_loop::messages::{DeviceGate, DownPrecision, MessageGate, device_gates, message_tensor};
+use crate::models::inkling2_loop::moe::{Bank, FaultCell, Proj, Route, bf16_proj, fault_cell, nvfp4_proj};
 
 pub(super) type Dev = burn::backend::cuda::CudaDevice;
 
@@ -254,8 +255,6 @@ pub struct SlidingLayer {
     gate_attn: Bf16W,
     wo: Bf16W,
     sink: Bf16W,
-    router: Bf16W,
-    router_bias: Vec<f32>,
     q_scale: Tensor<Bk, 3>,
     rel_scale: Tensor<Bk, 3>,
     rel_proj: Tensor<Bk, 2>,
@@ -263,7 +262,8 @@ pub struct SlidingLayer {
     v_sconv: Tensor<Bk, 2>,
     attn_sconv: Tensor<Bk, 2>,
     mlp_sconv: Tensor<Bk, 2>,
-    experts: Vec<Expert>,
+    /// The router and the routed experts.
+    pub(super) moe: Bank,
     /// Core layers only: the Q, K, V and MLP message gates, in
     /// [`super::messages::message_slot`] order.
     gates: Option<[DeviceGate; 4]>,
@@ -281,16 +281,33 @@ pub struct State {
     /// The last `k - 1` inputs of the K, V, attention-output and MLP-output
     /// convolutions, zero before the first token, as upstream pads.
     pub conv: [Tensor<Bk, 2>; 4],
+    /// The router fault cell this visit's experts write ([`super::moe::Bank::forward`]):
+    /// one u32 on the device, `1 + logit` once a row's router logits were not
+    /// finite. Nothing clears it; whoever owns the state reads it ([`State::fault`]).
+    fault: FaultCell,
 }
 
 impl State {
+    /// A fresh state with a fault cell of its own.
     pub fn new(d: &Dims, dev: &Dev) -> State {
+        State { pos: 0, kv: Kv::new(KEY_TILE), conv: Self::zero_conv(d, dev), fault: fault_cell(dev) }
+    }
+
+    /// A fresh state writing its router faults into `fault`, a cell shared
+    /// with the other visits of one sequence, so the sequence reads one cell.
+    pub fn sharing_fault(d: &Dims, dev: &Dev, fault: &FaultCell) -> State {
+        assert!(fault.device() == dev, "state: a fault cell on {:?} for a state on {dev:?}", fault.device());
+        State { pos: 0, kv: Kv::new(KEY_TILE), conv: Self::zero_conv(d, dev), fault: fault.clone() }
+    }
+
+    /// The router fault cell this state's visits write.
+    pub fn fault(&self) -> &FaultCell {
+        &self.fault
+    }
+
+    fn zero_conv(d: &Dims, dev: &Dev) -> [Tensor<Bk, 2>; 4] {
         let z = |w: usize| Tensor::zeros([d.kernel - 1, w], dev);
-        State {
-            pos: 0,
-            kv: Kv::new(KEY_TILE),
-            conv: [z(d.kv_dim()), z(d.kv_dim()), z(d.hidden), z(d.hidden)],
-        }
+        [z(d.kv_dim()), z(d.kv_dim()), z(d.hidden), z(d.hidden)]
     }
 }
 
@@ -299,8 +316,9 @@ pub struct Taps {
     pub attn: Tensor<Bk, 2>,
     pub attn_conv: Tensor<Bk, 2>,
     pub mlp_input: Tensor<Bk, 2>,
-    pub router_logits: Vec<f32>,
-    pub routing: Vec<(Vec<usize>, Vec<f32>)>,
+    /// The router's logits and picks, on the device ([`Route::logits`],
+    /// [`Route::picks`] read them back).
+    pub route: Route,
     pub experts: Tensor<Bk, 2>,
     pub mlp_conv: Tensor<Bk, 2>,
     /// A gated visit's four message-gate outputs `[t, H]`, before their
@@ -350,8 +368,7 @@ impl SlidingLayer {
             Ok(mat(s, d.heads, width)?.reshape([1, d.heads, width]))
         };
 
-        let router_bias = f32_le(want(w, l(LayerPart::GateBias), Dtype::F32, &[d.experts])?.bytes);
-        let experts = bind_experts(w, &d, layer, &client)?;
+        let moe = bind_bank(w, &d, layer, &client, lin(l(LayerPart::GateWeight), d.experts, h)?)?;
         let gates = bind_gates(w, t, layer, dev)?;
         Ok(SlidingLayer {
             layer,
@@ -371,8 +388,6 @@ impl SlidingLayer {
             gate_attn: lin(a(AttnPart::GateAttn), q, h)?,
             wo: lin(a(AttnPart::Wo), h, q)?,
             sink: lin(a(AttnPart::SinkProj), d.heads, h)?,
-            router: lin(l(LayerPart::GateWeight), d.experts, h)?,
-            router_bias,
             q_scale: per_head(a(AttnPart::QL2Clip), d.head_dim)?,
             rel_scale: per_head(a(AttnPart::RelL2Clip), d.d_rel)?,
             rel_proj: mat(a(AttnPart::RelLogitsProj), d.d_rel, d.rel_extent)?,
@@ -380,7 +395,7 @@ impl SlidingLayer {
             v_sconv: conv(a(AttnPart::VSconv(ConvPart::Weight)), kv)?,
             attn_sconv: conv(l(LayerPart::AttnSconv), h)?,
             mlp_sconv: conv(l(LayerPart::MlpSconv), h)?,
-            experts,
+            moe,
             gates,
         })
     }
@@ -421,10 +436,9 @@ impl SlidingLayer {
     ) -> (Tensor<Bk, 2>, Taps) {
         let d = self.dims;
         let [t, _] = x.dims();
-        let dev = x.device();
         let block_residual = x.clone();
         let h = match &self.attention_input {
-            Some(q) => block_attention(q.clone(), blocks, x.clone()),
+            Some(q) => prof::span("block_attn", &x.device(), || block_attention(q.clone(), blocks, x.clone())),
             None => x.clone(),
         };
         let gated = messages.map(|m| {
@@ -448,7 +462,7 @@ impl SlidingLayer {
                 qkv
             }
         };
-        let attn = self.attention(qkv, state);
+        let attn = prof::span("attention", &x.device(), || self.attention(qkv, state));
         let attn_conv = conv_step(&mut state.conv[2], attn.clone(), &self.attn_sconv, d.conv_scale());
 
         let residual = if self.is_block_boundary() {
@@ -467,37 +481,7 @@ impl SlidingLayer {
         };
         let mn = rms_norm(mlp_in, self.mlp_norm.clone(), d.eps);
 
-        let router_logits: Vec<f32> = linear_bf16(mn.clone(), &self.router)
-            .into_data()
-            .to_vec()
-            .expect("router logits are f32");
-        let routes = route_from_logits(
-            &router_logits,
-            &self.router_bias,
-            1.0,
-            d.route_scale,
-            t,
-            d.experts,
-            0,
-            d.top_k,
-        );
-        let mut by_expert: BTreeMap<usize, Vec<(usize, f32)>> = BTreeMap::new();
-        for (row, r) in routes.iter().enumerate() {
-            for (&e, &g) in r.experts.iter().zip(&r.weights) {
-                by_expert.entry(e).or_default().push((row, g));
-            }
-        }
-        let mut acc: Tensor<Bk, 2> = Tensor::zeros([t, d.hidden], &dev);
-        for (&e, rows) in &by_expert {
-            let idx: Vec<i64> = rows.iter().map(|&(r, _)| r as i64).collect();
-            let gw: Vec<f32> = rows.iter().map(|&(_, g)| g).collect();
-            let n = idx.len();
-            let idx = Tensor::<Bk, 1, Int>::from_data(TensorData::new(idx, [n]), &dev);
-            let gw = Tensor::<Bk, 2>::from_data(TensorData::new(gw, [n, 1]), &dev);
-            let xs = mn.clone().select(0, idx.clone());
-            let y = self.expert(e, xs, act) * gw;
-            acc = acc.select_assign(0, idx, y, burn::tensor::IndexingUpdateOp::Add);
-        }
+        let (acc, route) = self.moe.forward(&d, &mn, act, state.fault());
         let mlp_conv = conv_step(&mut state.conv[3], acc.clone(), &self.mlp_sconv, d.conv_scale());
         state.pos += t;
         let out = residual + mlp_conv.clone();
@@ -505,17 +489,12 @@ impl SlidingLayer {
             attn,
             attn_conv,
             mlp_input,
-            router_logits,
-            routing: routes.into_iter().map(|r| (r.experts, r.weights)).collect(),
+            route,
             experts: acc,
             mlp_conv,
             gates: gate_out,
         };
         (out, taps)
-    }
-
-    fn expert(&self, e: usize, x: Tensor<Bk, 2>, act: ExpertAct) -> Tensor<Bk, 2> {
-        self.experts[e].forward(&self.dims, x, act)
     }
 
     /// Attention over the three normed inputs: `qn` drives the queries, the
@@ -622,25 +601,29 @@ pub(super) fn block_attention(query: Tensor<Bk, 1>, blocks: &[Tensor<Bk, 2>], pa
     (normed * p).sum_dim(1).reshape([t, h])
 }
 
-/// Bind a layer's routed experts in the format they are stored in: U8 codes
-/// are NVFP4 (layers 0..19 of the release), F8_E4M3 values are MXFP8 (layers
-/// 20..23).
-pub(super) fn bind_experts(
+/// Bind a layer's router and routed experts ([`Bank`]), the experts in the
+/// format they are stored in: U8 codes are NVFP4 (layers 0..19 of the
+/// release), F8_E4M3 values are MXFP8 (layers 20..23). Each projection is one
+/// device buffer, experts stacked.
+pub(super) fn bind_bank(
     w: &dyn Weights,
     d: &Dims,
     layer: usize,
     client: &cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>,
-) -> Result<Vec<Expert>, String> {
+    router: Bf16W,
+) -> Result<Bank, String> {
+    let bias = f32_le(want(w, Slot::Layer(layer, LayerPart::GateBias), Dtype::F32, &[d.experts])?.bytes);
     let w13 = Slot::Layer(layer, LayerPart::Expert(ExpertMat::W13, ExpertPart::Weight));
-    match w.tensor(&w13.tensor_name())?.dtype {
-        Dtype::F8E4M3 => bind_mxfp8_experts(w, d, layer, client),
-        _ => bind_nvfp4_experts(w, d, layer, client),
-    }
+    let projs = match w.tensor(&w13.tensor_name())?.dtype {
+        Dtype::F8E4M3 => bind_mxfp8_experts(w, d, layer, client)?,
+        _ => bind_nvfp4_experts(w, d, layer, client)?,
+    };
+    Ok(Bank::new(client, router, bias, projs, d.top_k, d.route_scale, d.gate_softcap, d.up_softcap))
 }
 
 /// MXFP8 experts: E4M3 values `[e, rows, cols]` and one UE8M0 scale per 32
-/// values of a row `[e, rows, cols / 32]`, decoded on the host one expert at
-/// a time (upstream's `Inkling2LoopDequantizeExperts`, then `.to(bfloat16)`,
+/// values of a row `[e, rows, cols / 32]`, decoded on the host
+/// layer at a time (upstream's `Inkling2LoopDequantizeExperts`, then `.to(bfloat16)`,
 /// which is exact here) and uploaded as BF16. w13's rows are interleaved gate
 /// then up per intermediate unit, its scales with them (upstream's
 /// `Interleave(dim=1)` on both). About 2 GB per layer at the release's shape.
@@ -649,7 +632,7 @@ fn bind_mxfp8_experts(
     d: &Dims,
     layer: usize,
     client: &cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>,
-) -> Result<Vec<Expert>, String> {
+) -> Result<[Proj; 3], String> {
     use crate::models::inkling2_loop::experts::{MXFP8_BLOCK, decode_mxfp8_row};
     let (e, h, i) = (d.experts, d.hidden, d.inter);
     let part = |m: ExpertMat, p: ExpertPart| Slot::Layer(layer, LayerPart::Expert(m, p));
@@ -679,20 +662,17 @@ fn bind_mxfp8_experts(
         }
         Ok(out)
     };
-    let upload = |bytes: Vec<u8>, n: usize, k: usize| ExpertW::Bf16(Bf16W { h: client.create_from_slice(&bytes), n, k, align: 16 });
     let (m13, p13) = (2 * i * h, 2 * i * (h / MXFP8_BLOCK));
     let (m2, p2) = (h * i, h * (i / MXFP8_BLOCK));
-    (0..e)
-        .map(|x| {
-            let (v13, c13) = (&w13.bytes[x * m13..(x + 1) * m13], &s13.bytes[x * p13..(x + 1) * p13]);
-            let (v2, c2) = (&w2.bytes[x * m2..(x + 1) * m2], &s2.bytes[x * p2..(x + 1) * p2]);
-            Ok(Expert {
-                gate: upload(decode(v13, c13, h, 0, 2, i)?, i, h),
-                up: upload(decode(v13, c13, h, 1, 2, i)?, i, h),
-                down: upload(decode(v2, c2, i, 0, 1, h)?, h, i),
-            })
-        })
-        .collect()
+    let (mut gate, mut up, mut down) = (Vec::with_capacity(e * i * h * 2), Vec::with_capacity(e * i * h * 2), Vec::with_capacity(e * i * h * 2));
+    for x in 0..e {
+        let (v13, c13) = (&w13.bytes[x * m13..(x + 1) * m13], &s13.bytes[x * p13..(x + 1) * p13]);
+        let (v2, c2) = (&w2.bytes[x * m2..(x + 1) * m2], &s2.bytes[x * p2..(x + 1) * p2]);
+        gate.extend(decode(v13, c13, h, 0, 2, i)?);
+        up.extend(decode(v13, c13, h, 1, 2, i)?);
+        down.extend(decode(v2, c2, i, 0, 1, h)?);
+    }
+    Ok([bf16_proj(client, &gate, e, i, h), bf16_proj(client, &up, e, i, h), bf16_proj(client, &down, e, h, i)])
 }
 
 fn bind_nvfp4_experts(
@@ -700,7 +680,7 @@ fn bind_nvfp4_experts(
     d: &Dims,
     layer: usize,
     client: &cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>,
-) -> Result<Vec<Expert>, String> {
+) -> Result<[Proj; 3], String> {
     let (e, h, i) = (d.experts, d.hidden, d.inter);
     let part = |m: ExpertMat, p: ExpertPart| Slot::Layer(layer, LayerPart::Expert(m, p));
     let w13 = want(w, part(ExpertMat::W13, ExpertPart::Weight), Dtype::U8, &[e, 2 * i, h / 2])?;
@@ -725,27 +705,16 @@ fn bind_nvfp4_experts(
         }
         out
     };
-    let packed = |codes: &[u8], scales: &[u8], n: usize, k: usize, scale2: f32| {
-        ExpertW::Nvfp4(PackedW {
-            codes: client.create_from_slice(codes),
-            scales: client.create_from_slice(scales),
-            n,
-            k,
-            scale2,
-            swizzled: false,
-        })
-    };
-    Ok((0..e)
-        .map(|x| Expert {
-            gate: packed(&rows(w13.bytes, cb13, x, 0), &rows(s13.bytes, sb13, x, 0), i, h, sc13[x]),
-            up: packed(&rows(w13.bytes, cb13, x, 1), &rows(s13.bytes, sb13, x, 1), i, h, sc13[x]),
-            down: packed(
-                &w2.bytes[x * h * cb2..(x + 1) * h * cb2],
-                &s2.bytes[x * h * sb2..(x + 1) * h * sb2],
-                h,
-                i,
-                sc2[x],
-            ),
-        })
-        .collect())
+    let (mut gc, mut gs, mut uc, mut us) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for x in 0..e {
+        gc.extend(rows(w13.bytes, cb13, x, 0));
+        gs.extend(rows(s13.bytes, sb13, x, 0));
+        uc.extend(rows(w13.bytes, cb13, x, 1));
+        us.extend(rows(s13.bytes, sb13, x, 1));
+    }
+    Ok([
+        nvfp4_proj(client, &gc, &gs, sc13.clone(), i, h),
+        nvfp4_proj(client, &uc, &us, sc13, i, h),
+        nvfp4_proj(client, &w2.bytes[..e * h * cb2], &s2.bytes[..e * h * sb2], sc2, h, i),
+    ])
 }

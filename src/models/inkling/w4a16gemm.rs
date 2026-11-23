@@ -77,7 +77,7 @@ pub const CODES_PER_WORD: usize = 8;
 /// diffed by eye. The subnormal (`0x1` = 0.5) is the entry the arithmetic form
 /// gets wrong, and it is the one that is hardest to notice.
 #[cube]
-fn e2m1_value(code: u32) -> f32 {
+pub(crate) fn e2m1_value(code: u32) -> f32 {
     let mag = code & 7u32;
     let mut v = f32::new(0.0f32);
     if mag == 1u32 {

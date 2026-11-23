@@ -32,10 +32,12 @@ use std::collections::BTreeMap;
 use burn::prelude::*;
 
 use crate::models::inkling::seam::Bk;
+use crate::models::inkling2_loop::prof;
 use crate::models::inkling2_loop::config::{AttnKind, Inkling2LoopTextConfig};
 use crate::models::inkling2_loop::full::FullLayer;
 use crate::models::inkling2_loop::layout::{Dtype, Slot};
 use crate::models::inkling2_loop::messages::{DeviceQueries, MessageQueries, MessageSources};
+use crate::models::inkling2_loop::moe::{FaultCell, fault_cell};
 use crate::models::inkling2_loop::schedule::CacheId;
 use crate::models::inkling2_loop::sliding::{Dev, ExpertAct, SlidingLayer, State, Taps, Weights, f32_le, want};
 
@@ -53,10 +55,10 @@ impl CoreLayer {
         }
     }
 
-    fn new_state(&self, dev: &Dev) -> State {
+    fn new_state(&self, dev: &Dev, fault: &FaultCell) -> State {
         match self {
-            CoreLayer::Sliding(l) => State::new(&l.dims, dev),
-            CoreLayer::Full(l) => State::new(&l.dims, dev),
+            CoreLayer::Sliding(l) => State::sharing_fault(&l.dims, dev, fault),
+            CoreLayer::Full(l) => State::sharing_fault(&l.dims, dev, fault),
         }
     }
 
@@ -141,12 +143,18 @@ impl Core {
         Ok(Core { layers, queries, device_queries, passes: l.num_passes, hidden: h })
     }
 
-    /// Fresh state for every visit, `passes x layers`.
+    /// Fresh state for every visit, `passes x layers`, all writing one
+    /// router fault cell of their own.
     pub fn new_state(&self, dev: &Dev) -> CoreState {
+        self.new_state_sharing_fault(dev, &fault_cell(dev))
+    }
+
+    /// [`Self::new_state`], every visit writing its router faults into `fault`.
+    pub fn new_state_sharing_fault(&self, dev: &Dev, fault: &FaultCell) -> CoreState {
         let mut visits = BTreeMap::new();
         for pass in 0..self.passes {
             for l in &self.layers {
-                visits.insert(CacheId { layer: l.layer(), pass }, l.new_state(dev));
+                visits.insert(CacheId { layer: l.layer(), pass }, l.new_state(dev, fault));
             }
         }
         CoreState { visits }
@@ -184,8 +192,10 @@ impl Core {
             };
             for (i, layer) in self.layers.iter().enumerate() {
                 let q = if plant == Some(Plant::SharedQuery) { 0 } else { i };
-                let messages = prev.as_ref().map(|src| src.read(self.device_queries.layer(q)));
                 let id = CacheId { layer: layer.layer(), pass };
+                prof::at(id.layer, pass);
+                let dev = hs.device();
+                let messages = prof::span("msg_read", &dev, || prev.as_ref().map(|src| src.read(self.device_queries.layer(q))));
                 let st = state.visits.get_mut(&id).unwrap_or_else(|| panic!("no state for {id:?}"));
                 let (out, taps) = layer.visit(hs, &mut bs, st, act, origin, messages.as_ref());
                 if let Some(f) = hook.as_mut() {
@@ -194,8 +204,13 @@ impl Core {
                 hs = out;
             }
             // upstream: previous_block_states = block_states[..., num_pre_loop_blocks + 1:, :]
+            prof::at(usize::MAX, pass);
+            let prev_t0 = prof::enabled().then(std::time::Instant::now);
             let keep = &bs[(n_pre + 1).min(bs.len())..];
             prev = Some(MessageSources::new(keep, hs.clone()));
+            if let Some(t0) = prev_t0 {
+                prof::add("pass_sources", t0.elapsed().as_secs_f64());
+            }
             passes.push(PassOut { hidden: hs, blocks: bs });
         }
         passes

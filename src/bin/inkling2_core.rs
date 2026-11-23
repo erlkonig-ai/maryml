@@ -214,7 +214,7 @@ struct Seen {
 }
 
 fn seen(id: CacheId, out: &Tensor<Bk, 2>, taps: Taps, messages: Option<&Tensor<Bk, 3>>) -> Seen {
-    let mut v = vec![("out", host(out.clone())), ("mlp_input", host(taps.mlp_input)), ("router_logits", taps.router_logits)];
+    let mut v = vec![("out", host(out.clone())), ("mlp_input", host(taps.mlp_input)), ("router_logits", taps.route.logits())];
     if let Some([q, k, vv, m]) = taps.gates {
         v.extend([("gate_q", host(q)), ("gate_k", host(k)), ("gate_v", host(vv)), ("gate_mlp", host(m))]);
     }
@@ -225,7 +225,7 @@ fn seen(id: CacheId, out: &Tensor<Bk, 2>, taps: Taps, messages: Option<&Tensor<B
     Seen {
         id,
         taps: v,
-        routing: taps.routing.iter().map(|(e, _)| e.iter().map(|&x| x as i32).collect()).collect(),
+        routing: taps.route.picks().iter().map(|(e, _)| e.iter().map(|&x| x as i32).collect()).collect(),
     }
 }
 

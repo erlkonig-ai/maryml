@@ -195,7 +195,7 @@ fn main() {
     let mut rep = Report { lines: vec![], json: vec![], worst: 0.0, fails: 0 };
     let tap_rows = |taps: FullTaps, out: Tensor<Bk, 2>| -> (Vec<(&'static str, Vec<f32>)>, Vec<f32>, Vec<(Vec<usize>, Vec<f32>)>) {
         let FullTaps { inputs: [qi, ki, vi], rest } = taps;
-        let Taps { attn, attn_conv, mlp_input, router_logits, routing, experts, mlp_conv, gates } = rest;
+        let Taps { attn, attn_conv, mlp_input, route, experts, mlp_conv, gates } = rest;
         assert!(gates.is_none(), "layer 5 must not receive cross-pass messages");
         (
             vec![
@@ -209,8 +209,8 @@ fn main() {
                 ("mlp_conv", host(mlp_conv)),
                 ("out", host(out)),
             ],
-            router_logits,
-            routing,
+            route.logits(),
+            route.picks(),
         )
     };
 

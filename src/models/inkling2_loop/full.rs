@@ -50,24 +50,22 @@
 //!
 //! Experts bind in their stored format, including the MXFP8 experts in layer 23.
 
-use std::collections::BTreeMap;
-
 use burn::prelude::*;
 use burn::tensor::activation::sigmoid;
-use burn::tensor::{Int, TensorData};
+use burn::tensor::TensorData;
 
 use crate::models::inkling::bf16gemm::Bf16W;
-use crate::models::inkling::block::route_from_logits;
 use crate::models::inkling::burn::{linear_bf16, rms_norm};
 use crate::models::inkling::seam::{Bk, client_of};
 use crate::models::inkling2_loop::attend::{AttnShape, QUERY_TILE, attend};
 use crate::models::inkling2_loop::config::{AttnKind, Inkling2LoopTextConfig};
 use crate::models::inkling2_loop::layout::{AttnPart, ConvPart, Dtype, LayerPart, Slot};
 use crate::models::inkling2_loop::sliding::{
-    Dev, Dims, Expert, ExpertAct, STREAMS, State, Taps, Weights, bf16_to_f32, bind_experts, bind_gates,
+    Dev, Dims, ExpertAct, STREAMS, State, Taps, Weights, bf16_to_f32, bind_bank, bind_gates,
     block_attention, conv_step, f32_le, l2_clip, unit_rms, want,
 };
 use crate::models::inkling2_loop::messages::{DeviceGate, message_tensor};
+use crate::models::inkling2_loop::moe::Bank;
 
 /// A full-attention layer's weights, bound on the device.
 pub struct FullLayer {
@@ -88,8 +86,6 @@ pub struct FullLayer {
     gate_attn: Bf16W,
     wo: Bf16W,
     sink: Bf16W,
-    router: Bf16W,
-    router_bias: Vec<f32>,
     q_scale: Tensor<Bk, 3>,
     rel_scale: Tensor<Bk, 3>,
     rel_proj: Tensor<Bk, 2>,
@@ -101,7 +97,8 @@ pub struct FullLayer {
     v_static: Tensor<Bk, 2>,
     attn_sconv: Tensor<Bk, 2>,
     mlp_sconv: Tensor<Bk, 2>,
-    experts: Vec<Expert>,
+    /// The router and the routed experts.
+    moe: Bank,
     /// Core layers only: the Q, K, V and MLP message gates, in
     /// [`super::messages::message_slot`] order.
     gates: Option<[DeviceGate; 4]>,
@@ -167,8 +164,7 @@ impl FullLayer {
             let row = |i: usize| Tensor::from_data(TensorData::new(v[i * h..(i + 1) * h].to_vec(), [h]), dev);
             Some([row(0), row(1), row(2)])
         };
-        let router_bias = f32_le(want(w, l(LayerPart::GateBias), Dtype::F32, &[d.experts])?.bytes);
-        let experts = bind_experts(w, &d, layer, &client)?;
+        let moe = bind_bank(w, &d, layer, &client, lin(l(LayerPart::GateWeight), d.experts, h)?)?;
         Ok(FullLayer {
             layer,
             dims: d,
@@ -189,8 +185,6 @@ impl FullLayer {
             gate_attn: lin(a(AttnPart::GateAttn), q, h)?,
             wo: lin(a(AttnPart::Wo), h, q)?,
             sink: lin(a(AttnPart::SinkProj), d.heads, h)?,
-            router: lin(l(LayerPart::GateWeight), d.experts, h)?,
-            router_bias,
             q_scale: per_head(a(AttnPart::QL2Clip), d.head_dim)?,
             rel_scale: per_head(a(AttnPart::RelL2Clip), d.d_rel)?,
             rel_proj: mat(a(AttnPart::RelLogitsProj), d.d_rel, d.rel_extent)?,
@@ -200,7 +194,7 @@ impl FullLayer {
             v_static: mat(a(AttnPart::VSconv(ConvPart::StaticW)), d.kernel, kv)?,
             attn_sconv: conv(l(LayerPart::AttnSconv), h)?,
             mlp_sconv: conv(l(LayerPart::MlpSconv), h)?,
-            experts,
+            moe,
             gates: bind_gates(w, t, layer, dev)?,
         })
     }
@@ -256,7 +250,6 @@ impl FullLayer {
     ) -> (Tensor<Bk, 2>, FullTaps) {
         let d = self.dims;
         let [t, _] = x.dims();
-        let dev = x.device();
         let block_residual = x.clone();
         let inputs = match &self.attention_input {
             Some(qs) => qs.clone().map(|q| block_attention(q, blocks, x.clone())),
@@ -297,28 +290,7 @@ impl FullLayer {
         };
         let mn = rms_norm(mlp_in, self.mlp_norm.clone(), d.eps);
 
-        let router_logits: Vec<f32> = linear_bf16(mn.clone(), &self.router)
-            .into_data()
-            .to_vec()
-            .expect("router logits are f32");
-        let routes = route_from_logits(&router_logits, &self.router_bias, 1.0, d.route_scale, t, d.experts, 0, d.top_k);
-        let mut by_expert: BTreeMap<usize, Vec<(usize, f32)>> = BTreeMap::new();
-        for (row, r) in routes.iter().enumerate() {
-            for (&e, &g) in r.experts.iter().zip(&r.weights) {
-                by_expert.entry(e).or_default().push((row, g));
-            }
-        }
-        let mut acc: Tensor<Bk, 2> = Tensor::zeros([t, d.hidden], &dev);
-        for (&e, rows) in &by_expert {
-            let idx: Vec<i64> = rows.iter().map(|&(r, _)| r as i64).collect();
-            let gw: Vec<f32> = rows.iter().map(|&(_, g)| g).collect();
-            let n = idx.len();
-            let idx = Tensor::<Bk, 1, Int>::from_data(TensorData::new(idx, [n]), &dev);
-            let gw = Tensor::<Bk, 2>::from_data(TensorData::new(gw, [n, 1]), &dev);
-            let xs = mn.clone().select(0, idx.clone());
-            let y = expert(&self.experts[e], &d, xs, act) * gw;
-            acc = acc.select_assign(0, idx, y, burn::tensor::IndexingUpdateOp::Add);
-        }
+        let (acc, route) = self.moe.forward(&d, &mn, act, state.fault());
         let mlp_conv = conv_step(&mut state.conv[3], acc.clone(), &self.mlp_sconv, d.conv_scale());
         state.pos += t;
         let out = residual + mlp_conv.clone();
@@ -327,8 +299,7 @@ impl FullLayer {
             attn,
             attn_conv,
             mlp_input,
-            router_logits,
-            routing: routes.into_iter().map(|r| (r.experts, r.weights)).collect(),
+            route,
             experts: acc,
             mlp_conv,
         };
@@ -405,10 +376,4 @@ fn dyn_conv_step(
         acc = acc + rows.clone() * ws + rows * wd;
     }
     (acc.reshape([t, c]) + x).div_scalar(((2 * k + 1) as f32).sqrt())
-}
-
-/// One routed expert, in whichever format it bound as (the sliding layer's
-/// [`Expert::forward`]).
-fn expert(w: &Expert, d: &Dims, x: Tensor<Bk, 2>, act: ExpertAct) -> Tensor<Bk, 2> {
-    w.forward(d, x, act)
 }
