@@ -41,7 +41,7 @@ use mary::models::inkling2_loop::layout::{LayerPart, Slot};
 use mary::models::inkling2_loop::loop_core::{Core, CoreState, PassOut, Plant};
 use mary::models::inkling2_loop::pile::MiniRoot;
 use mary::models::inkling2_loop::schedule::CacheId;
-use mary::models::inkling2_loop::sliding::{ExpertAct, Taps, Weights};
+use mary::models::inkling2_loop::sliding::{ExpertAct, State, Taps, Weights};
 use triblespace::prelude::Id;
 
 /// A tensor is within this many times upstream's own bf16-vs-f32 spread.
@@ -102,6 +102,30 @@ fn rel_l2(a: &[f32], b: &[f32]) -> f64 {
 
 fn max_abs(a: &[f32], b: &[f32]) -> f64 {
     a.iter().zip(b).map(|(x, y)| (x - y).abs() as f64).fold(0.0, f64::max)
+}
+
+/// The rows Mary and upstream both still hold of a carried K or V cache: both
+/// end at the visit's last position, so the matching absolute positions are the
+/// last `min(ours, upstream)` rows of each. Mary's `attend::Kv` evicts whole tiles and
+/// upstream keeps the window, so either side may hold more.
+fn matching_suffix<'a>(ours: &'a [f32], a: &'a [f32], b: &'a [f32], width: usize) -> (&'a [f32], &'a [f32], &'a [f32], usize) {
+    assert_eq!(a.len(), b.len(), "the two upstream runs hold the same rows");
+    assert!(ours.len() % width == 0 && b.len() % width == 0, "rows of width {width}");
+    let n = ours.len().min(b.len()) / width;
+    assert!(n > 0, "no position held by both");
+    let tail = |v: &'a [f32]| &v[v.len() - n * width..];
+    (tail(ours), tail(a), tail(b), n)
+}
+
+/// A visit's held keys and values on the host, checked to end at its position.
+fn held_kv(st: &State) -> (Vec<f32>, Vec<f32>) {
+    let kv = &st.kv;
+    assert_eq!(kv.base() + kv.rows(), st.pos, "the cache ends at the visit's position");
+    let k = kv.keys().expect("a carried visit holds keys");
+    let v = kv.values().expect("a carried visit holds values");
+    assert_eq!(k.dims()[0], kv.rows());
+    assert_eq!(v.dims()[0], kv.rows());
+    (host(k), host(v))
 }
 
 /// Upstream's cache `[heads, n, d]` as Mary's rows `[n, heads * d]`.
@@ -267,13 +291,14 @@ fn main() {
             if let Some(st) = state {
                 let st = &st.visits[&s.id];
                 let base = format!("{{run}}.p{}.l{}.{phase}", s.id.pass, s.id.layer);
-                for (name, ours) in [("k", host(st.k.clone().unwrap())), ("v", host(st.v.clone().unwrap()))] {
-                    let f = |run: &str| {
-                        let (shape, v) = r.f32s(&format!("{}.{name}", base.replace("{run}", run)));
-                        heads_to_rows(&shape, &v)
-                    };
-                    let (a, b) = (f("bf16"), f("f32"));
-                    rep.row(&tag, &format!("state {name}"), &ours[ours.len() - b.len()..], &a, &b);
+                let (hk, hv) = held_kv(st);
+                for (name, ours) in [("k", hk), ("v", hv)] {
+                    let (shape, a) = r.f32s(&format!("{}.{name}", base.replace("{run}", "bf16")));
+                    let a = heads_to_rows(&shape, &a);
+                    let b = heads_to_rows(&shape, &r.f32s(&format!("{}.{name}", base.replace("{run}", "f32"))).1);
+                    let width = shape[0] * shape[2];
+                    let (ours, a, b, n) = matching_suffix(&ours, &a, &b, width);
+                    rep.row(&tag, &format!("state {name} ({n}r)"), ours, a, b);
                 }
                 for i in 0..4 {
                     let f = |run: &str| {
