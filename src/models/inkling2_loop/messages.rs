@@ -461,9 +461,9 @@ mod device {
                     if bf { round_bf16_dev(x) } else { x }
                 }
             };
-            let d = x.matmul(self.down_t.clone());
+            let d = rows::gemv(x.clone(), &self.down_t).unwrap_or_else(|| x.matmul(self.down_t.clone()));
             let d = if bf { rows::round_to_bf16(d.clone()).unwrap_or_else(|| round_bf16_dev(d)) } else { d };
-            let fg = d.matmul(self.forget_gain_t.clone());
+            let fg = rows::gemv(d.clone(), &self.forget_gain_t).unwrap_or_else(|| d.matmul(self.forget_gain_t.clone()));
             if let Some(out) = rows::gate_output(fg.clone(), hidden_states.clone(), message.clone()) {
                 return out;
             }

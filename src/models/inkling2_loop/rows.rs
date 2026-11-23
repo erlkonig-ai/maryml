@@ -31,10 +31,9 @@ pub const MAX_BLOCKS: usize = 6;
 /// Which row kernels run, cumulatively: `MINI_ROWS=burn` none (Burn's
 /// composition everywhere); `scale` the clip and norm kernels; `gates` also
 /// the message gates' input, rounding and output; `blocks` also the block
-/// attention and the message read; anything else (the default) also the
-/// short convolution step. The settings
-/// exist for an A/B in one binary. `blocks` stops before the convolution
-/// step's kernel, which the default adds.
+/// attention and the message read; `conv` also the short convolution step;
+/// anything else (the default) also the gate projections' short-call GEMV. The settings
+/// exist for an A/B in one binary.
 fn setting() -> u8 {
     static ON: OnceLock<u8> = OnceLock::new();
     *ON.get_or_init(|| match std::env::var("MINI_ROWS").as_deref() {
@@ -42,7 +41,8 @@ fn setting() -> u8 {
         Ok("scale") => 1,
         Ok("gates") => 2,
         Ok("blocks") => 3,
-        _ => 4,
+        Ok("conv") => 4,
+        _ => 5,
     })
 }
 
@@ -60,6 +60,10 @@ fn blocks_enabled() -> bool {
 
 fn conv_enabled() -> bool {
     setting() >= 4
+}
+
+fn gemv_enabled() -> bool {
+    setting() >= 5
 }
 
 /// `x * min(thr / (|x| + 1e-6), 1)` per row (`mode` 0); `x / sqrt(mean(x^2) + eps)`
@@ -683,4 +687,74 @@ pub fn conv_step(hist: &mut Tensor<Bk, 2>, x: Tensor<Bk, 2>, w: &Tensor<Bk, 2>, 
     }
     *hist = tensor_of(client.clone(), dev.clone(), next, keep, c);
     Some(tensor_of(client, dev, out, t, c))
+}
+
+/// Outputs per cube in [`gemv_rows`], one plane each.
+const GEMV_PLANES: u32 = 8;
+
+/// `out[t, j] = sum_k x[t, k] * w[j, k]`, one plane per output, `w`
+/// `[n, k]` row-major (the layout the transposed Burn weight views).
+#[cube(launch_unchecked)]
+fn gemv_rows(x: &Array<f32>, w: &Array<f32>, out: &mut Array<f32>, cells: u32, #[comptime] n: u32, #[comptime] k: u32) {
+    let cell = CUBE_POS_X * GEMV_PLANES + UNIT_POS_Y;
+    if cell < cells {
+        let l = UNIT_POS_X;
+        let t = cell / n;
+        let j = cell % n;
+        let steps = comptime!(k.div_ceil(32));
+        let mut acc = 0.0f32;
+        for s in 0..steps {
+            let i = l + s * 32u32;
+            if i < k {
+                acc += x[(t * k + i) as usize] * w[(j * k + i) as usize];
+            }
+        }
+        let total = plane_sum(acc);
+        if l == 0u32 {
+            out[cell as usize] = total;
+        }
+    }
+}
+
+/// The most rows [`gemv`] takes; longer calls keep Burn's matmul.
+pub const GEMV_MAX_ROWS: usize = 16;
+
+/// `x @ w_t` for a short call, `x` `[t, k]`, `w_t` `[k, n]` the transpose of
+/// a contiguous `[n, k]` weight. f32 products and an f32 plane-tree sum,
+/// where Burn's f32 matmul on this runtime is TF32 with an f32 accumulator;
+/// on the released gates every operand is a bf16 value, so the products are
+/// exact either way and only the summation order differs.
+pub fn gemv(x: Tensor<Bk, 2>, w_t: &Tensor<Bk, 2>) -> Option<Tensor<Bk, 2>> {
+    let [t, k] = x.dims();
+    let [wk, n] = w_t.dims();
+    if !gemv_enabled() || t == 0 || t > GEMV_MAX_ROWS || wk != k || !is_f32(&x) || !is_f32(w_t) {
+        return None;
+    }
+    let w = w_t.clone().transpose();
+    let wc: burn_cubecl::tensor::CubeTensor<cubecl::cuda::CudaRuntime> = match w.into_primitive() {
+        burn::tensor::TensorPrimitive::Float(c) => c,
+        _ => return None,
+    };
+    if !wc.is_contiguous() {
+        return None;
+    }
+    let client = client_of(&x);
+    let dev = x.device();
+    let xh = f32_handle(x).expect("f32");
+    let cells = t * n;
+    let out = client.empty(cells * 4);
+    unsafe {
+        gemv_rows::launch_unchecked::<cubecl::cuda::CudaRuntime>(
+            &client,
+            CubeCount::new_1d((cells as u32).div_ceil(GEMV_PLANES)),
+            CubeDim::new_2d(PLANE, GEMV_PLANES),
+            ArrayArg::from_raw_parts(xh, t * k),
+            ArrayArg::from_raw_parts(wc.handle, n * k),
+            ArrayArg::from_raw_parts(out.clone(), cells),
+            cells as u32,
+            n as u32,
+            k as u32,
+        );
+    }
+    Some(tensor_of(client, dev, out, t, n))
 }
