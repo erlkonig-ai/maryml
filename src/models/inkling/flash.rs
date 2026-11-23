@@ -569,6 +569,8 @@ fn nvfp4_at(codes: &Array<u32>, scales: &Array<e4m3>, idx: u32) -> f32 {
 #[cube(launch_unchecked)]
 #[allow(clippy::too_many_arguments)]
 fn flash_kernel<KV: Numeric>(
+    k_second: &Array<KV>,
+    v_second: &Array<KV>,
     q: &Array<f32>,
     k: &Array<KV>,
     v: &Array<KV>,
@@ -600,8 +602,17 @@ fn flash_kernel<KV: Numeric>(
     #[comptime] rows: u32,
     #[comptime] packed: bool,
     #[comptime] gapped: bool,
+    #[comptime] pair: bool,
 ) {
-    let qt = CUBE_POS_X;
+    // In the paired one-query specialization X selects a page. Both
+    // pages keep the original Z partition and output slots.
+    let mut qt = CUBE_POS_X;
+    if comptime![pair] {
+        qt = 0u32;
+    }
+    let second = comptime![pair] && CUBE_POS_X == 1;
+    let k0 = if second { k0 + khi } else { k0 };
+    let slot0 = if second { slot0 + splits } else { slot0 };
     let kvh = CUBE_POS_Y;
     let split = CUBE_POS_Z;
     let u = UNIT_POS_X;
@@ -722,7 +733,11 @@ fn flash_kernel<KV: Numeric>(
                 if comptime![packed] {
                     val = nvfp4_at(kc, ks, idx);
                 } else {
-                    val = f32::cast_from(k[idx as usize]);
+                    val = if second {
+                        f32::cast_from(k_second[idx as usize])
+                    } else {
+                        f32::cast_from(k[idx as usize])
+                    };
                 }
             }
             sk[(j * skw + d) as usize] = val;
@@ -873,7 +888,11 @@ fn flash_kernel<KV: Numeric>(
                         if comptime![packed] {
                             vv = sk[(j * skw + d) as usize];
                         } else {
-                            vv = f32::cast_from(v[(vbase + d) as usize]);
+                            vv = if second {
+                                f32::cast_from(v_second[(vbase + d) as usize])
+                            } else {
+                                f32::cast_from(v[(vbase + d) as usize])
+                            };
                         }
                         #[unroll]
                         for ri in 0..rpp {
@@ -1060,6 +1079,16 @@ pub struct KeyRun<'a> {
     /// there is one run and no dead prefix, which is every case but a
     /// windowed layer's, and windowed layers never carry gaps.
     pub row0: usize,
+}
+
+/// Split counts are per page. Only identical full pages with consecutive
+/// absolute positions can share a grid. The dense address starts at zero
+/// in each handle; `row0` belongs exclusively to the gap table.
+fn paired_full_pages(first: &KeyRun<'_>, second: &KeyRun<'_>, splits: usize, next_splits: usize) -> bool {
+    let full = |r: &KeyRun<'_>| r.rows == 1024 && r.lo == 0 && r.hi == r.rows;
+    splits == 4 && next_splits == splits && full(first) && full(second)
+        && first.base.checked_add(first.rows) == Some(second.base)
+        && second.base <= (u32::MAX as usize) - (second.rows - 1)
 }
 
 /// Where a cache has EVICTED rows, and how far each gap moves the absolute
@@ -1275,7 +1304,32 @@ fn flash_attention_inner<R: Runtime>(
     // axis and lands on one split everywhere; a decode step has `q_tiles == 1`
     // and splits until the device is busy. Proportional to the run's span, so a
     // merged 1M-row page and a 128-row tail page do not get the same treatment.
-    let spans: Vec<usize> = runs.iter().map(|r| r.hi.saturating_sub(r.lo)).collect();
+    // Validate every input before dispatch: a grid may consume two runs.
+    let spans: Vec<usize> = runs.iter().map(|run| {
+        let kv_elems = run.rows * kv_heads * head_dim;
+        assert!(
+            kv_elems <= u32::MAX as usize,
+            "{} key rows x {kv_heads} x {head_dim} is past the 32-bit index",
+            run.rows
+        );
+        assert!(
+            run.lo <= run.hi && run.hi <= run.rows,
+            "a key run's live range {}..{} is not inside its {} rows",
+            run.lo,
+            run.hi,
+            run.rows
+        );
+        assert!(
+            run.k_scales.is_some() == packed && run.v_scales.is_some() == packed,
+            "NVFP4 needs both block-scale handles and no other element type may carry them"
+        );
+        if kv == KvElem::Bf16 {
+            let bytes = kv_elems as u64 * core::mem::size_of::<half::bf16>() as u64;
+            assert!(run.k.size_in_used() >= bytes && run.v.size_in_used() >= bytes,
+                "BF16 key/value handle shorter than run extent");
+        }
+        run.hi - run.lo
+    }).collect();
     let split_of = key_run_splits(&spans, q_tiles, kv_heads);
     let slots: usize = split_of.iter().sum();
 
@@ -1297,25 +1351,15 @@ fn flash_attention_inner<R: Runtime>(
         _ => (rel.clone(), rel.clone(), 0usize),
     };
     let mut slot0 = 0usize;
-    for (run, splits) in runs.iter().zip(split_of.iter().copied()) {
+    let can_pair = (nq, heads, kv_heads, head_dim) == (1, 24, 8, 128)
+        && rows == decode_rows(3) && kv == KvElem::Bf16
+        && sinks.is_some() && window.is_none() && gaps.is_none();
+    let mut pages = runs.iter().zip(split_of).peekable();
+    while let Some((run, splits)) = pages.next() {
+        let neighbor = pages.next_if(|(next, next_splits)| can_pair && paired_full_pages(run, next, splits, *next_splits));
+        let pair = neighbor.is_some();
+        let second = neighbor.map_or(run, |(next, _)| next);
         let kv_elems = run.rows * kv_heads * head_dim;
-        assert!(
-            kv_elems <= u32::MAX as usize,
-            "{} key rows x {kv_heads} x {head_dim} is past the 32-bit index",
-            run.rows
-        );
-        assert!(
-            run.lo <= run.hi && run.hi <= run.rows,
-            "a key run's live range {}..{} is not inside its {} rows",
-            run.lo,
-            run.hi,
-            run.rows
-        );
-        assert_eq!(
-            packed,
-            run.k_scales.is_some() && run.v_scales.is_some(),
-            "NVFP4 needs both block-scale handles and no other element type may carry them"
-        );
         // THE TWO READERS' EXTENTS. Exactly one pair is live, and the other is
         // bound to a live handle at length ONE. The kernel's comptime branch
         // never reads the dead pair, and a length-one binding of a buffer that
@@ -1334,7 +1378,7 @@ fn flash_attention_inner<R: Runtime>(
         };
         let ks = run.k_scales.unwrap_or(run.k).clone();
         let vs = run.v_scales.unwrap_or(run.v).clone();
-        let count = CubeCount::Static(q_tiles as u32, kv_heads as u32, splits as u32);
+        let count = CubeCount::Static(if pair { 2 } else { q_tiles as u32 }, kv_heads as u32, splits as u32);
         let dim = CubeDim::new_1d(UNITS);
         macro_rules! go {
             ($e:ty) => {
@@ -1343,6 +1387,8 @@ fn flash_attention_inner<R: Runtime>(
                         client,
                         count.clone(),
                         dim,
+                        ArrayArg::from_raw_parts(second.k.clone(), if pair { kv_elems } else { 1 }),
+                        ArrayArg::from_raw_parts(second.v.clone(), if pair { kv_elems } else { 1 }),
                         ArrayArg::from_raw_parts(q.clone(), q_elems),
                         ArrayArg::from_raw_parts(run.k.clone(), dense_elems),
                         ArrayArg::from_raw_parts(run.v.clone(), dense_elems),
@@ -1376,6 +1422,7 @@ fn flash_attention_inner<R: Runtime>(
                         rows as u32,
                         packed,
                         gapped,
+                        pair,
                     )
                 }
             };
@@ -1388,7 +1435,7 @@ fn flash_attention_inner<R: Runtime>(
             // how to instantiate rather than adding a third instantiation.
             KvElem::Nvfp4 => go!(f32),
         };
-        slot0 += splits;
+        slot0 += if pair { 2 * splits } else { splits };
     }
 
     let out = client.empty(q_elems * core::mem::size_of::<f32>());
