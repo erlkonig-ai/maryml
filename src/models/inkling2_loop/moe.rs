@@ -387,10 +387,18 @@ fn softcapped_swiglu(
 }
 
 /// [`crate::models::inkling::w4a16gemm::w4a16_linear`] over stacked experts:
-/// M tile `CUBE_POS_X` belongs to expert `tile_slot[m_tile]` (or to none, and
+/// M tile `CUBE_POS_Y` belongs to expert `tile_slot[m_tile]` (or to none, and
 /// ends), whose weight rows start at `slot * size_n` of the `[E * n, k]`
 /// planes and whose second-level scale is `scale2[slot]`. Everything inside
 /// the k loop is the parent's.
+///
+/// The grid is the parent's transposed, N in x: the dense kernel puts M in x
+/// so the few m tiles sharing a weight row run together, but here M is every
+/// expert's rows stacked (about 2,200 tiles, 160 MB of A at a 4,096-token
+/// chunk), and M-fastest would stream all of A from DRAM once per N tile.
+/// N-fastest keeps one m tile's A and its expert's B (about 1.5 MB for a
+/// gate or up projection) in L2 while its N tiles run, which is the reuse the
+/// per-expert launches had by construction.
 #[cube(launch)]
 #[allow(clippy::too_many_arguments)]
 pub fn w4a16_grouped<AB: Scalar + Cast, S: Scalar, NA: Size, NC: Size>(
@@ -407,8 +415,8 @@ pub fn w4a16_grouped<AB: Scalar + Cast, S: Scalar, NA: Size, NC: Size>(
     let lane = UNIT_POS_PLANE;
     let pack = AB::packing_factor();
 
-    let m_tile = CUBE_POS_X as usize;
-    let n_tile = CUBE_POS_Y as usize;
+    let n_tile = CUBE_POS_X as usize;
+    let m_tile = CUBE_POS_Y as usize;
     let slot = tile_slot[m_tile];
     if slot == 0xFFFF_FFFFu32 {
         terminate!();
@@ -495,14 +503,14 @@ fn w4a16_grouped_launch(
     n: usize,
 ) -> Handle {
     assert!(n % NTILE == 0 && k % KTILE == 0, "w4a16_grouped: {n}x{k} does not tile");
-    assert!(n / NTILE <= 65535, "w4a16_grouped: {} n-tiles exceed grid y", n / NTILE);
+    assert!(max_tiles <= 65535, "w4a16_grouped: {max_tiles} m-tiles exceed grid y");
     let m = max_tiles * MTILE;
     let out = client.empty(m * n * core::mem::size_of::<f32>());
     let vs = 32 / bf16::cube_type().size_bits();
     unsafe {
         w4a16_grouped::launch::<bf16, e4m3, cubecl::cuda::CudaRuntime>(
             client,
-            CubeCount::Static(max_tiles as u32, (n / NTILE) as u32, 1),
+            CubeCount::Static((n / NTILE) as u32, max_tiles as u32, 1),
             CubeDim::new_1d(32),
             vs,
             2,
