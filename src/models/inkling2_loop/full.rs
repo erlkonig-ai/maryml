@@ -290,7 +290,7 @@ impl FullLayer {
         };
         let mn = rms_norm(mlp_in, self.mlp_norm.clone(), d.eps);
 
-        let (acc, route) = self.moe.forward(&d, &mn, act);
+        let (acc, route) = self.moe.forward(&d, &mn, act, &state.fault);
         let mlp_conv = conv_step(&mut state.conv[3], acc.clone(), &self.mlp_sconv, d.conv_scale());
         state.pos += t;
         let out = residual + mlp_conv.clone();

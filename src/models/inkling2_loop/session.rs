@@ -31,7 +31,12 @@
 //! refused and the session is unchanged. A failure during the forward itself
 //! (a device error surfaces as a panic in the backend) may leave some visits
 //! updated and others not; the session is then *poisoned* and refuses every
-//! call until [`MiniSession::reset`]. The caller replays the sequence from its
+//! call until [`MiniSession::reset`]. A non-finite router logit is such a
+//! failure on either expert lane: the loop lane panics as it reads the
+//! routing, and the grouped lane writes the session's own fault cell, which
+//! `append` reads after the forward and turns into the same panic. The cell
+//! is the session's, so a fault never reaches another session over the same
+//! model. The caller replays the sequence from its
 //! archive. There is no per-token snapshot.
 //!
 //! Memory. A sliding visit drops keys and values no later query can see; a
@@ -52,20 +57,24 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use burn::prelude::*;
 use burn::tensor::TensorData;
+use cubecl::server::Handle;
 use triblespace::core::collection::CollectionHandle;
 use triblespace::prelude::Id;
 
 use crate::models::inkling::burn::rms_norm;
-use crate::models::inkling::seam::Bk;
+use crate::models::inkling::seam::{Bk, client_of};
 use crate::models::inkling2_loop::prof;
 use crate::models::inkling2_loop::config::{AttnKind, Inkling2LoopConfig, Inkling2LoopTextConfig};
 use crate::models::inkling2_loop::full::FullLayer;
 use crate::models::inkling2_loop::head::Head;
 use crate::models::inkling2_loop::layout::{Dtype, Slot};
 use crate::models::inkling2_loop::loop_core::{Core, CoreState};
+use crate::models::inkling2_loop::moe::{fault_cell, read_fault};
 use crate::models::inkling2_loop::pile::MiniRoot;
 use crate::models::inkling2_loop::schedule::CacheId;
 use crate::models::inkling2_loop::sliding::{Dev, ExpertAct, SlidingLayer, State, Weights, bf16_to_f32, want};
+
+type Client = cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>;
 
 /// The most logit rows one call returns, so a long prefill cannot ask for
 /// `rows x 200058` floats on the host by accident.
@@ -134,10 +143,10 @@ impl Outer {
         }
     }
 
-    fn new_state(&self, dev: &Dev) -> State {
+    fn new_state(&self, dev: &Dev, fault: &Handle) -> State {
         match self {
-            Outer::Sliding(l) => State::new(&l.dims, dev),
-            Outer::Full(l) => State::new(&l.dims, dev),
+            Outer::Sliding(l) => State::sharing_fault(&l.dims, dev, fault),
+            Outer::Full(l) => State::sharing_fault(&l.dims, dev, fault),
         }
     }
 
@@ -246,11 +255,17 @@ impl MiniModel {
         self.config().vocab_size
     }
 
+    /// Fresh caches for one sequence: every visit's state, and the one router
+    /// fault cell all of them write.
     fn fresh(&self) -> Caches {
+        let client = client_of(&self.embed_gain);
+        let fault = fault_cell(&client);
         Caches {
-            pre: self.pre.iter().map(|l| l.new_state(&self.dev)).collect(),
-            core: self.core.new_state(&self.dev),
-            post: self.post.iter().map(|l| l.new_state(&self.dev)).collect(),
+            pre: self.pre.iter().map(|l| l.new_state(&self.dev, &fault)).collect(),
+            core: self.core.new_state_sharing_fault(&self.dev, &fault),
+            post: self.post.iter().map(|l| l.new_state(&self.dev, &fault)).collect(),
+            fault,
+            client,
         }
     }
 
@@ -315,6 +330,22 @@ struct Caches {
     pre: Vec<State>,
     core: CoreState,
     post: Vec<State>,
+    /// The router fault cell every visit above writes. A sequence owns it:
+    /// another session over the same model has its own, and [`MiniSession::reset`]
+    /// replaces it with the caches.
+    fault: Handle,
+    client: Client,
+}
+
+impl Caches {
+    /// The grouped lane's form of the loop lane's panic in `Route::picks`,
+    /// after a forward: a set cell is a non-finite router logit somewhere in
+    /// the call. The read is a sync; the head has already synced by then.
+    fn check_router(&self) {
+        if let Some(flag) = read_fault(&self.client, &self.fault) {
+            panic!("router logit is non-finite (grouped lane), logit {}", flag - 1);
+        }
+    }
 }
 
 /// One token sequence over a shared [`MiniModel`]: its own state for every
@@ -389,7 +420,12 @@ impl MiniSession {
         };
         let model = Arc::clone(&self.model);
         let caches = &mut self.caches;
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| model.forward(ids, caches, rows))) {
+        let call = || {
+            let logits = model.forward(ids, caches, rows);
+            caches.check_router();
+            logits
+        };
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(call)) {
             Ok(logits) => {
                 self.position += ids.len();
                 Ok(logits)
@@ -424,3 +460,4 @@ const _: fn() = || {
     send_sync::<MiniModel>();
     send::<MiniSession>();
 };
+

@@ -141,10 +141,6 @@ pub struct Bank {
     up_softcap: f32,
     /// The same experts as views, for the per-expert loop.
     pub(super) loop_experts: Vec<Expert>,
-    /// One u32, run-scoped: `1 + logit` of a row whose router logits were
-    /// not finite, written by [`route_place`]; read by [`Bank::fault`].
-    fault: Handle,
-    client: Client,
 }
 
 /// The routing a visit used, on the device; read it only if you want it.
@@ -572,25 +568,30 @@ impl Bank {
             gate_softcap,
             up_softcap,
             loop_experts,
-            fault: u32s(client, &[0]),
-            client: client.clone(),
         }
-    }
-
-    /// `Some(1 + logit)` if any visit since the bind saw a non-finite router
-    /// logit (the grouped lane's form of `route_from_logits`' panic; the read
-    /// is a sync, so it is the caller's to place).
-    pub fn fault(&self) -> Option<u32> {
-        read_fault(&self.client, &self.fault)
     }
 
     /// The router, then the experts in the lane `act` and `MINI_MOE` select:
     /// `[rows, H]` f32, and the routing on the device.
-    pub fn forward(&self, d: &super::sliding::Dims, x: &Tensor<Bk, 2>, act: super::sliding::ExpertAct) -> (Tensor<Bk, 2>, Route) {
+    ///
+    /// `fault` is the caller's cell ([`fault_cell`]): the grouped lane writes
+    /// `1 + logit` into it when a row's router logits are not finite, its form
+    /// of `route_from_logits`' panic, and nothing else reads or clears it. The
+    /// read is a sync, so it is the caller's to place ([`read_fault`]); the
+    /// loop lane panics in [`Route::picks`] instead. The cell belongs to
+    /// whoever owns the call's state, never to the bank, so one context's
+    /// fault cannot reach another context sharing these weights.
+    pub fn forward(
+        &self,
+        d: &super::sliding::Dims,
+        x: &Tensor<Bk, 2>,
+        act: super::sliding::ExpertAct,
+        fault: &Handle,
+    ) -> (Tensor<Bk, 2>, Route) {
         let dev = x.device();
         let route = super::prof::span("router", &dev, || self.route(x));
         let out = super::prof::span("experts", &dev, || match lane(act) {
-            Lane::Grouped => self.experts_grouped(x, &route),
+            Lane::Grouped => self.experts_grouped(x, &route, fault),
             Lane::Loop => experts_loop(self, d, x, &route.picks(), act),
         });
         (out, route)
@@ -598,6 +599,11 @@ impl Bank {
 
     pub fn experts(&self) -> usize {
         self.experts
+    }
+
+    #[cfg(test)]
+    fn client(&self) -> Client {
+        client_of(&Tensor::<Bk, 1>::zeros([1], &burn::backend::cuda::CudaDevice::default()))
     }
 
     /// The router logits and the device top-k of `x` (`[rows, H]`).
@@ -621,8 +627,8 @@ impl Bank {
 
     /// The device plan for `route` (see the module doc). `fault` (one u32)
     /// receives `1 + logit` of a row whose router logits were not finite.
-    pub fn plan(&self, client: &Client, route: &Route) -> Plan {
-        let fault = &self.fault;
+    fn plan(&self, client: &Client, route: &Route, fault: &Handle) -> Plan {
+        assert_eq!(route.top_k, self.top_k, "plan: a route of top {} on a bank of top {}", route.top_k, self.top_k);
         let (rows, k, e) = (route.rows, self.top_k, self.experts);
         let max_tiles = max_tiles(rows, k, e);
         let m_max = max_tiles * MTILE;
@@ -711,11 +717,16 @@ impl Bank {
 
     /// The grouped experts over `x` (`[rows, H]`) routed by `route`:
     /// `[rows, H]` f32, each row the weighted sum of its picks' outputs.
-    pub fn experts_grouped(&self, x: &Tensor<Bk, 2>, route: &Route) -> Tensor<Bk, 2> {
+    /// `fault` as in [`Bank::forward`]. The kernels below launch unchecked,
+    /// so the shapes are checked here.
+    fn experts_grouped(&self, x: &Tensor<Bk, 2>, route: &Route, fault: &Handle) -> Tensor<Bk, 2> {
         let [rows, h] = x.dims();
+        assert_eq!(h, self.hidden, "experts: x is {h} wide, the bank's hidden size is {}", self.hidden);
+        assert_eq!(route.rows, rows, "experts: a route of {} rows for {rows} rows of x", route.rows);
+        assert_eq!(route.top_k, self.top_k, "experts: a route of top {} on a bank of top {}", route.top_k, self.top_k);
         let client = client_of(x);
         let dev = x.device();
-        let plan = self.plan(&client, route);
+        let plan = self.plan(&client, route, fault);
         let m = plan.max_tiles * MTILE;
         let (xh, dt) = handle_of_any(x.clone());
         let a = match dt {
@@ -773,6 +784,11 @@ pub(super) fn bf16_proj(client: &Client, bytes: &[u8], experts: usize, n: usize,
         n,
         k,
     }
+}
+
+/// A fresh fault cell for [`Bank::forward`]: one u32, zero.
+pub fn fault_cell(client: &Client) -> Handle {
+    u32s(client, &[0])
 }
 
 /// Read a fault cell: `Some(logit + 1)` if a row's router logits were not finite.
@@ -900,9 +916,10 @@ mod tests {
         let xs = x(rows, d.hidden, seed ^ 0x5555);
         let route = b.route(&xs);
         let picks = route.picks();
-        let grouped = host(b.experts_grouped(&xs, &route));
+        let cell = fault_cell(&b.client());
+        let grouped = host(b.experts_grouped(&xs, &route, &cell));
         let looped = host(experts_loop(&b, d, &xs, &picks, ExpertAct::Bf16));
-        assert_eq!(b.fault(), None);
+        assert_eq!(read_fault(&b.client(), &cell), None);
         let h = d.hidden;
         let (mut worst, mut differ) = (0f32, 0);
         for row in 0..rows {

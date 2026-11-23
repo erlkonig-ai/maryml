@@ -67,6 +67,7 @@
 use burn::prelude::*;
 use burn::tensor::activation::{sigmoid, softmax};
 use burn::tensor::TensorData;
+use cubecl::server::Handle;
 
 use crate::models::inkling::bf16gemm::Bf16W;
 use crate::models::inkling::burn::{
@@ -81,7 +82,7 @@ use crate::models::inkling2_loop::layout::{
     AttnPart, ConvPart, Dtype, ExpertMat, ExpertPart, GatePart, LayerPart, Slot, Stream,
 };
 use crate::models::inkling2_loop::messages::{DeviceGate, DownPrecision, MessageGate, device_gates, message_tensor};
-use crate::models::inkling2_loop::moe::{Bank, Proj, Route, bf16_proj, nvfp4_proj};
+use crate::models::inkling2_loop::moe::{Bank, Proj, Route, bf16_proj, fault_cell, nvfp4_proj};
 
 pub(super) type Dev = burn::backend::cuda::CudaDevice;
 
@@ -281,16 +282,29 @@ pub struct State {
     /// The last `k - 1` inputs of the K, V, attention-output and MLP-output
     /// convolutions, zero before the first token, as upstream pads.
     pub conv: [Tensor<Bk, 2>; 4],
+    /// The router fault cell this visit's experts write ([`super::moe::Bank::forward`]):
+    /// one u32 on the device, `1 + logit` once a row's router logits were not
+    /// finite. Nothing clears it; whoever owns the state reads it.
+    pub fault: Handle,
 }
 
 impl State {
+    /// A fresh state with a fault cell of its own.
     pub fn new(d: &Dims, dev: &Dev) -> State {
+        let conv = Self::zero_conv(d, dev);
+        let fault = fault_cell(&client_of(&conv[0]));
+        State { pos: 0, kv: Kv::new(KEY_TILE), conv, fault }
+    }
+
+    /// A fresh state writing its router faults into `fault`, a cell shared
+    /// with the other visits of one sequence, so the sequence reads one cell.
+    pub fn sharing_fault(d: &Dims, dev: &Dev, fault: &Handle) -> State {
+        State { pos: 0, kv: Kv::new(KEY_TILE), conv: Self::zero_conv(d, dev), fault: fault.clone() }
+    }
+
+    fn zero_conv(d: &Dims, dev: &Dev) -> [Tensor<Bk, 2>; 4] {
         let z = |w: usize| Tensor::zeros([d.kernel - 1, w], dev);
-        State {
-            pos: 0,
-            kv: Kv::new(KEY_TILE),
-            conv: [z(d.kv_dim()), z(d.kv_dim()), z(d.hidden), z(d.hidden)],
-        }
+        [z(d.kv_dim()), z(d.kv_dim()), z(d.hidden), z(d.hidden)]
     }
 }
 
@@ -464,7 +478,7 @@ impl SlidingLayer {
         };
         let mn = rms_norm(mlp_in, self.mlp_norm.clone(), d.eps);
 
-        let (acc, route) = self.moe.forward(&d, &mn, act);
+        let (acc, route) = self.moe.forward(&d, &mn, act, &state.fault);
         let mlp_conv = conv_step(&mut state.conv[3], acc.clone(), &self.mlp_sconv, d.conv_scale());
         state.pos += t;
         let out = residual + mlp_conv.clone();
