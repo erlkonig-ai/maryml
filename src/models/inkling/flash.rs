@@ -965,6 +965,54 @@ pub(crate) fn flash_combine_kernel(
     out[(qrow * heads * head_dim + h * head_dim + d) as usize] = res;
 }
 
+/// [`flash_combine_kernel`] with one more term in every row's denominator: a
+/// sink, a logit with no value behind it, `sinks[qrow * heads + h]`.
+///
+/// This is the attention-sink softmax `sum_j exp(s_j) v_j / (sum_j exp(s_j) +
+/// exp(sink))` (Inkling 2 Mini's layers). It is the merge with one extra
+/// partial whose `o` is zero, `m` the sink and `l` one, so the sink takes part
+/// in the running maximum like any split and nothing else changes.
+#[cube(launch_unchecked)]
+pub(crate) fn flash_combine_sinks_kernel(
+    po: &Array<f32>,
+    pml: &Array<f32>,
+    sinks: &Array<f32>,
+    out: &mut Array<f32>,
+    slots: u32,
+    nq: u32,
+    #[comptime] heads: u32,
+    #[comptime] head_dim: u32,
+) {
+    let qrow = CUBE_POS_X;
+    let h = CUBE_POS_Y;
+    let d = UNIT_POS_X;
+
+    let sink = sinks[(qrow * heads + h) as usize];
+    let mut mx = sink;
+    for s in 0..slots {
+        let mb = ((s * nq + qrow) * heads + h) * 2;
+        if pml[mb as usize] > mx {
+            mx = pml[mb as usize];
+        }
+    }
+
+    let mut num = f32::new(0.0);
+    let mut den = Exp::exp(sink - mx);
+    for s in 0..slots {
+        let mb = ((s * nq + qrow) * heads + h) * 2;
+        let ms = pml[mb as usize];
+        let ls = pml[(mb + 1) as usize];
+        let mut wt = f32::new(0.0);
+        if ms > f32::new(NEG_INF) {
+            wt = Exp::exp(ms - mx);
+        }
+        den += wt * ls;
+        num += wt * po[(((s * nq + qrow) * heads + h) * head_dim + d) as usize];
+    }
+
+    out[(qrow * heads * head_dim + h * head_dim + d) as usize] = num / den;
+}
+
 /// The element type a key/value buffer is held in.
 ///
 /// Not `burn::tensor::DType`: this file is runtime-generic the way
@@ -1154,6 +1202,52 @@ pub fn flash_attention_launch<R: Runtime>(
     rows: usize,
     gaps: Option<Gaps<'_>>,
 ) -> Handle {
+    flash_attention_inner(client, q, runs, rel, kv, nq, q0, heads, kv_heads, head_dim, eff, window, scaling, rows, gaps, None)
+}
+
+/// [`flash_attention_launch`] with an attention sink per row: `sinks` is
+/// `[nq, heads]` f32, and each row's softmax denominator carries
+/// `exp(sinks[q, h])` beside its keys ([`flash_combine_sinks_kernel`]).
+#[allow(clippy::too_many_arguments)]
+pub fn flash_attention_launch_sinked<R: Runtime>(
+    client: &ComputeClient<R>,
+    q: &Handle,
+    runs: &[KeyRun<'_>],
+    rel: &Handle,
+    sinks: &Handle,
+    kv: KvElem,
+    nq: usize,
+    q0: usize,
+    heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    eff: usize,
+    window: Option<usize>,
+    scaling: f32,
+    rows: usize,
+) -> Handle {
+    flash_attention_inner(client, q, runs, rel, kv, nq, q0, heads, kv_heads, head_dim, eff, window, scaling, rows, None, Some(sinks))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn flash_attention_inner<R: Runtime>(
+    client: &ComputeClient<R>,
+    q: &Handle,
+    runs: &[KeyRun<'_>],
+    rel: &Handle,
+    kv: KvElem,
+    nq: usize,
+    q0: usize,
+    heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    eff: usize,
+    window: Option<usize>,
+    scaling: f32,
+    rows: usize,
+    gaps: Option<Gaps<'_>>,
+    sinks: Option<&Handle>,
+) -> Handle {
     assert!(nq > 0, "an empty query block has no attention");
     assert!(!runs.is_empty(), "attention over no keys at all");
     assert!(
@@ -1298,19 +1392,37 @@ pub fn flash_attention_launch<R: Runtime>(
     }
 
     let out = client.empty(q_elems * core::mem::size_of::<f32>());
-    unsafe {
-        flash_combine_kernel::launch_unchecked::<R>(
-            client,
-            CubeCount::Static(nq as u32, heads as u32, 1),
-            CubeDim::new_1d(head_dim as u32),
-            ArrayArg::from_raw_parts(po, po_elems),
-            ArrayArg::from_raw_parts(pml, pml_elems),
-            ArrayArg::from_raw_parts(out.clone(), q_elems),
-            slots as u32,
-            nq as u32,
-            heads as u32,
-            head_dim as u32,
-        )
+    let (count, dim) = (CubeCount::Static(nq as u32, heads as u32, 1), CubeDim::new_1d(head_dim as u32));
+    match sinks {
+        None => unsafe {
+            flash_combine_kernel::launch_unchecked::<R>(
+                client,
+                count,
+                dim,
+                ArrayArg::from_raw_parts(po, po_elems),
+                ArrayArg::from_raw_parts(pml, pml_elems),
+                ArrayArg::from_raw_parts(out.clone(), q_elems),
+                slots as u32,
+                nq as u32,
+                heads as u32,
+                head_dim as u32,
+            )
+        },
+        Some(sinks) => unsafe {
+            flash_combine_sinks_kernel::launch_unchecked::<R>(
+                client,
+                count,
+                dim,
+                ArrayArg::from_raw_parts(po, po_elems),
+                ArrayArg::from_raw_parts(pml, pml_elems),
+                ArrayArg::from_raw_parts(sinks.clone(), nq * heads),
+                ArrayArg::from_raw_parts(out.clone(), q_elems),
+                slots as u32,
+                nq as u32,
+                heads as u32,
+                head_dim as u32,
+            )
+        },
     };
     out
 }

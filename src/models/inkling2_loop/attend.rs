@@ -43,13 +43,20 @@
 use burn::prelude::*;
 use burn::tensor::Int;
 
-use crate::models::inkling::seam::Bk;
+use crate::models::inkling::flash::{self, KeyRun, KvElem};
+use crate::models::inkling::seam::{Bk, client_of, handle_of, handle_of_any, tensor_of};
 
 /// Rows of one key/value segment, and so of one key tile.
 pub const KEY_TILE: usize = 1024;
 
 /// Queries scored together against one key segment.
 pub const QUERY_TILE: usize = 1024;
+
+/// Calls of at most this many queries (a decode step, a short draft) take the
+/// fused flash-decoding kernel ([`crate::models::inkling::flash`]): one launch
+/// per key segment and one to merge, where the tiled loop below launches a
+/// chain of about twenty per segment. Longer calls keep the tiled loop.
+pub const FUSED_MAX_QUERIES: usize = 16;
 
 /// One visit's keys and values: post-clip K and post-norm V `[rows, kv_dim]`,
 /// in segments of `tile` rows, oldest first, from absolute position `base`.
@@ -134,6 +141,16 @@ impl Kv {
         })
     }
 
+    /// `(absolute position of row 0, keys, values, filled rows)` of each
+    /// segment, whole: the buffers as allocated, `tile` rows each.
+    fn whole_segments(&self) -> impl Iterator<Item = (usize, &Tensor<Bk, 2>, &Tensor<Bk, 2>, usize)> + '_ {
+        let n = self.segs.len();
+        self.segs.iter().enumerate().map(move |(s, [k, v])| {
+            let rows = if s + 1 == n { self.last } else { self.tile };
+            (self.base + s * self.tile, k, v, rows)
+        })
+    }
+
     fn joined(&self, which: usize) -> Option<Tensor<Bk, 2>> {
         let parts: Vec<Tensor<Bk, 2>> = self.segments().map(|(_, k, v)| if which == 0 { k } else { v }).collect();
         (!parts.is_empty()).then(|| Tensor::cat(parts, 0))
@@ -184,6 +201,12 @@ pub fn attend(
     let [_, d_rel] = rel.dims();
     assert_eq!(heads, a.heads, "q carries the shape's heads");
     assert_eq!(kv.end(), first + t, "the cache holds exactly the keys up to the call's last query");
+    if t <= FUSED_MAX_QUERIES {
+        let rows = flash::decode_rows(heads / a.kv_heads);
+        if flash::applies(heads, a.kv_heads, hd, rows) && kv.rows() > 0 {
+            return attend_fused(a, q, rel, rel_proj, sinks, kv, first, rows);
+        }
+    }
     let (kvh, e) = (a.kv_heads, a.rel_extent);
     let rep = heads / kvh;
     let dev = q.device();
@@ -252,6 +275,64 @@ pub fn attend(
         i0 += tq;
     }
     if outs.len() == 1 { outs.pop().expect("one tile") } else { Tensor::cat(outs, 0) }
+}
+
+/// [`attend`] for a short call, through the fused kernel: the relative-bias
+/// table `[t, heads, rel_extent]` is built here (the same product the tiled
+/// loop takes per query tile), and every held segment is one key run whose
+/// live rows are its filled ones. Causality, the window and the distance bias
+/// are the kernel's, per (query, key) cell; the sink enters each row's
+/// denominator in the merge.
+#[allow(clippy::too_many_arguments)]
+fn attend_fused(
+    a: &AttnShape,
+    q: Tensor<Bk, 3>,
+    rel: Tensor<Bk, 2>,
+    rel_proj: &Tensor<Bk, 2>,
+    sinks: Tensor<Bk, 2>,
+    kv: &Kv,
+    first: usize,
+    rows: usize,
+) -> Tensor<Bk, 2> {
+    let [t, heads, hd] = q.dims();
+    let dev = q.device();
+    let client = client_of(&q);
+    let table = rel.matmul(rel_proj.clone());
+    let q_h = handle_of(q.reshape([t, heads * hd]));
+    let rel_h = handle_of(table);
+    let sink_h = handle_of(sinks);
+    let mut elem = KvElem::F32;
+    let held: Vec<_> = kv
+        .whole_segments()
+        .map(|(base, k, v, filled)| {
+            let [tile, _] = k.dims();
+            let (kh, dt) = handle_of_any(k.clone());
+            let (vh, _) = handle_of_any(v.clone());
+            if dt == burn::tensor::DType::BF16 {
+                elem = KvElem::Bf16;
+            }
+            (kh, vh, tile, base, filled)
+        })
+        .collect();
+    let runs: Vec<KeyRun<'_>> = held
+        .iter()
+        .map(|(k, v, tile, base, filled)| KeyRun {
+            k,
+            v,
+            k_scales: None,
+            v_scales: None,
+            rows: *tile,
+            base: *base,
+            lo: 0,
+            hi: *filled,
+            row0: 0,
+        })
+        .collect();
+    let scale = (hd as f32).powf(-0.5);
+    let out = flash::flash_attention_launch_sinked(
+        &client, &q_h, &runs, &rel_h, &sink_h, elem, t, first, heads, a.kv_heads, hd, a.rel_extent, a.window, scale, rows,
+    );
+    tensor_of(client, dev, out, t, heads * hd)
 }
 
 #[cfg(test)]
