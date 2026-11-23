@@ -38,9 +38,29 @@
 //!   tokenizer's, not necessarily the ones sampled. Callers compare token
 //!   prefixes before reusing inference state.
 //!
-//! Images are not supported (the vision tower runs natively in `vision`, but
-//! the session takes no image features yet); neither is audio,
-//! which the template itself refuses.
+//! Images ([`Part::Image`] in [`Message::UserParts`] and [`Message::ToolParts`]):
+//!
+//! * every part of a user or tool message is its own frame with the role header
+//!   repeated (`<|message_tool|>NAME` for each part of a tool result), as the
+//!   template renders a list `content`; an image part's frame is
+//!   `role <|content_image|><|unused_200054|><|end_message|>`;
+//! * [`ChatCodec::render`] then does what the release's `Inkling2Processor` does
+//!   to that text: the image's one `<|unused_200054|>` becomes `rows * cols` of
+//!   them (its `image_grid_thw` product, one per projected feature row), in
+//!   image order. [`RenderedPrompt::images`] names each run of placeholders by
+//!   its place in the ids and the image it stands for, so no caller writes
+//!   those ids itself; [`RenderedPrompt::text`] stays the template's text, one
+//!   placeholder per image;
+//! * the expansion is bounded before it is allocated: a render refuses a
+//!   history whose image tokens, or whose whole prompt, exceed the codec's
+//!   prompt budget ([`ChatCodec::with_prompt_budget`], [`ChatCodec::render_within`]);
+//! * the assistant has no image parts, as the template refuses them; neither is
+//!   audio supported, which the template refuses too.
+//!
+//! Further named departures for images: a message with no parts is refused
+//! (the template would render nothing for it); a literal `<|unused_200054|>` in
+//! a text part is text, as every other marker spelling is, where upstream's
+//! processor counts it as one more image (and refuses the conversation).
 
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Map, Value};
@@ -60,10 +80,15 @@ pub enum Marker {
     ContentInvokeToolJson,
     EndMessage,
     EndSampling,
+    /// `<|content_image|>`: the content kind of an image part's frame.
+    ContentImage,
+    /// `<|unused_200054|>`: the processor's image token, one per projected
+    /// image feature row once a render expands it.
+    ImagePlaceholder,
 }
 
 impl Marker {
-    pub const ALL: [Marker; 10] = [
+    pub const ALL: [Marker; 12] = [
         Marker::MessageUser,
         Marker::MessageModel,
         Marker::MessageSystem,
@@ -74,6 +99,8 @@ impl Marker {
         Marker::ContentInvokeToolJson,
         Marker::EndMessage,
         Marker::EndSampling,
+        Marker::ContentImage,
+        Marker::ImagePlaceholder,
     ];
 
     pub fn spelling(self) -> &'static str {
@@ -88,6 +115,8 @@ impl Marker {
             Marker::ContentInvokeToolJson => "<|content_invoke_tool_json|>",
             Marker::EndMessage => "<|end_message|>",
             Marker::EndSampling => "<|content_model_end_sampling|>",
+            Marker::ContentImage => "<|content_image|>",
+            Marker::ImagePlaceholder => "<|unused_200054|>",
         }
     }
 
@@ -103,6 +132,8 @@ impl Marker {
             Marker::EndMessage => 200010,
             Marker::ContentXml => 200024,
             Marker::ContentInvokeToolJson => 200049,
+            Marker::ContentImage => 200005,
+            Marker::ImagePlaceholder => 200054,
         }
     }
 
@@ -387,12 +418,67 @@ fn write_sorted(out: &mut String, value: &Value) {
     }
 }
 
+/// One image in a message: the image token grid the processor gives it, and
+/// the identity of the image it was made from.
+///
+/// `origin` is the caller's own 32-byte name for the source image (Drive's is
+/// a digest of the media type and bytes); this module never interprets it,
+/// only carries it into [`ImageSpan`] so the caller can check, before it
+/// feeds features, that they come from the image the prompt names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ImagePart {
+    origin: [u8; 32],
+    grid: (usize, usize),
+}
+
+impl ImagePart {
+    /// An image whose processor grid is `(rows, cols)` image tokens.
+    pub fn new(origin: [u8; 32], grid: (usize, usize)) -> Result<Self> {
+        let (rows, cols) = grid;
+        ensure!(rows > 0 && cols > 0, "an image needs image tokens; its grid is {rows}x{cols}");
+        rows.checked_mul(cols).with_context(|| format!("an image grid of {rows}x{cols} overflows"))?;
+        Ok(Self { origin, grid })
+    }
+
+    /// The image the processor produced `tokens` for.
+    pub fn of(origin: [u8; 32], tokens: &super::vision_input::ImageTokens) -> Result<Self> {
+        Self::new(origin, tokens.grid)
+    }
+
+    pub fn origin(&self) -> [u8; 32] {
+        self.origin
+    }
+
+    /// `(rows, cols)` of image tokens.
+    pub fn grid(&self) -> (usize, usize) {
+        self.grid
+    }
+
+    /// How many placeholder ids the image becomes: `rows * cols`.
+    pub fn tokens(&self) -> usize {
+        self.grid.0 * self.grid.1
+    }
+}
+
+/// One part of a user or tool message, rendered as its own frame.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Part {
+    Text(String),
+    Image(ImagePart),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Message {
+    /// A user message of one text part.
     User(String),
     Assistant { reasoning: String, answer: String, tool_calls: Vec<Invocation> },
-    /// A tool's result, headed by the tool's name.
+    /// A tool's result of one text part, headed by the tool's name.
     Tool { name: String, content: String },
+    /// A user message of ordered text and image parts.
+    UserParts(Vec<Part>),
+    /// A tool's result of ordered text and image parts, every part headed by
+    /// the tool's name.
+    ToolParts { name: String, parts: Vec<Part> },
 }
 
 /// One rendered piece: a control token, or text the tokenizer encodes.
@@ -452,18 +538,67 @@ pub fn render_opening(system: &str, tools: &Tools, effort: Effort) -> Vec<Segmen
     parts
 }
 
+/// Each part its own frame under the same header, as the template renders a
+/// list `content`. Images are collected in order beside the segments.
+fn part_frames(
+    parts: &mut Vec<Segment>,
+    images: &mut Vec<ImagePart>,
+    role: Marker,
+    header: &str,
+    message_parts: &[Part],
+) -> Result<()> {
+    ensure!(!message_parts.is_empty(), "a {} message needs at least one part", role.spelling());
+    for part in message_parts {
+        match part {
+            Part::Text(text) => frame(parts, role, header, Marker::ContentText, text),
+            Part::Image(image) => {
+                control(parts, role);
+                content(parts, header);
+                control(parts, Marker::ContentImage);
+                control(parts, Marker::ImagePlaceholder);
+                control(parts, Marker::EndMessage);
+                images.push(*image);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The whole prompt as segments.
 pub fn render_segments(history: &History, tools: &Tools, effort: Effort) -> Result<Vec<Segment>> {
+    Ok(render_with_images(history, tools, effort)?.0)
+}
+
+/// The whole prompt as segments, and its images in the order of their
+/// [`Marker::ImagePlaceholder`] segments.
+fn render_with_images(history: &History, tools: &Tools, effort: Effort) -> Result<(Vec<Segment>, Vec<ImagePart>)> {
     let mut parts = match &history.rendered_opening {
-        Some(opening) => opening.clone(),
+        Some(opening) => {
+            ensure!(
+                !opening.iter().any(|segment| matches!(
+                    segment,
+                    Segment::Control(Marker::ContentImage | Marker::ImagePlaceholder)
+                )),
+                "a kept opening holds an image marker, which names no image"
+            );
+            opening.clone()
+        }
         None => render_opening(&history.system, tools, effort),
     };
+    let mut images = Vec::new();
     for message in &history.messages {
         match message {
             Message::User(text) => frame(&mut parts, Marker::MessageUser, "", Marker::ContentText, text),
             Message::Tool { name, content: text } => {
                 valid_name(name)?;
                 frame(&mut parts, Marker::MessageTool, name, Marker::ContentText, text)
+            }
+            Message::UserParts(message_parts) => {
+                part_frames(&mut parts, &mut images, Marker::MessageUser, "", message_parts)?
+            }
+            Message::ToolParts { name, parts: message_parts } => {
+                valid_name(name)?;
+                part_frames(&mut parts, &mut images, Marker::MessageTool, name, message_parts)?
             }
             Message::Assistant { reasoning, answer, tool_calls } => {
                 if !reasoning.is_empty() {
@@ -486,7 +621,7 @@ pub fn render_segments(history: &History, tools: &Tools, effort: Effort) -> Resu
             }
         }
     }
-    Ok(parts)
+    Ok((parts, images))
 }
 
 pub fn segments_text(parts: &[Segment]) -> String {
@@ -531,9 +666,31 @@ pub struct Completion {
 /// What a rendered prompt is: its text and its token ids.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RenderedPrompt {
+    /// The template's text: one `<|unused_200054|>` per image.
     pub text: String,
+    /// The processor's ids: each image's placeholder repeated `rows * cols`
+    /// times.
     pub token_ids: Vec<u32>,
+    /// One span per image, in history order.
+    pub images: Vec<ImageSpan>,
 }
+
+/// Where one image's placeholders are in [`RenderedPrompt::token_ids`]:
+/// `token_ids[start..start + len]` is exactly `len = image.tokens()` copies of
+/// [`Marker::ImagePlaceholder`] (not the `<|content_image|>` before them or the
+/// `<|end_message|>` after). `row` is the first of its rows among all images'
+/// feature rows concatenated in order: the sum of the earlier spans' `len`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImageSpan {
+    pub start: usize,
+    pub len: usize,
+    pub row: usize,
+    pub image: ImagePart,
+}
+
+/// The prompt budget a codec renders within unless told otherwise: the
+/// release's `model_max_length` (`tokenizer_config.json`).
+pub const DEFAULT_PROMPT_BUDGET: usize = 1 << 20;
 
 /// The renderer's identity, for the archive: the compiled source of this
 /// module, the tokenizer it holds, and a codec name with the source's hash.
@@ -551,6 +708,7 @@ pub struct ChatCodec {
     content: tokenizers::Tokenizer,
     tools: Tools,
     effort: Effort,
+    prompt_budget: usize,
 }
 
 #[cfg(feature = "tokenizer")]
@@ -580,7 +738,18 @@ impl ChatCodec {
                 added.content
             );
         }
-        Ok(Self { tokenizer, content, tools, effort })
+        Ok(Self { tokenizer, content, tools, effort, prompt_budget: DEFAULT_PROMPT_BUDGET })
+    }
+
+    /// The same codec rendering within `tokens`: [`Self::render`] refuses a
+    /// prompt longer than that, and an image expansion that would exceed it
+    /// before allocating it.
+    pub fn with_prompt_budget(self, tokens: usize) -> Self {
+        Self { prompt_budget: tokens, ..self }
+    }
+
+    pub fn prompt_budget(&self) -> usize {
+        self.prompt_budget
     }
 
     /// Build both tokenizers from a root's tokenizer graph.
@@ -648,22 +817,65 @@ impl ChatCodec {
         Ok(ids)
     }
 
+    /// The prompt within the codec's prompt budget.
     pub fn render(&self, history: &History) -> Result<RenderedPrompt> {
-        let parts = render_segments(history, &self.tools, self.effort)?;
+        self.render_within(history, self.prompt_budget)
+    }
+
+    /// The prompt, refused when it would be longer than `budget` tokens. The
+    /// images' placeholder count is checked against the budget before any of
+    /// it is allocated, and again, with the text, as it grows.
+    pub fn render_within(&self, history: &History, budget: usize) -> Result<RenderedPrompt> {
+        let (parts, images) = render_with_images(history, &self.tools, self.effort)?;
+        let image_tokens = images
+            .iter()
+            .try_fold(0usize, |sum, image| sum.checked_add(image.tokens()))
+            .context("the images' token count overflows")?;
+        ensure!(
+            image_tokens <= budget,
+            "the prompt's {} image(s) need {image_tokens} tokens, more than its budget of {budget}",
+            images.len()
+        );
+        let within = |ids: &Vec<u32>, more: usize| -> Result<()> {
+            let total = ids.len().checked_add(more).context("the prompt's length overflows")?;
+            ensure!(total <= budget, "the prompt needs more than its budget of {budget} tokens");
+            Ok(())
+        };
         let mut token_ids = Vec::new();
+        let mut spans = Vec::with_capacity(images.len());
+        let mut images = images.into_iter();
+        let mut row = 0;
         let mut pending = String::new();
         for part in &parts {
             match part {
                 Segment::Content(text) => pending.push_str(text),
                 Segment::Control(marker) => {
-                    token_ids.extend(self.encode_content(&pending)?);
+                    let text = self.encode_content(&pending)?;
+                    within(&token_ids, text.len())?;
+                    token_ids.extend(text);
                     pending.clear();
-                    token_ids.push(marker.id());
+                    if *marker == Marker::ImagePlaceholder {
+                        let image = images.next().context("an image placeholder without its image")?;
+                        let len = image.tokens();
+                        within(&token_ids, len)?;
+                        token_ids
+                            .try_reserve(len)
+                            .with_context(|| format!("cannot allocate an image's {len} tokens"))?;
+                        spans.push(ImageSpan { start: token_ids.len(), len, row, image });
+                        token_ids.resize(token_ids.len() + len, marker.id());
+                        row += len;
+                    } else {
+                        within(&token_ids, 1)?;
+                        token_ids.push(marker.id());
+                    }
                 }
             }
         }
-        token_ids.extend(self.encode_content(&pending)?);
-        Ok(RenderedPrompt { text: segments_text(&parts), token_ids })
+        ensure!(images.next().is_none(), "an image without its placeholder");
+        let text = self.encode_content(&pending)?;
+        within(&token_ids, text.len())?;
+        token_ids.extend(text);
+        Ok(RenderedPrompt { text: segments_text(&parts), token_ids, images: spans })
     }
 
     /// The exact bytes of non-control ids, by inverting the byte-level
@@ -779,3 +991,7 @@ fn byte_level_alphabet() -> std::collections::HashMap<char, u8> {
 #[cfg(test)]
 #[path = "chat_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "chat_image_tests.rs"]
+mod image_tests;

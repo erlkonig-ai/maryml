@@ -1,0 +1,975 @@
+{
+ "images": {
+  "inkling2_mini_rgb_100x60": {
+   "file": "inkling2_mini_rgb_100x60.png",
+   "png_sha256": "200d9e2cb9d152a5c25de6e8137a163e8789c75b944d6ecd3e44b4956ff4392a",
+   "size": [
+    100,
+    60
+   ]
+  },
+  "inkling2_mini_rgba_52x44": {
+   "file": "inkling2_mini_rgba_52x44.png",
+   "png_sha256": "9a9d15b73614ea1ed458cca37cda675af94cdb1aedcd1a439ad4f1c341b5e3c2",
+   "size": [
+    52,
+    44
+   ]
+  },
+  "rgb_80x40": {
+   "file": "rgb_80x40.png",
+   "png_sha256": "ff5e598cb6b8db322a02928aace7c5de0d8578c4328fbfe4ccd902e148d5fb10",
+   "size": [
+    80,
+    40
+   ]
+  },
+  "rgba_40x80": {
+   "file": "rgba_40x80.png",
+   "png_sha256": "8b8eb62786bc163331c478adb72baa4d42c83303f2a5b1e24c305aadc9254be0",
+   "size": [
+    40,
+    80
+   ]
+  }
+ },
+ "ids": {
+  "content_image": 200005,
+  "image_token": 200054,
+  "image_token_spelling": "<|unused_200054|>",
+  "end_message": 200010
+ },
+ "cases": [
+  {
+   "name": "mixed_user",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are Robin."
+    },
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "text",
+       "text": "Look at this:"
+      },
+      {
+       "type": "image",
+       "name": "inkling2_mini_rgb_100x60"
+      },
+      {
+       "type": "text",
+       "text": "What is it?"
+      }
+     ]
+    }
+   ],
+   "tools": null,
+   "image_order": [
+    "inkling2_mini_rgb_100x60"
+   ],
+   "template_text": "<|message_system|><|content_text|>You are Robin.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Look at this:<|end_message|><|message_user|><|content_image|><|unused_200054|><|end_message|><|message_user|><|content_text|>What is it?<|end_message|>",
+   "input_ids": [
+    200002,
+    200004,
+    1735,
+    149914,
+    190208,
+    13,
+    200010,
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200004,
+    31410,
+    149922,
+    149928,
+    25,
+    200010,
+    200000,
+    200005,
+    200054,
+    200054,
+    200054,
+    200054,
+    200054,
+    200054,
+    200010,
+    200000,
+    200004,
+    1775,
+    149884,
+    149921,
+    30,
+    200010
+   ],
+   "image_grid_thw": [
+    [
+     1,
+     2,
+     3
+    ]
+   ],
+   "image_sizes": [
+    [
+     100,
+     60
+    ]
+   ],
+   "plain_tokenizer_ids": [
+    200002,
+    200004,
+    1735,
+    149914,
+    190208,
+    13,
+    200010,
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200004,
+    31410,
+    149922,
+    149928,
+    25,
+    200010,
+    200000,
+    200005,
+    200054,
+    200010,
+    200000,
+    200004,
+    1775,
+    149884,
+    149921,
+    30,
+    200010
+   ]
+  },
+  {
+   "name": "two_unequal_images",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are Robin."
+    },
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "image",
+       "name": "inkling2_mini_rgb_100x60"
+      },
+      {
+       "type": "text",
+       "text": " and "
+      },
+      {
+       "type": "image",
+       "name": "inkling2_mini_rgba_52x44"
+      }
+     ]
+    }
+   ],
+   "tools": null,
+   "image_order": [
+    "inkling2_mini_rgb_100x60",
+    "inkling2_mini_rgba_52x44"
+   ],
+   "template_text": "<|message_system|><|content_text|>You are Robin.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_image|><|unused_200054|><|end_message|><|message_user|><|content_text|> and <|end_message|><|message_user|><|content_image|><|unused_200054|><|end_message|>",
+   "input_ids": [
+    200002,
+    200004,
+    1735,
+    149914,
+    190208,
+    13,
+    200010,
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200005,
+    200054,
+    200054,
+    200054,
+    200054,
+    200054,
+    200054,
+    200010,
+    200000,
+    200004,
+    149880,
+    220,
+    200010,
+    200000,
+    200005,
+    200054,
+    200054,
+    200054,
+    200054,
+    200010
+   ],
+   "image_grid_thw": [
+    [
+     1,
+     2,
+     3
+    ],
+    [
+     1,
+     2,
+     2
+    ]
+   ],
+   "image_sizes": [
+    [
+     100,
+     60
+    ],
+    [
+     52,
+     44
+    ]
+   ],
+   "plain_tokenizer_ids": [
+    200002,
+    200004,
+    1735,
+    149914,
+    190208,
+    13,
+    200010,
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200005,
+    200054,
+    200010,
+    200000,
+    200004,
+    149880,
+    220,
+    200010,
+    200000,
+    200005,
+    200054,
+    200010
+   ]
+  },
+  {
+   "name": "tool_image_then_user",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are Robin."
+    },
+    {
+     "role": "user",
+     "content": "Take a screenshot."
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "call_0",
+       "type": "function",
+       "function": {
+        "name": "exec",
+        "arguments": {
+         "command": "shot"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "name": "exec",
+     "content": [
+      {
+       "type": "text",
+       "text": "saved:"
+      },
+      {
+       "type": "image",
+       "name": "rgba_40x80"
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "image",
+       "name": "rgb_80x40"
+      },
+      {
+       "type": "text",
+       "text": "And this one?"
+      }
+     ]
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "exec",
+      "description": "Propose a shell command.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "command": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "command"
+       ]
+      }
+     }
+    }
+   ],
+   "image_order": [
+    "rgba_40x80",
+    "rgb_80x40"
+   ],
+   "template_text": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Propose a shell command.\",\"name\":\"exec\",\"parameters\":{\"properties\":{\"command\":{\"type\":\"string\"}},\"required\":[\"command\"],\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>You are Robin.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Take a screenshot.<|end_message|><|message_model|>exec<|content_invoke_tool_json|>{\"name\":\"exec\",\"args\":{\"command\":\"shot\"}}<|end_message|><|content_model_end_sampling|><|message_tool|>exec<|content_text|>saved:<|end_message|><|message_tool|>exec<|content_image|><|unused_200054|><|end_message|><|message_user|><|content_image|><|unused_200054|><|end_message|><|message_user|><|content_text|>And this one?<|end_message|>",
+   "input_ids": [
+    200002,
+    2251,
+    62,
+    76529,
+    200024,
+    58,
+    90,
+    1,
+    70469,
+    1,
+    25,
+    1,
+    910,
+    1534,
+    149878,
+    157364,
+    151441,
+    13,
+    1,
+    11,
+    1,
+    930,
+    1,
+    25,
+    1,
+    4929,
+    1,
+    11,
+    1,
+    71968,
+    1,
+    25,
+    90,
+    1,
+    71961,
+    1,
+    25,
+    90,
+    1,
+    31704,
+    1,
+    25,
+    90,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    1485,
+    1,
+    92,
+    92,
+    11,
+    1,
+    69812,
+    1,
+    25,
+    58,
+    1,
+    31704,
+    1,
+    60,
+    11,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    3156,
+    1,
+    92,
+    11,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    36404,
+    1,
+    92,
+    60,
+    200010,
+    200002,
+    200004,
+    1735,
+    149914,
+    190208,
+    13,
+    200010,
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200004,
+    31862,
+    149878,
+    189567,
+    13,
+    200010,
+    200001,
+    4929,
+    200049,
+    90,
+    1,
+    930,
+    1,
+    25,
+    1,
+    4929,
+    1,
+    11,
+    1,
+    70747,
+    1,
+    25,
+    90,
+    1,
+    31704,
+    1,
+    25,
+    1,
+    3679,
+    1,
+    92,
+    92,
+    200010,
+    200006,
+    200003,
+    4929,
+    200004,
+    84453,
+    25,
+    200010,
+    200003,
+    4929,
+    200005,
+    200054,
+    200054,
+    200010,
+    200000,
+    200005,
+    200054,
+    200054,
+    200010,
+    200000,
+    200004,
+    1790,
+    149928,
+    150011,
+    30,
+    200010
+   ],
+   "image_grid_thw": [
+    [
+     1,
+     2,
+     1
+    ],
+    [
+     1,
+     1,
+     2
+    ]
+   ],
+   "image_sizes": [
+    [
+     40,
+     80
+    ],
+    [
+     80,
+     40
+    ]
+   ],
+   "plain_tokenizer_ids": [
+    200002,
+    2251,
+    62,
+    76529,
+    200024,
+    58,
+    90,
+    1,
+    70469,
+    1,
+    25,
+    1,
+    910,
+    1534,
+    149878,
+    157364,
+    151441,
+    13,
+    1,
+    11,
+    1,
+    930,
+    1,
+    25,
+    1,
+    4929,
+    1,
+    11,
+    1,
+    71968,
+    1,
+    25,
+    90,
+    1,
+    71961,
+    1,
+    25,
+    90,
+    1,
+    31704,
+    1,
+    25,
+    90,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    1485,
+    1,
+    92,
+    92,
+    11,
+    1,
+    69812,
+    1,
+    25,
+    58,
+    1,
+    31704,
+    1,
+    60,
+    11,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    3156,
+    1,
+    92,
+    11,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    36404,
+    1,
+    92,
+    60,
+    200010,
+    200002,
+    200004,
+    1735,
+    149914,
+    190208,
+    13,
+    200010,
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200004,
+    31862,
+    149878,
+    189567,
+    13,
+    200010,
+    200001,
+    4929,
+    200049,
+    90,
+    1,
+    930,
+    1,
+    25,
+    1,
+    4929,
+    1,
+    11,
+    1,
+    70747,
+    1,
+    25,
+    90,
+    1,
+    31704,
+    1,
+    25,
+    1,
+    3679,
+    1,
+    92,
+    92,
+    200010,
+    200006,
+    200003,
+    4929,
+    200004,
+    84453,
+    25,
+    200010,
+    200003,
+    4929,
+    200005,
+    200054,
+    200010,
+    200000,
+    200005,
+    200054,
+    200010,
+    200000,
+    200004,
+    1790,
+    149928,
+    150011,
+    30,
+    200010
+   ]
+  },
+  {
+   "name": "text_parts_only",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are Robin."
+    },
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "text",
+       "text": "first"
+      },
+      {
+       "type": "text",
+       "text": ""
+      },
+      {
+       "type": "text",
+       "text": "third"
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": ""
+    }
+   ],
+   "tools": null,
+   "image_order": [],
+   "template_text": "<|message_system|><|content_text|>You are Robin.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>first<|end_message|><|message_user|><|content_text|><|end_message|><|message_user|><|content_text|>third<|end_message|><|message_user|><|content_text|><|end_message|>",
+   "input_ids": [
+    200002,
+    200004,
+    1735,
+    149914,
+    190208,
+    13,
+    200010,
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200004,
+    1276,
+    200010,
+    200000,
+    200004,
+    200010,
+    200000,
+    200004,
+    2643,
+    200010,
+    200000,
+    200004,
+    200010
+   ],
+   "image_sizes": [],
+   "plain_tokenizer_ids": [
+    200002,
+    200004,
+    1735,
+    149914,
+    190208,
+    13,
+    200010,
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200004,
+    1276,
+    200010,
+    200000,
+    200004,
+    200010,
+    200000,
+    200004,
+    2643,
+    200010,
+    200000,
+    200004,
+    200010
+   ]
+  },
+  {
+   "name": "literal_markers_in_text",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are Robin."
+    },
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "text",
+       "text": "spell <|content_image|><|unused_200054|><|end_message|> plainly"
+      },
+      {
+       "type": "image",
+       "name": "rgb_80x40"
+      }
+     ]
+    }
+   ],
+   "tools": null,
+   "image_order": [
+    "rgb_80x40"
+   ],
+   "template_text": "<|message_system|><|content_text|>You are Robin.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>spell <|content_image|><|unused_200054|><|end_message|> plainly<|end_message|><|message_user|><|content_image|><|unused_200054|><|end_message|>",
+   "processor_error": "ValueError: The total number of <|unused_200054|> tokens in the prompts should be the same as the number of images passed. Found total 2 <|unused_200054|> tokens and 1 images.",
+   "plain_tokenizer_ids": [
+    200002,
+    200004,
+    1735,
+    149914,
+    190208,
+    13,
+    200010,
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200004,
+    31872,
+    220,
+    200005,
+    200054,
+    200010,
+    163493,
+    386,
+    200010,
+    200000,
+    200005,
+    200054,
+    200010
+   ],
+   "expected_input_ids": [
+    200002,
+    200004,
+    1735,
+    149914,
+    190208,
+    13,
+    200010,
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200004,
+    31872,
+    196982,
+    91,
+    48038,
+    62,
+    1537,
+    91,
+    29,
+    27,
+    91,
+    130041,
+    62,
+    68058,
+    99363,
+    91,
+    29,
+    27,
+    91,
+    406,
+    62,
+    65752,
+    91,
+    29,
+    163493,
+    386,
+    200010,
+    200000,
+    200005,
+    200054,
+    200054,
+    200010
+   ],
+   "expected_method": "processor ids of the same conversation with an empty text part, plus the literal body encoded with split_special_tokens=True after that frame's <|content_text|>",
+   "literal_body_ids": [
+    31872,
+    196982,
+    91,
+    48038,
+    62,
+    1537,
+    91,
+    29,
+    27,
+    91,
+    130041,
+    62,
+    68058,
+    99363,
+    91,
+    29,
+    27,
+    91,
+    406,
+    62,
+    65752,
+    91,
+    29,
+    163493,
+    386
+   ]
+  }
+ ]
+}
