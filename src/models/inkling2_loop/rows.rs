@@ -211,9 +211,15 @@ fn pick(
     v
 }
 
+/// Planes per row in [`block_attend`]: one plane walking seven 2304-wide
+/// states left a decode row latency-bound (about 96 us a launch).
+const BA_PLANES: u32 = 8;
+
 /// Attention from one learned query over the unit-RMS-normed
 /// `[b0.., partial]` states of a row, whose values are the same normed
 /// states. `n` block arrays are read; the rest are bound to `p` and unused.
+/// One cube of [`BA_PLANES`] planes per row: each plane reduces its strided
+/// share, the planes' partial sums meet in shared memory.
 #[cube(launch_unchecked)]
 #[allow(clippy::too_many_arguments)]
 fn block_attend(
@@ -231,27 +237,52 @@ fn block_attend(
     #[comptime] d: u32,
 ) {
     let r = CUBE_POS_X;
-    if r < rows {
-        let l = UNIT_POS_PLANE;
-        let base = r * d;
-        let steps = comptime!(d.div_ceil(32));
-        let scale = comptime!(1.0f32 / (d as f32).sqrt());
-        let mut w = Array::<f32>::new(comptime!(MAX_BLOCKS + 1));
-        let mut logit = Array::<f32>::new(comptime!(MAX_BLOCKS + 1));
-        let mut mx = f32::new(-3.0e38);
-        for s in 0..n + 1u32 {
-            let mut ss = 0.0f32;
-            let mut dot = 0.0f32;
+    let l = UNIT_POS_X;
+    let plane = UNIT_POS_Y;
+    let tid = plane * 32u32 + l;
+    let threads = comptime!(32 * BA_PLANES);
+    let steps = comptime!(d.div_ceil(32 * BA_PLANES));
+    let scale = comptime!(1.0f32 / (d as f32).sqrt());
+    let slots = comptime!((MAX_BLOCKS as u32 + 1) * BA_PLANES);
+    let mut part_ss = SharedMemory::<f32>::new(slots as usize);
+    let mut part_dot = SharedMemory::<f32>::new(slots as usize);
+    let live = r < rows;
+    let base = r * d;
+    for s in 0..n + 1u32 {
+        let mut ss = 0.0f32;
+        let mut dot = 0.0f32;
+        if live {
             for t in 0..steps {
-                let j = l + t * 32u32;
+                let j = tid + t * threads;
                 if j < d {
                     let v = pick(b0, b1, b2, b3, b4, b5, p, s, n, (base + j) as usize);
                     ss += v * v;
                     dot += v * q[j as usize];
                 }
             }
-            let iv = 1.0f32 / Sqrt::sqrt(plane_sum(ss) / f32::cast_from(d) + 1e-6f32);
-            let lg = plane_sum(dot) * iv * scale;
+        }
+        let a = plane_sum(ss);
+        let b = plane_sum(dot);
+        if l == 0u32 {
+            part_ss[(s * BA_PLANES + plane) as usize] = a;
+            part_dot[(s * BA_PLANES + plane) as usize] = b;
+        }
+    }
+    sync_cube();
+    if live {
+        let mut w = Array::<f32>::new(comptime!(MAX_BLOCKS + 1));
+        let mut logit = Array::<f32>::new(comptime!(MAX_BLOCKS + 1));
+        let mut mx = f32::new(-3.0e38);
+        for s in 0..n + 1u32 {
+            let mut ss = 0.0f32;
+            let mut dot = 0.0f32;
+            #[unroll]
+            for k in 0..BA_PLANES {
+                ss += part_ss[(s * BA_PLANES + k) as usize];
+                dot += part_dot[(s * BA_PLANES + k) as usize];
+            }
+            let iv = 1.0f32 / Sqrt::sqrt(ss / f32::cast_from(d) + 1e-6f32);
+            let lg = dot * iv * scale;
             w[s as usize] = iv;
             logit[s as usize] = lg;
             if lg > mx {
@@ -268,7 +299,7 @@ fn block_attend(
             w[s as usize] = w[s as usize] * (logit[s as usize] / sum);
         }
         for t in 0..steps {
-            let j = l + t * 32u32;
+            let j = tid + t * threads;
             if j < d {
                 let i = (base + j) as usize;
                 let mut acc = 0.0f32;
@@ -307,7 +338,7 @@ pub fn block_attention(query: Tensor<Bk, 1>, blocks: &[Tensor<Bk, 2>], partial: 
             block_attend::launch_unchecked::<cubecl::cuda::CudaRuntime>(
                 &client,
                 CubeCount::new_1d(rows as u32),
-                CubeDim::new_1d(PLANE),
+                CubeDim::new_2d(PLANE, BA_PLANES),
                 ArrayArg::from_raw_parts(bh[0].clone(), len),
                 ArrayArg::from_raw_parts(bh[1].clone(), len),
                 ArrayArg::from_raw_parts(bh[2].clone(), len),
