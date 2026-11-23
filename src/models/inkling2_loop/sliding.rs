@@ -565,6 +565,9 @@ pub(super) fn bind_gates(
 /// Run one short convolution over `x`'s rows after the carried inputs in
 /// `hist`, and carry the last `k - 1` inputs forward.
 pub(super) fn conv_step(hist: &mut Tensor<Bk, 2>, x: Tensor<Bk, 2>, w: &Tensor<Bk, 2>, scale: f32) -> Tensor<Bk, 2> {
+    if let Some(y) = super::rows::conv_step(hist, x.clone(), w, scale) {
+        return y;
+    }
     let [t, c] = x.dims();
     let [keep, _] = hist.dims();
     let all = Tensor::cat(vec![hist.clone(), x], 0);

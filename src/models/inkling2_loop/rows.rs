@@ -30,16 +30,19 @@ pub const MAX_BLOCKS: usize = 6;
 
 /// Which row kernels run, cumulatively: `MINI_ROWS=burn` none (Burn's
 /// composition everywhere); `scale` the clip and norm kernels; `gates` also
-/// the message gates' input, rounding and output; anything else (the
-/// default) also the block attention and the message read. The settings
-/// exist for an A/B in one binary.
+/// the message gates' input, rounding and output; `blocks` also the block
+/// attention and the message read; anything else (the default) also the
+/// short convolution step. The settings
+/// exist for an A/B in one binary. `blocks` stops before the convolution
+/// step's kernel, which the default adds.
 fn setting() -> u8 {
     static ON: OnceLock<u8> = OnceLock::new();
     *ON.get_or_init(|| match std::env::var("MINI_ROWS").as_deref() {
         Ok("burn") => 0,
         Ok("scale") => 1,
         Ok("gates") => 2,
-        _ => 3,
+        Ok("blocks") => 3,
+        _ => 4,
     })
 }
 
@@ -53,6 +56,10 @@ fn gates_enabled() -> bool {
 
 fn blocks_enabled() -> bool {
     setting() >= 3
+}
+
+fn conv_enabled() -> bool {
+    setting() >= 4
 }
 
 /// `x * min(thr / (|x| + 1e-6), 1)` per row (`mode` 0); `x / sqrt(mean(x^2) + eps)`
@@ -553,4 +560,96 @@ pub fn read_messages(normed: &Tensor<Bk, 3>, queries: Tensor<Bk, 3>) -> Option<T
         }
     }
     Some(crate::models::inkling::seam::tensor_of3(client, dev, out, t, 4, h))
+}
+
+/// One short-convolution step over the window `[hist; x]` without building
+/// it: `out[i] = scale * (x_i + sum_j w[d, j] * window[i + j])` per channel,
+/// taps in ascending `j` as [`crate::models::inkling::sconv`]'s batched
+/// kernel, and `next` the window's last `keep` rows, the history the next call
+/// reads. `keep` is the kernel's width less one.
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn conv_step_kernel(
+    hist: &Array<f32>,
+    x: &Array<f32>,
+    w: &Array<f32>,
+    out: &mut Array<f32>,
+    next: &mut Array<f32>,
+    rows: u32,
+    span: u32,
+    scale: f32,
+    #[comptime] dim: u32,
+    #[comptime] kernel: u32,
+) {
+    let p = ABSOLUTE_POS as u32;
+    if p < span {
+        let i = p / dim;
+        let d = p % dim;
+        let keep = comptime!(kernel - 1);
+        if i < rows {
+            let xv = x[p as usize];
+            let mut acc = 0.0f32;
+            #[unroll]
+            for j in 0..keep {
+                let a = i + j;
+                let mut v = 0.0f32;
+                if a < keep {
+                    v = hist[(a * dim + d) as usize];
+                } else {
+                    v = x[((a - keep) * dim + d) as usize];
+                }
+                // from zero: the first fused multiply-add rounds the first
+                // product once, as the batched kernel's plain first product does
+                acc += w[(d * kernel + j) as usize] * v;
+            }
+            acc += w[(d * kernel + keep) as usize] * xv;
+            out[p as usize] = (xv + acc) * scale;
+        }
+        if i < keep {
+            let a = rows + i;
+            let mut v = 0.0f32;
+            if a < keep {
+                v = hist[(a * dim + d) as usize];
+            } else {
+                v = x[((a - keep) * dim + d) as usize];
+            }
+            next[p as usize] = v;
+        }
+    }
+}
+
+/// [`super::sliding::conv_step`] in one launch: the output `[t, c]`, and
+/// `hist` replaced by the new history. `w` is `[c, kernel]`.
+pub fn conv_step(hist: &mut Tensor<Bk, 2>, x: Tensor<Bk, 2>, w: &Tensor<Bk, 2>, scale: f32) -> Option<Tensor<Bk, 2>> {
+    let [t, c] = x.dims();
+    let [keep, hc] = hist.dims();
+    let [wc, kernel] = w.dims();
+    if !conv_enabled() || !is_f32(&x) || !is_f32(hist) || !is_f32(w) || t == 0 || hc != c || wc != c || kernel != keep + 1 || keep == 0 {
+        return None;
+    }
+    let client = client_of(&x);
+    let dev = x.device();
+    let (hh, xh, wh) = (f32_handle(hist.clone()).expect("f32"), f32_handle(x).expect("f32"), f32_handle(w.clone()).expect("f32"));
+    let out = client.empty(t * c * 4);
+    let next = client.empty(keep * c * 4);
+    let span = t.max(keep) * c;
+    unsafe {
+        conv_step_kernel::launch_unchecked::<cubecl::cuda::CudaRuntime>(
+            &client,
+            CubeCount::new_1d((span as u32).div_ceil(ELEMS)),
+            CubeDim::new_1d(ELEMS),
+            ArrayArg::from_raw_parts(hh, keep * c),
+            ArrayArg::from_raw_parts(xh, t * c),
+            ArrayArg::from_raw_parts(wh, c * kernel),
+            ArrayArg::from_raw_parts(out.clone(), t * c),
+            ArrayArg::from_raw_parts(next.clone(), keep * c),
+            t as u32,
+            span as u32,
+            scale,
+            c as u32,
+            kernel as u32,
+        );
+    }
+    *hist = tensor_of(client.clone(), dev.clone(), next, keep, c);
+    Some(tensor_of(client, dev, out, t, c))
 }
