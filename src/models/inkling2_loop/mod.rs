@@ -39,7 +39,21 @@
 //! * `session` (with `inkling2-session`): the whole text forward as a model
 //!   bound once from a pile root ([`session::MiniModel`]) and independent
 //!   token sequences over it ([`session::MiniSession`]): token IDs in,
-//!   softcapped logits out, every layer visit's state carried.
+//!   softcapped logits out, every layer visit's state carried; image features
+//!   at the placeholders, after the embedding norm, as upstream scatters them.
+//!
+//! * [`vision_input`]: the image front end on the CPU, a decoded RGB8 or
+//!   RGBA8 image to the processor's `pixel_values` and the vision tower's
+//!   native 20-pixel patch rows and positions, the learned position table's
+//!   bilinear taps and the rotary positions. Held to the published processor
+//!   and position helpers on saved images.
+//!
+//! * `vision` (with `inkling-cuda`): the ViT tower and its projector on the
+//!   device, image tokens to `text_hidden` features. Held to the published
+//!   tower's run on the saved images by the `inkling2_vision_check` binary.
+//!   The session binds it on first use ([`session::MiniModel::project_images`])
+//!   and puts its rows at a call's image placeholders
+//!   ([`session::MiniSession::append_with_image_rows`]).
 //!
 //! What the release declares beyond the text forward (the vision tower, the
 //! drafter, an MXFP8 device GEMM) is not native:
@@ -64,6 +78,7 @@ pub mod release;
 #[cfg(feature = "inkling2-import")]
 pub mod import;
 pub mod schedule;
+pub mod vision_input;
 #[cfg(feature = "inkling-cuda")]
 pub mod attend;
 #[cfg(feature = "inkling-cuda")]
@@ -82,5 +97,7 @@ pub mod session;
 pub mod prof;
 #[cfg(feature = "inkling-cuda")]
 pub mod rows;
+#[cfg(feature = "inkling-cuda")]
+pub mod vision;
 
 pub use config::{Family, Inkling2LoopConfig, family_of, family_of_str};

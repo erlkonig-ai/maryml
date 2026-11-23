@@ -1,0 +1,107 @@
+[
+ {
+  "name": "rgb_80x40",
+  "file": "rgb_80x40.png",
+  "mode": "RGB",
+  "width": 80,
+  "height": 40,
+  "has_transparency_data": false,
+  "png_sha256": "ff5e598cb6b8db322a02928aace7c5de0d8578c4328fbfe4ccd902e148d5fb10",
+  "image_grid_thw": [
+   1,
+   1,
+   2
+  ],
+  "pixel_values_shape": [
+   2,
+   40,
+   40,
+   3
+  ],
+  "pixel_values_f32_sha256": "a23a84a102dd6e4467825d29044363b74de4178ecd26a38187345c523be6a206"
+ },
+ {
+  "name": "rgba_40x80",
+  "file": "rgba_40x80.png",
+  "mode": "RGBA",
+  "width": 40,
+  "height": 80,
+  "has_transparency_data": true,
+  "png_sha256": "8b8eb62786bc163331c478adb72baa4d42c83303f2a5b1e24c305aadc9254be0",
+  "image_grid_thw": [
+   1,
+   2,
+   1
+  ],
+  "pixel_values_shape": [
+   2,
+   40,
+   40,
+   3
+  ],
+  "pixel_values_f32_sha256": "4dc4a0879c3845c1f8d86ae3133bb289b1d65d5332fa511ad49eb525fbb9ea5b"
+ },
+ {
+  "name": "la_33x47",
+  "file": "la_33x47.png",
+  "mode": "LA",
+  "width": 33,
+  "height": 47,
+  "has_transparency_data": true,
+  "png_sha256": "d992ca70cac820d40e42dd8a505dd28b600790b73b7da97876c7fe60fd485649",
+  "image_grid_thw": [
+   1,
+   2,
+   1
+  ],
+  "pixel_values_shape": [
+   2,
+   40,
+   40,
+   3
+  ],
+  "pixel_values_f32_sha256": "76cee3bbc2229287076f92508e19e75bc454a74a2d06938edec4d5bad4dc0721"
+ },
+ {
+  "name": "p_trns_30x20",
+  "file": "p_trns_30x20.png",
+  "mode": "P",
+  "width": 30,
+  "height": 20,
+  "has_transparency_data": true,
+  "png_sha256": "53ee80f05671c8a7be80f25ae49e45abfcd28c3474844881f423c04d944ae845",
+  "image_grid_thw": [
+   1,
+   1,
+   1
+  ],
+  "pixel_values_shape": [
+   1,
+   40,
+   40,
+   3
+  ],
+  "pixel_values_f32_sha256": "43ce5701efd7de31962f66c7064243621d30d697fbc409e5316b5d6e45526d3f"
+ },
+ {
+  "name": "l_45x41",
+  "file": "l_45x41.png",
+  "mode": "L",
+  "width": 45,
+  "height": 41,
+  "has_transparency_data": false,
+  "png_sha256": "b3dd310e9fc32eea86295383458f73376de25d83f1ec39fa6182a12bc6abd45c",
+  "image_grid_thw": [
+   1,
+   2,
+   2
+  ],
+  "pixel_values_shape": [
+   4,
+   40,
+   40,
+   3
+  ],
+  "pixel_values_f32_sha256": "01c0d62866577e2f361a019a0d603a4435e4007aa80dafd4356d23541b9c7436"
+ }
+]

@@ -353,6 +353,19 @@ pub struct Inkling2LoopConfig {
     pub mtp_config: Option<Inkling2MtpConfig>,
     #[serde(default)]
     pub quantization_config: Option<QuantizationConfig>,
+    /// The image placeholder (`<|unused_200054|>`): each image token's slot
+    /// in the text stream, replaced by its projected feature. The release's
+    /// `config.json` does not set it, so upstream's default applies
+    /// (`Inkling2LoopConfig.image_token_id`, transformers 046bdb8).
+    #[serde(default = "default_image_token_id")]
+    pub image_token_id: u32,
+}
+
+/// Upstream's `Inkling2LoopConfig.image_token_id` default.
+pub const DEFAULT_IMAGE_TOKEN_ID: u32 = 200_054;
+
+fn default_image_token_id() -> u32 {
+    DEFAULT_IMAGE_TOKEN_ID
 }
 
 impl Inkling2LoopConfig {
@@ -456,6 +469,12 @@ impl Inkling2LoopConfig {
                 self.vision_config.text_hidden_size, t.hidden_size
             ));
         }
+        if self.image_token_id as usize >= t.vocab_size {
+            errs.push(format!(
+                "image_token_id {} is outside the {}-row embedding",
+                self.image_token_id, t.vocab_size
+            ));
+        }
         if t.unpadded_vocab_size > t.vocab_size {
             errs.push(format!(
                 "unpadded_vocab_size {} > vocab_size {}",
@@ -495,6 +514,20 @@ mod tests {
         let mut v: serde_json::Value = serde_json::from_str(text).unwrap();
         f(&mut v);
         v.to_string()
+    }
+
+    #[test]
+    fn the_image_placeholder_is_upstreams_default_unless_set() {
+        // the release does not set it: upstream's Inkling2LoopConfig default
+        assert!(!MINI.contains("image_token_id"));
+        let c = Inkling2LoopConfig::from_json(MINI).unwrap();
+        assert_eq!(c.image_token_id, DEFAULT_IMAGE_TOKEN_ID);
+        assert_eq!(c.image_token_id, 200_054);
+        let set = edit(MINI, |v| v["image_token_id"] = 7.into());
+        assert_eq!(Inkling2LoopConfig::from_json(&set).unwrap().image_token_id, 7);
+        let outside = edit(MINI, |v| v["image_token_id"] = 1_000_000.into());
+        let e = Inkling2LoopConfig::from_json(&outside).unwrap_err();
+        assert!(e.contains("image_token_id"), "{e}");
     }
 
     #[test]

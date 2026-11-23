@@ -46,13 +46,31 @@
 //! ([`super::attend::QUERY_TILE`] by [`super::attend::KEY_TILE`]), not by the
 //! sequence.
 //!
+//! Images. Upstream (`Inkling2LoopModel.forward`) embeds and norms every ID,
+//! placeholders included, then `masked_scatter`s the projector's rows into
+//! the placeholder positions in order, and the decoder starts from that:
+//!
+//! ```text
+//! x = rms_norm(embed[ids], embed_norm)
+//! x[ids == image_token_id] = image rows, in placeholder order   not normed
+//! ```
+//!
+//! [`MiniModel::project_images`] runs the vision tower ([`super::vision`]),
+//! bound on its first call and kept, so a text-only user never holds its
+//! weights. [`MiniSession::append_with_image_rows`] takes, with the IDs of one
+//! call, the rows for exactly that call's placeholders: one image may be split
+//! over several calls and one call may hold several images, the caller slicing
+//! the concatenated features at the call boundaries. Text rows go through the
+//! same norm as [`MiniSession::append`], so a call without placeholders is the
+//! same computation.
+//!
 //! Scope, stated. No checkpoint, rewind or cache export. The head runs on the
 //! device ([`DeviceHead`]), the host [`Head`]'s arithmetic in its order.
 //! Logits are the release's: `unpadded_vocab_size` softcapped f32 values per
 //! row. Nothing here samples.
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use burn::prelude::*;
@@ -76,6 +94,8 @@ use crate::models::inkling2_loop::moe::{FaultCell, fault_cell, read_fault};
 use crate::models::inkling2_loop::pile::MiniRoot;
 use crate::models::inkling2_loop::schedule::CacheId;
 use crate::models::inkling2_loop::sliding::{Dev, SlidingLayer, State, Weights, bf16_to_f32, want};
+use crate::models::inkling2_loop::vision::{ImageFeatures, VisionTower};
+use crate::models::inkling2_loop::vision_input::ImageTokens;
 
 /// The most logit rows one call returns, so a long prefill cannot ask for
 /// `rows x 200058` floats on the host by accident.
@@ -159,6 +179,8 @@ pub struct MiniModel {
     core: Core,
     post: Vec<Outer>,
     head: DeviceHead,
+    /// The vision tower, bound by the first [`Self::project_images`].
+    vision: Mutex<Option<Arc<VisionTower>>>,
 }
 
 /// The output head on the device: [`Head`]'s four steps in its order and at
@@ -222,6 +244,15 @@ impl DeviceHead {
     }
 }
 
+/// The text of a caught panic.
+fn panic_text(cause: &(dyn std::any::Any + Send)) -> &str {
+    cause
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| cause.downcast_ref::<&str>().copied())
+        .unwrap_or("non-text panic")
+}
+
 impl MiniModel {
     /// Open `root` in `collection` of the pile at `path` and bind every layer
     /// on the default CUDA device. The weights are views over the pile
@@ -251,7 +282,98 @@ impl MiniModel {
         let core = Core::bind(&root, t, &dev).map_err(|e| anyhow!("bind the core: {e}"))?;
         let post = outer(l.core_end..t.num_hidden_layers)?;
         let head = DeviceHead::bind(t, &root, &dev)?;
-        Ok(MiniModel { root, cfg, tokenizer, content_tokenizer, dev, embed_gain, pre, core, post, head })
+        let vision = Mutex::new(None);
+        Ok(MiniModel { root, cfg, tokenizer, content_tokenizer, dev, embed_gain, pre, core, post, head, vision })
+    }
+
+    /// The image placeholder ID: each image token's slot in a call's IDs.
+    pub fn image_token_id(&self) -> u32 {
+        self.cfg.image_token_id
+    }
+
+    /// The vision tower, bound from this model's root on its device the first
+    /// time it is asked for. A failed bind is not kept; the next call tries
+    /// again.
+    fn vision(&self) -> Result<Arc<VisionTower>> {
+        let mut slot = self.vision.lock().map_err(|_| anyhow!("the vision tower's lock is poisoned"))?;
+        if let Some(tower) = slot.as_ref() {
+            return Ok(Arc::clone(tower));
+        }
+        let bound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            VisionTower::bind(&self.root, &self.cfg.vision_config, &self.dev)
+        }))
+        .map_err(|cause| anyhow!("binding the vision tower failed: {}", panic_text(&*cause)))?
+        .map_err(|e| anyhow!("bind the vision tower: {e}"))?;
+        let tower = Arc::new(bound);
+        *slot = Some(Arc::clone(&tower));
+        Ok(tower)
+    }
+
+    /// Whether [`Self::project_images`] has bound the vision tower.
+    pub fn vision_bound(&self) -> bool {
+        self.vision.lock().map(|s| s.is_some()).unwrap_or(false)
+    }
+
+    /// Each image's projected features, `tokens` rows of `hidden_size` f32 in
+    /// the order its placeholders take ([`super::vision::VisionTower`]). The
+    /// first call binds the vision tower and keeps it. Nothing of any session
+    /// is read or changed; a device failure is returned, not raised.
+    pub fn project_images(&self, images: &[ImageTokens]) -> Result<Vec<ImageFeatures>> {
+        if images.is_empty() {
+            // no images, no tower: nothing is bound
+            return Ok(Vec::new());
+        }
+        let tower = self.vision()?;
+        let h = self.config().hidden_size;
+        let feats = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tower.forward_images(images)))
+            .map_err(|cause| anyhow!("the vision tower failed: {}", panic_text(&*cause)))?
+            .map_err(|e| anyhow!("project images: {e}"))?;
+        for (i, f) in feats.iter().enumerate() {
+            ensure!(
+                f.width == h && f.values.len() == f.tokens * h,
+                "image {i}: {} values for {} tokens of {}, the text stream is {h} wide",
+                f.values.len(),
+                f.tokens,
+                f.width
+            );
+        }
+        Ok(feats)
+    }
+
+    /// Diagnostic: the decoder's input for one call, `[ids.len(),
+    /// hidden_size]` f32 row-major, the normed embedding of every ID with each
+    /// placeholder's row replaced by the next of `image_rows`. What
+    /// [`MiniSession::append_with_image_rows`] feeds the first layer, for
+    /// comparison with upstream's `inputs_embeds`; touches no session.
+    #[doc(hidden)]
+    pub fn decoder_inputs(&self, ids: &[u32], image_rows: &[f32]) -> Result<Vec<f32>> {
+        self.check_input(ids, image_rows)?;
+        let x = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.embed_merged(ids, image_rows)))
+            .map_err(|cause| anyhow!("embedding failed: {}", panic_text(&*cause)))?;
+        x.into_data().convert::<f32>().to_vec().map_err(|e| anyhow!("read the decoder inputs: {e:?}"))
+    }
+
+    /// Placeholders in `ids`, checked against `image_rows`: every ID inside
+    /// the table, and exactly one finite `hidden_size` row per placeholder.
+    fn check_input(&self, ids: &[u32], image_rows: &[f32]) -> Result<usize> {
+        ensure!(!ids.is_empty(), "append needs at least one token");
+        let limit = self.embedding_rows();
+        if let Some((i, &id)) = ids.iter().enumerate().find(|(_, id)| **id as usize >= limit) {
+            bail!("token {i} is id {id}, the embedding has {limit} rows");
+        }
+        let image = self.image_token_id();
+        let k = ids.iter().filter(|&&id| id == image).count();
+        let h = self.config().hidden_size;
+        let want = k.checked_mul(h).ok_or_else(|| anyhow!("{k} image rows of {h} overflow"))?;
+        ensure!(
+            image_rows.len() == want,
+            "{k} image placeholders (id {image}) need {k} rows of {h} = {want} values; {} arrived",
+            image_rows.len()
+        );
+        if let Some(i) = image_rows.iter().position(|v| !v.is_finite()) {
+            bail!("image row {} holds a non-finite value at column {}", i / h, i % h);
+        }
+        Ok(k)
     }
 
     pub fn config(&self) -> &Inkling2LoopTextConfig {
@@ -328,13 +450,45 @@ impl MiniModel {
         rms_norm(x, self.embed_gain.clone(), self.config().rms_norm_eps)
     }
 
-    /// The whole forward of `ids` through `caches`, and the head on the last
-    /// `rows` rows. Input is checked by the caller.
-    fn forward(&self, ids: &[u32], caches: &mut Caches, rows: usize) -> Logits {
+    /// [`Self::embed`] with each placeholder's row replaced by the next of
+    /// `image_rows`, one assignment per run of consecutive placeholders.
+    /// Without placeholders this is [`Self::embed`]. Input is checked by the
+    /// caller.
+    fn embed_merged(&self, ids: &[u32], image_rows: &[f32]) -> Tensor<Bk, 2> {
+        let mut x = self.embed(ids);
+        if image_rows.is_empty() {
+            return x;
+        }
+        let h = self.config().hidden_size;
+        let image = self.image_token_id();
+        let (mut i, mut used) = (0, 0);
+        while i < ids.len() {
+            if ids[i] != image {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < ids.len() && ids[i] == image {
+                i += 1;
+            }
+            let run = i - start;
+            let rows = image_rows[used * h..(used + run) * h].to_vec();
+            let v = Tensor::<Bk, 2>::from_data(TensorData::new(rows, [run, h]), &self.dev);
+            x = x.slice_assign([start..i, 0..h], v);
+            used += run;
+        }
+        debug_assert_eq!(used * h, image_rows.len());
+        x
+    }
+
+    /// The whole forward of `ids` (with `image_rows` at its placeholders)
+    /// through `caches`, and the head on the last `rows` rows. Input is
+    /// checked by the caller.
+    fn forward(&self, ids: &[u32], image_rows: &[f32], caches: &mut Caches, rows: usize) -> Logits {
         let t = self.config();
         let (n, h) = (ids.len(), t.hidden_size);
         prof::at(usize::MAX, 0);
-        let mut x = prof::span("embed", &self.dev, || self.embed(ids));
+        let mut x = prof::span("embed", &self.dev, || self.embed_merged(ids, image_rows));
         #[cfg(test)]
         if std::mem::take(&mut caches.nan_input) {
             x = x.mul_scalar(f32::NAN);
@@ -434,15 +588,44 @@ impl MiniSession {
     /// Attend to `ids` after everything already seen and return the logits of
     /// the requested rows. A prompt and a single decoded token are the same
     /// call.
+    ///
+    /// Text only: an image placeholder among `ids` is embedded as its own
+    /// table row. [`Self::append_with_image_rows`] puts features there.
     pub fn append(&mut self, ids: &[u32], rows: Rows) -> Result<Logits> {
+        self.run(ids, None, rows)
+    }
+
+    /// [`Self::append`] with images: `image_rows` holds one `hidden_size` row
+    /// of f32 per image placeholder ([`MiniModel::image_token_id`]) in `ids`,
+    /// in the order the placeholders appear in this call, packed row-major,
+    /// such as a slice of [`MiniModel::project_images`]' features. A call
+    /// without placeholders takes no rows and is exactly [`Self::append`].
+    ///
+    /// Refused before any state is touched, the session unchanged: anything
+    /// [`Self::append`] refuses, a row count other than the call's
+    /// placeholder count, and a non-finite value.
+    pub fn append_with_image_rows(&mut self, ids: &[u32], image_rows: &[f32], rows: Rows) -> Result<Logits> {
+        self.run(ids, Some(image_rows), rows)
+    }
+
+    fn run(&mut self, ids: &[u32], image_rows: Option<&[f32]>, rows: Rows) -> Result<Logits> {
         if self.poisoned {
             bail!("this session failed mid-forward and must be reset and replayed");
         }
-        ensure!(!ids.is_empty(), "append needs at least one token");
-        let limit = self.model.embedding_rows();
-        if let Some((i, &id)) = ids.iter().enumerate().find(|(_, id)| **id as usize >= limit) {
-            bail!("token {i} is id {id}, the embedding has {limit} rows");
-        }
+        let image_rows = match image_rows {
+            Some(r) => {
+                self.model.check_input(ids, r)?;
+                r
+            }
+            None => {
+                ensure!(!ids.is_empty(), "append needs at least one token");
+                let limit = self.model.embedding_rows();
+                if let Some((i, &id)) = ids.iter().enumerate().find(|(_, id)| **id as usize >= limit) {
+                    bail!("token {i} is id {id}, the embedding has {limit} rows");
+                }
+                &[]
+            }
+        };
         let rows = match rows {
             Rows::Last => 1,
             Rows::Tail(n) => {
@@ -458,7 +641,7 @@ impl MiniSession {
         let model = Arc::clone(&self.model);
         let caches = &mut self.caches;
         let call = || {
-            let logits = model.forward(ids, caches, rows);
+            let logits = model.forward(ids, image_rows, caches, rows);
             caches.check_router();
             logits
         };
@@ -469,11 +652,7 @@ impl MiniSession {
             }
             Err(cause) => {
                 self.poisoned = true;
-                let why = cause
-                    .downcast_ref::<String>()
-                    .map(String::as_str)
-                    .or_else(|| cause.downcast_ref::<&str>().copied())
-                    .unwrap_or("non-text panic");
+                let why = panic_text(&*cause);
                 Err(anyhow!("forward failed at position {}: {why}; the session is poisoned", self.position))
             }
         }

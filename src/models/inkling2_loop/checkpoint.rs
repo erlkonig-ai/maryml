@@ -324,7 +324,10 @@ pub fn native_gaps(cfg: &Inkling2LoopConfig, experts: &BTreeMap<usize, Precision
         what: "vision tower",
         detail: format!(
             "{}-layer ViT with a class token and a merge-{} projector, not the original \
-             Inkling's HMLP",
+             Inkling's HMLP: preprocessing (vision_input), the tower and the projector \
+             (vision, held by inkling2_vision_check) are native and the session takes their \
+             rows at the image placeholders (append_with_image_rows), but no chat codec here \
+             lays out the placeholder spans yet",
             cfg.vision_config.num_hidden_layers, cfg.vision_config.adapter_merge_size
         ),
     });
