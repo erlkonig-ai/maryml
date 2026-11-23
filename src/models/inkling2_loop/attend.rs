@@ -58,6 +58,10 @@ pub const QUERY_TILE: usize = 1024;
 /// chain of about twenty per segment. Longer calls keep the tiled loop.
 pub const FUSED_MAX_QUERIES: usize = 16;
 
+/// The most bytes the fused kernel's partial outputs take in one block of
+/// queries (one `[queries, heads, head_dim]` f32 slot per key run).
+pub const FUSED_PARTIAL_BYTES: usize = 512 << 20;
+
 /// One visit's keys and values: post-clip K and post-norm V `[rows, kv_dim]`,
 /// in segments of `tile` rows, oldest first, from absolute position `base`.
 pub struct Kv {
@@ -201,11 +205,12 @@ pub fn attend(
     let [_, d_rel] = rel.dims();
     assert_eq!(heads, a.heads, "q carries the shape's heads");
     assert_eq!(kv.end(), first + t, "the cache holds exactly the keys up to the call's last query");
-    if t <= FUSED_MAX_QUERIES {
-        let rows = flash::decode_rows(heads / a.kv_heads);
-        if flash::applies(heads, a.kv_heads, hd, rows) && kv.rows() > 0 {
-            return attend_fused(a, q, rel, rel_proj, sinks, kv, first, rows);
-        }
+    // Every call takes the fused kernel: a short one with the decode tile, a
+    // long one with the wider prefill tile, a block of queries at a time.
+    let groups = heads / a.kv_heads;
+    let rows = if t <= FUSED_MAX_QUERIES { flash::decode_rows(groups) } else { flash::prefill_rows(groups) };
+    if flash::applies(heads, a.kv_heads, hd, rows) && kv.rows() > 0 {
+        return attend_fused(a, q, rel, rel_proj, sinks, kv, first, rows, query_tile);
     }
     let (kvh, e) = (a.kv_heads, a.rel_extent);
     let rep = heads / kvh;
@@ -277,12 +282,13 @@ pub fn attend(
     if outs.len() == 1 { outs.pop().expect("one tile") } else { Tensor::cat(outs, 0) }
 }
 
-/// [`attend`] for a short call, through the fused kernel: the relative-bias
-/// table `[t, heads, rel_extent]` is built here (the same product the tiled
-/// loop takes per query tile), and every held segment is one key run whose
-/// live rows are its filled ones. Causality, the window and the distance bias
-/// are the kernel's, per (query, key) cell; the sink enters each row's
-/// denominator in the merge.
+/// [`attend`] through the fused kernel, a block of queries at a time: the
+/// relative-bias table `[block, heads, rel_extent]` is built here (the same
+/// product the tiled loop takes per query tile), and each held segment a
+/// query of the block can see is one key run whose live rows are its filled
+/// ones. Causality, the window and the distance bias are the kernel's, per
+/// (query, key) cell; the sink enters each row's denominator in the merge.
+/// `rows` is the cube's `(head, query)` row count.
 #[allow(clippy::too_many_arguments)]
 fn attend_fused(
     a: &AttnShape,
@@ -293,14 +299,14 @@ fn attend_fused(
     kv: &Kv,
     first: usize,
     rows: usize,
+    query_tile: usize,
 ) -> Tensor<Bk, 2> {
     let [t, heads, hd] = q.dims();
+    let [_, d_rel] = rel.dims();
     let dev = q.device();
     let client = client_of(&q);
-    let table = rel.matmul(rel_proj.clone());
-    let q_h = handle_of(q.reshape([t, heads * hd]));
-    let rel_h = handle_of(table);
-    let sink_h = handle_of(sinks);
+    let scale = (hd as f32).powf(-0.5);
+    let q = q.reshape([t, heads * hd]);
     let mut elem = KvElem::F32;
     let held: Vec<_> = kv
         .whole_segments()
@@ -314,25 +320,44 @@ fn attend_fused(
             (kh, vh, tile, base, filled)
         })
         .collect();
-    let runs: Vec<KeyRun<'_>> = held
-        .iter()
-        .map(|(k, v, tile, base, filled)| KeyRun {
-            k,
-            v,
-            k_scales: None,
-            v_scales: None,
-            rows: *tile,
-            base: *base,
-            lo: 0,
-            hi: *filled,
-            row0: 0,
-        })
-        .collect();
-    let scale = (hd as f32).powf(-0.5);
-    let out = flash::flash_attention_launch_sinked(
-        &client, &q_h, &runs, &rel_h, &sink_h, elem, t, first, heads, a.kv_heads, hd, a.rel_extent, a.window, scale, rows,
-    );
-    tensor_of(client, dev, out, t, heads * hd)
+    let mut outs = Vec::new();
+    let mut i0 = 0;
+    while i0 < t {
+        // a block's partials are one `[queries, heads, head_dim]` slot per
+        // key run, so a long cache takes fewer queries at once
+        let cap = FUSED_PARTIAL_BYTES / (held.len() * heads * hd * 4);
+        let tq = query_tile.min(cap.max(1)).min(t - i0);
+        let p0 = first + i0;
+        let runs: Vec<KeyRun<'_>> = held
+            .iter()
+            .filter(|(_, _, _, base, filled)| {
+                let past = *base < p0 + tq;
+                let in_window = a.window.is_none_or(|w| base + filled + w > p0 + 1);
+                past && in_window
+            })
+            .map(|(k, v, tile, base, filled)| KeyRun {
+                k,
+                v,
+                k_scales: None,
+                v_scales: None,
+                rows: *tile,
+                base: *base,
+                lo: 0,
+                hi: *filled,
+                row0: 0,
+            })
+            .collect();
+        let table = rel.clone().slice([i0 * heads..(i0 + tq) * heads, 0..d_rel]).matmul(rel_proj.clone());
+        let q_h = handle_of(q.clone().slice([i0..i0 + tq, 0..heads * hd]));
+        let rel_h = handle_of(table);
+        let sink_h = handle_of(sinks.clone().slice([i0..i0 + tq, 0..heads]));
+        let out = flash::flash_attention_launch_sinked(
+            &client, &q_h, &runs, &rel_h, &sink_h, elem, tq, p0, heads, a.kv_heads, hd, a.rel_extent, a.window, scale, rows,
+        );
+        outs.push(tensor_of(client.clone(), dev.clone(), out, tq, heads * hd));
+        i0 += tq;
+    }
+    if outs.len() == 1 { outs.pop().expect("one block") } else { Tensor::cat(outs, 0) }
 }
 
 #[cfg(test)]
