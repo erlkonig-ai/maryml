@@ -234,10 +234,10 @@ fn main() {
             );
             let up = |run: &str| input(&format!("{run}.p1{prev}.{phase}.messages"));
             rep.row(&format!("p1{prev}:{phase}"), "messages", &m, &up("bf16"), &up("f32"));
-            m
+            Tensor::<Bk, 3>::from_data(TensorData::new(m, [n, 4, h]), &dev)
         });
         let state = states.entry(CacheId { layer: LAYER, pass }).or_insert_with(|| State::new(&layer.dims, &dev));
-        let (out, taps) = layer.forward_visit(rows(x, n), &mut blocks, state, ExpertAct::Bf16, messages.as_deref());
+        let (out, taps) = layer.forward_visit(rows(x, n), &mut blocks, state, ExpertAct::Bf16, messages.as_ref());
         assert_eq!(blocks.len(), 2, "layer 6 is a block boundary: its input joins the blocks once");
         let mut seen = vec![
             ("attn", host(taps.attn)),
@@ -250,7 +250,7 @@ fn main() {
         ];
         assert_eq!(taps.gates.is_some(), pass > 0);
         if let Some([q, k, v, m]) = taps.gates {
-            seen.extend([("gate_q", q), ("gate_k", k), ("gate_v", v), ("gate_mlp", m)]);
+            seen.extend([("gate_q", host(q)), ("gate_k", host(k)), ("gate_v", host(v)), ("gate_mlp", host(m))]);
         }
         Seen {
             taps: seen,
