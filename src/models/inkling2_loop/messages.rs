@@ -444,6 +444,19 @@ mod device {
             DeviceGate { hidden: h, rank: r, eps: g.eps as f64, precision: g.precision, down_t: down, forget_gain_t: fg }
         }
 
+        /// `a @ w` for one of the gate's projections, and whether the
+        /// short-call GEMV computed it. The GEMV only where every operand is a
+        /// bf16 value, so its f32 products equal the TF32 matmul's: under F32
+        /// it would change the variant's arithmetic with the row count.
+        fn project(&self, a: Tensor<Bk, 2>, w: &Tensor<Bk, 2>) -> (Tensor<Bk, 2>, bool) {
+            if self.precision == DownPrecision::Bf16 {
+                if let Some(y) = crate::models::inkling2_loop::rows::gemv(a.clone(), w) {
+                    return (y, true);
+                }
+            }
+            (a.matmul(w.clone()), false)
+        }
+
         /// `(1 - tanh(forget)) * hidden + tanh(gain) * message`, `[t, H]`:
         /// [`MessageGate::apply`] on the device.
         pub fn apply(&self, hidden_states: Tensor<Bk, 2>, message: Tensor<Bk, 2>) -> Tensor<Bk, 2> {
@@ -462,22 +475,82 @@ mod device {
                     if bf { round_bf16_dev(x) } else { x }
                 }
             };
-            // The short-call GEMV only where every operand is a bf16 value, so
-            // its f32 products equal the TF32 matmul's: under F32 it would
-            // change the variant's arithmetic with the row count.
-            let mm = |a: Tensor<Bk, 2>, w: &Tensor<Bk, 2>| match bf.then(|| rows::gemv(a.clone(), w)).flatten() {
-                Some(y) => y,
-                None => a.matmul(w.clone()),
-            };
-            let d = mm(x, &self.down_t);
+            let d = self.project(x, &self.down_t).0;
             let d = if bf { rows::round_to_bf16(d.clone()).unwrap_or_else(|| round_bf16_dev(d)) } else { d };
-            let fg = mm(d, &self.forget_gain_t);
+            let fg = self.project(d, &self.forget_gain_t).0;
             if let Some(out) = rows::gate_output(fg.clone(), hidden_states.clone(), message.clone()) {
                 return out;
             }
             let f = fg.clone().slice([0..t, 0..h]);
             let g = fg.slice([0..t, h..2 * h]);
             f.tanh().neg().add_scalar(1.0) * hidden_states + g.tanh() * message
+        }
+    }
+
+    /// The gate projections' dispatch at the GEMV's row limit: 1, 16 and 17
+    /// rows, each precision. Says which path ran, holds it against Burn's
+    /// matmul on the same operands, and the whole gate against the host gate.
+    #[cfg(test)]
+    mod dispatch {
+        use super::*;
+        use crate::models::inkling2_loop::rows::GEMV_MAX_ROWS;
+
+        fn host<const D: usize>(t: Tensor<Bk, D>) -> Vec<f32> {
+            t.into_data().convert::<f32>().to_vec().unwrap()
+        }
+
+        fn rel_err(got: &[f32], want: &[f32]) -> f32 {
+            assert_eq!(got.len(), want.len());
+            assert!(got.iter().all(|v| v.is_finite()), "a non-finite output");
+            let peak = want.iter().fold(0f32, |m, v| m.max(v.abs()));
+            got.iter().zip(want).fold(0f32, |m, (g, w)| m.max((g - w).abs())) / peak
+        }
+
+        #[test]
+        fn the_gate_projections_switch_path_at_the_gemv_limit() {
+            let dev = burn::backend::cuda::CudaDevice::default();
+            let (h, r) = (2304, 64);
+            let mut seed = 0x853c49e6748fea9bu64;
+            let mut rnd = |scale: f32| -> f32 {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                ((seed >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 2.0 * scale
+            };
+            let b = |v: f32| half::bf16::from_f32(v).to_f32();
+            let down: Vec<f32> = (0..r * 2 * h).map(|_| rnd(0.05)).collect();
+            let forget: Vec<f32> = (0..h * r).map(|_| b(rnd(0.1))).collect();
+            let gain: Vec<f32> = (0..h * r).map(|_| b(rnd(0.1))).collect();
+            for precision in [DownPrecision::Bf16, DownPrecision::F32] {
+                let bf = precision == DownPrecision::Bf16;
+                let g = MessageGate::new(down.clone(), forget.clone(), gain.clone(), h, r, 1e-6, precision).unwrap();
+                let dg = DeviceGate::new(&g, &dev);
+                for t in [1, GEMV_MAX_ROWS, GEMV_MAX_ROWS + 1] {
+                    let want_gemv = bf && t <= GEMV_MAX_ROWS;
+                    // operands as the gate hands them on: bf16 values on the released lane
+                    let x: Vec<f32> = (0..t * 2 * h).map(|_| if bf { b(rnd(1.0)) } else { rnd(1.0) }).collect();
+                    let dv: Vec<f32> = (0..t * r).map(|_| if bf { b(rnd(4.0)) } else { rnd(4.0) }).collect();
+                    for (name, a, w) in [
+                        ("down", Tensor::<Bk, 2>::from_data(TensorData::new(x, [t, 2 * h]), &dev), &dg.down_t),
+                        ("forget/gain", Tensor::<Bk, 2>::from_data(TensorData::new(dv, [t, r]), &dev), &dg.forget_gain_t),
+                    ] {
+                        let (y, gemv) = dg.project(a.clone(), w);
+                        let e = rel_err(&host(y), &host(a.matmul(w.clone())));
+                        eprintln!("{precision:?} {name} {t} rows: {} path, rel err vs Burn matmul {e:e}", if gemv { "gemv" } else { "matmul" });
+                        assert_eq!(gemv, want_gemv, "{precision:?} {name} {t} rows took the wrong path");
+                        // bf16 operands: exact products either way, only the summation order differs
+                        assert!(e < 1e-5, "{precision:?} {name} {t} rows: rel err {e}");
+                    }
+                    let hs: Vec<f32> = (0..t * h).map(|_| rnd(8.0)).collect();
+                    let ms: Vec<f32> = (0..t * h).map(|_| rnd(1.0)).collect();
+                    let up = |v: Vec<f32>| Tensor::<Bk, 2>::from_data(TensorData::new(v, [t, h]), &dev);
+                    let got = host(dg.apply(up(hs.clone()), up(ms.clone())));
+                    let e = rel_err(&got, &g.apply(&hs, &ms, t));
+                    eprintln!("{precision:?} whole gate {t} rows: rel err vs host gate {e:e}");
+                    // the release-shape test's bug bound: a wrong kernel is off by tens
+                    assert!(e < 1e-2, "{precision:?} gate {t} rows: rel err {e}");
+                }
+            }
         }
     }
 
