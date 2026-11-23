@@ -109,6 +109,9 @@ impl Kv {
         let (k, v) = (k.cast(DType::BF16), v.cast(DType::BF16));
         let [t, c] = k.dims();
         assert_eq!(v.dims(), [t, c], "keys and values are the same shape");
+        if let Some([held, _]) = self.segs.last() {
+            assert_eq!(held.dims()[1], c, "the cache holds rows of one width");
+        }
         let mut i = 0;
         while i < t {
             if self.segs.is_empty() || self.last == self.tile {
@@ -186,12 +189,42 @@ pub struct AttnShape {
     pub window: Option<usize>,
 }
 
+impl AttnShape {
+    /// The operands of [`attend`] are what this shape says they are, and on
+    /// one device. The kernels launch unchecked over extents named by the
+    /// shape, so this comes before any handle is taken.
+    fn check(&self, q: &Tensor<Bk, 3>, rel: &Tensor<Bk, 2>, rel_proj: &Tensor<Bk, 2>, sinks: &Tensor<Bk, 2>, kv: &Kv) {
+        let AttnShape { heads, kv_heads, head_dim, rel_extent, .. } = *self;
+        assert!(
+            kv_heads > 0 && heads > 0 && heads % kv_heads == 0 && head_dim > 0 && rel_extent > 0,
+            "attention operand: {self:?} is not a grouping of heads"
+        );
+        let [t, _, _] = q.dims();
+        let [_, d_rel] = rel.dims();
+        assert!(t > 0, "attention operand: no queries");
+        assert_eq!(q.dims(), [t, heads, head_dim], "attention operand: queries of {self:?}");
+        assert_eq!(rel.dims(), [t * heads, d_rel], "attention operand: relative states of {t} queries of {self:?}");
+        assert_eq!(rel_proj.dims(), [d_rel, rel_extent], "attention operand: the relative projection of {self:?}");
+        assert_eq!(sinks.dims(), [t, heads], "attention operand: sinks of {t} queries of {self:?}");
+        let dev = q.device();
+        for (what, d) in [("relative states", rel.device()), ("relative projection", rel_proj.device()), ("sinks", sinks.device())] {
+            assert!(d == dev, "attention operand: the {what} are on {d:?}, the queries on {dev:?}");
+        }
+        for [k, v] in &kv.segs {
+            assert_eq!(k.dims(), [kv.tile, kv_heads * head_dim], "attention operand: keys of {self:?}");
+            assert_eq!(v.dims(), k.dims(), "attention operand: values of {self:?}");
+            assert!(k.device() == dev && v.device() == dev, "attention operand: the cache is on {:?}, the queries on {dev:?}", k.device());
+        }
+    }
+}
+
 /// Attention of `t` queries at absolute positions `first ..` over every key in
 /// `kv`, which already holds the call's own rows.
 ///
 /// `q` is `[t, heads, head_dim]`, `rel` `[t * heads, d_rel]` (both clipped and,
 /// on a full layer, log-scaled), `rel_proj` `[d_rel, rel_extent]`, `sinks`
-/// `[t, heads]`. Returns `[t, heads * head_dim]`.
+/// `[t, heads]`. Returns `[t, heads * head_dim]`. Panics on an operand of
+/// another shape or device.
 #[allow(clippy::too_many_arguments)]
 pub fn attend(
     a: &AttnShape,
@@ -203,9 +236,9 @@ pub fn attend(
     first: usize,
     query_tile: usize,
 ) -> Tensor<Bk, 2> {
+    a.check(&q, &rel, rel_proj, &sinks, kv);
     let [t, heads, hd] = q.dims();
     let [_, d_rel] = rel.dims();
-    assert_eq!(heads, a.heads, "q carries the shape's heads");
     assert_eq!(kv.end(), first + t, "the cache holds exactly the keys up to the call's last query");
     if t > FUSED_MAX_QUERIES && attend_mma::applies(heads, a.kv_heads, hd) {
         return attend_blocks(a, q, rel, rel_proj, sinks, kv, first, query_tile);
@@ -342,8 +375,8 @@ fn held_segments(kv: &Kv) -> Vec<Held> {
         .map(|(base, k, v, filled)| {
             let [rows, _] = k.dims();
             let (k, dt) = handle_of_any(k.clone());
-            let (v, _) = handle_of_any(v.clone());
-            assert_eq!(dt, DType::BF16, "the cache holds BF16");
+            let (v, vdt) = handle_of_any(v.clone());
+            assert_eq!((dt, vdt), (DType::BF16, DType::BF16), "the cache holds BF16");
             Held { k, v, rows, base, filled }
         })
         .collect()
@@ -943,6 +976,107 @@ mod tests {
                 println!("window {window:?} {label}: worst abs {d:.3e} at {row}; on the other readings {far:?}");
                 assert!(d < 2e-5, "window {window:?} {label}: {d} from the definition at position {row}");
                 assert!(far.iter().all(|f| *f > 1e-3), "window {window:?} {label}: {far:?} does not tell the readings apart");
+            }
+        }
+    }
+
+    /// A malformed operand is refused at the typed boundary, before any
+    /// handle is taken: the kernels are launched unchecked with extents named
+    /// by the shape, so a narrower buffer would be read past its end.
+    mod malformed {
+        use super::*;
+
+        struct Args {
+            a: AttnShape,
+            t: usize,
+            q: [usize; 3],
+            rel: [usize; 2],
+            proj: [usize; 2],
+            sinks: [usize; 2],
+            kv: usize,
+        }
+
+        impl Args {
+            fn good(t: usize) -> Args {
+                let a = small(Some(48), 48);
+                Args { a, t, q: [t, 6, 32], rel: [t * 6, 4], proj: [4, 48], sinks: [t, 6], kv: 64 }
+            }
+
+            fn run(&self) -> Vec<f32> {
+                let dev = Dev::default();
+                let mut kv = Kv::new(16);
+                kv.append(Tensor::ones([self.t, self.kv], &dev), Tensor::ones([self.t, self.kv], &dev));
+                let proj = Tensor::<Bk, 2>::zeros(self.proj, &dev);
+                host(attend(
+                    &self.a,
+                    Tensor::ones(self.q, &dev),
+                    Tensor::ones(self.rel, &dev),
+                    &proj,
+                    Tensor::zeros(self.sinks, &dev),
+                    &kv,
+                    0,
+                    QUERY_TILE,
+                ))
+            }
+        }
+
+        /// Every malformation, in a long call and in a short one.
+        fn refused(what: &str, spoil: impl Fn(&mut Args)) {
+            for t in [40, 3] {
+                assert_eq!(Args::good(t).run().len(), t * 192, "the well-formed call");
+                let mut args = Args::good(t);
+                spoil(&mut args);
+                let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| args.run())).expect_err(&format!("{what} of {t} queries is accepted"));
+                let msg = err.downcast_ref::<String>().cloned().unwrap_or_default();
+                assert!(msg.contains("attention operand"), "{what} of {t} queries fails elsewhere: {msg}");
+            }
+        }
+
+        #[test]
+        fn a_narrower_cache() {
+            refused("a cache of one KV head", |x| x.kv = 32);
+        }
+
+        #[test]
+        fn a_narrower_projection() {
+            refused("a projection short of the extent", |x| x.proj = [4, 47]);
+        }
+
+        #[test]
+        fn another_relative_width() {
+            refused("relative states of another width", |x| x.rel[1] = 8);
+        }
+
+        #[test]
+        fn too_few_relative_rows() {
+            refused("relative states one head short", |x| x.rel[0] -= 1);
+        }
+
+        #[test]
+        fn too_few_sinks() {
+            refused("sinks one row short", |x| x.sinks[0] -= 1);
+            refused("sinks one head short", |x| x.sinks[1] -= 1);
+        }
+
+        #[test]
+        fn another_head_dim() {
+            refused("queries of another head dim", |x| x.q[2] = 16);
+        }
+
+        #[test]
+        fn another_head_count() {
+            refused("queries of another head count", |x| x.q[1] = 5);
+            refused("heads that do not divide over the KV heads", |x| x.a.kv_heads = 4);
+        }
+
+        #[test]
+        fn a_cache_whose_width_changes() {
+            let dev = Dev::default();
+            for next in [32, 128] {
+                let mut kv = Kv::new(16);
+                kv.append(Tensor::ones([3, 64], &dev), Tensor::ones([3, 64], &dev));
+                let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| kv.append(Tensor::ones([3, next], &dev), Tensor::ones([3, next], &dev))));
+                assert!(err.is_err(), "rows of {next} follow rows of 64");
             }
         }
     }
