@@ -48,9 +48,11 @@
 //! convolutions. Upstream's cache keeps `k` columns of conv input; only its
 //! last `k - 1` are ever read, and those are what is kept here.
 //!
-//! Experts bind in their stored format ([`bind_experts`]): NVFP4 (layers
-//! 0..19) as packed codes, MXFP8 (layers 20..23) decoded on the host to BF16
-//! and multiplied by [`linear_bf16`] with BF16 activations.
+//! Experts bind in their stored format ([`bind_bank`]): NVFP4 (layers
+//! 0..19) as packed codes, MXFP8 (layers 20..23) decoded on the host to BF16,
+//! one device buffer per projection with the experts stacked. The router and
+//! the experts run as [`super::moe::Bank`]: routed on the device, one grouped
+//! launch per projection.
 //!
 //! Attention itself is [`super::attend`]: keys and values in fixed segments,
 //! scored a tile at a time. A sliding visit drops a segment once no later query
@@ -603,8 +605,8 @@ pub(super) fn bind_bank(
 }
 
 /// MXFP8 experts: E4M3 values `[e, rows, cols]` and one UE8M0 scale per 32
-/// values of a row `[e, rows, cols / 32]`, decoded on the host one expert at
-/// a time (upstream's `Inkling2LoopDequantizeExperts`, then `.to(bfloat16)`,
+/// values of a row `[e, rows, cols / 32]`, decoded on the host
+/// layer at a time (upstream's `Inkling2LoopDequantizeExperts`, then `.to(bfloat16)`,
 /// which is exact here) and uploaded as BF16. w13's rows are interleaved gate
 /// then up per intermediate unit, its scales with them (upstream's
 /// `Interleave(dim=1)` on both). About 2 GB per layer at the release's shape.
