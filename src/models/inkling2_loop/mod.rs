@@ -39,7 +39,8 @@
 //! * `session` (with `inkling2-session`): the whole text forward as a model
 //!   bound once from a pile root ([`session::MiniModel`]) and independent
 //!   token sequences over it ([`session::MiniSession`]): token IDs in,
-//!   softcapped logits out, every layer visit's state carried.
+//!   softcapped logits out, every layer visit's state carried; image features
+//!   at the placeholders, after the embedding norm, as upstream scatters them.
 //!
 //! * [`vision_input`]: the image front end on the CPU, a decoded RGB8 or
 //!   RGBA8 image to the processor's `pixel_values` and the vision tower's
@@ -50,7 +51,9 @@
 //! * `vision` (with `inkling-cuda`): the ViT tower and its projector on the
 //!   device, image tokens to `text_hidden` features. Held to the published
 //!   tower's run on the saved images by the `inkling2_vision_check` binary.
-//!   Not yet fed into the session's text stream.
+//!   The session binds it on first use ([`session::MiniModel::project_images`])
+//!   and puts its rows at a call's image placeholders
+//!   ([`session::MiniSession::append_with_image_rows`]).
 //!
 //! What the release declares beyond the text forward (the vision tower, the
 //! drafter, the declared expert activation quantisation) is not native:
