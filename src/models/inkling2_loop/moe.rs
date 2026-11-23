@@ -46,7 +46,8 @@
 //! once. Nothing about the plan crosses to the host.
 //!
 //! * `select`: one unit per (row, expert) writes `pick + 1` or 0 into a
-//!   `[rows, experts]` table, and the stacked buffer's padding is initialised.
+//!   `[rows, experts]` table, and the stacked buffer's padding and every
+//!   scatter slot (`tok_rows`, to stacked row 0) are initialised.
 //! * `rank`: one cube, one unit per expert, walks the rows in order and gives
 //!   each pick its place among that expert's rows; then the tile prefix sum
 //!   and the per-tile expert table.
@@ -228,6 +229,7 @@ fn route_select(
     sel: &mut Array<u32>,
     row_src: &mut Array<i32>,
     row_w: &mut Array<f32>,
+    tok_rows: &mut Array<u32>,
     rows: u32,
     m_max: u32,
     #[comptime] experts: u32,
@@ -235,6 +237,14 @@ fn route_select(
 ) {
     let p = ABSOLUTE_POS as u32;
     let width = comptime!(2 * top_k + 1);
+    // A row with at least `top_k` non-NaN logits has distinct picks, so
+    // `route_place` writes every one of its `top_k` scatter slots. A row with
+    // fewer repeats expert 0 (`router_topk` never picks a NaN) and leaves
+    // slots unwritten; stacked row 0 always exists, so those slots read an
+    // in-range row. Such a row is a router fault either way.
+    if p < rows * top_k {
+        tok_rows[p as usize] = 0u32;
+    }
     if p < rows * experts {
         let r = p / experts;
         let e = p % experts;
@@ -636,6 +646,7 @@ impl Bank {
                 ArrayArg::from_raw_parts(sel.clone(), rows * e),
                 ArrayArg::from_raw_parts(row_src.clone(), m_max),
                 ArrayArg::from_raw_parts(row_w.clone(), m_max),
+                ArrayArg::from_raw_parts(tok_rows.clone(), rows * k),
                 rows as u32,
                 m_max as u32,
                 e as u32,
