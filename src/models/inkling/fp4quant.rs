@@ -408,6 +408,7 @@ fn quantize_nvfp4_46_kernel<E: Scalar + Cast>(
     scales: &mut Array<e4m3>,
     alpha_out: &mut Array<f32>,
     #[comptime] bpr: usize,
+    #[comptime] four_over_six: bool,
 ) {
     let row = CUBE_POS_X as usize;
     let b = UNIT_POS_X as usize;
@@ -435,7 +436,10 @@ fn quantize_nvfp4_46_kernel<E: Scalar + Cast>(
         sync_cube();
         stride /= 2u32;
     }
-    let alpha = red[0] / (6.0f32 * FOUR_OVER_SIX_E4M3_MAX);
+    let mut alpha = red[0] / (6.0f32 * FOUR_OVER_SIX_E4M3_MAX);
+    if comptime!(!four_over_six) {
+        alpha = red[0] / (6.0f32 * E4M3_MAX);
+    }
 
     if b < bpr {
         if b == 0 {
@@ -462,7 +466,7 @@ fn quantize_nvfp4_46_kernel<E: Scalar + Cast>(
             se = s6;
             w0 = w06;
             w1 = w16;
-            if e4 < e6 {
+            if comptime!(four_over_six) && e4 < e6 {
                 se = s4;
                 w0 = w04;
                 w1 = w14;
@@ -482,6 +486,19 @@ pub fn quantize_nvfp4_46_bf16<R: Runtime>(
     rows: usize,
     k: usize,
 ) -> (Handle, Handle, Handle) {
+    quantize_nvfp4_rowscaled_bf16(client, x, rows, k, true)
+}
+
+/// The same kernel with the block rule chosen: `four_over_six` false is
+/// plain NVFP4 with a per-row outer scale, `alpha = amax / (6 * 448)` and every
+/// block's largest magnitude onto 6.
+pub fn quantize_nvfp4_rowscaled_bf16<R: Runtime>(
+    client: &ComputeClient<R>,
+    x: &Handle,
+    rows: usize,
+    k: usize,
+    four_over_six: bool,
+) -> (Handle, Handle, Handle) {
     let bpr = k / GROUP;
     assert!(k > 0 && k % 64 == 0 && rows > 0, "4/6 NVFP4 needs rows > 0 and k a positive multiple of 64");
     assert!(bpr <= ROW_CUBE as usize, "a row of {k} is more blocks than one cube of {ROW_CUBE}");
@@ -499,6 +516,7 @@ pub fn quantize_nvfp4_46_bf16<R: Runtime>(
             ArrayArg::from_raw_parts(scales.clone(), n / GROUP),
             ArrayArg::from_raw_parts(alpha.clone(), rows),
             bpr,
+            four_over_six,
         );
     }
     (codes, scales, alpha)

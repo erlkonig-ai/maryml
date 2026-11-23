@@ -70,7 +70,7 @@ use half::bf16;
 
 use crate::models::inkling::bf16gemm::{Bf16W, linear_bf16 as linear_bf16_handle, linear_bf16_narrow};
 use crate::models::inkling::burn::PackedW;
-use crate::models::inkling::fp4quant::{qdq_mxfp8_bf16, quantize_nvfp4_46_bf16};
+use crate::models::inkling::fp4quant::{qdq_mxfp8_bf16, quantize_nvfp4_46_bf16, quantize_nvfp4_rowscaled_bf16};
 use crate::models::inkling::moegroup::{
     BlockPlanDev, bf16_linear_grouped_launch, fp4_linear_grouped_planes_launch_as, gather_grouped_bf16,
     gather_grouped_bf16_from_bf16, scatter_weighted,
@@ -209,6 +209,30 @@ pub fn lane(act: super::sliding::ExpertAct) -> Lane {
         super::sliding::ExpertAct::Bf16 if forced => Lane::Loop,
         super::sliding::ExpertAct::Bf16 => Lane::Grouped,
     }
+}
+
+/// Measurement arms inside [`super::sliding::ExpertAct::Trained`], read once:
+/// `MINI_TRAINED=nvfp4|mxfp8` keeps the trained precision on only those layers
+/// (the others multiply BF16 activations), and `MINI_SCALE_RULE=static6` replaces
+/// Four Over Six with plain NVFP4 (`amax / (6 * 448)`, every block onto 6).
+/// Unset is the trained precision everywhere.
+fn trained_arms() -> (bool, bool, bool) {
+    use std::sync::OnceLock;
+    static ARMS: OnceLock<(bool, bool, bool)> = OnceLock::new();
+    *ARMS.get_or_init(|| {
+        let (nv, mx) = match std::env::var("MINI_TRAINED").as_deref() {
+            Ok("all") | Err(_) => (true, true),
+            Ok("nvfp4") => (true, false),
+            Ok("mxfp8") => (false, true),
+            Ok(other) => panic!("MINI_TRAINED={other}: all, nvfp4 or mxfp8"),
+        };
+        let rule = match std::env::var("MINI_SCALE_RULE").as_deref() {
+            Ok("fouroversix") | Err(_) => true,
+            Ok("static6") => false,
+            Ok(other) => panic!("MINI_SCALE_RULE={other}: fouroversix or static6"),
+        };
+        (nv, mx, rule)
+    })
 }
 
 /// The device plan of one visit. `m_max = 16 * max_tiles` stacked rows.
@@ -761,6 +785,8 @@ impl Bank {
             other => panic!("experts: no lane for a {other:?} activation"),
         };
         let nvfp4 = matches!(self.gate.stack, Stack::Nvfp4 { .. });
+        let (on_nv, on_mx, four_over_six) = trained_arms();
+        let trained = trained && if nvfp4 { on_nv } else { on_mx };
         let total = m * self.inter;
         let s = client.empty(total * 2);
         let swiglu = |g: Handle, u: Handle, alpha: Option<&Handle>| unsafe {
@@ -785,11 +811,11 @@ impl Bank {
             // Over Six; the per-token outer scale multiplies the GEMM's rows,
             // so it enters the SwiGLU for gate and up and the scatter weight
             // for down.
-            let (ac, asc, alpha) = quantize_nvfp4_46_bf16(&client, &a, m, h);
+            let (ac, asc, alpha) = quantize_nvfp4_rowscaled_bf16(&client, &a, m, h, four_over_six);
             let g = self.project_w4a4(&client, &self.gate, &ac, &asc, &plan);
             let u = self.project_w4a4(&client, &self.up, &ac, &asc, &plan);
             swiglu(g, u, Some(&alpha));
-            let (sc, ssc, alpha2) = quantize_nvfp4_46_bf16(&client, &s, m, self.inter);
+            let (sc, ssc, alpha2) = quantize_nvfp4_rowscaled_bf16(&client, &s, m, self.inter, four_over_six);
             let y = self.project_w4a4(&client, &self.down, &sc, &ssc, &plan);
             (y, scale_rows(&client, &plan.row_w, &alpha2, m))
         } else if trained {
