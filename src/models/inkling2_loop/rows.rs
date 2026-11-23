@@ -12,10 +12,9 @@
 //!
 //! The arithmetic is the Burn composition's, in the same order per element;
 //! the reductions are a plane tree instead of Burn's, so the last bits differ.
-//! Only f32 contiguous inputs take these kernels; anything else keeps the
-//! Burn path (`MINI_ROWS=burn` forces it, for an A/B in one binary).
-
-use std::sync::OnceLock;
+//! Each entry point takes f32 inputs (a strided view is made contiguous first)
+//! within its shape limits and returns `None` otherwise; the caller then runs
+//! the Burn composition.
 
 use burn::tensor::Tensor;
 use cubecl::prelude::*;
@@ -27,44 +26,6 @@ const PLANE: u32 = 32;
 
 /// The most block states [`block_attention`] reads besides the partial one.
 pub const MAX_BLOCKS: usize = 6;
-
-/// Which row kernels run, cumulatively: `MINI_ROWS=burn` none (Burn's
-/// composition everywhere); `scale` the clip and norm kernels; `gates` also
-/// the message gates' input, rounding and output; `blocks` also the block
-/// attention and the message read; `conv` also the short convolution step;
-/// anything else (the default) also the gate projections' short-call GEMV. The settings
-/// exist for an A/B in one binary.
-fn setting() -> u8 {
-    static ON: OnceLock<u8> = OnceLock::new();
-    *ON.get_or_init(|| match std::env::var("MINI_ROWS").as_deref() {
-        Ok("burn") => 0,
-        Ok("scale") => 1,
-        Ok("gates") => 2,
-        Ok("blocks") => 3,
-        Ok("conv") => 4,
-        _ => 5,
-    })
-}
-
-fn enabled() -> bool {
-    setting() >= 1
-}
-
-fn gates_enabled() -> bool {
-    setting() >= 2
-}
-
-fn blocks_enabled() -> bool {
-    setting() >= 3
-}
-
-fn conv_enabled() -> bool {
-    setting() >= 4
-}
-
-fn gemv_enabled() -> bool {
-    setting() >= 5
-}
 
 /// `x * min(thr / (|x| + 1e-6), 1)` per row (`mode` 0); `x / sqrt(mean(x^2) + eps)`
 /// (1); the same times `gain` (2).
@@ -156,7 +117,7 @@ fn is_f32<const D: usize>(x: &Tensor<Bk, D>) -> bool {
 
 /// [`super::sliding::l2_clip`] over the last axis, one launch.
 pub fn l2_clip(x: Tensor<Bk, 3>, thr: f32) -> Option<Tensor<Bk, 3>> {
-    if !enabled() || !is_f32(&x) {
+    if !is_f32(&x) {
         return None;
     }
     let [a, b, d] = x.dims();
@@ -165,7 +126,7 @@ pub fn l2_clip(x: Tensor<Bk, 3>, thr: f32) -> Option<Tensor<Bk, 3>> {
 
 /// [`super::sliding::unit_rms`] over the last axis, one launch.
 pub fn unit_rms(x: Tensor<Bk, 3>, eps: f64) -> Option<Tensor<Bk, 3>> {
-    if !enabled() || !is_f32(&x) {
+    if !is_f32(&x) {
         return None;
     }
     let [a, b, d] = x.dims();
@@ -174,7 +135,7 @@ pub fn unit_rms(x: Tensor<Bk, 3>, eps: f64) -> Option<Tensor<Bk, 3>> {
 
 /// `rms_norm` with a gain, one launch.
 pub fn rms_norm(x: Tensor<Bk, 2>, gain: Tensor<Bk, 1>, eps: f64) -> Option<Tensor<Bk, 2>> {
-    if !enabled() || !is_f32(&x) || !is_f32(&gain) {
+    if !is_f32(&x) || !is_f32(&gain) {
         return None;
     }
     Some(launch_scale(x, Some(gain), eps as f32, 2))
@@ -319,7 +280,7 @@ fn block_attend(
 /// [`super::sliding::block_attention`] in one launch, with no concatenation:
 /// each block state is read where it is.
 pub fn block_attention(query: Tensor<Bk, 1>, blocks: &[Tensor<Bk, 2>], partial: Tensor<Bk, 2>) -> Option<Tensor<Bk, 2>> {
-    if !blocks_enabled() || blocks.len() > MAX_BLOCKS || !is_f32(&partial) || !is_f32(&query) || blocks.iter().any(|b| !is_f32(b)) {
+    if blocks.len() > MAX_BLOCKS || !is_f32(&partial) || !is_f32(&query) || blocks.iter().any(|b| !is_f32(b)) {
         return None;
     }
     let [rows, d] = partial.dims();
@@ -434,7 +395,7 @@ const ELEMS: u32 = 256;
 /// [`super::messages::DeviceGate::apply`]'s input: `[rms(hidden), rms(message)]`,
 /// `[t, 2H]`, bf16-rounded when `round`. One launch.
 pub fn gate_input(hidden: Tensor<Bk, 2>, message: Tensor<Bk, 2>, eps: f64, round: bool) -> Option<Tensor<Bk, 2>> {
-    if !gates_enabled() || !is_f32(&hidden) || !is_f32(&message) {
+    if !is_f32(&hidden) || !is_f32(&message) {
         return None;
     }
     let [rows, h] = hidden.dims();
@@ -463,7 +424,7 @@ pub fn gate_input(hidden: Tensor<Bk, 2>, message: Tensor<Bk, 2>, eps: f64, round
 
 /// Round to bf16, kept as f32, in one launch.
 pub fn round_to_bf16(x: Tensor<Bk, 2>) -> Option<Tensor<Bk, 2>> {
-    if !gates_enabled() || !is_f32(&x) {
+    if !is_f32(&x) {
         return None;
     }
     let [rows, c] = x.dims();
@@ -490,7 +451,7 @@ pub fn round_to_bf16(x: Tensor<Bk, 2>) -> Option<Tensor<Bk, 2>> {
 /// [`super::messages::DeviceGate::apply`]'s output from the stacked forget
 /// and gain pre-activations `fg` (`[t, 2H]`), in one launch.
 pub fn gate_output(fg: Tensor<Bk, 2>, hidden: Tensor<Bk, 2>, message: Tensor<Bk, 2>) -> Option<Tensor<Bk, 2>> {
-    if !gates_enabled() || !is_f32(&fg) || !is_f32(&hidden) || !is_f32(&message) {
+    if !is_f32(&fg) || !is_f32(&hidden) || !is_f32(&message) {
         return None;
     }
     let [rows, h] = hidden.dims();
@@ -569,7 +530,7 @@ fn msg_read(normed: &Array<f32>, q: &Array<f32>, out: &mut Array<f32>, cells: u3
 /// `[t, keys, H]`, `queries` `[1, 4, H]`, the messages `[t, 4, H]`.
 pub fn read_messages(normed: &Tensor<Bk, 3>, queries: Tensor<Bk, 3>) -> Option<Tensor<Bk, 3>> {
     let [t, keys, h] = normed.dims();
-    if !blocks_enabled() || keys > MAX_BLOCKS + 2 || !is_f32(normed) || !is_f32(&queries) {
+    if keys > MAX_BLOCKS + 2 || !is_f32(normed) || !is_f32(&queries) {
         return None;
     }
     assert_eq!(queries.dims(), [1, 4, h], "message queries are [1, 4, H]");
@@ -659,7 +620,7 @@ pub fn conv_step(hist: &mut Tensor<Bk, 2>, x: Tensor<Bk, 2>, w: &Tensor<Bk, 2>, 
     let [t, c] = x.dims();
     let [keep, hc] = hist.dims();
     let [wc, kernel] = w.dims();
-    if !conv_enabled() || !is_f32(&x) || !is_f32(hist) || !is_f32(w) || t == 0 || hc != c || wc != c || kernel != keep + 1 || keep == 0 {
+    if !is_f32(&x) || !is_f32(hist) || !is_f32(w) || t == 0 || hc != c || wc != c || kernel != keep + 1 || keep == 0 {
         return None;
     }
     let client = client_of(&x);
@@ -727,7 +688,7 @@ pub const GEMV_MAX_ROWS: usize = 16;
 pub fn gemv(x: Tensor<Bk, 2>, w_t: &Tensor<Bk, 2>) -> Option<Tensor<Bk, 2>> {
     let [t, k] = x.dims();
     let [wk, n] = w_t.dims();
-    if !gemv_enabled() || t == 0 || t > GEMV_MAX_ROWS || wk != k || !is_f32(&x) || !is_f32(w_t) {
+    if t == 0 || t > GEMV_MAX_ROWS || wk != k || !is_f32(&x) || !is_f32(w_t) {
         return None;
     }
     let w = w_t.clone().transpose();
