@@ -45,8 +45,8 @@
 //! m = gate_mlp(mlp_input(blocks, h), m_mlp)
 //! ```
 //!
-//! With no messages it is exactly the ungated visit. The gates run on the host
-//! (CC's [`MessageGate`], BF16 down projection), as in a sliding core layer.
+//! With no messages it is exactly the ungated visit. The gates run on the device
+//! ([`DeviceGate`], BF16 down projection), as in a sliding core layer.
 //!
 //! Experts bind in their stored format, including the MXFP8 experts in layer 23.
 
@@ -65,9 +65,9 @@ use crate::models::inkling2_loop::config::{AttnKind, Inkling2LoopTextConfig};
 use crate::models::inkling2_loop::layout::{AttnPart, ConvPart, Dtype, LayerPart, Slot};
 use crate::models::inkling2_loop::sliding::{
     Dev, Dims, Expert, ExpertAct, STREAMS, State, Taps, Weights, bf16_to_f32, bind_experts, bind_gates,
-    block_attention, conv_step, f32_le, l2_clip, message_of, unit_rms, want,
+    block_attention, conv_step, f32_le, l2_clip, unit_rms, want,
 };
-use crate::models::inkling2_loop::messages::MessageGate;
+use crate::models::inkling2_loop::messages::{DeviceGate, message_tensor};
 
 /// A full-attention layer's weights, bound on the device.
 pub struct FullLayer {
@@ -104,7 +104,7 @@ pub struct FullLayer {
     experts: Vec<Expert>,
     /// Core layers only: the Q, K, V and MLP message gates, in
     /// [`super::messages::message_slot`] order.
-    gates: Option<[MessageGate; 4]>,
+    gates: Option<[DeviceGate; 4]>,
 }
 
 /// What a full visit returns besides its output.
@@ -201,7 +201,7 @@ impl FullLayer {
             attn_sconv: conv(l(LayerPart::AttnSconv), h)?,
             mlp_sconv: conv(l(LayerPart::MlpSconv), h)?,
             experts,
-            gates: bind_gates(w, t, layer)?,
+            gates: bind_gates(w, t, layer, dev)?,
         })
     }
 
@@ -252,7 +252,7 @@ impl FullLayer {
         state: &mut State,
         act: ExpertAct,
         origin: usize,
-        messages: Option<&[f32]>,
+        messages: Option<&Tensor<Bk, 3>>,
     ) -> (Tensor<Bk, 2>, FullTaps) {
         let d = self.dims;
         let [t, _] = x.dims();
@@ -264,22 +264,17 @@ impl FullLayer {
         };
         let gated = messages.map(|m| {
             let g = self.gates.as_ref().unwrap_or_else(|| panic!("layer {} reads no messages", self.layer));
-            assert_eq!(m.len(), t * 4 * d.hidden, "messages are [t, 4, H]");
+            assert_eq!(m.dims(), [t, 4, d.hidden], "messages are [t, 4, H]");
             (g, m)
         });
-        let upload = |v: Vec<f32>| Tensor::<Bk, 2>::from_data(TensorData::new(v, [t, d.hidden]), &dev);
-        let mut gate_out: Option<[Vec<f32>; 4]> = None;
+        let mut gate_out: Option<[Tensor<Bk, 2>; 4]> = None;
         let streams = match gated {
             None => inputs.clone(),
             Some((g, m)) => {
-                let out = [0, 1, 2].map(|j| {
-                    let hh: Vec<f32> = inputs[j].clone().into_data().convert::<f32>().to_vec().expect("f32");
-                    g[j].apply(&hh, &message_of(m, STREAMS[j], t, d.hidden), t)
-                });
-                let up = out.clone().map(upload);
-                let [q, k, v] = out;
-                gate_out = Some([q, k, v, Vec::new()]);
-                up
+                let out = [0, 1, 2].map(|j| g[j].apply(inputs[j].clone(), message_tensor(m, STREAMS[j])));
+                let [q, k, v] = out.clone();
+                gate_out = Some([q.clone(), k, v, q]);
+                out
             }
         };
         let normed = [0, 1, 2].map(|i| rms_norm(streams[i].clone(), self.in_norm[i].clone(), d.eps));
@@ -295,9 +290,8 @@ impl FullLayer {
         let mlp_input = block_attention(self.mlp_input.clone(), blocks, residual.clone());
         let mlp_in = match (gated, gate_out.as_mut()) {
             (Some((g, m)), Some(out)) => {
-                let hh: Vec<f32> = mlp_input.clone().into_data().convert::<f32>().to_vec().expect("f32");
-                out[3] = g[3].apply(&hh, &message_of(m, STREAMS[3], t, d.hidden), t);
-                upload(out[3].clone())
+                out[3] = g[3].apply(mlp_input.clone(), message_tensor(m, STREAMS[3]));
+                out[3].clone()
             }
             _ => mlp_input.clone(),
         };

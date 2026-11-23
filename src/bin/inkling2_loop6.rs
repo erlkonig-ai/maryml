@@ -102,6 +102,30 @@ fn max_abs(a: &[f32], b: &[f32]) -> f64 {
     a.iter().zip(b).map(|(x, y)| (x - y).abs() as f64).fold(0.0, f64::max)
 }
 
+/// The rows Mary and upstream both still hold of a carried K or V cache: both
+/// end at the visit's last position, so the matching absolute positions are the
+/// last `min(ours, upstream)` rows of each. Mary's `attend::Kv` evicts whole tiles and
+/// upstream keeps the window, so either side may hold more.
+fn matching_suffix<'a>(ours: &'a [f32], a: &'a [f32], b: &'a [f32], width: usize) -> (&'a [f32], &'a [f32], &'a [f32], usize) {
+    assert_eq!(a.len(), b.len(), "the two upstream runs hold the same rows");
+    assert!(ours.len() % width == 0 && b.len() % width == 0, "rows of width {width}");
+    let n = ours.len().min(b.len()) / width;
+    assert!(n > 0, "no position held by both");
+    let tail = |v: &'a [f32]| &v[v.len() - n * width..];
+    (tail(ours), tail(a), tail(b), n)
+}
+
+/// A visit's held keys and values on the host, checked to end at its position.
+fn held_kv(st: &State) -> (Vec<f32>, Vec<f32>) {
+    let kv = &st.kv;
+    assert_eq!(kv.base() + kv.rows(), st.pos, "the cache ends at the visit's position");
+    let k = kv.keys().expect("a carried visit holds keys");
+    let v = kv.values().expect("a carried visit holds values");
+    assert_eq!(k.dims()[0], kv.rows());
+    assert_eq!(v.dims()[0], kv.rows());
+    (host(k), host(v))
+}
+
 /// Upstream's cache `[heads, n, d]` as Mary's rows `[n, heads * d]`.
 fn heads_to_rows(shape: &[usize], v: &[f32]) -> Vec<f32> {
     let (h, n, d) = (shape[0], shape[1], shape[2]);
@@ -234,10 +258,10 @@ fn main() {
             );
             let up = |run: &str| input(&format!("{run}.p1{prev}.{phase}.messages"));
             rep.row(&format!("p1{prev}:{phase}"), "messages", &m, &up("bf16"), &up("f32"));
-            m
+            Tensor::<Bk, 3>::from_data(TensorData::new(m, [n, 4, h]), &dev)
         });
         let state = states.entry(CacheId { layer: LAYER, pass }).or_insert_with(|| State::new(&layer.dims, &dev));
-        let (out, taps) = layer.forward_visit(rows(x, n), &mut blocks, state, ExpertAct::Bf16, messages.as_deref());
+        let (out, taps) = layer.forward_visit(rows(x, n), &mut blocks, state, ExpertAct::Bf16, messages.as_ref());
         assert_eq!(blocks.len(), 2, "layer 6 is a block boundary: its input joins the blocks once");
         let mut seen = vec![
             ("attn", host(taps.attn)),
@@ -250,13 +274,14 @@ fn main() {
         ];
         assert_eq!(taps.gates.is_some(), pass > 0);
         if let Some([q, k, v, m]) = taps.gates {
-            seen.extend([("gate_q", q), ("gate_k", k), ("gate_v", v), ("gate_mlp", m)]);
+            seen.extend([("gate_q", host(q)), ("gate_k", host(k)), ("gate_v", host(v)), ("gate_mlp", host(m))]);
         }
+        let (k, v) = held_kv(state);
         Seen {
             taps: seen,
             routing: taps.routing.iter().map(|(e, _)| e.iter().map(|&x| x as i32).collect()).collect(),
-            k: host(state.k.clone().unwrap()),
-            v: host(state.v.clone().unwrap()),
+            k,
+            v,
             conv: state.conv.iter().map(|c| host(c.clone())).collect(),
         }
     };
@@ -268,16 +293,17 @@ fn main() {
             rep.row(&tag, name, v, &up("bf16", name), &up("f32", name));
         }
         if carried {
-            // upstream's sliding layer keeps at most the window; Mary keeps every
-            // position and masks, so compare the rows upstream still holds
+            // upstream's sliding layer keeps at most the window and Mary's cache
+            // drops whole tiles, so compare the positions both still hold
             for (name, ours) in [("k", &seen.k), ("v", &seen.v)] {
                 let f = |run: &str| {
                     let (shape, v) = r.f32s(&format!("{run}.{visit}.{phase}.{name}"));
                     heads_to_rows(&shape, &v)
                 };
                 let (a, b) = (f("bf16"), f("f32"));
-                let tail = &ours[ours.len() - b.len()..];
-                rep.row(&tag, &format!("state {name} ({}r)", b.len() / (t.swa_num_key_value_heads * t.swa_head_dim)), tail, &a, &b);
+                let width = t.swa_num_key_value_heads * t.swa_head_dim;
+                let (ours, a, b, n) = matching_suffix(ours, &a, &b, width);
+                rep.row(&tag, &format!("state {name} ({n}r)"), ours, a, b);
             }
             for (i, ours) in seen.conv.iter().enumerate() {
                 let f = |run: &str| {

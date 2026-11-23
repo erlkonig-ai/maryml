@@ -31,8 +31,8 @@
 //! ```
 //!
 //! With no messages a core layer is exactly the visit above, so the first
-//! pass is independent of anything a later pass reads. The gates run on the
-//! host: one `[t, H]` download and up to four uploads per gated visit.
+//! pass is independent of anything a later pass reads. The messages and gates
+//! run on the device ([`DeviceGate`]), over all of a call's tokens at once.
 //!
 //! What is Mary's here: the BF16 projections ([`linear_bf16`]), the NVFP4
 //! expert GEMMs ([`linear_fp4`] / [`linear_w4a16`] over [`PackedW`]), the short
@@ -80,7 +80,7 @@ use crate::models::inkling2_loop::experts::nvfp4_scale2;
 use crate::models::inkling2_loop::layout::{
     AttnPart, ConvPart, Dtype, ExpertMat, ExpertPart, GatePart, LayerPart, Slot, Stream,
 };
-use crate::models::inkling2_loop::messages::{DownPrecision, MessageGate, message_slot};
+use crate::models::inkling2_loop::messages::{DeviceGate, DownPrecision, MessageGate, device_gates, message_tensor};
 
 pub(super) type Dev = burn::backend::cuda::CudaDevice;
 
@@ -265,8 +265,8 @@ pub struct SlidingLayer {
     mlp_sconv: Tensor<Bk, 2>,
     experts: Vec<Expert>,
     /// Core layers only: the Q, K, V and MLP message gates, in
-    /// [`message_slot`] order.
-    gates: Option<[MessageGate; 4]>,
+    /// [`super::messages::message_slot`] order.
+    gates: Option<[DeviceGate; 4]>,
 }
 
 pub(super) const STREAMS: [Stream; 4] = [Stream::Query, Stream::Key, Stream::Value, Stream::Mlp];
@@ -304,8 +304,8 @@ pub struct Taps {
     pub experts: Tensor<Bk, 2>,
     pub mlp_conv: Tensor<Bk, 2>,
     /// A gated visit's four message-gate outputs `[t, H]`, before their
-    /// norms, in [`message_slot`] order.
-    pub gates: Option<[Vec<f32>; 4]>,
+    /// norms, in [`super::messages::message_slot`] order, on the device.
+    pub gates: Option<[Tensor<Bk, 2>; 4]>,
 }
 
 impl SlidingLayer {
@@ -352,7 +352,7 @@ impl SlidingLayer {
 
         let router_bias = f32_le(want(w, l(LayerPart::GateBias), Dtype::F32, &[d.experts])?.bytes);
         let experts = bind_experts(w, &d, layer, &client)?;
-        let gates = bind_gates(w, t, layer)?;
+        let gates = bind_gates(w, t, layer, dev)?;
         Ok(SlidingLayer {
             layer,
             dims: d,
@@ -417,7 +417,7 @@ impl SlidingLayer {
         blocks: &mut Vec<Tensor<Bk, 2>>,
         state: &mut State,
         act: ExpertAct,
-        messages: Option<&[f32]>,
+        messages: Option<&Tensor<Bk, 3>>,
     ) -> (Tensor<Bk, 2>, Taps) {
         let d = self.dims;
         let [t, _] = x.dims();
@@ -429,25 +429,22 @@ impl SlidingLayer {
         };
         let gated = messages.map(|m| {
             let g = self.gates.as_ref().unwrap_or_else(|| panic!("layer {} reads no messages", self.layer));
-            assert_eq!(m.len(), t * 4 * d.hidden, "messages are [t, 4, H]");
+            assert_eq!(m.dims(), [t, 4, d.hidden], "messages are [t, 4, H]");
             (g, m)
         });
-        let message = |m: &[f32], s: Stream| message_of(m, s, t, d.hidden);
-        let upload = |v: Vec<f32>| Tensor::<Bk, 2>::from_data(TensorData::new(v, [t, d.hidden]), &dev);
         // upstream casts each normed input back to the layer dtype; here every
         // consumer of the three is a `linear_bf16`, whose entry is that cast
         let norm = |v: Tensor<Bk, 2>| rms_norm(v, self.attn_norm.clone(), d.eps);
-        let mut gate_out: Option<[Vec<f32>; 4]> = None;
+        let mut gate_out: Option<[Tensor<Bk, 2>; 4]> = None;
         let qkv = match gated {
             None => {
                 let hn = norm(h);
                 [hn.clone(), hn.clone(), hn]
             }
             Some((g, m)) => {
-                let hh: Vec<f32> = h.into_data().convert::<f32>().to_vec().expect("f32");
-                let [q, k, v] = [0, 1, 2].map(|j| g[j].apply(&hh, &message(m, STREAMS[j]), t));
-                let qkv = [norm(upload(q.clone())), norm(upload(k.clone())), norm(upload(v.clone()))];
-                gate_out = Some([q, k, v, Vec::new()]);
+                let [q, k, v] = [0, 1, 2].map(|j| g[j].apply(h.clone(), message_tensor(m, STREAMS[j])));
+                let qkv = [norm(q.clone()), norm(k.clone()), norm(v.clone())];
+                gate_out = Some([q.clone(), k, v, q]);
                 qkv
             }
         };
@@ -463,9 +460,8 @@ impl SlidingLayer {
         let mlp_input = block_attention(self.mlp_input.clone(), blocks, residual.clone());
         let mlp_in = match (gated, gate_out.as_mut()) {
             (Some((g, m)), Some(out)) => {
-                let hh: Vec<f32> = mlp_input.clone().into_data().convert::<f32>().to_vec().expect("f32");
-                out[3] = g[3].apply(&hh, &message(m, Stream::Mlp), t);
-                upload(out[3].clone())
+                out[3] = g[3].apply(mlp_input.clone(), message_tensor(m, Stream::Mlp));
+                out[3].clone()
             }
             _ => mlp_input.clone(),
         };
@@ -555,14 +551,15 @@ impl SlidingLayer {
     }
 }
 
-/// A core layer's four message gates (Q, K, V, MLP, in [`message_slot`]
-/// order) with the released model's BF16 down projection; `None` outside the
-/// core. Shared by the sliding and the full-attention core layers.
+/// A core layer's four message gates (Q, K, V, MLP, in [`super::messages::message_slot`]
+/// order) with the released model's BF16 down projection, bound on the
+/// device; `None` outside the core. Shared by the sliding and the full-attention core layers.
 pub(super) fn bind_gates(
     w: &dyn Weights,
     t: &Inkling2LoopTextConfig,
     layer: usize,
-) -> Result<Option<[MessageGate; 4]>, String> {
+    dev: &Dev,
+) -> Result<Option<[DeviceGate; 4]>, String> {
     if !t.is_core(layer) {
         return Ok(None);
     }
@@ -582,13 +579,8 @@ pub(super) fn bind_gates(
             DownPrecision::Bf16,
         )
     };
-    Ok(Some([gate(STREAMS[0])?, gate(STREAMS[1])?, gate(STREAMS[2])?, gate(STREAMS[3])?]))
-}
-
-/// The `[t, H]` message of stream `s` out of a visit's `[t, 4, H]` messages.
-pub(super) fn message_of(m: &[f32], s: Stream, t: usize, h: usize) -> Vec<f32> {
-    let j = message_slot(s);
-    (0..t).flat_map(|i| m[(i * 4 + j) * h..(i * 4 + j + 1) * h].iter().copied()).collect()
+    let host = [gate(STREAMS[0])?, gate(STREAMS[1])?, gate(STREAMS[2])?, gate(STREAMS[3])?];
+    Ok(Some(device_gates(&host, dev)))
 }
 
 /// Run one short convolution over `x`'s rows after the carried inputs in
