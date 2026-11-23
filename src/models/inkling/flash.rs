@@ -1086,7 +1086,7 @@ pub struct KeyRun<'a> {
 /// in each handle; `row0` belongs exclusively to the gap table.
 fn paired_full_pages(first: &KeyRun<'_>, second: &KeyRun<'_>, splits: usize, next_splits: usize) -> bool {
     let full = |r: &KeyRun<'_>| r.rows == 1024 && r.lo == 0 && r.hi == r.rows;
-    splits == 4 && next_splits == splits && full(first) && full(second)
+    (2..=4).contains(&splits) && next_splits == splits && full(first) && full(second)
         && first.base.checked_add(first.rows) == Some(second.base)
         && second.base <= (u32::MAX as usize) - (second.rows - 1)
 }
