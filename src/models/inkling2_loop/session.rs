@@ -57,6 +57,7 @@ use triblespace::prelude::Id;
 
 use crate::models::inkling::burn::rms_norm;
 use crate::models::inkling::seam::Bk;
+use crate::models::inkling2_loop::prof;
 use crate::models::inkling2_loop::config::{AttnKind, Inkling2LoopConfig, Inkling2LoopTextConfig};
 use crate::models::inkling2_loop::full::FullLayer;
 use crate::models::inkling2_loop::head::Head;
@@ -271,17 +272,22 @@ impl MiniModel {
         let t = self.config();
         let (n, h) = (ids.len(), t.hidden_size);
         let act = self.opts.experts;
-        let mut x = self.embed(ids);
+        prof::at(usize::MAX, 0);
+        let mut x = prof::span("embed", &self.dev, || self.embed(ids));
         let mut blocks: Vec<Tensor<Bk, 2>> = Vec::new();
         for (layer, st) in self.pre.iter().zip(caches.pre.iter_mut()) {
+            prof::at(layer.layer(), 0);
             x = layer.forward(x, &mut blocks, st, act);
         }
         let mut passes = self.core.forward(x, &blocks, &mut caches.core, act, 0, None, None);
         let last = passes.pop().expect("the core runs at least one pass");
         let (mut x, mut blocks) = (last.hidden, last.blocks);
         for (layer, st) in self.post.iter().zip(caches.post.iter_mut()) {
+            prof::at(layer.layer(), 0);
             x = layer.forward(x, &mut blocks, st, act);
         }
+        prof::at(usize::MAX, 0);
+        let head_t0 = prof::enabled().then(std::time::Instant::now);
         // the head, on the host, for the last `rows` rows only
         let tail = |v: Tensor<Bk, 2>| -> Vec<f32> {
             v.slice([n - rows..n, 0..h]).into_data().convert::<f32>().to_vec().expect("f32")
@@ -297,6 +303,9 @@ impl MiniModel {
         }
         let head = Head::from_root(t, &self.root).expect("checked at open");
         let out = head.forward(&stacked, nb, &partial);
+        if let Some(t0) = head_t0 {
+            prof::add("head_download_host", t0.elapsed().as_secs_f64());
+        }
         Logits { rows, vocab: head.vocab(), values: out.logits }
     }
 }

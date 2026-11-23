@@ -569,11 +569,12 @@ impl Bank {
     /// The router, then the experts in the lane `act` and `MINI_MOE` select:
     /// `[rows, H]` f32, and the routing on the device.
     pub fn forward(&self, d: &super::sliding::Dims, x: &Tensor<Bk, 2>, act: super::sliding::ExpertAct) -> (Tensor<Bk, 2>, Route) {
-        let route = self.route(x);
-        let out = match lane(act) {
+        let dev = x.device();
+        let route = super::prof::span("router", &dev, || self.route(x));
+        let out = super::prof::span("experts", &dev, || match lane(act) {
             Lane::Grouped => self.experts_grouped(x, &route),
             Lane::Loop => experts_loop(self, d, x, &route.picks(), act),
-        };
+        });
         (out, route)
     }
 

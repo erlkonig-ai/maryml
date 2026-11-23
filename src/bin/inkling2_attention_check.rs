@@ -148,6 +148,7 @@ fn run(args: &[String]) {
             Step::Call { n, rows } => {
                 let (secs, pool) = call(n, rows, &mut s, &mut at);
                 println!("call {n} tokens to position {at}: {secs:.2} s, pool {:.2} GiB", pool as f64 / (1u64 << 30) as f64);
+                mary::models::inkling2_loop::prof::report(&format!("call{n}@{at}"));
             }
             Step::Decode(d) => {
                 let t = Instant::now();

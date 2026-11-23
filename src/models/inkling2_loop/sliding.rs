@@ -71,6 +71,7 @@ use crate::models::inkling::burn::{
     PackedW, linear_bf16, linear_fp4, linear_w4a16, rms_norm, short_conv_window,
 };
 use crate::models::inkling::seam::{Bk, client_of};
+use crate::models::inkling2_loop::prof;
 use crate::models::inkling2_loop::attend::{AttnShape, KEY_TILE, Kv, QUERY_TILE, attend};
 use crate::models::inkling2_loop::config::Inkling2LoopTextConfig;
 use crate::models::inkling2_loop::experts::nvfp4_scale2;
@@ -418,7 +419,7 @@ impl SlidingLayer {
         let [t, _] = x.dims();
         let block_residual = x.clone();
         let h = match &self.attention_input {
-            Some(q) => block_attention(q.clone(), blocks, x.clone()),
+            Some(q) => prof::span("block_attn", &x.device(), || block_attention(q.clone(), blocks, x.clone())),
             None => x.clone(),
         };
         let gated = messages.map(|m| {
@@ -442,7 +443,7 @@ impl SlidingLayer {
                 qkv
             }
         };
-        let attn = self.attention(qkv, state);
+        let attn = prof::span("attention", &x.device(), || self.attention(qkv, state));
         let attn_conv = conv_step(&mut state.conv[2], attn.clone(), &self.attn_sconv, d.conv_scale());
 
         let residual = if self.is_block_boundary() {
