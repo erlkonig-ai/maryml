@@ -684,7 +684,8 @@ pub const GEMV_MAX_ROWS: usize = 16;
 /// a contiguous `[n, k]` weight. f32 products and an f32 plane-tree sum,
 /// where Burn's f32 matmul on this runtime is TF32 with an f32 accumulator;
 /// on the released gates every operand is a bf16 value, so the products are
-/// exact either way and only the summation order differs.
+/// exact either way and only the summation order differs. Callers whose
+/// operands are full f32 keep the matmul: TF32 and f32 products differ there.
 pub fn gemv(x: Tensor<Bk, 2>, w_t: &Tensor<Bk, 2>) -> Option<Tensor<Bk, 2>> {
     let [t, k] = x.dims();
     let [wk, n] = w_t.dims();

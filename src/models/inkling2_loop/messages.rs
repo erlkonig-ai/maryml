@@ -461,9 +461,16 @@ mod device {
                     if bf { round_bf16_dev(x) } else { x }
                 }
             };
-            let d = rows::gemv(x.clone(), &self.down_t).unwrap_or_else(|| x.matmul(self.down_t.clone()));
+            // The short-call GEMV only where every operand is a bf16 value, so
+            // its f32 products equal the TF32 matmul's: under F32 it would
+            // change the variant's arithmetic with the row count.
+            let mm = |a: Tensor<Bk, 2>, w: &Tensor<Bk, 2>| match bf.then(|| rows::gemv(a.clone(), w)).flatten() {
+                Some(y) => y,
+                None => a.matmul(w.clone()),
+            };
+            let d = mm(x, &self.down_t);
             let d = if bf { rows::round_to_bf16(d.clone()).unwrap_or_else(|| round_bf16_dev(d)) } else { d };
-            let fg = rows::gemv(d.clone(), &self.forget_gain_t).unwrap_or_else(|| d.matmul(self.forget_gain_t.clone()));
+            let fg = mm(d, &self.forget_gain_t);
             if let Some(out) = rows::gate_output(fg.clone(), hidden_states.clone(), message.clone()) {
                 return out;
             }
