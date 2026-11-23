@@ -297,8 +297,8 @@ pub const NATIVE_TEXT: &str = "the text forward (all 24 layers, the three-pass c
 /// The looped core, the cross-pass messages, the block attention residual,
 /// the attention variant, the dynamic K/V convolutions and the softcaps are
 /// native (`sliding`, `full`, `loop_core`, `head`, `session`), so they are not
-/// listed. What remains is feeding the (native) vision tower's features into
-/// the session, the drafter, and the activation
+/// listed. What remains is the image path around the session (the chat
+/// codec's placeholder spans and their callers), the drafter, and the activation
 /// quantisation `hf_quant_config.json` declares for the experts: the session
 /// multiplies BF16 activations, as upstream does, and never runs the declared
 /// NVFP4 `fouroversix_mae` or MXFP8 `e4m3` activation formats.
@@ -337,8 +337,9 @@ pub fn native_gaps(cfg: &Inkling2LoopConfig, experts: &BTreeMap<usize, Precision
         detail: format!(
             "{}-layer ViT with a class token and a merge-{} projector, not the original \
              Inkling's HMLP: preprocessing (vision_input), the tower and the projector \
-             (vision, held by inkling2_vision_check) are native, but the session's text \
-             stream takes no image features yet",
+             (vision, held by inkling2_vision_check) are native and the session takes their \
+             rows at the image placeholders (append_with_image_rows), but no chat codec here \
+             lays out the placeholder spans yet",
             cfg.vision_config.num_hidden_layers, cfg.vision_config.adapter_merge_size
         ),
     });

@@ -547,6 +547,13 @@ required-features = ["inkling2-session", "inkling2-head-check"]
 name = "inkling2_vision_check"
 required-features = ["inkling2-vision-check"]
 
+# Images through the Mini session (append_with_image_rows) against upstream's whole
+# run of a two-image prompt (capture_inkling2_images.py): decoder input, logits,
+# chunks split inside the placeholders, refusals, text unchanged, negative controls.
+[[bin]]
+name = "inkling2_session_image_check"
+required-features = ["inkling2-session", "inkling2-vision-check"]
+
 # Inkling 2 Mini from the embedding through layer 5, chained, from a pile root,
 # against transformers' own run of the same layers (golden/capture_inkling2_chain5.py).
 [[bin]]
