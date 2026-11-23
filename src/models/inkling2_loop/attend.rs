@@ -42,9 +42,11 @@
 
 use burn::prelude::*;
 use burn::tensor::{DType, Int};
+use cubecl::server::Handle;
 
 use crate::models::inkling::flash::{self, KeyRun, KvElem};
 use crate::models::inkling::seam::{Bk, client_of, handle_of, handle_of_any, tensor_of};
+use crate::models::inkling2_loop::attend_mma;
 
 /// Rows of one key/value segment, and so of one key tile.
 pub const KEY_TILE: usize = 1024;
@@ -54,13 +56,10 @@ pub const QUERY_TILE: usize = 1024;
 
 /// Calls of at most this many queries (a decode step, a short draft) take the
 /// fused flash-decoding kernel ([`crate::models::inkling::flash`]): one launch
-/// per key segment and one to merge, where the tiled loop below launches a
-/// chain of about twenty per segment. Longer calls keep the tiled loop.
+/// per key segment and one to merge. Longer calls take the tensor-core kernel
+/// ([`super::attend_mma`]) where it covers the shape, and otherwise the tiled
+/// loop below, which launches a chain of about twenty per segment.
 pub const FUSED_MAX_QUERIES: usize = 16;
-
-/// The most bytes the fused kernel's partial outputs take in one block of
-/// queries (one `[queries, heads, head_dim]` f32 slot per key run).
-pub const FUSED_PARTIAL_BYTES: usize = 512 << 20;
 
 /// One visit's keys and values: post-clip K and post-norm V `[rows, kv_dim]`
 /// in BF16 (upstream's clip and norm hand back the layer's dtype, and its
@@ -208,12 +207,14 @@ pub fn attend(
     let [_, d_rel] = rel.dims();
     assert_eq!(heads, a.heads, "q carries the shape's heads");
     assert_eq!(kv.end(), first + t, "the cache holds exactly the keys up to the call's last query");
-    // Every call takes the fused kernel: a short one with the decode tile, a
-    // long one with the wider prefill tile, a block of queries at a time.
-    let groups = heads / a.kv_heads;
-    let rows = if t <= FUSED_MAX_QUERIES { flash::decode_rows(groups) } else { flash::prefill_rows(groups) };
-    if flash::applies(heads, a.kv_heads, hd, rows) && kv.rows() > 0 {
-        return attend_fused(a, q, rel, rel_proj, sinks, kv, first, rows, query_tile);
+    if t > FUSED_MAX_QUERIES && attend_mma::applies(heads, a.kv_heads, hd) {
+        return attend_blocks(a, q, rel, rel_proj, sinks, kv, first, query_tile);
+    }
+    if t <= FUSED_MAX_QUERIES {
+        let rows = flash::decode_rows(heads / a.kv_heads);
+        if flash::applies(heads, a.kv_heads, hd, rows) && kv.rows() > 0 {
+            return attend_fused(a, q, rel, rel_proj, sinks, kv, first, rows);
+        }
     }
     let (kvh, e) = (a.kv_heads, a.rel_extent);
     let rep = heads / kvh;
@@ -286,13 +287,92 @@ pub fn attend(
     if outs.len() == 1 { outs.pop().expect("one tile") } else { Tensor::cat(outs, 0) }
 }
 
-/// [`attend`] through the fused kernel, a block of queries at a time: the
-/// relative-bias table `[block, heads, rel_extent]` is built here (the same
-/// product the tiled loop takes per query tile), and each held segment a
-/// query of the block can see is one key run whose live rows are its filled
-/// ones. Causality, the window and the distance bias are the kernel's, per
-/// (query, key) cell; the sink enters each row's denominator in the merge.
-/// `rows` is the cube's `(head, query)` row count.
+/// [`attend`] on tensor cores ([`attend_mma`]), a block of `query_tile` queries
+/// at a time: the block's relative-bias table, then one launch per segment it
+/// can see, the running softmax carried between them.
+#[allow(clippy::too_many_arguments)]
+fn attend_blocks(
+    a: &AttnShape,
+    q: Tensor<Bk, 3>,
+    rel: Tensor<Bk, 2>,
+    rel_proj: &Tensor<Bk, 2>,
+    sinks: Tensor<Bk, 2>,
+    kv: &Kv,
+    first: usize,
+    query_tile: usize,
+) -> Tensor<Bk, 2> {
+    let [t, heads, hd] = q.dims();
+    let [_, d_rel] = rel.dims();
+    let dev = q.device();
+    let client = client_of(&q);
+    let scale = (hd as f32).powf(-0.5);
+    let q = q.reshape([t, heads * hd]).cast(DType::BF16);
+    let held = held_segments(kv);
+    let mut outs = Vec::with_capacity(t.div_ceil(query_tile));
+    let mut i0 = 0;
+    while i0 < t {
+        let tq = query_tile.min(t - i0);
+        let p0 = first + i0;
+        let runs = visible_runs(&held, a.window, p0, tq);
+        let table = rel.clone().slice([i0 * heads..(i0 + tq) * heads, 0..d_rel]).matmul(rel_proj.clone());
+        let (q_h, _) = handle_of_any(q.clone().slice([i0..i0 + tq, 0..heads * hd]));
+        let rel_h = handle_of(table);
+        let sink_h = handle_of(sinks.clone().slice([i0..i0 + tq, 0..heads]));
+        let out = attend_mma::attend_mma_launch(
+            &client, &q_h, &runs, &rel_h, &sink_h, tq, p0, heads, a.kv_heads, hd, a.rel_extent, a.window, scale,
+        );
+        outs.push(tensor_of(client.clone(), dev.clone(), out, tq, heads * hd));
+        i0 += tq;
+    }
+    if outs.len() == 1 { outs.pop().expect("one block") } else { Tensor::cat(outs, 0) }
+}
+
+/// One held segment's handles: keys, values, allocated rows, absolute position
+/// of row 0, filled rows.
+struct Held {
+    k: Handle,
+    v: Handle,
+    rows: usize,
+    base: usize,
+    filled: usize,
+}
+
+fn held_segments(kv: &Kv) -> Vec<Held> {
+    kv.whole_segments()
+        .map(|(base, k, v, filled)| {
+            let [rows, _] = k.dims();
+            let (k, dt) = handle_of_any(k.clone());
+            let (v, _) = handle_of_any(v.clone());
+            assert_eq!(dt, DType::BF16, "the cache holds BF16");
+            Held { k, v, rows, base, filled }
+        })
+        .collect()
+}
+
+/// The segments with a key some query of `p0 .. p0 + tq` can see, as key runs.
+fn visible_runs(held: &[Held], window: Option<usize>, p0: usize, tq: usize) -> Vec<KeyRun<'_>> {
+    held.iter()
+        .filter(|s| s.base < p0 + tq && window.is_none_or(|w| s.base + s.filled + w > p0 + 1))
+        .map(|s| KeyRun {
+            k: &s.k,
+            v: &s.v,
+            k_scales: None,
+            v_scales: None,
+            rows: s.rows,
+            base: s.base,
+            lo: 0,
+            hi: s.filled,
+            row0: 0,
+        })
+        .collect()
+}
+
+/// [`attend`] for a short call, through the fused kernel: the relative-bias
+/// table `[t, heads, rel_extent]` is built here (the same product the tiled
+/// loop takes per query tile), and every held segment a query can see is one
+/// key run whose live rows are its filled ones. Causality, the window and the
+/// distance bias are the kernel's, per (query, key) cell; the sink enters each
+/// row's denominator in the merge.
 #[allow(clippy::too_many_arguments)]
 fn attend_fused(
     a: &AttnShape,
@@ -303,65 +383,22 @@ fn attend_fused(
     kv: &Kv,
     first: usize,
     rows: usize,
-    query_tile: usize,
 ) -> Tensor<Bk, 2> {
     let [t, heads, hd] = q.dims();
-    let [_, d_rel] = rel.dims();
     let dev = q.device();
     let client = client_of(&q);
+    let table = rel.matmul(rel_proj.clone());
+    let q_h = handle_of(q.reshape([t, heads * hd]));
+    let rel_h = handle_of(table);
+    let sink_h = handle_of(sinks);
+    let held = held_segments(kv);
+    let runs = visible_runs(&held, a.window, first, t);
     let scale = (hd as f32).powf(-0.5);
-    let q = q.reshape([t, heads * hd]);
-    let mut elem = KvElem::F32;
-    let held: Vec<_> = kv
-        .whole_segments()
-        .map(|(base, k, v, filled)| {
-            let [tile, _] = k.dims();
-            let (kh, dt) = handle_of_any(k.clone());
-            let (vh, _) = handle_of_any(v.clone());
-            if dt == burn::tensor::DType::BF16 {
-                elem = KvElem::Bf16;
-            }
-            (kh, vh, tile, base, filled)
-        })
-        .collect();
-    let mut outs = Vec::new();
-    let mut i0 = 0;
-    while i0 < t {
-        // a block's partials are one `[queries, heads, head_dim]` slot per
-        // key run, so a long cache takes fewer queries at once
-        let cap = FUSED_PARTIAL_BYTES / (held.len() * heads * hd * 4);
-        let tq = query_tile.min(cap.max(1)).min(t - i0);
-        let p0 = first + i0;
-        let runs: Vec<KeyRun<'_>> = held
-            .iter()
-            .filter(|(_, _, _, base, filled)| {
-                let past = *base < p0 + tq;
-                let in_window = a.window.is_none_or(|w| base + filled + w > p0 + 1);
-                past && in_window
-            })
-            .map(|(k, v, tile, base, filled)| KeyRun {
-                k,
-                v,
-                k_scales: None,
-                v_scales: None,
-                rows: *tile,
-                base: *base,
-                lo: 0,
-                hi: *filled,
-                row0: 0,
-            })
-            .collect();
-        let table = rel.clone().slice([i0 * heads..(i0 + tq) * heads, 0..d_rel]).matmul(rel_proj.clone());
-        let q_h = handle_of(q.clone().slice([i0..i0 + tq, 0..heads * hd]));
-        let rel_h = handle_of(table);
-        let sink_h = handle_of(sinks.clone().slice([i0..i0 + tq, 0..heads]));
-        let out = flash::flash_attention_launch_sinked(
-            &client, &q_h, &runs, &rel_h, &sink_h, elem, tq, p0, heads, a.kv_heads, hd, a.rel_extent, a.window, scale, rows,
-        );
-        outs.push(tensor_of(client.clone(), dev.clone(), out, tq, heads * hd));
-        i0 += tq;
-    }
-    if outs.len() == 1 { outs.pop().expect("one block") } else { Tensor::cat(outs, 0) }
+    let out = flash::flash_attention_launch_sinked(
+        &client, &q_h, &runs, &rel_h, &sink_h, KvElem::Bf16, t, first, heads, a.kv_heads, hd, a.rel_extent, a.window, scale,
+        rows,
+    );
+    tensor_of(client, dev, out, t, heads * hd)
 }
 
 #[cfg(test)]
@@ -471,15 +508,15 @@ mod tests {
             let dev = Dev::default();
             let mut r = Lcg(seed);
             let (h, kvd) = (a.heads, a.kv_heads * a.head_dim);
-            let q = r.vec(n * h * a.head_dim, 2.0);
+            // BF16 values, so the rounding of Q, K and V changes nothing
+            let bf = |v: Vec<f32>| -> Vec<f32> { v.into_iter().map(|x| half::bf16::from_f32(x).to_f32()).collect() };
+            let q = bf(r.vec(n * h * a.head_dim, 2.0));
             let rel = r.vec(n * h * d_rel, 1.0);
             let mut sinks = r.vec(n * h, 2.0);
             // a sink-dominated row: every head of position 7 sinks hard
             for x in &mut sinks[7 * h..8 * h] {
                 *x = 60.0;
             }
-            // BF16 values, so the cache's rounding changes nothing
-            let bf = |v: Vec<f32>| -> Vec<f32> { v.into_iter().map(|x| half::bf16::from_f32(x).to_f32()).collect() };
             let k = bf(r.vec(n * kvd, 1.0));
             let v = bf(r.vec(n * kvd, 1.0));
             let rel_proj = up(r.vec(d_rel * a.rel_extent, 1.0), [d_rel, a.rel_extent], &dev);
@@ -759,6 +796,37 @@ mod tests {
                 let want: Vec<f32> = (0..h).flat_map(|hh| c.v[(j * kvh + hh / (h / kvh)) * hd..][..hd].to_vec()).collect();
                 let d = got[p * width..(p + 1) * width].iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
                 assert!(d < 5e-2, "plan {plan:?}: query {p} should return v[{j}] (biased at distance {}), is {d} away", e - 1);
+            }
+        }
+    }
+
+    /// The kernels without the bias table's own rounding: one-hot relative
+    /// states over a BF16 profile make the table exact, so what is left is the
+    /// attention's arithmetic against the f64 definition, for long calls (the
+    /// tensor-core kernel) and for single tokens (the fused kernel) alike. The
+    /// tests above cannot see this: the f32 matmul that builds a random table
+    /// is about 1e-3 from exact.
+    #[test]
+    fn the_kernels_match_the_definition_given_an_exact_table() {
+        for (window, e, n) in [(Some(48), 48, 203), (None, 40, 211)] {
+            let mut c = Case::new(small(window, e), 4, n, 61);
+            for (i, x) in c.rel.iter_mut().enumerate() {
+                *x = if i % 4 == i / 4 % 4 { 1.0 } else { 0.0 };
+            }
+            let mut r = Lcg(62);
+            let proj = r.vec(4 * e, 1.0).into_iter().map(|x| half::bf16::from_f32(x).to_f32()).collect();
+            c.rel_proj = up(proj, [4, e], &c.dev);
+            let exact = c.exact();
+            let width = c.a.heads * c.a.head_dim;
+            for (label, plan, kt, qt) in [
+                ("one call", vec![n], 1024, 1024),
+                ("one call, small tiles", vec![n], 16, 40),
+                ("single tokens", vec![1; n], 16, 12),
+            ] {
+                let got = c.tiled(&plan, kt, qt);
+                let (d, row) = worst(&got, &exact, width);
+                println!("window {window:?} {label}: worst abs {d:.3e} at position {row}");
+                assert!(d < 2e-5, "window {window:?} {label}: {d} from exact at position {row}");
             }
         }
     }

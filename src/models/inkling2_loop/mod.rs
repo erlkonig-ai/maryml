@@ -67,6 +67,8 @@ pub mod schedule;
 #[cfg(feature = "inkling-cuda")]
 pub mod attend;
 #[cfg(feature = "inkling-cuda")]
+mod attend_mma;
+#[cfg(feature = "inkling-cuda")]
 pub mod loop_core;
 #[cfg(feature = "inkling-cuda")]
 pub mod full;
