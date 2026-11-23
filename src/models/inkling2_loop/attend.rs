@@ -41,7 +41,7 @@
 //! probabilities), never one as wide as the prompt.
 
 use burn::prelude::*;
-use burn::tensor::Int;
+use burn::tensor::{DType, Int};
 
 use crate::models::inkling::flash::{self, KeyRun, KvElem};
 use crate::models::inkling::seam::{Bk, client_of, handle_of, handle_of_any, tensor_of};
@@ -62,8 +62,9 @@ pub const FUSED_MAX_QUERIES: usize = 16;
 /// queries (one `[queries, heads, head_dim]` f32 slot per key run).
 pub const FUSED_PARTIAL_BYTES: usize = 512 << 20;
 
-/// One visit's keys and values: post-clip K and post-norm V `[rows, kv_dim]`,
-/// in segments of `tile` rows, oldest first, from absolute position `base`.
+/// One visit's keys and values: post-clip K and post-norm V `[rows, kv_dim]`
+/// in BF16 (upstream's clip and norm hand back the layer's dtype, and its
+/// cache holds that), in segments of `tile` rows, oldest first, from absolute position `base`.
 pub struct Kv {
     tile: usize,
     base: usize,
@@ -103,15 +104,17 @@ impl Kv {
         self.segs.len() * self.tile
     }
 
-    /// Append `k` and `v` (`[t, kv_dim]`) at positions `end() ..`.
+    /// Append `k` and `v` (`[t, kv_dim]`) at positions `end() ..`, rounded to
+    /// BF16.
     pub fn append(&mut self, k: Tensor<Bk, 2>, v: Tensor<Bk, 2>) {
+        let (k, v) = (k.cast(DType::BF16), v.cast(DType::BF16));
         let [t, c] = k.dims();
         assert_eq!(v.dims(), [t, c], "keys and values are the same shape");
         let mut i = 0;
         while i < t {
             if self.segs.is_empty() || self.last == self.tile {
-                let dev = k.device();
-                self.segs.push([Tensor::zeros([self.tile, c], &dev), Tensor::zeros([self.tile, c], &dev)]);
+                let opts = (&k.device(), DType::BF16);
+                self.segs.push([Tensor::zeros([self.tile, c], opts), Tensor::zeros([self.tile, c], opts)]);
                 self.last = 0;
             }
             let take = (self.tile - self.last).min(t - i);
@@ -157,10 +160,10 @@ impl Kv {
 
     fn joined(&self, which: usize) -> Option<Tensor<Bk, 2>> {
         let parts: Vec<Tensor<Bk, 2>> = self.segments().map(|(_, k, v)| if which == 0 { k } else { v }).collect();
-        (!parts.is_empty()).then(|| Tensor::cat(parts, 0))
+        (!parts.is_empty()).then(|| Tensor::cat(parts, 0).cast(DType::F32))
     }
 
-    /// Every key held, `[rows, kv_dim]`, as one tensor: for the comparison
+    /// Every key held, `[rows, kv_dim]`, as one f32 tensor: for the comparison
     /// binaries, which line a short cache up with upstream's.
     pub fn keys(&self) -> Option<Tensor<Bk, 2>> {
         self.joined(0)
@@ -246,6 +249,7 @@ pub fn attend(
             if a.window.is_some_and(|w| near >= w as i64) {
                 continue;
             }
+            let (k, v) = (k.cast(DType::F32), v.cast(DType::F32));
             let kt = k.reshape([tk, kvh, hd]).swap_dims(0, 1).swap_dims(1, 2);
             let mut s = qt.clone().matmul(kt).mul_scalar(scale).reshape([heads, tq, tk]);
             let need_mask = near < 0 || a.window.is_some_and(|w| far >= w as i64);
@@ -474,8 +478,10 @@ mod tests {
             for x in &mut sinks[7 * h..8 * h] {
                 *x = 60.0;
             }
-            let k = r.vec(n * kvd, 1.0);
-            let v = r.vec(n * kvd, 1.0);
+            // BF16 values, so the cache's rounding changes nothing
+            let bf = |v: Vec<f32>| -> Vec<f32> { v.into_iter().map(|x| half::bf16::from_f32(x).to_f32()).collect() };
+            let k = bf(r.vec(n * kvd, 1.0));
+            let v = bf(r.vec(n * kvd, 1.0));
             let rel_proj = up(r.vec(d_rel * a.rel_extent, 1.0), [d_rel, a.rel_extent], &dev);
             Case { a, d_rel, n, q, rel, sinks, k, v, rel_proj, dev }
         }
