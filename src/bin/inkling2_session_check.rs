@@ -147,6 +147,9 @@ fn replay(model: &Arc<MiniModel>, ids: &[u32]) -> Logits {
 }
 
 fn main() {
+    // Mini's pool policy is the Inkling engine's: exclusive pages unless the
+    // operator set CUBECL_MEMORY_CONFIG. It must run before any CUDA context.
+    mary::models::inkling::pool::choose_memory_config();
     let args: Vec<String> = std::env::args().collect();
     let (pile, collection, root, ids, prompt) = (&args[1], &args[2], &args[3], &args[4], &args[5]);
     let flag = |name: &str| args.iter().position(|a| a == name).map(|i| args[i + 1].clone());

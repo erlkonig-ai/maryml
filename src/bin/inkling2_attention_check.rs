@@ -249,6 +249,9 @@ fn compare(args: &[String]) {
 }
 
 fn main() {
+    // Mini's pool policy is the Inkling engine's: exclusive pages unless the
+    // operator set CUBECL_MEMORY_CONFIG. It must run before any CUDA context.
+    mary::models::inkling::pool::choose_memory_config();
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("run") if args.len() >= 8 => run(&args[2..]),
