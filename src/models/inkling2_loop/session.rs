@@ -287,14 +287,14 @@ impl MiniModel {
             x = layer.forward(x, &mut blocks, st, act);
         }
         prof::at(usize::MAX, 0);
-        let head_t0 = prof::enabled().then(std::time::Instant::now);
         // the head, on the host, for the last `rows` rows only
         let tail = |v: Tensor<Bk, 2>| -> Vec<f32> {
             v.slice([n - rows..n, 0..h]).into_data().convert::<f32>().to_vec().expect("f32")
         };
         let nb = blocks.len();
-        let host_blocks: Vec<Vec<f32>> = blocks.into_iter().map(tail).collect();
-        let partial = tail(x);
+        let (host_blocks, partial): (Vec<Vec<f32>>, Vec<f32>) =
+            prof::span("head_download", &self.dev, || (blocks.into_iter().map(tail).collect(), tail(x)));
+        let head_t0 = prof::enabled().then(std::time::Instant::now);
         let mut stacked = Vec::with_capacity(rows * nb * h);
         for r in 0..rows {
             for b in &host_blocks {
@@ -302,10 +302,10 @@ impl MiniModel {
             }
         }
         let head = Head::from_root(t, &self.root).expect("checked at open");
-        let out = head.forward(&stacked, nb, &partial);
         if let Some(t0) = head_t0 {
-            prof::add("head_download_host", t0.elapsed().as_secs_f64());
+            prof::add("head_rebind_host", t0.elapsed().as_secs_f64());
         }
+        let out = prof::span("head_forward_host", &self.dev, || head.forward(&stacked, nb, &partial));
         Logits { rows, vocab: head.vocab(), values: out.logits }
     }
 }

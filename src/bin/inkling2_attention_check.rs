@@ -162,6 +162,7 @@ fn run(args: &[String]) {
                     t.elapsed().as_secs_f64() / d.max(1) as f64,
                     last.1 as f64 / (1u64 << 30) as f64
                 );
+                mary::models::inkling2_loop::prof::report(&format!("decode{d}@{at}"));
             }
         }
     }
