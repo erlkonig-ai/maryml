@@ -7,8 +7,8 @@
 //!
 //! Per prompt: `off` is [`MiniSession::decode`], one target pass per token.
 //! `on` at depth `k` is one draft block and one target pass of `k + 1` tokens,
-//! the rejected ones taken back. Times are wall, after the prompt; the prompt
-//! is prefilled with the hidden states tapped in both.
+//! the rejected ones taken back. Times are wall, after the prompt, whose
+//! prefill is not timed. `on` taps the hidden states; `off` does not.
 //!
 //! usage: inkling2_speculate <pile> <collection> <root> <dir of NAME.ids/NAME.json> <names,comma> <new tokens> <depths,comma> <out.json>
 //!
