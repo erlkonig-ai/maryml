@@ -66,7 +66,7 @@ use crate::models::inkling::seam::client_of;
 use burn::tensor::FloatDType;
 use burn::tensor::activation::softmax;
 use crate::models::inkling::seam::Bk;
-use crate::models::inkling2_loop::prof;
+use crate::models::inkling2_loop::{prof, steptrace};
 use crate::models::inkling2_loop::config::{AttnKind, Inkling2LoopConfig, Inkling2LoopTextConfig};
 use crate::models::inkling2_loop::full::FullLayer;
 use crate::models::inkling2_loop::head::{self, Head};
@@ -355,7 +355,11 @@ impl MiniModel {
         // The head needs only the requested trailing rows.
         let tail = |v: Tensor<Bk, 2>| v.slice([n - rows..n, 0..h]);
         let logits = self.head.forward(blocks.into_iter().map(tail).collect(), tail(x));
-        let values = logits.into_data().convert::<f32>().to_vec().expect("f32");
+        steptrace::mark("built", 0, 0);
+        let data = logits.into_data();
+        steptrace::mark("read", 0, 0);
+        let values = data.convert::<f32>().to_vec().expect("f32");
+        steptrace::mark("values", 0, 0);
         Logits { rows, vocab: self.head.vocab, values }
     }
 }
@@ -460,6 +464,7 @@ impl MiniSession {
         let call = || {
             let logits = model.forward(ids, caches, rows);
             caches.check_router();
+            steptrace::mark("fault", 0, 0);
             logits
         };
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(call)) {

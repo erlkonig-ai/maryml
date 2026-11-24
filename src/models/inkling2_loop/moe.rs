@@ -427,6 +427,11 @@ impl Bank {
         let dev = x.device();
         assert!(fault.dev == dev, "moe: a fault cell on {:?} for x on {dev:?}", fault.dev);
         let route = super::prof::span("router", &dev, || self.route(x));
+        if super::steptrace::counting() {
+            let picks = route.picks();
+            let distinct: std::collections::BTreeSet<usize> = picks.iter().flat_map(|(e, _)| e.iter().copied()).collect();
+            super::steptrace::add_distinct(picks.len(), distinct.len());
+        }
         let out = super::prof::span("experts", &dev, || self.experts_grouped(x, &route, fault));
         (out, route)
     }

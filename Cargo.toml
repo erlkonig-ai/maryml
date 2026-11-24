@@ -538,6 +538,12 @@ required-features = ["inkling2-session"]
 name = "inkling2_attention_check"
 required-features = ["inkling2-session", "inkling2-head-check"]
 
+# One-stream decode of a Mini session, timed per step from the host: generated
+# tokens, and the same forced tokens at several rows per call.
+[[bin]]
+name = "inkling2_step_profile"
+required-features = ["inkling2-session"]
+
 # Inkling 2 Mini from the embedding through layer 5, chained, from a pile root,
 # against transformers' own run of the same layers (golden/capture_inkling2_chain5.py).
 [[bin]]

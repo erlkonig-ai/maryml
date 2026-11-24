@@ -45,6 +45,7 @@ pub fn enabled() -> bool {
 
 /// The layer and pass the next phases belong to.
 pub fn at(layer: usize, pass: usize) {
+    super::steptrace::mark("at", layer, pass);
     if enabled() {
         *CTX.lock().unwrap() = (layer, pass);
     }

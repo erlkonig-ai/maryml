@@ -85,6 +85,8 @@ pub mod session;
 #[cfg(feature = "inkling-cuda")]
 pub mod prof;
 #[cfg(feature = "inkling-cuda")]
+pub mod steptrace;
+#[cfg(feature = "inkling-cuda")]
 pub mod rows;
 
 pub use config::{Family, Inkling2LoopConfig, family_of, family_of_str};
