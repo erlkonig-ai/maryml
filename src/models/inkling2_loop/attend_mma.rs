@@ -5,7 +5,7 @@
 //! [`crate::models::inkling::flash`]'s kernel multiplies in f32 on the plain
 //! lanes; it is bound by the bytes a cube reads per row it serves. Here a cube
 //! serves [`rows_per_cube`] rows from one staged key tile, on
-//! `mma.sync.m16n8k16`. The staging, the fragment maps and the P split are
+//! `mma.sync.m16n8k16`. The staging and the fragment maps are
 //! Nemotron-H's phase-A BF16 kernel
 //! ([`crate::models::nemotron_h`], mary d36d7ef); what differs is Mini's shape
 //! (three query heads per KV head, so a fragment's sixteen rows are sixteen
@@ -32,8 +32,9 @@
 //! # Precision
 //!
 //! Q, K and V are BF16, which is what upstream's clips and norms hand to its
-//! attention. The scores and the softmax are f32. P enters `P V` as two BF16
-//! operands, `hi = bf16(p)` and `lo = bf16(p - hi)`, into one f32 accumulator.
+//! attention. The scores and the softmax are f32. P is rounded to BF16 for
+//! `P V`, as upstream casts its softmax to the query's dtype; the accumulator
+//! is f32, and the denominator is the unrounded softmax's.
 
 use cubecl::{ir::MatrixIdent, prelude::*, server::Handle};
 use half::bf16;
@@ -370,18 +371,11 @@ fn attend_mma_kernel<N: Size>(
         // --- O += P V: P's A fragment is two adjacent S accumulator tiles
         #[unroll]
         for kk in 0..pv_steps {
-            let mut ph = Array::<Vector<bf16, N>>::new(vc_a);
-            let mut pl = Array::<Vector<bf16, N>>::new(vc_a);
+            let mut p = Array::<Vector<bf16, N>>::new(vc_a);
             #[unroll]
             for i in 0..vc_c {
-                let s0 = sacc[(kk * 2usize) * vc_c + i];
-                let s1 = sacc[(kk * 2usize + 1usize) * vc_c + i];
-                let h0 = Vector::<bf16, N>::cast_from(s0);
-                let h1 = Vector::<bf16, N>::cast_from(s1);
-                ph[i] = h0;
-                ph[i + vc_c] = h1;
-                pl[i] = Vector::<bf16, N>::cast_from(s0 - Vector::<f32, N>::cast_from(h0));
-                pl[i + vc_c] = Vector::<bf16, N>::cast_from(s1 - Vector::<f32, N>::cast_from(h1));
+                p[i] = Vector::<bf16, N>::cast_from(sacc[(kk * 2usize) * vc_c + i]);
+                p[i + vc_c] = Vector::<bf16, N>::cast_from(sacc[(kk * 2usize + 1usize) * vc_c + i]);
             }
             #[unroll]
             for dt in 0..dim_tiles {
@@ -398,11 +392,10 @@ fn attend_mma_kernel<N: Size>(
                 for i in 0..vc_c {
                     c[i] = of[dt * vc_c + i];
                 }
-                let d = def.execute(&ph, &b, &c);
-                let d2 = def.execute(&pl, &b, &d);
+                let d = def.execute(&p, &b, &c);
                 #[unroll]
                 for i in 0..vc_c {
-                    of[dt * vc_c + i] = d2[i];
+                    of[dt * vc_c + i] = d[i];
                 }
             }
         }
