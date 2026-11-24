@@ -531,6 +531,12 @@ required-features = ["inkling-cuda", "inkling2-head-check"]
 name = "inkling2_session_check"
 required-features = ["inkling2-session"]
 
+# Chat and loss requests as JSON lines on stdin, answered one at a time on stdout
+# by a Mini session each, from a pile root.
+[[bin]]
+name = "inkling2_answer"
+required-features = ["inkling2-session"]
+
 # Fixed tokens through a Mini session by a call plan, every returned row written
 # with its position; and a row-by-row comparison of two such runs (attention
 # footprint work: old vs new code, chunked vs one-shot).
