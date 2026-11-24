@@ -315,7 +315,7 @@ pub fn native_gaps(cfg: &Inkling2LoopConfig, experts: &BTreeMap<usize, Precision
         gaps.push(Gap {
             what: "MXFP8 device GEMM",
             detail: format!(
-                "layers {mxfp8:?}: the weights decode exactly to BF16 on the host, the activations \
+                "layers {mxfp8:?}: the weights decode exactly to BF16, the activations \
                  round to the declared 'mxfp8_e4m3' and both multiply as BF16; an FP8 MMA is not run"
             ),
         });

@@ -108,6 +108,8 @@ pub(super) enum Stack {
     /// expert `e`'s first code byte and first scale byte, the table
     /// [`fp4_linear_grouped_planes_launch_as`] reads.
     Nvfp4 { codes: Handle, scales: Handle, scale2: Handle, off: Handle },
+    /// E4M3 codes and UE8M0 scales in the grouped consumer's fragment order.
+    Mxfp8 { codes: Handle, scales: Handle },
     /// BF16 (MXFP8 decoded exactly): `[E * n, k]`, and the per-expert element
     /// offsets `[E]` u64 that [`bf16_linear_grouped_launch`] indexes.
     Bf16 { w: Handle, off: Handle },
@@ -531,13 +533,14 @@ impl Bank {
     /// One MXFP8 projection as the BF16 GEMM multiplies it: `[m, n]` f32 from
     /// the MXFP8-rounded activations `a` (`[m, k]` BF16).
     fn project_mxfp8(&self, client: &Client, p: &Proj, a: &Handle, plan: &Plan) -> Handle {
-        let Stack::Bf16 { w, off } = &p.stack else {
-            panic!("project_mxfp8: a projection decoded to BF16 only");
-        };
-        let bytes = self.experts * p.n * p.k * 2;
-        bf16_linear_grouped_launch(
-            client, a, w, bytes, &plan.blk, off, self.experts, plan.max_tiles * MTILE, p.k, p.n,
-        )
+        let m = plan.max_tiles * MTILE;
+        match &p.stack {
+            Stack::Mxfp8 { codes, scales } => super::mxfp8::project(client, a, codes, scales, &plan.blk, m, p.n, p.k),
+            Stack::Bf16 { w, off } => bf16_linear_grouped_launch(
+                client, a, w, self.experts * p.n * p.k * 2, &plan.blk, off, self.experts, m, p.k, p.n,
+            ),
+            Stack::Nvfp4 { .. } => unreachable!("MXFP8 projection on an NVFP4 bank"),
+        }
     }
 
     /// The grouped experts over `x` (`[rows, H]`) routed by `route`:
@@ -1255,6 +1258,7 @@ mod tests {
                 };
                 linear_w4a16(x, &w)
             }
+            Stack::Mxfp8 { .. } => unreachable!("the synthetic dense oracle uses BF16 weights"),
             Stack::Bf16 { w, .. } => {
                 linear_bf16(x, &Bf16W { h: slice(w, p.n * p.k * 2), n: p.n, k: p.k, align: 16 })
             }

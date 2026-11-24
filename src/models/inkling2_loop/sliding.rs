@@ -49,8 +49,9 @@
 //! last `k - 1` are ever read, and those are what is kept here.
 //!
 //! Experts bind in their stored format ([`bind_bank`]): NVFP4 (layers
-//! 0..19) as packed codes, MXFP8 (layers 20..23) decoded on the host to BF16,
-//! one device buffer per projection with the experts stacked. The router and
+//! 0..19) as packed codes, MXFP8 (layers 20..23) as packed codes and scales
+//! for register conversion to BF16 where the device supports E4M3. Other
+//! devices bind decoded BF16. Each projection stacks its experts. The router and
 //! the experts run as [`super::moe::Bank`]: routed on the device, one grouped
 //! launch per projection.
 //!
@@ -601,7 +602,7 @@ pub(super) fn bind_bank(
 
 /// Fill `bufs`, each `e` equal parts, with `f(x, parts)` for every expert `x`,
 /// on as many host threads as there are.
-fn fill_experts<const N: usize>(
+pub(super) fn fill_experts<const N: usize>(
     e: usize,
     bufs: [&mut [u8]; N],
     f: impl Fn(usize, [&mut [u8]; N]) -> Result<(), String> + Sync,
@@ -635,11 +636,8 @@ fn fill_experts<const N: usize>(
 }
 
 /// MXFP8 experts: E4M3 values `[e, rows, cols]` and one UE8M0 scale per 32
-/// values of a row `[e, rows, cols / 32]`, decoded on the host
-/// layer at a time (upstream's `Inkling2LoopDequantizeExperts`, then `.to(bfloat16)`,
-/// which is exact here) and uploaded as BF16. w13's rows are interleaved gate
-/// then up per intermediate unit, its scales with them (upstream's
-/// `Interleave(dim=1)` on both). About 2 GB per layer at the release's shape.
+/// values of a row. Keep both in fragment order on devices that can convert
+/// E4M3 in registers. Older devices use the decoded BF16 weight bank.
 fn bind_mxfp8_experts(
     w: &dyn Weights,
     d: &Dims,
@@ -649,14 +647,32 @@ fn bind_mxfp8_experts(
     use crate::models::inkling2_loop::experts::{MXFP8_BLOCK, decode_mxfp8_row};
     let (e, h, i) = (d.experts, d.hidden, d.inter);
     let part = |m: ExpertMat, p: ExpertPart| Slot::Layer(layer, LayerPart::Expert(m, p));
-    let w13 = want(w, part(ExpertMat::W13, ExpertPart::Weight), Dtype::F8E4M3, &[e, 2 * i, h])?;
-    let s13 = want(w, part(ExpertMat::W13, ExpertPart::Scale), Dtype::U8, &[e, 2 * i, h / MXFP8_BLOCK])?;
+    let rows13 = i.checked_mul(2).ok_or_else(|| format!("layer {layer}: MXFP8 row count overflow"))?;
+    let w13 = want(w, part(ExpertMat::W13, ExpertPart::Weight), Dtype::F8E4M3, &[e, rows13, h])?;
+    let s13 = want(w, part(ExpertMat::W13, ExpertPart::Scale), Dtype::U8, &[e, rows13, h / MXFP8_BLOCK])?;
     let w2 = want(w, part(ExpertMat::W2, ExpertPart::Weight), Dtype::F8E4M3, &[e, h, i])?;
     let s2 = want(w, part(ExpertMat::W2, ExpertPart::Scale), Dtype::U8, &[e, h, i / MXFP8_BLOCK])?;
+    if e == 0 || h == 0 || i == 0 {
+        return Err(format!("layer {layer}: empty MXFP8 expert bank"));
+    }
     for (n, k) in [(i, h), (h, i)] {
         if !Bf16W::tileable(n, k) || k % MXFP8_BLOCK != 0 {
             return Err(format!("layer {layer}: MXFP8 expert {n}x{k} does not tile"));
         }
+    }
+    // Weight sources can include storage padding after the logical tensor.
+    // Slice by the declared shape before either consumer divides it into experts.
+    fn logical(t: Stored<'_>) -> Result<&[u8], String> {
+        let len = t.shape.iter().try_fold(1usize, |len, &n| len.checked_mul(n))
+            .ok_or_else(|| "MXFP8 tensor length overflow".to_string())?;
+        t.bytes.get(..len).ok_or_else(|| format!("short MXFP8 tensor: {} bytes for shape {:?}", t.bytes.len(), t.shape))
+    }
+    let (w13, s13, w2, s2) = (logical(w13)?, logical(s13)?, logical(w2)?, logical(s2)?);
+    if super::mxfp8::supported(client) {
+        let bind = |codes: &[u8], scales: &[u8], n, k, first, step| {
+            super::mxfp8::bind(client, codes, scales, e, n, k, first, step).map_err(|err| format!("layer {layer}: {err}"))
+        };
+        return Ok([bind(w13, s13, i, h, 0, 2)?, bind(w13, s13, i, h, 1, 2)?, bind(w2, s2, h, i, 0, 1)?]);
     }
     // rows `first, first + step, ..` (count of them) of a `[rows, cols]` matrix, as BF16 bytes into `out`
     let decode = |vals: &[u8], scales: &[u8], cols: usize, first: usize, step: usize, out: &mut [u8]| -> Result<(), String> {
@@ -680,8 +696,8 @@ fn bind_mxfp8_experts(
     let part = e * i * h * 2;
     let (mut gate, mut up, mut down) = (vec![0; part], vec![0; part], vec![0; part]);
     fill_experts(e, [&mut gate, &mut up, &mut down], |x, [gate, up, down]| {
-        let (v13, c13) = (&w13.bytes[x * m13..(x + 1) * m13], &s13.bytes[x * p13..(x + 1) * p13]);
-        let (v2, c2) = (&w2.bytes[x * m2..(x + 1) * m2], &s2.bytes[x * p2..(x + 1) * p2]);
+        let (v13, c13) = (&w13[x * m13..(x + 1) * m13], &s13[x * p13..(x + 1) * p13]);
+        let (v2, c2) = (&w2[x * m2..(x + 1) * m2], &s2[x * p2..(x + 1) * p2]);
         decode(v13, c13, h, 0, 2, gate)?;
         decode(v13, c13, h, 1, 2, up)?;
         decode(v2, c2, i, 0, 1, down)
@@ -735,7 +751,99 @@ fn bind_nvfp4_experts(
 
 #[cfg(test)]
 mod tests {
-    use super::fill_experts;
+    use super::*;
+
+    #[test]
+    fn mxfp8_bind_checks_lengths_and_accepts_padded_release_layout() {
+        use crate::models::inkling2_loop::{config::Inkling2LoopConfig, moe::Stack};
+        use cubecl::{
+            cuda::{CudaDevice, CudaRuntime},
+            prelude::Runtime,
+        };
+        use std::collections::HashMap;
+
+        struct Source(HashMap<String, (Dtype, Vec<usize>, Vec<u8>)>);
+        impl Weights for Source {
+            fn tensor(&self, name: &str) -> Result<Stored<'_>, String> {
+                let (dtype, shape, bytes) = self.0.get(name).ok_or_else(|| name.to_owned())?;
+                Ok(Stored {
+                    dtype: *dtype,
+                    shape: shape.clone(),
+                    bytes,
+                })
+            }
+        }
+        let mut d = Dims::of(
+            &Inkling2LoopConfig::from_json(include_str!("fixtures/config.json"))
+                .unwrap()
+                .text_config,
+        );
+        (d.experts, d.hidden, d.inter) = (3, 64, 32);
+        let mut w = Source(HashMap::new());
+        let name = |m, p| Slot::Layer(0, LayerPart::Expert(m, p)).tensor_name();
+        for (mat, rows, cols) in [
+            (ExpertMat::W13, 2 * d.inter, d.hidden),
+            (ExpertMat::W2, d.hidden, d.inter),
+        ] {
+            for (part, dtype, width) in [
+                (ExpertPart::Weight, Dtype::F8E4M3, cols),
+                (ExpertPart::Scale, Dtype::U8, cols / 32),
+            ] {
+                let len = d.experts * rows * width;
+                let mut bytes: Vec<_> = (0..len)
+                    .map(|j| match part {
+                        ExpertPart::Weight => ((j * 17 + j / cols) % 127) as u8,
+                        _ => 120 + (j % 13) as u8,
+                    })
+                    .collect();
+                bytes.extend_from_slice(&[255; 7]);
+                w.0.insert(name(mat, part), (dtype, vec![d.experts, rows, width], bytes));
+            }
+        }
+        let client = CudaRuntime::client(&CudaDevice::default());
+        let projs = bind_mxfp8_experts(&w, &d, 0, &client).unwrap();
+        for (projection, (mat, first, step)) in
+            projs
+                .into_iter()
+                .zip([(ExpertMat::W13, 0, 2), (ExpertMat::W13, 1, 2), (ExpertMat::W2, 0, 1)])
+        {
+            if let Stack::Mxfp8 { codes, scales } = projection.stack {
+                let packed = client.read_one(codes).unwrap();
+                let exps = client.read_one(scales).unwrap();
+                let (n, k) = (projection.n, projection.k);
+                let src = w.tensor(&name(mat, ExpertPart::Weight)).unwrap();
+                let scale = w.tensor(&name(mat, ExpertPart::Scale)).unwrap();
+                assert_eq!((packed.len(), exps.len()), (d.experts * n * k, d.experts * n * k / 32));
+                for row in 0..d.experts * n {
+                    for col in 0..k {
+                        let source = (row * step + first) * k + col;
+                        let group = (row / 8) * (k / 32) + col / 32;
+                        assert_eq!(
+                            packed[group * 256 + (col % 32) / 8 * 64 + row % 8 * 8 + col % 8],
+                            src.bytes[source]
+                        );
+                        assert_eq!(exps[group * 8 + row % 8], scale.bytes[source / 32]);
+                    }
+                }
+            } else {
+                assert!(!super::super::mxfp8::supported(&client));
+            }
+        }
+        for key in w.0.keys().cloned().collect::<Vec<_>>() {
+            let (_, shape, bytes) = w.0.get_mut(&key).unwrap();
+            let tail = bytes.split_off(shape.iter().product::<usize>() - 1);
+            assert!(
+                bind_mxfp8_experts(&w, &d, 0, &client)
+                    .err()
+                    .unwrap()
+                    .contains("short MXFP8 tensor")
+            );
+            w.0.get_mut(&key).unwrap().2.extend(tail);
+        }
+        w.0.get_mut(&name(ExpertMat::W13, ExpertPart::Weight)).unwrap().2[0] = 1;
+        w.0.get_mut(&name(ExpertMat::W13, ExpertPart::Scale)).unwrap().2[0] = 0;
+        assert!(bind_mxfp8_experts(&w, &d, 0, &client).err().unwrap().contains("BF16"));
+    }
 
     #[test]
     fn every_expert_fills_its_own_parts() {
