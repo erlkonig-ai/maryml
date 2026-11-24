@@ -42,8 +42,11 @@
 
 use burn::prelude::*;
 use burn::tensor::{DType, Int};
+use cubecl::cuda::CudaRuntime;
+use cubecl::prelude::ComputeClient;
 use cubecl::server::Handle;
 
+use crate::models::inkling::bf16gemm::{self, Bf16W, bf16_linear_launch, to_bf16_launch};
 use crate::models::inkling::flash::{self, KeyRun, KvElem};
 use crate::models::inkling::seam::{Bk, client_of, handle_of, handle_of_any, tensor_of};
 use crate::models::inkling2_loop::attend_mma;
@@ -189,11 +192,52 @@ pub struct AttnShape {
     pub window: Option<usize>,
 }
 
+/// A layer's relative projection `[d_rel, rel_extent]`: transposed, as the
+/// weight of a BF16 GEMM, zeros filling a shape that does not tile.
+pub struct RelProj {
+    w: Bf16W,
+    d_rel: usize,
+    rel_extent: usize,
+}
+
+impl RelProj {
+    /// From the stored BF16 bytes, row order.
+    pub fn new(client: &ComputeClient<CudaRuntime>, bytes: &[u8], d_rel: usize, rel_extent: usize) -> RelProj {
+        assert_eq!(bytes.len(), d_rel * rel_extent * 2, "the projection is [{d_rel}, {rel_extent}] BF16");
+        let (n, k) = (rel_extent.next_multiple_of(bf16gemm::NTILE), d_rel.next_multiple_of(bf16gemm::KTILE));
+        let mut t = vec![0u8; n * k * 2];
+        for (i, x) in bytes.chunks_exact(2).enumerate() {
+            let at = (i % rel_extent * k + i / rel_extent) * 2;
+            t[at..at + 2].copy_from_slice(x);
+        }
+        RelProj { w: Bf16W { h: client.create_from_slice(&t), n, k, align: 16 }, d_rel, rel_extent }
+    }
+
+    /// The relative-bias table of `rel`'s rows, f32 `[rows at least, rel_extent]`:
+    /// the product of BF16 operands, as upstream's, in an f32 accumulator.
+    /// Burn's f32 matmul multiplies in TF32, which is neither.
+    fn table(&self, client: &ComputeClient<CudaRuntime>, rel: Tensor<Bk, 2>) -> Handle {
+        let [m, _] = rel.dims();
+        let dev = rel.device();
+        let pad = m.next_multiple_of(bf16gemm::MTILE);
+        let rel = match self.w.k - self.d_rel {
+            0 => rel,
+            more => Tensor::cat(vec![rel, Tensor::zeros([m, more], &dev)], 1),
+        };
+        let a = to_bf16_launch(client, &handle_of(rel), m * self.w.k, pad * self.w.k);
+        let out = bf16_linear_launch(client, &a, &self.w.h, pad, self.w.k, self.w.n);
+        if self.w.n == self.rel_extent {
+            return out;
+        }
+        handle_of(tensor_of(client.clone(), dev, out, pad, self.w.n).slice([0..m, 0..self.rel_extent]))
+    }
+}
+
 impl AttnShape {
     /// The operands of [`attend`] are what this shape says they are, and on
     /// one device. The kernels launch unchecked over extents named by the
     /// shape, so this comes before any handle is taken.
-    fn check(&self, q: &Tensor<Bk, 3>, rel: &Tensor<Bk, 2>, rel_proj: &Tensor<Bk, 2>, sinks: &Tensor<Bk, 2>, kv: &Kv) {
+    fn check(&self, q: &Tensor<Bk, 3>, rel: &Tensor<Bk, 2>, rel_proj: &RelProj, sinks: &Tensor<Bk, 2>, kv: &Kv) {
         let AttnShape { heads, kv_heads, head_dim, rel_extent, .. } = *self;
         assert!(
             kv_heads > 0 && heads > 0 && heads % kv_heads == 0 && head_dim > 0 && rel_extent > 0,
@@ -204,10 +248,10 @@ impl AttnShape {
         assert!(t > 0, "attention operand: no queries");
         assert_eq!(q.dims(), [t, heads, head_dim], "attention operand: queries of {self:?}");
         assert_eq!(rel.dims(), [t * heads, d_rel], "attention operand: relative states of {t} queries of {self:?}");
-        assert_eq!(rel_proj.dims(), [d_rel, rel_extent], "attention operand: the relative projection of {self:?}");
+        assert_eq!([rel_proj.d_rel, rel_proj.rel_extent], [d_rel, rel_extent], "attention operand: the relative projection of {self:?}");
         assert_eq!(sinks.dims(), [t, heads], "attention operand: sinks of {t} queries of {self:?}");
         let dev = q.device();
-        for (what, d) in [("relative states", rel.device()), ("relative projection", rel_proj.device()), ("sinks", sinks.device())] {
+        for (what, d) in [("relative states", rel.device()), ("sinks", sinks.device())] {
             assert!(d == dev, "attention operand: the {what} are on {d:?}, the queries on {dev:?}");
         }
         for [k, v] in &kv.segs {
@@ -222,7 +266,8 @@ impl AttnShape {
 /// `kv`, which already holds the call's own rows.
 ///
 /// `q` is `[t, heads, head_dim]`, `rel` `[t * heads, d_rel]` (both clipped and,
-/// on a full layer, log-scaled), `rel_proj` `[d_rel, rel_extent]`, `sinks`
+/// on a full layer, log-scaled), `rel_proj` the
+/// layer's projection, `sinks`
 /// `[t, heads]`. Returns `[t, heads * head_dim]`. Panics on an operand of
 /// another shape or device.
 #[allow(clippy::too_many_arguments)]
@@ -230,7 +275,7 @@ pub fn attend(
     a: &AttnShape,
     q: Tensor<Bk, 3>,
     rel: Tensor<Bk, 2>,
-    rel_proj: &Tensor<Bk, 2>,
+    rel_proj: &RelProj,
     sinks: Tensor<Bk, 2>,
     kv: &Kv,
     first: usize,
@@ -261,10 +306,9 @@ pub fn attend(
         // the layouts and the swap-then-reshape chains are the materialised
         // attention's, applied to a slice of rows
         let qt = q.clone().slice([i0..i0 + tq, 0..heads, 0..hd]).swap_dims(0, 1).reshape([kvh, rep * tq, hd]);
-        let relt = rel
-            .clone()
-            .slice([i0 * heads..(i0 + tq) * heads, 0..d_rel])
-            .matmul(rel_proj.clone())
+        let client = client_of(&q);
+        let table = rel_proj.table(&client, rel.clone().slice([i0 * heads..(i0 + tq) * heads, 0..d_rel]));
+        let relt = tensor_of(client, dev.clone(), table, tq * heads, e)
             .reshape([tq, heads, e])
             .swap_dims(0, 1);
         // `[heads, tq, 1]`, never reshaped: on this backend a reshape after a
@@ -328,7 +372,7 @@ fn attend_blocks(
     a: &AttnShape,
     q: Tensor<Bk, 3>,
     rel: Tensor<Bk, 2>,
-    rel_proj: &Tensor<Bk, 2>,
+    rel_proj: &RelProj,
     sinks: Tensor<Bk, 2>,
     kv: &Kv,
     first: usize,
@@ -347,9 +391,8 @@ fn attend_blocks(
         let tq = query_tile.min(t - i0);
         let p0 = first + i0;
         let runs = visible_runs(&held, a.window, p0, tq);
-        let table = rel.clone().slice([i0 * heads..(i0 + tq) * heads, 0..d_rel]).matmul(rel_proj.clone());
+        let rel_h = rel_proj.table(&client, rel.clone().slice([i0 * heads..(i0 + tq) * heads, 0..d_rel]));
         let (q_h, _) = handle_of_any(q.clone().slice([i0..i0 + tq, 0..heads * hd]));
-        let rel_h = handle_of(table);
         let sink_h = handle_of(sinks.clone().slice([i0..i0 + tq, 0..heads]));
         let out = attend_mma::attend_mma_launch(
             &client, &q_h, &runs, &rel_h, &sink_h, tq, p0, heads, a.kv_heads, hd, a.rel_extent, a.window, scale,
@@ -411,7 +454,7 @@ fn attend_fused(
     a: &AttnShape,
     q: Tensor<Bk, 3>,
     rel: Tensor<Bk, 2>,
-    rel_proj: &Tensor<Bk, 2>,
+    rel_proj: &RelProj,
     sinks: Tensor<Bk, 2>,
     kv: &Kv,
     first: usize,
@@ -420,9 +463,8 @@ fn attend_fused(
     let [t, heads, hd] = q.dims();
     let dev = q.device();
     let client = client_of(&q);
-    let table = rel.matmul(rel_proj.clone());
+    let rel_h = rel_proj.table(&client, rel);
     let q_h = handle_of(q.reshape([t, heads * hd]));
-    let rel_h = handle_of(table);
     let sink_h = handle_of(sinks);
     let held = held_segments(kv);
     let runs = visible_runs(&held, a.window, first, t);
@@ -521,6 +563,10 @@ mod tests {
             .reshape([t, heads * hd])
     }
 
+    fn bf(v: Vec<f32>) -> Vec<f32> {
+        v.into_iter().map(|x| half::bf16::from_f32(x).to_f32()).collect()
+    }
+
     /// One random sequence of `n` positions: per-position Q, rel states and
     /// sinks, and K, V.
     struct Case {
@@ -532,7 +578,8 @@ mod tests {
         sinks: Vec<f32>,
         k: Vec<f32>,
         v: Vec<f32>,
-        rel_proj: Tensor<Bk, 2>,
+        /// `[d_rel, rel_extent]`, BF16 values.
+        proj: Vec<f32>,
         dev: Dev,
     }
 
@@ -542,7 +589,8 @@ mod tests {
             let mut r = Lcg(seed);
             let (h, kvd) = (a.heads, a.kv_heads * a.head_dim);
             let q = r.vec(n * h * a.head_dim, 2.0);
-            let rel = r.vec(n * h * d_rel, 1.0);
+            // the states and the projection as the bias table's GEMM rounds them
+            let rel = bf(r.vec(n * h * d_rel, 1.0));
             let mut sinks = r.vec(n * h, 2.0);
             // a sink-dominated row: every head of position 7 sinks hard
             for x in &mut sinks[7 * h..8 * h] {
@@ -550,16 +598,16 @@ mod tests {
             }
             let k = r.vec(n * kvd, 1.0);
             let v = r.vec(n * kvd, 1.0);
-            let rel_proj = up(r.vec(d_rel * a.rel_extent, 1.0), [d_rel, a.rel_extent], &dev);
+            let proj = bf(r.vec(d_rel * a.rel_extent, 1.0));
             // BF16 values, so the rounding of Q, K and V changes nothing
-            Case { a, d_rel, n, q, rel, sinks, k, v, rel_proj, dev }.rounded(true, true)
+            Case { a, d_rel, n, q, rel, sinks, k, v, proj, dev }.rounded(true, true)
         }
 
         /// [`Self::new`]'s shapes with Q, K and V that BF16 does not hold
         /// (every value of them has low f32 bits), and the bias table exact:
         /// one-hot relative states over a BF16 profile.
         fn unrounded(a: AttnShape, n: usize, seed: u64) -> Case {
-            let mut c = Case::new(a, 4, n, seed);
+            let mut c = Case::new(a, 16, n, seed);
             let mut r = Lcg(seed + 1);
             let mut odd = |n: usize, scale: f32| -> Vec<f32> {
                 let v = r.vec(n, scale);
@@ -573,15 +621,18 @@ mod tests {
         }
 
         fn rounded(mut self, q: bool, kv: bool) -> Case {
-            let bf = |v: &mut Vec<f32>| v.iter_mut().for_each(|x| *x = half::bf16::from_f32(*x).to_f32());
             if q {
-                bf(&mut self.q);
+                self.q = bf(self.q);
             }
             if kv {
-                bf(&mut self.k);
-                bf(&mut self.v);
+                (self.k, self.v) = (bf(self.k), bf(self.v));
             }
             self
+        }
+
+        fn rel_proj(&self) -> RelProj {
+            let bytes: Vec<u8> = self.proj.iter().flat_map(|x| half::bf16::from_f32(*x).to_le_bytes()).collect();
+            RelProj::new(&client_of(&Tensor::<Bk, 1>::zeros([1], &self.dev)), &bytes, self.d_rel, self.a.rel_extent)
         }
 
         /// One-hot relative states over a BF16 profile: the bias table has no
@@ -591,8 +642,7 @@ mod tests {
             for (i, x) in self.rel.iter_mut().enumerate() {
                 *x = if i % dr == i / dr % dr { 1.0 } else { 0.0 };
             }
-            let proj = Lcg(seed).vec(dr * e, 1.0).into_iter().map(|x| half::bf16::from_f32(x).to_f32()).collect();
-            self.rel_proj = up(proj, [dr, e], &self.dev);
+            self.proj = bf(Lcg(seed).vec(dr * e, 1.0));
         }
 
         fn rows(&self, r: std::ops::Range<usize>) -> (Tensor<Bk, 3>, Tensor<Bk, 2>, Tensor<Bk, 2>, Tensor<Bk, 2>, Tensor<Bk, 2>) {
@@ -610,7 +660,7 @@ mod tests {
         /// whole sequence at once.
         fn reference(&self) -> Vec<f32> {
             let (q, rel, sinks, k, v) = self.rows(0..self.n);
-            host(materialised(&self.a, q, rel, &self.rel_proj, sinks, k, v, 0))
+            host(materialised(&self.a, q, rel, &up(self.proj.clone(), [self.d_rel, self.a.rel_extent], &self.dev), sinks, k, v, 0))
         }
 
         /// Every position's output in f64 on the host, from the definition in
@@ -626,7 +676,7 @@ mod tests {
             let a = &self.a;
             let (h, hd, kvh, e, dr) = (a.heads, a.head_dim, a.kv_heads, a.rel_extent, self.d_rel);
             let rep = h / kvh;
-            let proj = host(self.rel_proj.clone());
+            let proj = &self.proj;
             let mut out = vec![0f32; self.n * h * hd];
             let mut slack = vec![0f32; self.n * h * hd];
             let mut w = vec![0f64; self.n];
@@ -675,12 +725,13 @@ mod tests {
         /// the next query can see, and drops everything a segment earlier.
         fn tiled(&self, plan: &[usize], key_tile: usize, query_tile: usize) -> Vec<f32> {
             let mut kv = Kv::new(key_tile);
+            let proj = self.rel_proj();
             let mut out = Vec::new();
             let mut at = 0;
             for &len in plan {
                 let (q, rel, sinks, k, v) = self.rows(at..at + len);
                 kv.append(k, v);
-                out.extend(host(attend(&self.a, q, rel, &self.rel_proj, sinks, &kv, at, query_tile)));
+                out.extend(host(attend(&self.a, q, rel, &proj, sinks, &kv, at, query_tile)));
                 at += len;
                 if let Some(w) = self.a.window {
                     let oldest = (at + 1).saturating_sub(w);
@@ -755,10 +806,9 @@ mod tests {
     }
 
     /// Each plan through [`attend`] against the exact host attention, beside
-    /// the materialised device attention against the same: the tiled path
-    /// must be no further from the definition than the code it replaces was
-    /// (with slack for the order of the sums, and for a long call's BF16 P),
-    /// and the sink-dominated row
+    /// the materialised device attention against the same: the definition on
+    /// the operands as each call rounds them, a long call's P included, and
+    /// the sink-dominated row
     /// must be zero.
     fn check(c: &Case, plans: &[(&[usize], usize, usize)]) {
         let (exact, slack) = c.exact_and_p_rounding();
@@ -778,7 +828,7 @@ mod tests {
                 &plan[..plan.len().min(12)],
                 if plan.len() > 12 { format!(" .. ({} calls)", plan.len()) } else { String::new() }
             );
-            assert!(d <= 1.5 * dm + 1e-5, "plan {plan:?}, tiles {kt}/{qt}: position {row} is {d} from exact, the materialised path {dm}");
+            assert!(d < 5e-5, "plan {plan:?}, tiles {kt}/{qt}: position {row} is {d} from exact, the materialised path {dm}");
             let s = max_abs_diff(&got[7 * width..8 * width], &zeros);
             assert!(s < 1e-12, "position 7 under the sink: {s}");
         }
@@ -796,7 +846,7 @@ mod tests {
         // and query tiles of 12 never line up, so query tiles straddle segments
         // and some rows see no key of a live segment (rows 12..15 of the tile
         // at 12 against the segment at 16, and rows beyond the window)
-        let c = Case::new(small(Some(48), 48), 4, 203, 11);
+        let c = Case::new(small(Some(48), 48), 16, 203, 11);
         check(
             &c,
             &[
@@ -813,7 +863,7 @@ mod tests {
     fn full_tiles_match_materialised() {
         // no window, rel_extent 40: many full segments behind every query,
         // some wholly beyond the bias extent
-        let c = Case::new(small(None, 40), 4, 211, 23);
+        let c = Case::new(small(None, 40), 16, 211, 23);
         check(
             &c,
             &[
@@ -913,7 +963,7 @@ mod tests {
         }
         let mut proj = vec![0f32; 16 * e];
         proj[e - 1] = 30.0;
-        c.rel_proj = up(proj, [16, e], &c.dev);
+        c.proj = proj;
         let width = h * hd;
         for plan in [&[n][..], &[1000, 23, 1, 1, 1, 274]] {
             let got = c.tiled(plan, KEY_TILE, QUERY_TILE);
@@ -929,13 +979,11 @@ mod tests {
     /// The kernels without the bias table's own rounding: one-hot relative
     /// states over a BF16 profile make the table exact, so what is left is the
     /// attention's arithmetic against the f64 definition, for long calls (the
-    /// tensor-core kernel) and for single tokens (the fused kernel) alike. The
-    /// tests above cannot see this: the f32 matmul that builds a random table
-    /// is about 1e-3 from exact.
+    /// tensor-core kernel) and for single tokens (the fused kernel) alike.
     #[test]
     fn the_kernels_match_the_definition_given_an_exact_table() {
         for (window, e, n) in [(Some(48), 48, 203), (None, 40, 211)] {
-            let mut c = Case::new(small(window, e), 4, n, 61);
+            let mut c = Case::new(small(window, e), 16, n, 61);
             c.exact_table(62);
             let (exact, rounding) = c.exact_and_p_rounding();
             let none = vec![0f32; exact.len()];
@@ -1035,14 +1083,15 @@ mod tests {
         impl Args {
             fn good(t: usize) -> Args {
                 let a = small(Some(48), 48);
-                Args { a, t, q: [t, 6, 32], rel: [t * 6, 4], proj: [4, 48], sinks: [t, 6], kv: 64 }
+                Args { a, t, q: [t, 6, 32], rel: [t * 6, 16], proj: [16, 48], sinks: [t, 6], kv: 64 }
             }
 
             fn run(&self) -> Vec<f32> {
                 let dev = Dev::default();
                 let mut kv = Kv::new(16);
                 kv.append(Tensor::ones([self.t, self.kv], &dev), Tensor::ones([self.t, self.kv], &dev));
-                let proj = Tensor::<Bk, 2>::zeros(self.proj, &dev);
+                let client = client_of(&Tensor::<Bk, 1>::zeros([1], &dev));
+                let proj = RelProj::new(&client, &vec![0u8; self.proj[0] * self.proj[1] * 2], self.proj[0], self.proj[1]);
                 host(attend(
                     &self.a,
                     Tensor::ones(self.q, &dev),
@@ -1075,12 +1124,12 @@ mod tests {
 
         #[test]
         fn a_narrower_projection() {
-            refused("a projection short of the extent", |x| x.proj = [4, 47]);
+            refused("a projection short of the extent", |x| x.proj = [16, 40]);
         }
 
         #[test]
         fn another_relative_width() {
-            refused("relative states of another width", |x| x.rel[1] = 8);
+            refused("relative states of another width", |x| x.rel[1] = 32);
         }
 
         #[test]
@@ -1145,7 +1194,7 @@ mod cost {
 
     type Dev = burn::backend::cuda::CudaDevice;
 
-    fn time(kv: &Kv, t: usize, first: usize, a: &AttnShape, proj: &Tensor<Bk, 2>, dev: &Dev, reps: usize) -> f64 {
+    fn time(kv: &Kv, t: usize, first: usize, a: &AttnShape, proj: &RelProj, dev: &Dev, reps: usize) -> f64 {
         let q = Tensor::<Bk, 3>::random([t, a.heads, a.head_dim], burn::tensor::Distribution::Normal(0.0, 1.0), dev);
         let rel = Tensor::<Bk, 2>::random([t * a.heads, 16], burn::tensor::Distribution::Normal(0.0, 1.0), dev);
         let sinks = Tensor::<Bk, 2>::zeros([t, a.heads], dev);
@@ -1162,7 +1211,7 @@ mod cost {
     fn full_attention_cost_at_length() {
         let dev = Dev::default();
         let a = AttnShape { heads: 24, kv_heads: 8, head_dim: 128, rel_extent: 1024, window: None };
-        let proj = Tensor::<Bk, 2>::random([16, 1024], burn::tensor::Distribution::Normal(0.0, 1.0), &dev);
+        let proj = RelProj::new(&client_of(&Tensor::<Bk, 1>::zeros([1], &dev)), &[0u8; 16 * 1024 * 2], 16, 1024);
         let kvd = a.kv_heads * a.head_dim;
         let mut kv = Kv::new(KEY_TILE);
         let mut filled = 0;

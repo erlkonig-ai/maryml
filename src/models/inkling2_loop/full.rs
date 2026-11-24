@@ -57,7 +57,7 @@ use burn::tensor::TensorData;
 use crate::models::inkling::bf16gemm::Bf16W;
 use crate::models::inkling::burn::linear_bf16;
 use crate::models::inkling::seam::{Bk, client_of};
-use crate::models::inkling2_loop::attend::{AttnShape, QUERY_TILE, attend};
+use crate::models::inkling2_loop::attend::{AttnShape, QUERY_TILE, RelProj, attend};
 use crate::models::inkling2_loop::config::{AttnKind, Inkling2LoopTextConfig};
 use crate::models::inkling2_loop::layout::{AttnPart, ConvPart, Dtype, LayerPart, Slot};
 use crate::models::inkling2_loop::sliding::{
@@ -88,7 +88,7 @@ pub struct FullLayer {
     sink: Bf16W,
     q_scale: Tensor<Bk, 3>,
     rel_scale: Tensor<Bk, 3>,
-    rel_proj: Tensor<Bk, 2>,
+    rel_proj: RelProj,
     /// K and V dynamic convs: `weight_proj` `[kv_heads * k, hidden]` and
     /// `static_w` `[k, kv_dim]`, row `lag` weighting the input `lag` back.
     k_proj: Bf16W,
@@ -187,7 +187,12 @@ impl FullLayer {
             sink: lin(a(AttnPart::SinkProj), d.heads, h)?,
             q_scale: per_head(a(AttnPart::QL2Clip), d.head_dim)?,
             rel_scale: per_head(a(AttnPart::RelL2Clip), d.d_rel)?,
-            rel_proj: mat(a(AttnPart::RelLogitsProj), d.d_rel, d.rel_extent)?,
+            rel_proj: RelProj::new(
+                &client,
+                want(w, a(AttnPart::RelLogitsProj), Dtype::Bf16, &[d.d_rel, d.rel_extent])?.bytes,
+                d.d_rel,
+                d.rel_extent,
+            ),
             k_proj: lin(a(AttnPart::KSconv(ConvPart::WeightProj)), d.kv_heads * d.kernel, h)?,
             k_static: mat(a(AttnPart::KSconv(ConvPart::StaticW)), d.kernel, kv)?,
             v_proj: lin(a(AttnPart::VSconv(ConvPart::WeightProj)), d.kv_heads * d.kernel, h)?,
