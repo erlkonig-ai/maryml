@@ -43,8 +43,11 @@ use crate::models::inkling::flash::{self, KeyRun, NEG_INF, PLANE};
 
 /// Keys per staged tile.
 const NK: usize = 64;
-/// Sixteen-query fragments per head in a cube.
-const QB: usize = 2;
+/// Sixteen-query fragments per head in a cube. A cube reads every key its
+/// queries can see, so more queries per cube read each key less often: two to
+/// four took a warm 4,096-token call's attention from 1.16 to 0.88 s at 32,768
+/// tokens. Eight (24 planes a cube) was 8 to 12 times slower than four.
+const QB: usize = 4;
 /// Words (BF16 pairs) per staged V^T row: the keys' 32 plus 4 of padding, so
 /// a fragment read's 32 lanes land on distinct banks. K rows are padded the
 /// same way ([`k_row_words`]).
