@@ -21,7 +21,8 @@
 //! logits read, logits as a host vector, router fault read, and the end
 //! of selection. Thread CPU time is read before and after each repetition.
 //!
-//! usage: inkling2_step_profile <pile> <collection> <root> <fixture.json> <out.json> <gen|rows|distinct> <pad> <reps> <gen: new tokens | rows: span> [ks] [last|tail]
+//! usage: inkling2_step_profile launches
+//!        inkling2_step_profile <pile> <collection> <root> <fixture.json> <out.json> <gen|rows|distinct> <pad> <reps> <gen: new tokens | rows: span> [ks] [last|tail]
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -32,8 +33,68 @@ use anyhow::{Context, Result, bail, ensure};
 use mary::model_collection::parse_collection_handle;
 use mary::models::inkling2_loop::session::{Logits, MiniModel, MiniSession, Rows};
 use mary::models::inkling2_loop::steptrace;
+use mary::models::inkling::seam::{Bk, client_of};
+use burn::prelude::Tensor;
+use cubecl::prelude::*;
 use serde_json::{Value, json};
 use triblespace::prelude::Id;
+
+/// Busy work of a chosen length: `iters` dependent steps on every unit.
+#[cube(launch_unchecked)]
+fn spin(out: &mut Array<f32>, iters: u32) {
+    let mut x = out[ABSOLUTE_POS];
+    for _ in 0..iters {
+        x = x * 1.0000001f32 + 0.5f32;
+    }
+    out[ABSOLUTE_POS] = x;
+}
+
+/// What one more launch costs with no profiler attached. A long kernel goes
+/// first, then `n` small ones over the same buffer, then a read. While the long
+/// kernel outlasts the host's enqueueing, the extra wall per small launch is
+/// the device's alone; with no long kernel it is whichever of host and device
+/// is slower. Prints both, per launch.
+fn launches() -> Result<()> {
+    let client = client_of(&Tensor::<Bk, 1>::zeros([1], &Default::default()));
+    let units = 2304usize;
+    let buf = client.create_from_slice(&vec![0u8; units * 4]);
+    let go = |iters: u32| unsafe {
+        spin::launch_unchecked::<cubecl::cuda::CudaRuntime>(
+            &client,
+            CubeCount::new_1d(9),
+            CubeDim::new_1d(256),
+            ArrayArg::from_raw_parts(buf.clone(), units),
+            iters,
+        );
+    };
+    let drain = || client.read_one(buf.clone()).expect("read").len();
+    for _ in 0..50 {
+        go(1);
+    }
+    drain();
+    for long in [0u32, 4_000_000] {
+        for n in [0usize, 100, 200, 400, 800, 1600, 4000] {
+            let mut walls = Vec::new();
+            let mut enq = Vec::new();
+            for _ in 0..9 {
+                let t = Instant::now();
+                if long > 0 {
+                    go(long);
+                }
+                for _ in 0..n {
+                    go(1);
+                }
+                enq.push(t.elapsed().as_secs_f64() * 1e3);
+                drain();
+                walls.push(t.elapsed().as_secs_f64() * 1e3);
+            }
+            walls.sort_by(f64::total_cmp);
+            enq.sort_by(f64::total_cmp);
+            println!("rep launch long {long} n {n}: wall median {:.3} ms (min {:.3} max {:.3}), enqueued after {:.3} ms", walls[4], walls[0], walls[8], enq[4]);
+        }
+    }
+    Ok(())
+}
 
 fn argmax(row: &[f32]) -> u32 {
     let mut best = 0usize;
@@ -123,6 +184,9 @@ fn generate(model: &Arc<MiniModel>, prompt: &[u32], n: usize) -> Result<(Vec<u32
 fn main() -> Result<()> {
     mary::models::inkling::pool::choose_memory_config();
     let a: Vec<String> = std::env::args().skip(1).collect();
+    if a.first().map(String::as_str) == Some("launches") {
+        return launches();
+    }
     ensure!(a.len() >= 9, "see the module doc");
     let (mode, pad, reps, n): (&str, usize, usize, usize) = (&a[5], a[6].parse()?, a[7].parse()?, a[8].parse()?);
     let fixture: Value = serde_json::from_str(&std::fs::read_to_string(&a[3])?)?;
