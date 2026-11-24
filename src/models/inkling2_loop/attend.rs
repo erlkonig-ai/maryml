@@ -616,11 +616,19 @@ mod tests {
         /// Every position's output in f64 on the host, from the definition in
         /// the module doc: no device arithmetic at all.
         fn exact(&self) -> Vec<f32> {
+            self.exact_and_p_rounding().0
+        }
+
+        /// [`Self::exact`], and the most each output moves when every `exp(s -
+        /// m)` is rounded to BF16 (at most half a unit of eight significant bits,
+        /// 2^-8 of it) before it weighs its value: `2^-8 sum p |v| / den`.
+        fn exact_and_p_rounding(&self) -> (Vec<f32>, Vec<f32>) {
             let a = &self.a;
             let (h, hd, kvh, e, dr) = (a.heads, a.head_dim, a.kv_heads, a.rel_extent, self.d_rel);
             let rep = h / kvh;
             let proj = host(self.rel_proj.clone());
             let mut out = vec![0f32; self.n * h * hd];
+            let mut slack = vec![0f32; self.n * h * hd];
             let mut w = vec![0f64; self.n];
             for p in 0..self.n {
                 for hh in 0..h {
@@ -642,20 +650,23 @@ mod tests {
                     }
                     let mut den = (sink - m).exp();
                     let mut acc = vec![0f64; hd];
+                    let mut abs = vec![0f64; hd];
                     for j in lo..=p {
                         let pj = (w[j] - m).exp();
                         den += pj;
                         let v = &self.v[(j * kvh + g) * hd..(j * kvh + g + 1) * hd];
-                        for (o, x) in acc.iter_mut().zip(v) {
+                        for ((o, b), x) in acc.iter_mut().zip(&mut abs).zip(v) {
                             *o += pj * *x as f64;
+                            *b += pj * (*x as f64).abs();
                         }
                     }
-                    for (d, o) in acc.iter().enumerate() {
+                    for (d, (o, b)) in acc.iter().zip(&abs).enumerate() {
                         out[(p * h + hh) * hd + d] = (o / den) as f32;
+                        slack[(p * h + hh) * hd + d] = (b / den / 256.0) as f32;
                     }
                 }
             }
-            out
+            (out, slack)
         }
 
         /// Every position's output from [`attend`], fed in calls of `plan`
@@ -716,6 +727,14 @@ mod tests {
         w
     }
 
+    /// How far `got` is from `want` beyond `slack`, element by element.
+    fn worst_beyond(got: &[f32], want: &[f32], slack: &[f32], width: usize) -> (f32, usize) {
+        assert_eq!(slack.len(), want.len(), "the sides differ in length");
+        let near: Vec<f32> = got.iter().zip(want).zip(slack).map(|((g, w), s)| if (g - w).abs() <= *s { *w } else { *g }).collect();
+        assert_eq!(near.len(), want.len(), "the sides differ in length");
+        worst(&near, want, width)
+    }
+
     #[test]
     fn worst_rejects_missing_and_non_finite_values() {
         let good = vec![1f32; 12];
@@ -738,10 +757,11 @@ mod tests {
     /// Each plan through [`attend`] against the exact host attention, beside
     /// the materialised device attention against the same: the tiled path
     /// must be no further from the definition than the code it replaces was
-    /// (with slack for the order of the sums), and the sink-dominated row
+    /// (with slack for the order of the sums, and for a long call's BF16 P),
+    /// and the sink-dominated row
     /// must be zero.
     fn check(c: &Case, plans: &[(&[usize], usize, usize)]) {
-        let exact = c.exact();
+        let (exact, slack) = c.exact_and_p_rounding();
         let width = c.a.heads * c.a.head_dim;
         let zeros = vec![0f32; width];
         let sunk = max_abs_diff(&exact[7 * width..8 * width], &zeros);
@@ -751,10 +771,10 @@ mod tests {
         println!("materialised (d17aa9d) vs exact: worst abs {dm:.3e} at position {rm}");
         for &(plan, kt, qt) in plans {
             let got = c.tiled(plan, kt, qt);
-            let (d, row) = worst(&got, &exact, width);
+            let (d, row) = worst_beyond(&got, &exact, &slack, width);
             let (dt, rt) = worst(&got, &mat, width);
             println!(
-                "plan {:?}{} key tile {kt} query tile {qt}: vs exact worst abs {d:.3e} at position {row}; vs materialised {dt:.3e} at {rt}",
+                "plan {:?}{} key tile {kt} query tile {qt}: vs exact, beyond P's rounding, worst abs {d:.3e} at position {row}; vs materialised {dt:.3e} at {rt}",
                 &plan[..plan.len().min(12)],
                 if plan.len() > 12 { format!(" .. ({} calls)", plan.len()) } else { String::new() }
             );
@@ -917,17 +937,21 @@ mod tests {
         for (window, e, n) in [(Some(48), 48, 203), (None, 40, 211)] {
             let mut c = Case::new(small(window, e), 4, n, 61);
             c.exact_table(62);
-            let exact = c.exact();
+            let (exact, rounding) = c.exact_and_p_rounding();
+            let none = vec![0f32; exact.len()];
             let width = c.a.heads * c.a.head_dim;
-            for (label, plan, kt, qt) in [
-                ("one call", vec![n], 1024, 1024),
-                ("one call, small tiles", vec![n], 16, 40),
-                ("single tokens", vec![1; n], 16, 12),
+            for (label, plan, kt, qt, long) in [
+                ("one call", vec![n], 1024, 1024, true),
+                ("one call, small tiles", vec![n], 16, 40, true),
+                ("single tokens", vec![1; n], 16, 12, false),
             ] {
                 let got = c.tiled(&plan, kt, qt);
-                let (d, row) = worst(&got, &exact, width);
-                println!("window {window:?} {label}: worst abs {d:.3e} at position {row}");
+                let (d, row) = worst_beyond(&got, &exact, if long { &rounding } else { &none }, width);
+                let plain = worst(&got, &exact, width).0;
+                println!("window {window:?} {label}: worst abs {plain:.3e}, {d:.3e} past P's rounding at position {row}");
                 assert!(d < 2e-5, "window {window:?} {label}: {d} from exact at position {row}");
+                // the long call's P is BF16 and the short one's is not
+                assert_eq!(plain > 1e-4, long, "window {window:?} {label}: {plain} from exact");
             }
         }
     }
@@ -961,23 +985,35 @@ mod tests {
     #[test]
     fn operands_bf16_does_not_hold() {
         for (window, e, n) in [(Some(48), 48, 203), (None, 40, 211)] {
-            let seen = |q, kv| Case::unrounded(small(window, e), n, 81).rounded(q, kv).exact();
+            let seen = |q, kv| Case::unrounded(small(window, e), n, 81).rounded(q, kv).exact_and_p_rounding();
             let (both, kv_only, q_only) = (seen(true, true), seen(false, true), seen(true, false));
+            let none = vec![0f32; both.0.len()];
             let c = Case::unrounded(small(window, e), n, 81);
             let width = c.a.heads * c.a.head_dim;
-            for (label, plan, kt, qt, want, others) in [
-                ("one call", vec![n], 1024, 1024, &both, [&kv_only, &q_only]),
-                ("one call, small tiles", vec![n], 16, 40, &both, [&kv_only, &q_only]),
-                ("single tokens", vec![1; n], 16, 12, &kv_only, [&both, &q_only]),
+            for (label, plan, kt, qt, want, others, long) in [
+                ("one call", vec![n], 1024, 1024, &both, [&kv_only, &q_only], true),
+                ("one call, small tiles", vec![n], 16, 40, &both, [&kv_only, &q_only], true),
+                ("single tokens", vec![1; n], 16, 12, &kv_only, [&both, &q_only], false),
             ] {
                 let got = c.tiled(&plan, kt, qt);
-                let (d, row) = worst(&got, want, width);
-                let far = others.map(|o| worst(&got, o, width).0);
-                println!("window {window:?} {label}: worst abs {d:.3e} at {row}; on the other readings {far:?}");
+                let (d, row) = worst_beyond(&got, &want.0, if long { &want.1 } else { &none }, width);
+                let on = others.map(|o| along(&got, &o.0, &want.0));
+                println!("window {window:?} {label}: worst abs {d:.3e} at {row}; from the other readings to this one {on:.3?}");
                 assert!(d < 2e-5, "window {window:?} {label}: {d} from the definition at position {row}");
-                assert!(far.iter().all(|f| *f > 1e-3), "window {window:?} {label}: {far:?} does not tell the readings apart");
+                assert!(on.iter().all(|x| (x - 1.0).abs() < 0.1), "window {window:?} {label}: {on:?} of the way from another reading");
             }
         }
+    }
+
+    /// How far `got` is along the way from `from` to `to`: 0 at `from`, 1 at `to`.
+    fn along(got: &[f32], from: &[f32], to: &[f32]) -> f64 {
+        assert!(got.len() == to.len() && from.len() == to.len(), "the sides differ in length");
+        let (mut num, mut den) = (0f64, 0f64);
+        for ((g, f), t) in got.iter().zip(from).zip(to) {
+            num += (*g - *f) as f64 * (*t - *f) as f64;
+            den += ((*t - *f) as f64).powi(2);
+        }
+        num / den
     }
 
     /// A malformed operand is refused at the typed boundary, before any
