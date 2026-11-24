@@ -75,9 +75,12 @@
 //! scale (the OCP MX v1.0 rule), BF16 for the values that enter a quantizer,
 //! f32 for the MMA accumulator, the SwiGLU and the weighted scatter.
 //!
-//! Not reproduced: an FP8 MMA (layers 20..23 multiply MXFP8-rounded operands
-//! in a BF16 GEMM, whose accumulator and summation order are not shown to
-//! match one), and the compressed transport the training run's combine used.
+//! On qualified devices the MXFP8 tail uses a block-scaled E4M3 MMA with
+//! FP32 accumulators and BF16 gate, up and down stores. The BF16 fallback
+//! multiplies dequantized operands and stores FP32. Both keep the routing
+//! weight in the final scatter. The release specifies nearest E4M3 with a
+//! UE8M0 scale per 32. It does not specify the rule for choosing that scale.
+//! Both paths use Mary's same block exponent and saturation at ±448.
 
 use burn::tensor::Tensor;
 use cubecl::prelude::*;
@@ -109,7 +112,7 @@ pub(super) enum Stack {
     /// [`fp4_linear_grouped_planes_launch_as`] reads.
     Nvfp4 { codes: Handle, scales: Handle, scale2: Handle, off: Handle },
     /// E4M3 codes and UE8M0 scales in the grouped consumer's fragment order.
-    Mxfp8 { codes: Handle, scales: Handle },
+    Mxfp8 { codes: Handle, scales: Handle, native: bool },
     /// BF16 (MXFP8 decoded exactly): `[E * n, k]`, and the per-expert element
     /// offsets `[E]` u64 that [`bf16_linear_grouped_launch`] indexes.
     Bf16 { w: Handle, off: Handle },
@@ -342,9 +345,9 @@ fn route_place(
 /// per-token outer scale the W4A4 GEMM leaves out).
 #[cube(launch_unchecked)]
 #[allow(clippy::too_many_arguments)]
-fn softcapped_swiglu(
-    g: &Array<f32>,
-    u: &Array<f32>,
+fn softcapped_swiglu<E: Scalar + Cast>(
+    g: &Array<E>,
+    u: &Array<E>,
     tile_slot: &Array<u32>,
     alpha: &Array<f32>,
     out: &mut Array<bf16>,
@@ -358,8 +361,8 @@ fn softcapped_swiglu(
     if p < total {
         let tile = p / comptime!(inter * 16);
         if tile_slot[tile as usize] != 0xFFFF_FFFFu32 {
-            let mut gv = g[p as usize];
-            let mut uv = u[p as usize];
+            let mut gv = f32::cast_from(g[p as usize]);
+            let mut uv = f32::cast_from(u[p as usize]);
             if comptime!(scaled) {
                 // the row's per-token outer scale of its NVFP4 activation
                 let a = alpha[(p / comptime!(inter)) as usize];
@@ -535,7 +538,7 @@ impl Bank {
     fn project_mxfp8(&self, client: &Client, p: &Proj, a: &Handle, plan: &Plan) -> Handle {
         let m = plan.max_tiles * MTILE;
         match &p.stack {
-            Stack::Mxfp8 { codes, scales } => super::mxfp8::project(client, a, codes, scales, &plan.blk, m, p.n, p.k),
+            Stack::Mxfp8 { codes, scales, .. } => super::mxfp8::project(client, a, codes, scales, &plan.blk, m, p.n, p.k),
             Stack::Bf16 { w, off } => bf16_linear_grouped_launch(
                 client, a, w, self.experts * p.n * p.k * 2, &plan.blk, off, self.experts, m, p.k, p.n,
             ),
@@ -572,10 +575,26 @@ impl Bank {
             let (ac, asc, alpha) = quantize_nvfp4_46_bf16(&client, &a, m, h);
             let g = self.project_w4a4(&client, &self.gate, &ac, &asc, &plan);
             let u = self.project_w4a4(&client, &self.up, &ac, &asc, &plan);
-            self.swiglu(&client, g, u, Some(&alpha), &plan, &s);
+            self.swiglu::<f32>(&client, g, u, Some(&alpha), &plan, &s);
             let (sc, ssc, alpha2) = quantize_nvfp4_46_bf16(&client, &s, m, self.inter);
             let y = self.project_w4a4(&client, &self.down, &sc, &ssc, &plan);
             (y, scale_rows(&client, &plan.row_w, &alpha2, m))
+        } else if matches!(self.gate.stack, Stack::Mxfp8 { native: true, .. }) {
+            use crate::models::inkling::fp4quant::pack_mxfp8;
+            let project = |p: &Proj, a: &(Handle, Handle)| {
+                let Stack::Mxfp8 { codes, scales, .. } = &p.stack else { unreachable!() };
+                super::mxfp8::scaled_project(&client, a, codes, scales, &plan.blk, m, p.n, p.k)
+            };
+            let aq = pack_mxfp8(&client, &a, m, h);
+            let g = project(&self.gate, &aq);
+            let u = project(&self.up, &aq);
+            self.swiglu::<bf16>(&client, g, u, None, &plan, &s);
+            let sq = pack_mxfp8(&client, &s, m, self.inter);
+            let y = project(&self.down, &sq);
+            let out = crate::models::inkling::moegroup::scatter_weighted_bf16(
+                &client, &y, &plan.row_w, &plan.tok_rows, &plan.tok_cnt, m, rows, h, self.top_k,
+            );
+            return tensor_of(client, dev, out, rows, h);
         } else {
             // MXFP8: the activations rounded to MXFP8 and held as BF16, against
             // the decoded MXFP8 weights, in the BF16 GEMM (whose accumulator
@@ -583,7 +602,7 @@ impl Bank {
             let aq = qdq_mxfp8_bf16(&client, &a, m, h);
             let g = self.project_mxfp8(&client, &self.gate, &aq, &plan);
             let u = self.project_mxfp8(&client, &self.up, &aq, &plan);
-            self.swiglu(&client, g, u, None, &plan, &s);
+            self.swiglu::<f32>(&client, g, u, None, &plan, &s);
             let sq = qdq_mxfp8_bf16(&client, &s, m, self.inter);
             (self.project_mxfp8(&client, &self.down, &sq, &plan), plan.row_w.clone())
         };
@@ -593,11 +612,11 @@ impl Bank {
 
     /// [`softcapped_swiglu`] over every stacked row of `plan` into `s` (`[m,
     /// inter]` BF16); `alpha` (`[m]` f32) scales `g` and `u` per row first.
-    fn swiglu(&self, client: &Client, g: Handle, u: Handle, alpha: Option<&Handle>, plan: &Plan, s: &Handle) {
+    fn swiglu<E: Scalar + Cast>(&self, client: &Client, g: Handle, u: Handle, alpha: Option<&Handle>, plan: &Plan, s: &Handle) {
         let m = plan.max_tiles * MTILE;
         let total = m * self.inter;
         unsafe {
-            softcapped_swiglu::launch_unchecked::<cubecl::cuda::CudaRuntime>(
+            softcapped_swiglu::launch_unchecked::<E, cubecl::cuda::CudaRuntime>(
                 client,
                 CubeCount::new_1d(total.div_ceil(CUBE as usize) as u32),
                 CubeDim::new_1d(CUBE),
@@ -1372,7 +1391,7 @@ mod tests {
         for scaled in [true, false] {
             let g = client.create_from_slice(f32::as_bytes(&gu));
             let s = bf16_handle(&client, &vec![3.0e5f32; m * i]);
-            b.swiglu(&client, g.clone(), g, scaled.then_some(&ones), &plan, &s);
+            b.swiglu::<f32>(&client, g.clone(), g, scaled.then_some(&ones), &plan, &s);
             let bytes = client.read_one(s.clone()).unwrap();
             let sv: Vec<f32> = bytes.chunks_exact(2).map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32()).collect();
             let (codes, scales, alpha) = quantize_nvfp4_46_bf16(&client, &s, m, i);

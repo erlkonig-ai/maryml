@@ -519,6 +519,26 @@ fn bf16_extent(x: &Handle, rows: usize, k: usize) -> usize {
 /// Elements per MXFP8 block scale.
 pub(crate) const MX_BLOCK: usize = 32;
 
+/// Mini's block exponent policy, shared by the BF16 and native consumers.
+#[cube]
+fn mxfp8_exponent(x: &Array<half::bf16>, base: usize) -> u8 {
+    let mut amax = f32::new(0.0f32);
+    #[unroll]
+    for i in 0..MX_BLOCK {
+        amax = max(amax, Abs::abs(f32::cast_from(x[base + i])));
+    }
+    // floor(log2 amax) from the f32 exponent field; a zero or subnormal
+    // amax gives the smallest normal scale.
+    let ex = i32::cast_from((u32::reinterpret(amax) >> 23) & 255u32);
+    u8::cast_from(max(min(ex - 8i32, 254i32), 1i32))
+}
+
+#[cube]
+fn mxfp8_code(x: half::bf16, inv: f32) -> e4m3 {
+    let v = f32::cast_from(x) * inv;
+    e4m3::cast_from(max(min(v, 448.0f32), -448.0f32))
+}
+
 /// MXFP8 (E4M3 elements, one UE8M0 scale per 32) quantised and dequantised in
 /// one pass, BF16 in and BF16 out: one unit per 32-element block.
 ///
@@ -534,21 +554,12 @@ fn qdq_mxfp8_bf16_kernel(x: &Array<half::bf16>, out: &mut Array<half::bf16>, blo
     let blk = ABSOLUTE_POS;
     if blk < blocks {
         let base = blk * MX_BLOCK;
-        let mut amax = f32::new(0.0f32);
-        #[unroll]
-        for i in 0..MX_BLOCK {
-            amax = max(amax, Abs::abs(f32::cast_from(x[base + i])));
-        }
-        // floor(log2 amax) from the f32 exponent field; a zero or subnormal
-        // amax gives the smallest normal scale.
-        let ex = i32::cast_from((u32::reinterpret(amax) >> 23) & 255u32);
-        let biased = max(min(ex - 8i32, 254i32), 1i32);
-        let scale = f32::reinterpret(u32::cast_from(biased) << 23);
+        let exponent = mxfp8_exponent(x, base);
+        let scale = f32::reinterpret(u32::cast_from(exponent) << 23);
         let inv = 1.0f32 / scale;
         #[unroll]
         for i in 0..MX_BLOCK {
-            let v = f32::cast_from(x[base + i]) * inv;
-            let q = e4m3::cast_from(max(min(v, 448.0f32), -448.0f32));
+            let q = mxfp8_code(x[base + i], inv);
             out[base + i] = half::bf16::cast_from(f32::cast_from(q) * scale);
         }
     }
@@ -573,6 +584,41 @@ pub(crate) fn qdq_mxfp8_bf16<R: Runtime>(client: &ComputeClient<R>, x: &Handle, 
         );
     }
     out
+}
+
+#[cube(launch_unchecked)]
+fn pack_mxfp8_kernel(x: &Array<half::bf16>, out: &mut Array<e4m3>, scales: &mut Array<u8>, blocks: usize) {
+    let blk = ABSOLUTE_POS;
+    if blk < blocks {
+        let base = blk * MX_BLOCK;
+        let exponent = mxfp8_exponent(x, base);
+        scales[blk] = exponent;
+        let inv = 1.0f32 / f32::reinterpret(u32::cast_from(exponent) << 23);
+        #[unroll]
+        for i in 0..MX_BLOCK {
+            out[base + i] = mxfp8_code(x[base + i], inv);
+        }
+    }
+}
+
+pub(crate) fn pack_mxfp8<R: Runtime>(client: &ComputeClient<R>, x: &Handle, rows: usize, k: usize) -> (Handle, Handle) {
+    assert!(k > 0 && k % MX_BLOCK == 0 && rows > 0, "{rows} rows of {k} are not whole MX blocks of {MX_BLOCK}");
+    let n = bf16_extent(x, rows, k);
+    let blocks = n / MX_BLOCK;
+    let out = client.empty(n);
+    let scales = client.empty(blocks);
+    unsafe {
+        pack_mxfp8_kernel::launch_unchecked::<R>(
+            client,
+            CubeCount::new_1d(blocks.div_ceil(CUBE_SIZE as usize) as u32),
+            CubeDim::new_1d(CUBE_SIZE),
+            ArrayArg::from_raw_parts(x.clone(), n),
+            ArrayArg::from_raw_parts(out.clone(), n),
+            ArrayArg::from_raw_parts(scales.clone(), blocks),
+            blocks,
+        );
+    }
+    (out, scales)
 }
 
 /// The eight representable E2M1 magnitudes, indexed by the code's low three

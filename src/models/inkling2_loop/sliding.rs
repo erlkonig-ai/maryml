@@ -50,8 +50,8 @@
 //!
 //! Experts bind in their stored format ([`bind_bank`]): NVFP4 (layers
 //! 0..19) as packed codes, MXFP8 (layers 20..23) as packed codes and scales
-//! for register conversion to BF16 where the device supports E4M3. Other
-//! devices bind decoded BF16. Each projection stacks its experts. The router and
+//! for scaled MMA or register expansion to BF16. Devices without E4M3
+//! conversion bind decoded BF16. Each projection stacks its experts. The router and
 //! the experts run as [`super::moe::Bank`]: routed on the device, one grouped
 //! launch per projection.
 //!
@@ -669,8 +669,12 @@ fn bind_mxfp8_experts(
     }
     let (w13, s13, w2, s2) = (logical(w13)?, logical(s13)?, logical(w2)?, logical(s2)?);
     if super::mxfp8::supported(client) {
+        // Gate/up share one activation and all three projections share a store
+        // precision. An exceptional block anywhere selects the BF16 bank.
+        let native = super::mxfp8::native_supported(client)
+            && s13.iter().chain(s2).all(|&exp| super::mxfp8::ordinary_scale(exp));
         let bind = |codes: &[u8], scales: &[u8], n, k, first, step| {
-            super::mxfp8::bind(client, codes, scales, e, n, k, first, step).map_err(|err| format!("layer {layer}: {err}"))
+            super::mxfp8::bind(client, codes, scales, e, n, k, first, step, native).map_err(|err| format!("layer {layer}: {err}"))
         };
         return Ok([bind(w13, s13, i, h, 0, 2)?, bind(w13, s13, i, h, 1, 2)?, bind(w2, s2, h, i, 0, 1)?]);
     }
@@ -807,7 +811,8 @@ mod tests {
                 .into_iter()
                 .zip([(ExpertMat::W13, 0, 2), (ExpertMat::W13, 1, 2), (ExpertMat::W2, 0, 1)])
         {
-            if let Stack::Mxfp8 { codes, scales } = projection.stack {
+            if let Stack::Mxfp8 { codes, scales, native } = projection.stack {
+                assert_eq!(native, super::super::mxfp8::native_supported(&client));
                 let packed = client.read_one(codes).unwrap();
                 let exps = client.read_one(scales).unwrap();
                 let (n, k) = (projection.n, projection.k);
@@ -839,6 +844,18 @@ mod tests {
                     .contains("short MXFP8 tensor")
             );
             w.0.get_mut(&key).unwrap().2.extend(tail);
+        }
+        for (mat, block, exponent) in [
+            (ExpertMat::W13, 0, 0), (ExpertMat::W13, d.hidden / 32, 255),
+            (ExpertMat::W2, 0, 247),
+        ] {
+            let key = name(mat, ExpertPart::Scale);
+            let old = std::mem::replace(&mut w.0.get_mut(&key).unwrap().2[block], exponent);
+            // Representable weights still bind, including NaN scale 255.
+            w.0.get_mut(&name(mat, ExpertPart::Weight)).unwrap().2[block * 32..(block + 1) * 32].fill(0x38);
+            let projections = bind_mxfp8_experts(&w, &d, 0, &client).unwrap();
+            assert!(projections.iter().all(|p| !matches!(p.stack, Stack::Mxfp8 { native: true, .. })));
+            w.0.get_mut(&key).unwrap().2[block] = old;
         }
         w.0.get_mut(&name(ExpertMat::W13, ExpertPart::Weight)).unwrap().2[0] = 1;
         w.0.get_mut(&name(ExpertMat::W13, ExpertPart::Scale)).unwrap().2[0] = 0;

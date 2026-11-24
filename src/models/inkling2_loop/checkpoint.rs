@@ -10,7 +10,7 @@
 //!
 //! The text forward is native ([`NATIVE_TEXT`], `super::session`).
 //! [`native_gaps`] lists what the release declares beyond it: the vision
-//! tower, the drafter and an MXFP8 device GEMM. Nothing
+//! tower and the drafter. Nothing
 //! is skipped silently and nothing falls back to the original Inkling's code;
 //! the original Inkling's loader refuses a Mini config and names the session
 //! ([`refusal_for_config`]).
@@ -289,7 +289,8 @@ pub struct Gap {
 /// Where the native text forward is.
 pub const NATIVE_TEXT: &str = "the text forward (all 24 layers, the three-pass core, the head) runs natively \
      as models::inkling2_loop::session::MiniModel / MiniSession (feature inkling2-session), the experts \
-     with the activation quantisation the release declares (NVFP4 with Four Over Six, MXFP8)";
+     with the activation quantisation the release declares (NVFP4 with Four Over Six, MXFP8); eligible \
+     MXFP8 banks use scaled FP8 MMA on supported CUDA devices and toolchains, otherwise BF16";
 
 /// What the release declares beyond Mary's native text forward
 /// ([`NATIVE_TEXT`]).
@@ -298,28 +299,10 @@ pub const NATIVE_TEXT: &str = "the text forward (all 24 layers, the three-pass c
 /// the attention variant, the dynamic K/V convolutions and the softcaps are
 /// native (`sliding`, `full`, `loop_core`, `head`, `session`), and so is the
 /// activation quantisation `hf_quant_config.json` declares for the experts
-/// (`moe`), so they are not listed. What remains is the vision tower, the
-/// drafter, and a device GEMM in MXFP8: those layers multiply MXFP8-rounded
-/// operands as BF16.
-pub fn native_gaps(cfg: &Inkling2LoopConfig, experts: &BTreeMap<usize, Precision>) -> Vec<Gap> {
-    let layers = |p: fn(&Precision) -> bool| -> Vec<usize> {
-        experts
-            .iter()
-            .filter(|(_, q)| p(q))
-            .map(|(i, _)| *i)
-            .collect()
-    };
-    let mxfp8 = layers(|p| matches!(p, Precision::Mxfp8 { .. }));
+/// (`moe`). MXFP8 projection dispatch is decided when the bank is bound.
+/// A header-only inspection cannot select its device kernel.
+pub fn native_gaps(cfg: &Inkling2LoopConfig, _experts: &BTreeMap<usize, Precision>) -> Vec<Gap> {
     let mut gaps = Vec::new();
-    if !mxfp8.is_empty() {
-        gaps.push(Gap {
-            what: "MXFP8 device GEMM",
-            detail: format!(
-                "layers {mxfp8:?}: the weights decode exactly to BF16, the activations \
-                 round to the declared 'mxfp8_e4m3' and both multiply as BF16; an FP8 MMA is not run"
-            ),
-        });
-    }
     gaps.push(Gap {
         what: "vision tower",
         detail: format!(
@@ -343,8 +326,6 @@ pub fn native_gaps(cfg: &Inkling2LoopConfig, experts: &BTreeMap<usize, Precision
 /// native and what is not. Text inference itself is not refused; it is
 /// [`NATIVE_TEXT`].
 pub fn require_native_forward(cfg: &Inkling2LoopConfig) -> Result<(), String> {
-    // Without hf_quant_config the expert precisions are unknown, so name the
-    // gaps that do not depend on them.
     refuse(&native_gaps(cfg, &BTreeMap::new()))
 }
 
@@ -521,9 +502,8 @@ mod tests {
         let (cfg, p) = setup();
         let ins = inspect(&cfg, &p, &pinned()).unwrap();
         let what: Vec<&str> = ins.gaps.iter().map(|g| g.what).collect();
-        assert!(what.contains(&"MXFP8 device GEMM"), "{what:?}");
         // the text operators are native now and must not be listed as missing
-        for native in ["activation quantisation", "looped core", "cross-pass messages", "block attention residual", "attention variant"] {
+        for native in ["MXFP8 device GEMM", "activation quantisation", "looped core", "cross-pass messages", "block attention residual", "attention variant"] {
             assert!(!what.iter().any(|w| w.contains(native)), "{native} listed as missing: {what:?}");
         }
         let text = refuse(&ins.gaps).unwrap_err();

@@ -16,7 +16,7 @@
 //!   per-tensor precision from `hf_quant_config.json`;
 //! * [`checkpoint`]: a header-only inspection of a checkpoint directory
 //!   against that layout, and the explicit list of what Mary does not run
-//!   natively (vision, drafter, an MXFP8 device GEMM);
+//!   natively (vision and drafter);
 //! * [`experts`]: the NVFP4 (amax / denominator) and MXFP8 weight decodes;
 //! * `sliding` (with `inkling-cuda`): one visit of a sliding layer outside
 //!   the looped core, on the device, with its K/V and conv state. Held to
@@ -41,9 +41,8 @@
 //!   token sequences over it ([`session::MiniSession`]): token IDs in,
 //!   softcapped logits out, every layer visit's state carried.
 //!
-//! What the release declares beyond the text forward (the vision tower, the
-//! drafter, an MXFP8 device GEMM) is not native:
-//! [`checkpoint::native_gaps`] names it, and the original Inkling's loader
+//! The vision tower and drafter remain outside the native text forward:
+//! [`checkpoint::native_gaps`] lists them, and the original Inkling's loader
 //! refuses a Mini config with that list and a pointer to the session
 //! ([`checkpoint::refusal_for_config`]).
 //!
