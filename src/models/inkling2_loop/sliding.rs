@@ -599,6 +599,41 @@ pub(super) fn bind_bank(
     Ok(Bank::new(client, router, bias, projs, d.top_k, d.route_scale, d.gate_softcap, d.up_softcap))
 }
 
+/// Fill `bufs`, each `e` equal parts, with `f(x, parts)` for every expert `x`,
+/// on as many host threads as there are.
+fn fill_experts<const N: usize>(
+    e: usize,
+    bufs: [&mut [u8]; N],
+    f: impl Fn(usize, [&mut [u8]; N]) -> Result<(), String> + Sync,
+) -> Result<(), String> {
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let per = e.div_ceil(threads);
+    let parts = bufs.each_ref().map(|b| b.len() / e);
+    let mut i = 0;
+    let mut chunks = bufs.map(|b| {
+        i += 1;
+        b.chunks_mut(per * parts[i - 1])
+    });
+    std::thread::scope(|s| {
+        let threads: Vec<_> = (0..e)
+            .step_by(per)
+            .map(|first| {
+                let mine = chunks.each_mut().map(|c| c.next().expect("one chunk per thread"));
+                let f = &f;
+                s.spawn(move || {
+                    let mut i = 0;
+                    let mut mine = mine.map(|m| {
+                        i += 1;
+                        m.chunks_mut(parts[i - 1])
+                    });
+                    (first..e.min(first + per)).try_for_each(|x| f(x, mine.each_mut().map(|m| m.next().expect("one part per expert"))))
+                })
+            })
+            .collect();
+        threads.into_iter().try_for_each(|t| t.join().expect("a bind thread panicked"))
+    })
+}
+
 /// MXFP8 experts: E4M3 values `[e, rows, cols]` and one UE8M0 scale per 32
 /// values of a row `[e, rows, cols / 32]`, decoded on the host
 /// layer at a time (upstream's `Inkling2LoopDequantizeExperts`, then `.to(bfloat16)`,
@@ -623,33 +658,34 @@ fn bind_mxfp8_experts(
             return Err(format!("layer {layer}: MXFP8 expert {n}x{k} does not tile"));
         }
     }
-    // rows `first, first + step, ..` (count of them) of a `[rows, cols]` matrix, as BF16 bytes
-    let decode = |vals: &[u8], scales: &[u8], cols: usize, first: usize, step: usize, count: usize| -> Result<Vec<u8>, String> {
+    // rows `first, first + step, ..` (count of them) of a `[rows, cols]` matrix, as BF16 bytes into `out`
+    let decode = |vals: &[u8], scales: &[u8], cols: usize, first: usize, step: usize, out: &mut [u8]| -> Result<(), String> {
         let per = cols / MXFP8_BLOCK;
         let mut row = vec![0f32; cols];
-        let mut out = Vec::with_capacity(count * cols * 2);
-        for r in (0..count).map(|j| first + j * step) {
+        for (j, out) in out.chunks_exact_mut(cols * 2).enumerate() {
+            let r = first + j * step;
             decode_mxfp8_row(&vals[r * cols..(r + 1) * cols], &scales[r * per..(r + 1) * per], MXFP8_BLOCK, &mut row);
-            for &v in &row {
+            for (&v, out) in row.iter().zip(out.chunks_exact_mut(2)) {
                 let b = half::bf16::from_f32(v);
                 if b.to_f32().to_bits() != v.to_bits() && !v.is_nan() {
                     return Err(format!("layer {layer}: MXFP8 value {v} is not a BF16"));
                 }
-                out.extend_from_slice(&b.to_le_bytes());
+                out.copy_from_slice(&b.to_le_bytes());
             }
         }
-        Ok(out)
+        Ok(())
     };
     let (m13, p13) = (2 * i * h, 2 * i * (h / MXFP8_BLOCK));
     let (m2, p2) = (h * i, h * (i / MXFP8_BLOCK));
-    let (mut gate, mut up, mut down) = (Vec::with_capacity(e * i * h * 2), Vec::with_capacity(e * i * h * 2), Vec::with_capacity(e * i * h * 2));
-    for x in 0..e {
+    let part = e * i * h * 2;
+    let (mut gate, mut up, mut down) = (vec![0; part], vec![0; part], vec![0; part]);
+    fill_experts(e, [&mut gate, &mut up, &mut down], |x, [gate, up, down]| {
         let (v13, c13) = (&w13.bytes[x * m13..(x + 1) * m13], &s13.bytes[x * p13..(x + 1) * p13]);
         let (v2, c2) = (&w2.bytes[x * m2..(x + 1) * m2], &s2.bytes[x * p2..(x + 1) * p2]);
-        gate.extend(decode(v13, c13, h, 0, 2, i)?);
-        up.extend(decode(v13, c13, h, 1, 2, i)?);
-        down.extend(decode(v2, c2, i, 0, 1, h)?);
-    }
+        decode(v13, c13, h, 0, 2, gate)?;
+        decode(v13, c13, h, 1, 2, up)?;
+        decode(v2, c2, i, 0, 1, down)
+    })?;
     Ok([bf16_proj(client, &gate, e, i, h), bf16_proj(client, &up, e, i, h), bf16_proj(client, &down, e, h, i)])
 }
 
@@ -674,25 +710,49 @@ fn bind_nvfp4_experts(
     let (cb13, sb13, cb2, sb2) = (h / 2, h / 16, i / 2, i / 16);
     // w13's rows are stored interleaved, gate then up per intermediate unit
     // (upstream de-interleaves them on load with `Interleave(dim=1)`)
-    let rows = |src: &[u8], width: usize, e: usize, parity: usize| -> Vec<u8> {
+    let rows = |src: &[u8], width: usize, e: usize, parity: usize, out: &mut [u8]| {
         let base = e * 2 * i * width;
-        let mut out = Vec::with_capacity(i * width);
-        for r in 0..i {
+        for (r, out) in out.chunks_exact_mut(width).enumerate() {
             let s = base + (2 * r + parity) * width;
-            out.extend_from_slice(&src[s..s + width]);
+            out.copy_from_slice(&src[s..s + width]);
         }
-        out
     };
-    let (mut gc, mut gs, mut uc, mut us) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    for x in 0..e {
-        gc.extend(rows(w13.bytes, cb13, x, 0));
-        gs.extend(rows(s13.bytes, sb13, x, 0));
-        uc.extend(rows(w13.bytes, cb13, x, 1));
-        us.extend(rows(s13.bytes, sb13, x, 1));
-    }
+    let (codes, scales) = (e * i * cb13, e * i * sb13);
+    let (mut gc, mut gs, mut uc, mut us) = (vec![0; codes], vec![0; scales], vec![0; codes], vec![0; scales]);
+    fill_experts(e, [&mut gc, &mut gs, &mut uc, &mut us], |x, [gc, gs, uc, us]| {
+        rows(w13.bytes, cb13, x, 0, gc);
+        rows(s13.bytes, sb13, x, 0, gs);
+        rows(w13.bytes, cb13, x, 1, uc);
+        rows(s13.bytes, sb13, x, 1, us);
+        Ok(())
+    })?;
     Ok([
         nvfp4_proj(client, &gc, &gs, sc13.clone(), i, h),
         nvfp4_proj(client, &uc, &us, sc13, i, h),
         nvfp4_proj(client, &w2.bytes[..e * h * cb2], &s2.bytes[..e * h * sb2], sc2, h, i),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fill_experts;
+
+    #[test]
+    fn every_expert_fills_its_own_parts() {
+        for e in [1, 2, 7, 19, 20, 21, 64, 257] {
+            let (mut a, mut b) = (vec![0u8; e * 3], vec![0u8; e * 5]);
+            fill_experts(e, [&mut a, &mut b], |x, [a, b]| {
+                a.fill(x as u8);
+                b.fill(!(x as u8));
+                Ok(())
+            })
+            .unwrap();
+            assert!(a.chunks(3).zip(b.chunks(5)).enumerate().all(|(x, (a, b))| {
+                a.iter().all(|v| *v == x as u8) && b.iter().all(|v| *v == !(x as u8))
+            }));
+            let stop = e / 2;
+            let err = fill_experts(e, [&mut a, &mut b], |x, _| if x == stop { Err("stop".into()) } else { Ok(()) });
+            assert_eq!(err, Err("stop".to_string()));
+        }
+    }
 }
