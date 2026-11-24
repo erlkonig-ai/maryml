@@ -249,6 +249,12 @@ impl State {
         State { pos: 0, kv: Kv::new(KEY_TILE), conv: Self::zero_conv(d, dev), fault: fault.clone() }
     }
 
+    /// Share tensor storage under Burn's value semantics. The fork writes its
+    /// faults to its own session cell, including in unchecked device kernels.
+    pub(super) fn fork(&self, fault: &FaultCell) -> State {
+        State { pos: self.pos, kv: self.kv.clone(), conv: self.conv.clone(), fault: fault.clone() }
+    }
+
     /// The router fault cell this state's visits write.
     pub fn fault(&self) -> &FaultCell {
         &self.fault

@@ -67,6 +67,7 @@ pub const FUSED_MAX_QUERIES: usize = 16;
 /// One visit's keys and values: post-clip K and post-norm V `[rows, kv_dim]`
 /// in BF16 (upstream's clip and norm hand back the layer's dtype, and its
 /// cache holds that), in segments of `tile` rows, oldest first, from absolute position `base`.
+#[derive(Clone)]
 pub struct Kv {
     tile: usize,
     base: usize,

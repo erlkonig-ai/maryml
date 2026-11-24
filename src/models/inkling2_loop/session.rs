@@ -46,7 +46,7 @@
 //! ([`super::attend::QUERY_TILE`] by [`super::attend::KEY_TILE`]), not by the
 //! sequence.
 //!
-//! Scope, stated. No checkpoint, rewind or cache export. The head runs on the
+//! A healthy session can fork in process. Its state stays on its bound device. The head runs on the
 //! device ([`DeviceHead`]), the host [`Head`]'s arithmetic in its order.
 //! Logits are the release's: `unpadded_vocab_size` softcapped f32 values per
 //! row. Nothing here samples.
@@ -401,6 +401,27 @@ impl MiniSession {
     /// [`Self::reset`] clears it.
     pub fn is_poisoned(&self) -> bool {
         self.poisoned
+    }
+
+    /// Snapshot a completed append on this model and device. Full immutable KV
+    /// pages share storage. Partial pages and convolution tails follow Burn's
+    /// copy-on-write semantics. Each branch gets an independent router fault cell.
+    pub fn fork(&self) -> Result<Self> {
+        ensure!(!self.poisoned, "cannot fork a failed Mini session");
+        // CubeCL reports allocation failures by unwinding. This optional fork
+        // has not touched the original session and can be declined.
+        let fault = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fault_cell(&self.model.dev)))
+            .map_err(|_| anyhow!("could not allocate a private Mini router fault cell"))?;
+        let caches = Caches {
+            pre: self.caches.pre.iter().map(|s| s.fork(&fault)).collect(),
+            core: CoreState { visits: self.caches.core.visits.iter()
+                .map(|(id, s)| (*id, s.fork(&fault))).collect() },
+            post: self.caches.post.iter().map(|s| s.fork(&fault)).collect(),
+            fault,
+            #[cfg(test)]
+            nan_input: false,
+        };
+        Ok(Self { model: Arc::clone(&self.model), caches, position: self.position, poisoned: false })
     }
 
     /// Drop every cache and return to position 0. The weights stay bound.
