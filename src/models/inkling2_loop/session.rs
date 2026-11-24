@@ -707,16 +707,22 @@ mod tests {
 
     /// Release weights: after a call is taken back to its first `keep` tokens,
     /// nothing of the rejected ones is left. Two sessions whose rejected tokens
-    /// differ hold bit-equal convolution histories, keys and next logits. A
-    /// session that only ever appended the kept tokens differs from them by the
-    /// rounding of another call shape; a session that kept one token fewer or
-    /// more differs by far more. The prompt ends just before a key segment fills
+    /// differ hold bit-equal convolution histories, keys and next logits. Target-only
+    /// decoding of the kept tokens differs from them by the rounding of another
+    /// call shape: no more than twice what the same eight tokens differ by in one
+    /// call and one by one, nothing taken back, and every history is nearer its
+    /// own than one token off. The prompt ends just before a key segment fills
     /// and just before the window lets the first one go.
     #[test]
     #[ignore = "needs the imported Mini release (MINI_MODEL_PILE, MINI_MODEL_COLLECTION, MINI_MODEL_ROOT) and a GPU"]
     fn a_retracted_session_holds_only_the_kept_tokens() {
         let model = open();
         let points = TapPoints::new(model.config(), &[5, 23, 41, 48]).unwrap();
+        enum How {
+            Retract,
+            OneCall,
+            OneByOne,
+        }
         let t = 8usize;
         let host = |x: Tensor<Bk, 2>| -> Vec<f32> { x.into_data().convert::<f32>().to_vec().unwrap() };
         let rel = |a: &[f32], b: &[f32]| -> f64 {
@@ -730,15 +736,16 @@ mod tests {
             let ids: Vec<u32> = (0..prompt as u32 + 16).map(|i| 1000 + (37 * i) % 90_000).collect();
             let probe = &ids[prompt + 12..prompt + 13];
             // `then`: tokens past the prompt; `keep` of them stay
-            let run = |then: &[u32], keep: usize, revoke: bool| {
+            let run = |then: &[u32], keep: usize, how: How| {
                 let mut s = MiniSession::new(Arc::clone(&model));
                 s.prefill(&ids[..prompt]).unwrap();
-                if revoke {
-                    s.append_tapped(then, Rows::Last, &points, true).unwrap();
-                    s.retract(keep).unwrap();
-                } else {
-                    assert_eq!(then.len(), keep);
-                    s.append(then, Rows::Last).unwrap();
+                match how {
+                    How::Retract => {
+                        s.append_tapped(then, Rows::Last, &points, true).unwrap();
+                        s.retract(keep).unwrap();
+                    }
+                    How::OneCall => drop(s.append(then, Rows::Last).unwrap()),
+                    How::OneByOne => then.iter().for_each(|&id| drop(s.decode(id).unwrap())),
                 }
                 assert_eq!(s.position(), prompt + keep);
                 let mut conv = Vec::new();
@@ -755,28 +762,38 @@ mod tests {
                 let next = s.append(probe, Rows::Last).unwrap();
                 (conv, kv, next.values)
             };
+            let worst = |a: &[Vec<f32>], b: &[Vec<f32>]| a.iter().zip(b).map(|(p, q)| rel(p, q)).fold(0.0, f64::max);
+            // the rounding of another call shape with nothing taken back: the same eight tokens in one call and one by one
+            let eight = &ids[prompt..prompt + t];
+            let (one, each) = (run(eight, t, How::OneCall), run(eight, t, How::OneByOne));
+            let noise = worst(&one.0, &each.0);
+            eprintln!(
+                "RETRACT prompt {prompt} no retract, 8 tokens in one call vs one by one: conv {noise:.3e} keys {:.3e} next logits {:.3e}",
+                worst(&one.1, &each.1),
+                rel(&one.2, &each.2)
+            );
             let with = |keep: usize, fill: u32| -> Vec<u32> {
                 let mut v = ids[prompt..prompt + keep].to_vec();
                 v.extend((keep..t).map(|i| fill + i as u32));
                 v
             };
             for keep in [1usize, 3, 4, 5, 8] {
-                let x = run(&with(keep, 5000), keep, true);
-                let y = run(&with(keep, 70_000), keep, true);
+                let x = run(&with(keep, 5000), keep, How::Retract);
+                let y = run(&with(keep, 70_000), keep, How::Retract);
                 let bits = |v: &[Vec<f32>]| -> Vec<u32> { v.iter().flatten().map(|f| f.to_bits()).collect() };
                 assert_eq!(bits(&x.0), bits(&y.0), "keep {keep}: a rejected token reached a convolution history");
                 assert_eq!(bits(&x.1), bits(&y.1), "keep {keep}: a rejected token reached the keys");
                 assert_eq!(bits(&[x.2.clone()]), bits(&[y.2.clone()]), "keep {keep}: a rejected token reached the next logits");
-                let z = run(&ids[prompt..prompt + keep], keep, false);
-                let worst = |a: &[Vec<f32>], b: &[Vec<f32>]| a.iter().zip(b).map(|(p, q)| rel(p, q)).fold(0.0, f64::max);
+                let z = run(&ids[prompt..prompt + keep], keep, How::OneByOne);
                 let (wc, wk, wl) = (worst(&x.0, &z.0), worst(&x.1, &z.1), rel(&x.2, &z.2));
-                // the same histories one token off, for scale
-                let off = run(&ids[prompt..prompt + keep + 1], keep + 1, false);
-                let least = x.0.iter().zip(&off.0).map(|(p, q)| rel(p, q)).fold(f64::INFINITY, f64::min);
+                // the same histories one token off: each tensor must be nearer its own
+                let off = run(&ids[prompt..prompt + keep + 1], keep + 1, How::OneByOne);
+                let ratio = x.0.iter().zip(&z.0).zip(&off.0).map(|((p, q), o)| rel(p, q) / rel(p, o)).fold(0.0, f64::max);
                 eprintln!(
-                    "RETRACT prompt {prompt} keep {keep}/{t}: rejected tokens bit-invisible; vs the kept tokens alone: conv {wc:.3e} keys {wk:.3e} next logits {wl:.3e}; one token off, the least-moved conv history {least:.3e}"
+                    "RETRACT prompt {prompt} keep {keep}/{t}: rejected tokens bit-invisible; vs the kept tokens one by one: conv {wc:.3e} keys {wk:.3e} next logits {wl:.3e}; worst conv distance as a share of the same tensor one token off {ratio:.3}"
                 );
-                assert!(wc < 0.5 * least, "keep {keep}: the histories are not the kept tokens' ({wc} against {least} one token off)");
+                assert!(ratio < 1.0, "keep {keep}: a history is nearer one token off than the kept tokens");
+                assert!(wc <= 2.0 * noise, "keep {keep}: conv {wc} against {noise} with nothing taken back");
             }
         }
     }
