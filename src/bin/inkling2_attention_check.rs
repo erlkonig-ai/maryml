@@ -111,7 +111,10 @@ fn run(args: &[String]) {
     } else if let Some(f) = source.strip_prefix("text:") {
         let bytes = std::fs::read(f).expect("read text");
         let text = String::from_utf8_lossy(&bytes);
-        let enc = model.content_tokenizer().encode(text.as_ref(), false).expect("tokenize");
+        let root = model.root();
+        let content = mary::tokenizer::build_tokenizer_with_added(root.facts(), root.store(), root.tokenizer_root(), false)
+            .expect("build the content tokenizer");
+        let enc = content.encode(text.as_ref(), false).expect("tokenize");
         (enc.get_ids().to_vec(), hexs(Sha256::digest(&bytes)))
     } else {
         panic!("source must be ids:FILE or text:FILE");

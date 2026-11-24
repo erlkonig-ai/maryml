@@ -146,13 +146,12 @@ impl Outer {
     }
 }
 
-/// Inkling 2 Mini, bound once from a model root in a pile: config, tokenizer,
-/// chat template and weights, all from that root.
+/// Inkling 2 Mini, bound once from a model root in a pile: config, chat template
+/// and weights, all from that root. Text becomes ids in a
+/// [`super::chat::ChatCodec`] over the same root's tokenizer graph.
 pub struct MiniModel {
     root: MiniRoot,
     cfg: Inkling2LoopConfig,
-    tokenizer: tokenizers::Tokenizer,
-    content_tokenizer: tokenizers::Tokenizer,
     dev: Dev,
     embed_gain: Tensor<Bk, 1>,
     pre: Vec<Outer>,
@@ -235,9 +234,6 @@ impl MiniModel {
     pub fn from_root(root: MiniRoot) -> Result<MiniModel> {
         let cfg = Inkling2LoopConfig::from_json(&root.config().context("config facts")?.to_string())
             .map_err(|e| anyhow!("config: {e}"))?;
-        let tok = root.tokenizer_root();
-        let (tokenizer, content_tokenizer) = crate::tokenizer::build_tokenizer_and_content(root.facts(), root.store(), tok)
-            .map_err(|e| anyhow!("build the tokenizers from the root's graph: {e:?}"))?;
         let dev = Dev::default();
         let t = &cfg.text_config;
         let l = &t.loop_config;
@@ -254,23 +250,11 @@ impl MiniModel {
         let core = Core::bind(&root, t, &dev).map_err(|e| anyhow!("bind the core: {e}"))?;
         let post = outer(l.core_end..t.num_hidden_layers)?;
         let head = DeviceHead::bind(t, &root, &dev)?;
-        Ok(MiniModel { root, cfg, tokenizer, content_tokenizer, dev, embed_gain, pre, core, post, head })
+        Ok(MiniModel { root, cfg, dev, embed_gain, pre, core, post, head })
     }
 
     pub fn config(&self) -> &Inkling2LoopTextConfig {
         &self.cfg.text_config
-    }
-
-    /// The whole tokenizer, added (special) tokens included, from the root's
-    /// own tokenizer graph.
-    pub fn tokenizer(&self) -> &tokenizers::Tokenizer {
-        &self.tokenizer
-    }
-
-    /// The same graph without its added tokens: literal marker spellings in
-    /// untrusted text become ordinary pieces.
-    pub fn content_tokenizer(&self) -> &tokenizers::Tokenizer {
-        &self.content_tokenizer
     }
 
     /// The root's chat template, as imported.
