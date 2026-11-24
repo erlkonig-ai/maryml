@@ -74,7 +74,7 @@ use crate::models::inkling::burn::{
 };
 use crate::models::inkling::seam::{Bk, client_of};
 use crate::models::inkling2_loop::prof;
-use crate::models::inkling2_loop::attend::{AttnShape, KEY_TILE, Kv, QUERY_TILE, attend};
+use crate::models::inkling2_loop::attend::{AttnShape, KEY_TILE, Kv, QUERY_TILE, RelProj, attend};
 use crate::models::inkling2_loop::config::Inkling2LoopTextConfig;
 use crate::models::inkling2_loop::experts::nvfp4_scale2;
 use crate::models::inkling2_loop::layout::{
@@ -205,7 +205,7 @@ pub struct SlidingLayer {
     sink: Bf16W,
     q_scale: Tensor<Bk, 3>,
     rel_scale: Tensor<Bk, 3>,
-    rel_proj: Tensor<Bk, 2>,
+    rel_proj: RelProj,
     k_sconv: Tensor<Bk, 2>,
     v_sconv: Tensor<Bk, 2>,
     attn_sconv: Tensor<Bk, 2>,
@@ -338,7 +338,12 @@ impl SlidingLayer {
             sink: lin(a(AttnPart::SinkProj), d.heads, h)?,
             q_scale: per_head(a(AttnPart::QL2Clip), d.head_dim)?,
             rel_scale: per_head(a(AttnPart::RelL2Clip), d.d_rel)?,
-            rel_proj: mat(a(AttnPart::RelLogitsProj), d.d_rel, d.rel_extent)?,
+            rel_proj: RelProj::new(
+                &client,
+                want(w, a(AttnPart::RelLogitsProj), Dtype::Bf16, &[d.d_rel, d.rel_extent])?.bytes,
+                d.d_rel,
+                d.rel_extent,
+            ),
             k_sconv: conv(a(AttnPart::KSconv(ConvPart::Weight)), kv)?,
             v_sconv: conv(a(AttnPart::VSconv(ConvPart::Weight)), kv)?,
             attn_sconv: conv(l(LayerPart::AttnSconv), h)?,
