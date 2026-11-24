@@ -38,6 +38,7 @@
 //! nothing downstream has to be told a new address.
 
 use anyhow::{Context, Result};
+use std::sync::LazyLock;
 use triblespace::core::attribute::Attribute;
 use triblespace::core::blob::encodings::tensor::elements::{BF16, E4M3, F16, F32, NVFP4, U8};
 use triblespace::core::blob::encodings::tensor::{Tensor, TensorElement, TensorView, tensor_blob};
@@ -401,9 +402,14 @@ pub fn resolve(tribles: &TribleSet, blobs: &impl BlobStoreGet, weight: Id) -> Re
 
     macro_rules! typed {
         ($elem:ty, $rank:literal, $tag:expr_2021) => {{
+            // Deriving the attribute builds and hashes its identity fragment,
+            // which costs far more than the probe; a model asks thousands of times.
+            static LEAF: LazyLock<Attribute<Handle<Tensor<$elem, $rank>>>> =
+                LazyLock::new(leaf::<$elem, $rank>);
+            let leaf = &*LEAF;
             if let Some((h,)) = triblespace::macros::find!(
                 (h: Inline<Handle<Tensor<$elem, $rank>>>),
-                triblespace::macros::pattern!(tribles, [{ weight @ leaf::<$elem, $rank>(): ?h }])
+                triblespace::macros::pattern!(tribles, [{ weight @ leaf: ?h }])
             )
             .next()
             {
