@@ -1442,3 +1442,8 @@ required-features = ["qwen3_5-gpu", "tokenizer"]
 [[bin]]
 name = "flint_tokenizer_gate"
 required-features = ["import", "tokenizer"]
+
+# Greedy decoding of fixed prompts by Mini with and without its drafter.
+[[bin]]
+name = "inkling2_speculate"
+required-features = ["inkling2-session"]

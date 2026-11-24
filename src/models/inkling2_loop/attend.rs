@@ -121,6 +121,18 @@ impl Kv {
         }
     }
 
+    /// Forget every row at absolute position `end` and after. The rows left
+    /// are untouched; what is past them in the last segment is dead.
+    pub fn truncate(&mut self, end: usize) {
+        assert!(end >= self.base && end <= self.end(), "truncate to {end} outside {}..{}", self.base, self.end());
+        let rows = end - self.base;
+        self.segs.truncate(rows.div_ceil(self.tile));
+        self.last = match self.segs.len() {
+            0 => 0,
+            s => rows - (s - 1) * self.tile,
+        };
+    }
+
     /// Drop every whole segment whose rows all sit before absolute position
     /// `first`. The segment holding `first`, and the one being filled, stay.
     pub fn evict_before(&mut self, first: usize) {
@@ -143,7 +155,7 @@ impl Kv {
 
     /// `(absolute position of row 0, keys, values, filled rows)` of each
     /// segment, whole: the buffers as allocated, `tile` rows each.
-    fn whole_segments(&self) -> impl Iterator<Item = (usize, &Tensor<Bk, 2>, &Tensor<Bk, 2>, usize)> + '_ {
+    pub(super) fn whole_segments(&self) -> impl Iterator<Item = (usize, &Tensor<Bk, 2>, &Tensor<Bk, 2>, usize)> + '_ {
         let n = self.segs.len();
         self.segs.iter().enumerate().map(move |(s, [k, v])| {
             let rows = if s + 1 == n { self.last } else { self.tile };

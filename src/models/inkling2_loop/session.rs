@@ -51,6 +51,7 @@
 //! Logits are the release's: `unpadded_vocab_size` softcapped f32 values per
 //! row. Nothing here samples.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -71,11 +72,11 @@ use crate::models::inkling2_loop::config::{AttnKind, Inkling2LoopConfig, Inkling
 use crate::models::inkling2_loop::full::FullLayer;
 use crate::models::inkling2_loop::head::{self, Head};
 use crate::models::inkling2_loop::layout::{Dtype, Slot};
-use crate::models::inkling2_loop::loop_core::{Core, CoreState};
+use crate::models::inkling2_loop::loop_core::{Core, CoreState, VisitHook};
 use crate::models::inkling2_loop::moe::{FaultCell, fault_cell, read_fault};
 use crate::models::inkling2_loop::pile::MiniRoot;
-use crate::models::inkling2_loop::schedule::CacheId;
-use crate::models::inkling2_loop::sliding::{Dev, SlidingLayer, State, Weights, bf16_to_f32, want};
+use crate::models::inkling2_loop::schedule::{CacheId, Schedule, Segment};
+use crate::models::inkling2_loop::sliding::{Dev, SlidingLayer, State, Taps, Weights, bf16_to_f32, want};
 
 /// The most logit rows one call returns, so a long prefill cannot ask for
 /// `rows x 200058` floats on the host by accident.
@@ -203,6 +204,11 @@ impl DeviceHead {
     /// `blocks` and `partial` are `[rows, hidden]` each; returns the
     /// softcapped `[rows, vocab]` logits.
     fn forward(&self, blocks: Vec<Tensor<Bk, 2>>, partial: Tensor<Bk, 2>) -> Tensor<Bk, 2> {
+        self.logits(self.normed(blocks, partial))
+    }
+
+    /// The normed final state, rounded to BF16: what the unembedding reads.
+    fn normed(&self, blocks: Vec<Tensor<Bk, 2>>, partial: Tensor<Bk, 2>) -> Tensor<Bk, 2> {
         let [rows, h] = partial.dims();
         let mut states = blocks;
         states.push(partial);
@@ -216,7 +222,13 @@ impl DeviceHead {
         let selected = (normed * w).sum_dim(1).reshape([rows, h]);
         debug_assert!(n > 0);
         let bf16 = |x: Tensor<Bk, 2>| x.cast(FloatDType::BF16).cast(FloatDType::F32);
-        let y = bf16(rms_norm(selected, self.gain.clone(), self.eps));
+        bf16(rms_norm(selected, self.gain.clone(), self.eps))
+    }
+
+    /// The softcapped logits of [`Self::normed`] rows.
+    fn logits(&self, y: Tensor<Bk, 2>) -> Tensor<Bk, 2> {
+        let [rows, _] = y.dims();
+        let bf16 = |x: Tensor<Bk, 2>| x.cast(FloatDType::BF16).cast(FloatDType::F32);
         let raw = bf16(linear_bf16(y, &self.unembed).slice([0..rows, 0..self.vocab]));
         (raw / self.cap).tanh() * self.cap
     }
@@ -316,7 +328,7 @@ impl MiniModel {
         }
     }
 
-    fn embed(&self, ids: &[u32]) -> Tensor<Bk, 2> {
+    pub(super) fn embed(&self, ids: &[u32]) -> Tensor<Bk, 2> {
         let h = self.config().hidden_size;
         let table = Weights::tensor(&self.root, &Slot::Embed.tensor_name()).expect("checked at open");
         let mut v = Vec::with_capacity(ids.len() * h);
@@ -330,7 +342,7 @@ impl MiniModel {
 
     /// The whole forward of `ids` through `caches`, and the head on the last
     /// `rows` rows. Input is checked by the caller.
-    fn forward(&self, ids: &[u32], caches: &mut Caches, rows: usize) -> Logits {
+    fn forward(&self, ids: &[u32], caches: &mut Caches, rows: usize, taps: Option<(&TapPoints, &mut Vec<Tensor<Bk, 2>>)>) -> Logits {
         let t = self.config();
         let (n, h) = (ids.len(), t.hidden_size);
         prof::at(usize::MAX, 0);
@@ -340,11 +352,23 @@ impl MiniModel {
             x = x.mul_scalar(f32::NAN);
         }
         let mut blocks: Vec<Tensor<Bk, 2>> = Vec::new();
+        let mut seen: BTreeMap<CacheId, Tensor<Bk, 2>> = BTreeMap::new();
+        let points = taps.as_ref().map(|(p, _)| *p);
         for (layer, st) in self.pre.iter().zip(caches.pre.iter_mut()) {
             prof::at(layer.layer(), 0);
             x = layer.forward(x, &mut blocks, st);
+            let id = CacheId { layer: layer.layer(), pass: 0 };
+            if points.is_some_and(|p| p.after.contains(&id)) {
+                seen.insert(id, x.clone());
+            }
         }
-        let mut passes = self.core.forward(x, &blocks, &mut caches.core, 0, None, None);
+        let mut hook = |id: CacheId, out: &Tensor<Bk, 2>, _: Taps, _: Option<&Tensor<Bk, 3>>| {
+            if points.is_some_and(|p| p.after.contains(&id)) {
+                seen.insert(id, out.clone());
+            }
+        };
+        let hook: Option<VisitHook<'_>> = points.is_some().then_some(&mut hook);
+        let mut passes = self.core.forward(x, &blocks, &mut caches.core, 0, None, hook);
         let last = passes.pop().expect("the core runs at least one pass");
         let (mut x, mut blocks) = (last.hidden, last.blocks);
         for (layer, st) in self.post.iter().zip(caches.post.iter_mut()) {
@@ -354,9 +378,51 @@ impl MiniModel {
         prof::at(usize::MAX, 0);
         // The head needs only the requested trailing rows.
         let tail = |v: Tensor<Bk, 2>| v.slice([n - rows..n, 0..h]);
-        let logits = self.head.forward(blocks.into_iter().map(tail).collect(), tail(x));
+        let logits = match taps {
+            None => self.head.forward(blocks.into_iter().map(tail).collect(), tail(x)),
+            Some((points, out)) => {
+                let y = self.head.normed(blocks, x);
+                *out = points.after.iter().map(|id| seen.remove(id).expect("a tapped visit ran")).collect();
+                out.push(y.clone());
+                self.head.logits(tail(y))
+            }
+        };
         let values = logits.into_data().convert::<f32>().to_vec().expect("f32");
         Logits { rows, vocab: self.head.vocab, values }
+    }
+}
+
+/// Where a forward's hidden states are read for a drafter: the outputs of these
+/// visits, which are the inputs of the logical visits the drafter names, then
+/// the normed final state.
+pub struct TapPoints {
+    after: Vec<CacheId>,
+}
+
+impl TapPoints {
+    /// `ids` as a release lists them: logical visits, each read at its input,
+    /// then the number of visits for the normed final state. A visit whose
+    /// input is not the previous visit's output (a pass's first), or one after
+    /// the core, is refused.
+    pub fn new(t: &Inkling2LoopTextConfig, ids: &[usize]) -> Result<TapPoints> {
+        let schedule = Schedule::of(t);
+        let visits = schedule.visits();
+        let (last, inner) = ids.split_last().context("no tapped visits")?;
+        ensure!(*last == visits.len(), "the last tap is {last}, the model has {} visits", visits.len());
+        let after = inner
+            .iter()
+            .map(|&v| {
+                ensure!(v > 0 && v < visits.len(), "no visit {v} with one before it");
+                let (prev, this) = (&visits[v - 1], &visits[v]);
+                ensure!(
+                    this.segment != Segment::PostLoop && prev.cache.pass == this.cache.pass,
+                    "visit {v} does not start from visit {}'s output",
+                    v - 1
+                );
+                Ok(prev.cache)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(TapPoints { after })
     }
 }
 
@@ -376,6 +442,10 @@ struct Caches {
 }
 
 impl Caches {
+    fn states(&mut self) -> impl Iterator<Item = &mut State> {
+        self.pre.iter_mut().chain(self.core.visits.values_mut()).chain(self.post.iter_mut())
+    }
+
     /// The panic of `Route::picks`, after a forward: a set cell is a non-finite router logit somewhere in
     /// the call. The read is a sync; the head has already synced by then.
     fn check_router(&self) {
@@ -392,13 +462,15 @@ pub struct MiniSession {
     caches: Caches,
     position: usize,
     poisoned: bool,
+    /// Tokens of the last call that [`MiniSession::retract`] may still take back.
+    open: usize,
 }
 
 impl MiniSession {
     /// A fresh sequence at position 0 against `model`'s warm weights.
     pub fn new(model: Arc<MiniModel>) -> MiniSession {
         let caches = model.fresh();
-        MiniSession { model, caches, position: 0, poisoned: false }
+        MiniSession { model, caches, position: 0, poisoned: false, open: 0 }
     }
 
     pub fn model(&self) -> &Arc<MiniModel> {
@@ -421,6 +493,7 @@ impl MiniSession {
         self.caches = self.model.fresh();
         self.position = 0;
         self.poisoned = false;
+        self.open = 0;
     }
 
     /// The state identities this session holds, in execution order.
@@ -435,6 +508,38 @@ impl MiniSession {
     /// the requested rows. A prompt and a single decoded token are the same
     /// call.
     pub fn append(&mut self, ids: &[u32], rows: Rows) -> Result<Logits> {
+        self.append_with(ids, rows, None, false)
+    }
+
+    /// [`Self::append`], also returning the hidden states at `points`, every
+    /// row of each `[ids.len(), hidden]` on the device. With `revocable`, all
+    /// but the first of `ids` can be taken back by [`Self::retract`].
+    pub fn append_tapped(&mut self, ids: &[u32], rows: Rows, points: &TapPoints, revocable: bool) -> Result<(Logits, Vec<Tensor<Bk, 2>>)> {
+        let mut taps = Vec::new();
+        let logits = self.append_with(ids, rows, Some((points, &mut taps)), revocable)?;
+        Ok((logits, taps))
+    }
+
+    /// Take back all but the first `keep` tokens of the last call, which must
+    /// have been a revocable one. The sequence is then as if only those had been
+    /// appended, up to the rounding of a row computed beside others.
+    pub fn retract(&mut self, keep: usize) -> Result<()> {
+        ensure!(!self.poisoned, "a poisoned session has nothing to take back");
+        let t = std::mem::take(&mut self.open);
+        ensure!(t > 0, "the last call was not revocable");
+        ensure!(keep >= 1 && keep <= t, "keep {keep} of {t} tokens");
+        self.caches.states().for_each(|s| s.retract(t, keep));
+        self.position -= t - keep;
+        Ok(())
+    }
+
+    fn append_with(
+        &mut self,
+        ids: &[u32],
+        rows: Rows,
+        taps: Option<(&TapPoints, &mut Vec<Tensor<Bk, 2>>)>,
+        revocable: bool,
+    ) -> Result<Logits> {
         if self.poisoned {
             bail!("this session failed mid-forward and must be reset and replayed");
         }
@@ -457,14 +562,17 @@ impl MiniSession {
         };
         let model = Arc::clone(&self.model);
         let caches = &mut self.caches;
+        caches.states().for_each(|s| s.record(revocable));
+        self.open = 0;
         let call = || {
-            let logits = model.forward(ids, caches, rows);
+            let logits = model.forward(ids, caches, rows, taps);
             caches.check_router();
             logits
         };
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(call)) {
             Ok(logits) => {
                 self.position += ids.len();
+                self.open = if revocable { ids.len() } else { 0 };
                 Ok(logits)
             }
             Err(cause) => {
@@ -593,6 +701,82 @@ mod tests {
             for (what, x) in [("the replay's row", &whole), ("the cached step's row", &mixed)] {
                 let line = l.moe.row_is_its_own(x, &l.moe.route(x), n - 1).unwrap_or_else(|e| panic!("layer {layer}, {what}: {e}"));
                 eprintln!("EXPERT INPUT layer {layer}, {what}: {line}");
+            }
+        }
+    }
+
+    /// Release weights: after a call is taken back to its first `keep` tokens,
+    /// nothing of the rejected ones is left. Two sessions whose rejected tokens
+    /// differ hold bit-equal convolution histories, keys and next logits. A
+    /// session that only ever appended the kept tokens differs from them by the
+    /// rounding of another call shape; a session that kept one token fewer or
+    /// more differs by far more. The prompt ends just before a key segment fills
+    /// and just before the window lets the first one go.
+    #[test]
+    #[ignore = "needs the imported Mini release (MINI_MODEL_PILE, MINI_MODEL_COLLECTION, MINI_MODEL_ROOT) and a GPU"]
+    fn a_retracted_session_holds_only_the_kept_tokens() {
+        let model = open();
+        let points = TapPoints::new(model.config(), &[5, 23, 41, 48]).unwrap();
+        let t = 8usize;
+        let host = |x: Tensor<Bk, 2>| -> Vec<f32> { x.into_data().convert::<f32>().to_vec().unwrap() };
+        let rel = |a: &[f32], b: &[f32]| -> f64 {
+            assert_eq!(a.len(), b.len());
+            let (d, n) = a.iter().zip(b).fold((0f64, 0f64), |(d, n), (x, y)| {
+                (d + ((x - y) as f64).powi(2), n + (*y as f64).powi(2))
+            });
+            (d / n.max(f64::MIN_POSITIVE)).sqrt()
+        };
+        for prompt in [1020usize, 2044] {
+            let ids: Vec<u32> = (0..prompt as u32 + 16).map(|i| 1000 + (37 * i) % 90_000).collect();
+            let probe = &ids[prompt + 12..prompt + 13];
+            // `then`: tokens past the prompt; `keep` of them stay
+            let run = |then: &[u32], keep: usize, revoke: bool| {
+                let mut s = MiniSession::new(Arc::clone(&model));
+                s.prefill(&ids[..prompt]).unwrap();
+                if revoke {
+                    s.append_tapped(then, Rows::Last, &points, true).unwrap();
+                    s.retract(keep).unwrap();
+                } else {
+                    assert_eq!(then.len(), keep);
+                    s.append(then, Rows::Last).unwrap();
+                }
+                assert_eq!(s.position(), prompt + keep);
+                let mut conv = Vec::new();
+                let mut kv = Vec::new();
+                for st in s.caches.states() {
+                    assert_eq!(st.pos, prompt + keep);
+                    assert_eq!(st.kv.end(), prompt + keep, "keys end at the position");
+                    conv.extend(st.conv.iter().map(|c| host(c.clone())));
+                    let (k, rows) = (st.kv.keys().unwrap(), st.kv.rows());
+                    // the last eight rows held, whose positions are the retracted call's neighbourhood
+                    let [_, c] = k.dims();
+                    kv.push(host(k.slice([rows - 8..rows, 0..c])));
+                }
+                let next = s.append(probe, Rows::Last).unwrap();
+                (conv, kv, next.values)
+            };
+            let with = |keep: usize, fill: u32| -> Vec<u32> {
+                let mut v = ids[prompt..prompt + keep].to_vec();
+                v.extend((keep..t).map(|i| fill + i as u32));
+                v
+            };
+            for keep in [1usize, 3, 4, 5, 8] {
+                let x = run(&with(keep, 5000), keep, true);
+                let y = run(&with(keep, 70_000), keep, true);
+                let bits = |v: &[Vec<f32>]| -> Vec<u32> { v.iter().flatten().map(|f| f.to_bits()).collect() };
+                assert_eq!(bits(&x.0), bits(&y.0), "keep {keep}: a rejected token reached a convolution history");
+                assert_eq!(bits(&x.1), bits(&y.1), "keep {keep}: a rejected token reached the keys");
+                assert_eq!(bits(&[x.2.clone()]), bits(&[y.2.clone()]), "keep {keep}: a rejected token reached the next logits");
+                let z = run(&ids[prompt..prompt + keep], keep, false);
+                let worst = |a: &[Vec<f32>], b: &[Vec<f32>]| a.iter().zip(b).map(|(p, q)| rel(p, q)).fold(0.0, f64::max);
+                let (wc, wk, wl) = (worst(&x.0, &z.0), worst(&x.1, &z.1), rel(&x.2, &z.2));
+                // the same histories one token off, for scale
+                let off = run(&ids[prompt..prompt + keep + 1], keep + 1, false);
+                let least = x.0.iter().zip(&off.0).map(|(p, q)| rel(p, q)).fold(f64::INFINITY, f64::min);
+                eprintln!(
+                    "RETRACT prompt {prompt} keep {keep}/{t}: rejected tokens bit-invisible; vs the kept tokens alone: conv {wc:.3e} keys {wk:.3e} next logits {wl:.3e}; one token off, the least-moved conv history {least:.3e}"
+                );
+                assert!(wc < 0.5 * least, "keep {keep}: the histories are not the kept tokens' ({wc} against {least} one token off)");
             }
         }
     }

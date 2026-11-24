@@ -80,6 +80,8 @@ pub mod sliding;
 pub mod tail_check;
 #[cfg(feature = "inkling2-session")]
 pub mod session;
+#[cfg(feature = "inkling2-session")]
+pub mod drafter;
 #[cfg(feature = "inkling-cuda")]
 pub mod prof;
 #[cfg(feature = "inkling-cuda")]

@@ -233,24 +233,71 @@ pub struct State {
     /// one u32 on the device, `1 + logit` once a row's router logits were not
     /// finite. Nothing clears it; whoever owns the state reads it ([`State::fault`]).
     fault: FaultCell,
+    /// `Some` while the call running is one that may be partly taken back
+    /// ([`State::record`]): each convolution's history before the call and the
+    /// call's own inputs. Tensor clones, so nothing is copied.
+    undo: Option<[Option<(Tensor<Bk, 2>, Tensor<Bk, 2>)>; 4]>,
 }
 
 impl State {
     /// A fresh state with a fault cell of its own.
     pub fn new(d: &Dims, dev: &Dev) -> State {
-        State { pos: 0, kv: Kv::new(KEY_TILE), conv: Self::zero_conv(d, dev), fault: fault_cell(dev) }
+        State { pos: 0, kv: Kv::new(KEY_TILE), conv: Self::zero_conv(d, dev), fault: fault_cell(dev), undo: None }
     }
 
     /// A fresh state writing its router faults into `fault`, a cell shared
     /// with the other visits of one sequence, so the sequence reads one cell.
     pub fn sharing_fault(d: &Dims, dev: &Dev, fault: &FaultCell) -> State {
         assert!(fault.device() == dev, "state: a fault cell on {:?} for a state on {dev:?}", fault.device());
-        State { pos: 0, kv: Kv::new(KEY_TILE), conv: Self::zero_conv(d, dev), fault: fault.clone() }
+        State { pos: 0, kv: Kv::new(KEY_TILE), conv: Self::zero_conv(d, dev), fault: fault.clone(), undo: None }
     }
 
     /// The router fault cell this state's visits write.
     pub fn fault(&self) -> &FaultCell {
         &self.fault
+    }
+
+    /// Whether the next visit keeps what [`State::retract`] needs. A recorded
+    /// visit also holds back eviction, so every key a retracted position can
+    /// see is still there.
+    pub fn record(&mut self, on: bool) {
+        self.undo = on.then(|| [const { None }; 4]);
+    }
+
+    /// Remember convolution `i`'s history and its call's inputs, when recording.
+    pub(super) fn note_conv(&mut self, i: usize, x: &Tensor<Bk, 2>) {
+        if let Some(undo) = self.undo.as_mut() {
+            undo[i] = Some((self.conv[i].clone(), x.clone()));
+        }
+    }
+
+    /// The first absolute position the next visit's queries can start at, after
+    /// a visit of `t` rows: `pos + t`, or `pos + 1` when all but the first row
+    /// may still be taken back.
+    pub(super) fn next_query(&self, t: usize) -> usize {
+        self.pos + if self.undo.is_some() { 1 } else { t }
+    }
+
+    /// Take back all but the first `keep` (`>= 1`) of the last, recorded,
+    /// visit's `t` rows.
+    pub fn retract(&mut self, t: usize, keep: usize) {
+        assert!(keep >= 1 && keep <= t, "keep {keep} of {t} rows");
+        let undo = self.undo.take().expect("retract needs a recorded visit");
+        if keep == t {
+            return;
+        }
+        self.pos -= t - keep;
+        self.kv.truncate(self.pos);
+        for (hist, undo) in self.conv.iter_mut().zip(undo) {
+            let (before, x) = undo.expect("a recorded visit notes every convolution");
+            let ([h, c], [rows, _]) = (before.dims(), x.dims());
+            assert_eq!(rows, t, "the recorded convolution input is the visit's");
+            *hist = if keep >= h {
+                x.slice([keep - h..keep, 0..c])
+            } else {
+                Tensor::cat(vec![before.slice([keep..h, 0..c]), x.slice([0..keep, 0..c])], 0)
+            };
+        }
     }
 
     fn zero_conv(d: &Dims, dev: &Dev) -> [Tensor<Bk, 2>; 4] {
@@ -409,6 +456,7 @@ impl SlidingLayer {
             }
         };
         let attn = prof::span("attention", &x.device(), || self.attention(qkv, state));
+        state.note_conv(2, &attn);
         let attn_conv = conv_step(&mut state.conv[2], attn.clone(), &self.attn_sconv, d.conv_scale());
 
         let residual = if self.is_block_boundary() {
@@ -428,6 +476,7 @@ impl SlidingLayer {
         let mn = rms_norm(mlp_in, self.mlp_norm.clone(), d.eps);
 
         let (acc, route) = self.moe.forward(&mn, state.fault());
+        state.note_conv(3, &acc);
         let mlp_conv = conv_step(&mut state.conv[3], acc.clone(), &self.mlp_sconv, d.conv_scale());
         state.pos += t;
         let out = residual + mlp_conv.clone();
@@ -461,9 +510,11 @@ impl SlidingLayer {
         let q = l2_clip(q, d.qk_clip);
 
         let kp = linear_bf16(kn, &self.wk);
+        state.note_conv(0, &kp);
         let k = conv_step(&mut state.conv[0], kp, &self.k_sconv, d.conv_scale());
         let k = l2_clip(k.reshape([t, kvh, hd]), d.qk_clip).reshape([t, kvh * hd]);
         let vp = linear_bf16(vn, &self.wv);
+        state.note_conv(1, &vp);
         let v = conv_step(&mut state.conv[1], vp, &self.v_sconv, d.conv_scale());
         let v = unit_rms(v.reshape([t, kvh, hd]), d.eps).reshape([t, kvh * hd]);
         state.kv.append(k, v);
@@ -475,8 +526,8 @@ impl SlidingLayer {
         let sinks = linear_bf16(hn.clone(), &self.sink);
         let shape = AttnShape { heads, kv_heads: kvh, head_dim: hd, rel_extent: d.rel_extent, window: Some(d.window) };
         let o = attend(&shape, q, rel, &self.rel_proj, sinks, &state.kv, state.pos, QUERY_TILE);
-        // the next call's first query is `pos + t`; it sees keys from `pos + t + 1 - window`
-        state.kv.evict_before((state.pos + t + 1).saturating_sub(d.window));
+        // the next call's first query is `next_query`; it sees keys from `next_query + 1 - window`
+        state.kv.evict_before((state.next_query(t) + 1).saturating_sub(d.window));
         let gate = sigmoid(linear_bf16(hn, &self.gate_attn));
         linear_bf16(o * gate, &self.wo)
     }

@@ -269,6 +269,7 @@ impl FullLayer {
         };
         let normed = [0, 1, 2].map(|i| rms_norm(streams[i].clone(), self.in_norm[i].clone(), d.eps));
         let attn = self.attention(normed, state, origin);
+        state.note_conv(2, &attn);
         let attn_conv = conv_step(&mut state.conv[2], attn.clone(), &self.attn_sconv, d.conv_scale());
 
         let residual = if self.is_block_boundary() {
@@ -288,6 +289,7 @@ impl FullLayer {
         let mn = rms_norm(mlp_in, self.mlp_norm.clone(), d.eps);
 
         let (acc, route) = self.moe.forward(&mn, state.fault());
+        state.note_conv(3, &acc);
         let mlp_conv = conv_step(&mut state.conv[3], acc.clone(), &self.mlp_sconv, d.conv_scale());
         state.pos += t;
         let out = residual + mlp_conv.clone();
@@ -326,9 +328,11 @@ impl FullLayer {
         let q = l2_clip(q, d.qk_clip) * tau.clone();
 
         let k = linear_bf16(kn.clone(), &self.wk);
+        state.note_conv(0, &k);
         let k = dyn_conv_step(&mut state.conv[0], k, linear_bf16(kn, &self.k_proj), &self.k_static, kvh, d.kernel);
         let k = l2_clip(k.reshape([t, kvh, hd]), d.qk_clip).reshape([t, kvh * hd]);
         let v = linear_bf16(vn.clone(), &self.wv);
+        state.note_conv(1, &v);
         let v = dyn_conv_step(&mut state.conv[1], v, linear_bf16(vn, &self.v_proj), &self.v_static, kvh, d.kernel);
         let v = unit_rms(v.reshape([t, kvh, hd]), d.eps).reshape([t, kvh * hd]);
         state.kv.append(k, v);
