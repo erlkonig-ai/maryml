@@ -227,7 +227,12 @@ impl MiniModel {
     /// on the default CUDA device. The weights are views over the pile
     /// mapping until bound; binding uploads them.
     pub fn open(path: &Path, collection: CollectionHandle, root: Id) -> Result<MiniModel> {
-        let root = MiniRoot::open(path, collection, root).context("open the Mini model root")?;
+        Self::from_root(MiniRoot::open(path, collection, root).context("open the Mini model root")?)
+    }
+
+    /// [`Self::open`] from a root that is open already, so that a caller that
+    /// opened it to admit a prompt does not open and validate it again.
+    pub fn from_root(root: MiniRoot) -> Result<MiniModel> {
         let cfg = Inkling2LoopConfig::from_json(&root.config().context("config facts")?.to_string())
             .map_err(|e| anyhow!("config: {e}"))?;
         let tok = root.tokenizer_root();
