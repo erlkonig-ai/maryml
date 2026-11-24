@@ -590,10 +590,8 @@ impl ChatCodec {
         tools: Tools,
         effort: Effort,
     ) -> Result<Self> {
-        let whole = crate::tokenizer::build_tokenizer_with_added(facts, blobs, tokenizer_root, true)
-            .map_err(|e| anyhow::anyhow!("build the Mini tokenizer: {e}"))?;
-        let content = crate::tokenizer::build_tokenizer_with_added(facts, blobs, tokenizer_root, false)
-            .map_err(|e| anyhow::anyhow!("build the Mini content tokenizer: {e}"))?;
+        let (whole, content) = crate::tokenizer::build_tokenizer_and_content(facts, blobs, tokenizer_root)
+            .map_err(|e| anyhow::anyhow!("build the Mini tokenizers: {e}"))?;
         Self::new(whole, content, tools, effort)
     }
 

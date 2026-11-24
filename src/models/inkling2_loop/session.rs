@@ -231,10 +231,8 @@ impl MiniModel {
         let cfg = Inkling2LoopConfig::from_json(&root.config().context("config facts")?.to_string())
             .map_err(|e| anyhow!("config: {e}"))?;
         let tok = root.tokenizer_root();
-        let tokenizer = crate::tokenizer::build_tokenizer(root.facts(), root.store(), tok)
-            .map_err(|e| anyhow!("build the tokenizer from the root's graph: {e:?}"))?;
-        let content_tokenizer = crate::tokenizer::build_tokenizer_with_added(root.facts(), root.store(), tok, false)
-            .map_err(|e| anyhow!("build the content-only tokenizer from the root's graph: {e:?}"))?;
+        let (tokenizer, content_tokenizer) = crate::tokenizer::build_tokenizer_and_content(root.facts(), root.store(), tok)
+            .map_err(|e| anyhow!("build the tokenizers from the root's graph: {e:?}"))?;
         let dev = Dev::default();
         let t = &cfg.text_config;
         let l = &t.loop_config;

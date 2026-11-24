@@ -1325,6 +1325,33 @@ pub fn build_tokenizer_with_added(
     tok_id: Id,
     with_added: bool,
 ) -> Result<tokenizers::Tokenizer, Err> {
+    let mut tok = build_base(tribles, blobs, tok_id)?;
+    if with_added {
+        add_added(tribles, blobs, tok_id, &mut tok)?;
+    }
+    Ok(tok)
+}
+
+/// [`build_tokenizer`] and its content-only view, from one read of the graph.
+#[cfg(feature = "tokenizer")]
+pub fn build_tokenizer_and_content(
+    tribles: &TribleSet,
+    blobs: &impl BlobStoreGet,
+    tok_id: Id,
+) -> Result<(tokenizers::Tokenizer, tokenizers::Tokenizer), Err> {
+    let content = build_base(tribles, blobs, tok_id)?;
+    let mut whole = content.clone();
+    add_added(tribles, blobs, tok_id, &mut whole)?;
+    Ok((whole, content))
+}
+
+/// Everything of a tokenizer but its added tokens.
+#[cfg(feature = "tokenizer")]
+fn build_base(
+    tribles: &TribleSet,
+    blobs: &impl BlobStoreGet,
+    tok_id: Id,
+) -> Result<tokenizers::Tokenizer, Err> {
     use tokenizers::models::bpe::BPE;
     use tokenizers::models::wordpiece::WordPiece;
 
@@ -1411,6 +1438,17 @@ pub fn build_tokenizer_with_added(
         tok.with_post_processor(Some(build_post_processor(tribles, blobs, p)?));
     }
 
+    Ok(tok)
+}
+
+/// Add a tokenizer graph's added tokens to its base.
+#[cfg(feature = "tokenizer")]
+fn add_added(
+    tribles: &TribleSet,
+    blobs: &impl BlobStoreGet,
+    tok_id: Id,
+    tok: &mut tokenizers::Tokenizer,
+) -> Result<(), Err> {
     // Added tokens, in their original order and with their options (absent
     // options are the pre-2026-11-07 reconstruction: special, nothing else).
     // `tokenizers` assigns an id to a token the vocab lacks by appending it
@@ -1418,30 +1456,28 @@ pub fn build_tokenizer_with_added(
     // what makes the ids come out right; each is checked against the stored
     // id, because a graph whose added ids are not contiguous after the vocab
     // would otherwise rebuild with silently different ids.
-    if with_added {
-        for (content, id, options) in load_added_strict(tribles, blobs, tok_id)? {
-            let special = !options.contains(&flag::NOT_SPECIAL);
-            let token = tokenizers::AddedToken::from(content.clone(), special)
-                .normalized(options.contains(&flag::NORMALIZED))
-                .lstrip(options.contains(&flag::LSTRIP))
-                .rstrip(options.contains(&flag::RSTRIP))
-                .single_word(options.contains(&flag::SINGLE_WORD));
-            if special {
-                tok.add_special_tokens(&[token]);
-            } else {
-                tok.add_tokens(&[token]);
-            }
-            let assigned = tok.token_to_id(&content);
-            if assigned != Some(id as u32) {
-                return Err(format!(
-                    "added token {content:?} has id {id} in tokenizer {tok_id}, \
-                     but rebuilding assigns {assigned:?}"
-                )
-                .into());
-            }
+    for (content, id, options) in load_added_strict(tribles, blobs, tok_id)? {
+        let special = !options.contains(&flag::NOT_SPECIAL);
+        let token = tokenizers::AddedToken::from(content.clone(), special)
+            .normalized(options.contains(&flag::NORMALIZED))
+            .lstrip(options.contains(&flag::LSTRIP))
+            .rstrip(options.contains(&flag::RSTRIP))
+            .single_word(options.contains(&flag::SINGLE_WORD));
+        if special {
+            tok.add_special_tokens(&[token]);
+        } else {
+            tok.add_tokens(&[token]);
+        }
+        let assigned = tok.token_to_id(&content);
+        if assigned != Some(id as u32) {
+            return Err(format!(
+                "added token {content:?} has id {id} in tokenizer {tok_id}, \
+                 but rebuilding assigns {assigned:?}"
+            )
+            .into());
         }
     }
-    Ok(tok)
+    Ok(())
 }
 
 /// Reconstruct one post-processor node (recursing through `Sequence`).
