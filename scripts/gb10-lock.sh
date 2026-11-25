@@ -50,12 +50,21 @@
 # the true holder's processes and refuses -- so the failure mode is a lost
 # reservation and a wasted slot rather than an OOM. Beat anyway.
 #
+# THE LINE. On 2026-11-25 a job asked for a box for 76 minutes and never got it:
+# every gap went to whoever happened to poll first. So `take` keeps a place: the
+# first call that does not get the lock leaves a ticket with the time it asked,
+# every further call keeps it fresh, and a free box goes to the oldest ticket
+# still asking (QUEUED and rc 3 for everyone else). Stop asking for two minutes
+# and the place is gone, so a waiter that died holds nobody up for longer. A
+# `check` alone keeps no place. `release <host> <tag>` also leaves the line.
+#
 # USAGE, and note every call passes paths in a FILE rather than on a command line:
 #   gb10-lock.sh take <host> <tag>     -> rc 0 took it, rc 3 someone else holds it
 #   gb10-lock.sh release <host> <tag>  -> releases only if <tag> holds it
 #   gb10-lock.sh check <host>          -> prints the holder, rc 0 free, rc 3 held,
 #                                        rc 4 UNREACHABLE (state unknown -- never
 #                                        treat this as free OR as held)
+#   gb10-lock.sh queue <host>          -> who is waiting, first asker first
 #   gb10-lock.sh refresh <host> <tag> -> rc 0 renewed, rc 3 no longer owned,
 #                                      rc 5 heartbeat metadata/write failure
 #
@@ -260,6 +269,26 @@ find_tag_dir() { for d in $(held_dirs); do [ "$(tag_of "$d")" = "$TAG" ] && { ec
 avail_gb() { awk '/^MemAvailable:/{print int($2/1048576)}' /proc/meminfo; }
 holders() { for d in $(held_dirs); do tr '\n' ' ' < "$d/info" 2>/dev/null; echo; done; }
 
+# The waiting line (see the header). A ticket is a file named by its tag, holding
+# the time that tag first asked; asking again touches it. One that has not asked
+# for QUEUE_FRESH seconds has left the line.
+QUEUED="$LOCKROOT/queue"; QUEUE_FRESH=120; TICKET=${TAG//\//_}
+line() { # tickets still asking, oldest first: "<asked> <tag>"
+  [ -d "$QUEUED" ] || return 0
+  for t in "$QUEUED"/*; do
+    [ -f "$t" ] || continue
+    m=$(stat -c %Y "$t" 2>/dev/null) || continue
+    if [ $(( NOW - m )) -gt "$QUEUE_FRESH" ]; then rm -f -- "$t"; continue; fi
+    printf '%s %s\n' "$(head -c 24 "$t" | tr -dc 0-9)" "${t##*/}"
+  done | sort -n -k1,1 -k2,2
+}
+ask() { # take a place in the line, or keep the one this tag has
+  mkdir -p "$QUEUED" 2>/dev/null || return 0
+  [ -f "$QUEUED/$TICKET" ] || date -u +%s%N > "$QUEUED/$TICKET"
+  touch -c "$QUEUED/$TICKET"
+}
+leave() { rm -f -- "$QUEUED/$TICKET"; }
+
 write_info() {
   printf 'host=%s\ntag=%s\nstart=%s\nbeat=%s\n' "$ME" "$TAG" "$NOW" "$NOW" > "$1/info"
 }
@@ -308,6 +337,15 @@ case "$ACTION" in
       refresh_info "$d" || exit $?
       echo "TAKEN $TAG (already held by you; beat refreshed)"; exit 0
     fi
+    # Whoever asked first and is still asking goes first. With build slots a
+    # later asker may fit where the first does not, so there the line is only
+    # kept, not enforced.
+    ask
+    first=$(line | head -1 | cut -d' ' -f2-)
+    turn=1; [ "$SLOTS" != 1 ] || [ -z "$first" ] || [ "$first" = "$TICKET" ] || turn=0
+    if [ "$turn" = 0 ] && [ -z "$(held_dirs)" ]; then
+      echo "QUEUED: $first asked first -- keep asking, your place is kept while you do"; exit 3
+    fi
     notes=""
     for i in $(seq 1 "$SLOTS"); do
       d=$(slotdir "$i")
@@ -317,7 +355,7 @@ case "$ACTION" in
           notes="$notes slot $i needs ${MINGB} GB available, box has ${av:-?} GB;"; continue
         fi
       fi
-      if mkdir "$d" 2>/dev/null; then write_info "$d"
+      if mkdir "$d" 2>/dev/null; then write_info "$d"; leave
         [ "$i" -gt 1 ] && slot=" (build slot $i of $SLOTS)" || slot=""
         echo "TAKEN $TAG$slot -- you MUST call 'refresh $HOSTALIAS $TAG' at least every ${TIMEOUT}s"
         echo "  or this lock goes stale and another agent may take the box while you run."
@@ -328,9 +366,9 @@ case "$ACTION" in
       # THERE IS DELIBERATELY NO PID-LIVENESS TEST: the pid a take could record
       # is the transient ssh shell, dead the moment the take returns, so every
       # lock would be born dead. Liveness is a HEARTBEAT: `refresh`.
-      if [ "$age" -gt "$TIMEOUT" ]; then
+      if [ "$age" -gt "$TIMEOUT" ] && [ "$turn" = 1 ]; then
         htag=$(tag_of "$d"); rm -rf "$d"
-        if mkdir "$d" 2>/dev/null; then write_info "$d"
+        if mkdir "$d" 2>/dev/null; then write_info "$d"; leave
           echo "TAKEN $TAG (broke a stale lock in slot $i: $htag silent ${age}s > ${TIMEOUT}s)"; exit 0; fi
       fi
       notes="$notes slot $i held by tag=$(tag_of "$d") on $(sed -n 's/^host=//p' "$d/info"), last beat ${age}s ago;"
@@ -355,6 +393,7 @@ case "$ACTION" in
     echo "BEAT $TAG"; exit 0
     ;;
   release)
+    leave
     [ -n "$(held_dirs)" ] || { echo "NOT HELD"; exit 0; }
     if d=$(find_tag_dir); then rm -rf "$d"; echo "RELEASED $TAG"; exit 0; fi
     echo "REFUSING: held by $(for x in $(held_dirs); do tag_of "$x"; done | paste -sd' '), not $TAG"; exit 3
@@ -364,7 +403,11 @@ case "$ACTION" in
     holders
     exit 3
     ;;
-  *) echo "usage: gb10-lock.sh take|refresh|release|check <host> [tag]"; exit 2 ;;
+  queue)
+    line | while read -r asked tag; do echo "$tag asked $(( NOW - ${asked:-0} / 1000000000 ))s ago"; done
+    exit 0
+    ;;
+  *) echo "usage: gb10-lock.sh take|refresh|release|check|queue <host> [tag]"; exit 2 ;;
 esac
 REMOTE
 rc=$?
